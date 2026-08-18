@@ -868,6 +868,19 @@ private struct PullRequestActivityView: View {
                                     Text(comment.author?.login ?? "Unknown")
                                         .font(T3Typography.supportingStrong)
                                     MarkdownMessageView(comment.body, copyActionTitle: "Copy comment")
+                                    if model.detail?.capabilities.reactions == true {
+                                        PullRequestReactionsView(
+                                            reactions: comment.reactions ?? []
+                                        ) { reaction, reacted in
+                                            Task {
+                                                await model.react(
+                                                    subjectID: comment.id,
+                                                    reaction: reaction,
+                                                    reacted: reacted
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if model.detail?.capabilities.review.reply == true,
