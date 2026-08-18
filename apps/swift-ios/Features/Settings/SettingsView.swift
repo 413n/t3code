@@ -107,15 +107,27 @@ public struct SettingsView: View {
 
     private var generalSection: some View {
         SettingsSection(title: "General") {
-            NavigationLink {
-                UsageView(client: model.client)
-            } label: {
-                SettingsNavigationRow(
-                    title: "Usage",
-                    systemImage: "chart.bar.xaxis"
-                )
+            VStack(spacing: 0) {
+                NavigationLink {
+                    PullRequestsView(model: model)
+                } label: {
+                    SettingsNavigationRow(
+                        title: "Pull Requests",
+                        systemImage: "arrow.triangle.pull"
+                    )
+                }
+                .buttonStyle(.plain)
+                settingsDivider
+                NavigationLink {
+                    UsageView(client: model.client)
+                } label: {
+                    SettingsNavigationRow(
+                        title: "Usage",
+                        systemImage: "chart.bar.xaxis"
+                    )
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
     }
 
