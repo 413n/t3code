@@ -146,6 +146,7 @@ public struct NewThreadView: View {
             case .project:
                 NewTaskProjectPicker(
                     groups: creationProjectGroups,
+                    environments: model.snapshot.environments,
                     selectionID: selectedProjectGroup?.id,
                     onSelect: { group in
                         if selectProjectGroup(group) {
@@ -959,6 +960,7 @@ private enum NewTaskPicker: String, Identifiable {
 private struct NewTaskProjectPicker: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
     let groups: [DailyUXProjectGroup]
+    let environments: [FeatureEnvironment]
     let selectionID: String?
     let onSelect: (DailyUXProjectGroup) -> Void
 
@@ -976,9 +978,25 @@ private struct NewTaskProjectPicker: View {
                         Button {
                             onSelect(group)
                         } label: {
-                            HStack(spacing: 12) {
-                                Text(group.name)
-                                    .foregroundStyle(T3Colors.textPrimary)
+                            HStack(alignment: .top, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(group.name)
+                                        .foregroundStyle(T3Colors.textPrimary)
+
+                                    ForEach(group.projects.prefix(2)) { project in
+                                        Text(projectLocation(project))
+                                            .font(T3Typography.supporting)
+                                            .foregroundStyle(T3Colors.textTertiary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+
+                                    if group.projects.count > 2 {
+                                        Text("+\(group.projects.count - 2) more locations")
+                                            .font(T3Typography.supporting)
+                                            .foregroundStyle(T3Colors.textTertiary)
+                                    }
+                                }
 
                                 Spacer(minLength: 10)
 
@@ -988,7 +1006,7 @@ private struct NewTaskProjectPicker: View {
                                         .foregroundStyle(T3Colors.accent)
                                 }
                             }
-                            .frame(minHeight: 34)
+                            .frame(minHeight: 46)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -1012,6 +1030,12 @@ private struct NewTaskProjectPicker: View {
         }
         .presentationDetents([.medium, .large])
         .presentationBackground(T3Colors.background)
+    }
+
+    private func projectLocation(_ project: FeatureProject) -> String {
+        let environment = environments.first { $0.id == project.environmentID }?.name
+            ?? project.environmentID
+        return "\(environment) · \(project.path)"
     }
 }
 

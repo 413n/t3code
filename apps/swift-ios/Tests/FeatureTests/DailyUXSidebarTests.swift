@@ -7,6 +7,38 @@ struct DailyUXSidebarTests {
     private let now = Date(timeIntervalSince1970: 2_000_000)
 
     @Test
+    func snoozePresetsUseUsefulLocalClockBoundaries() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-18T17:00:00Z")
+        )
+
+        let presets = DailyUXSnoozePresets.resolve(now: now, calendar: calendar)
+
+        #expect(presets.map(\.id) == [.hour, .threeHours, .evening, .tomorrow, .nextWeek])
+        #expect(presets[0].until == now.addingTimeInterval(3_600))
+        #expect(presets[1].until == now.addingTimeInterval(10_800))
+        #expect(calendar.component(.hour, from: presets[2].until) == 18)
+        #expect(calendar.component(.hour, from: presets[3].until) == 9)
+        #expect(calendar.component(.weekday, from: presets[4].until) == 2)
+        #expect(calendar.component(.hour, from: presets[4].until) == 9)
+    }
+
+    @Test
+    func snoozePresetsHideEveningWhenItIsTooClose() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-19T00:30:00Z")
+        )
+
+        let presets = DailyUXSnoozePresets.resolve(now: now, calendar: calendar)
+
+        #expect(!presets.map(\.id).contains(.evening))
+    }
+
+    @Test
     func activeOrderUsesCreationTimeAndDoesNotJumpWithActivity() {
         let olderCreationRecentActivity = thread(
             id: "old",

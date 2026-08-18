@@ -27,15 +27,33 @@ public enum UsageCostSource: String, Codable, Sendable {
     case unpriced
 }
 
+public enum UsageResolution: String, Codable, Equatable, Sendable {
+    case day
+    case hour
+}
+
 public struct UsageSummaryInput: Codable, Equatable, Sendable {
     public let sinceDay: String
     public let untilDay: String
     public let timeZone: String
+    public let resolution: UsageResolution?
+    public let sinceTime: String?
+    public let untilTime: String?
 
-    public init(sinceDay: String, untilDay: String, timeZone: String) {
+    public init(
+        sinceDay: String,
+        untilDay: String,
+        timeZone: String,
+        resolution: UsageResolution? = nil,
+        sinceTime: String? = nil,
+        untilTime: String? = nil
+    ) {
         self.sinceDay = sinceDay
         self.untilDay = untilDay
         self.timeZone = timeZone
+        self.resolution = resolution
+        self.sinceTime = sinceTime
+        self.untilTime = untilTime
     }
 }
 
@@ -49,6 +67,7 @@ public struct UsageTokenTotals: Codable, Equatable, Sendable {
 
 public struct UsageBucket: Codable, Equatable, Sendable {
     public let day: String
+    public let hourStart: String?
     public let provider: UsageProviderKind
     public let model: String
     public let totals: UsageTokenTotals
@@ -58,6 +77,32 @@ public struct UsageBucket: Codable, Equatable, Sendable {
     public let records: Int
     public let unpricedRecords: Int
     public let sessions: Int
+
+    public init(
+        day: String,
+        hourStart: String? = nil,
+        provider: UsageProviderKind,
+        model: String,
+        totals: UsageTokenTotals,
+        costUsd: Double,
+        cacheSavingsUsd: Double,
+        costSource: UsageCostSource,
+        records: Int,
+        unpricedRecords: Int,
+        sessions: Int
+    ) {
+        self.day = day
+        self.hourStart = hourStart
+        self.provider = provider
+        self.model = model
+        self.totals = totals
+        self.costUsd = costUsd
+        self.cacheSavingsUsd = cacheSavingsUsd
+        self.costSource = costSource
+        self.records = records
+        self.unpricedRecords = unpricedRecords
+        self.sessions = sessions
+    }
 }
 
 public struct UsageSourceFingerprint: Codable, Equatable, Hashable, Sendable {

@@ -57,6 +57,15 @@ struct UsageDailyTotals: Identifiable, Equatable {
     var id: String { day }
 }
 
+struct UsageHourlyTotals: Identifiable, Equatable {
+    let hourStart: String
+    let costUsd: Double
+    let totalTokens: Int
+    let byProvider: [UsageProviderKind: UsageProviderValue]
+
+    var id: String { hourStart }
+}
+
 struct UsageCostQuality: Equatable {
     let providerReportedShare: Double
     let modelPricedShare: Double
@@ -77,6 +86,7 @@ struct MergedUsage: Equatable {
     var providers: [UsageProviderTotals] = []
     var models: [UsageModelTotals] = []
     var daily: [UsageDailyTotals] = []
+    var hourly: [UsageHourlyTotals] = []
     var costQuality = UsageCostQuality(
         providerReportedShare: 0,
         modelPricedShare: 0,
@@ -223,6 +233,7 @@ enum UsageMerger {
         var providers: [UsageProviderKind: ProviderAccumulator] = [:]
         var models: [String: ModelAccumulator] = [:]
         var daily: [String: DailyAccumulator] = [:]
+        var hourly: [String: DailyAccumulator] = [:]
 
         for (environment, summary) in current {
             let contribution = ownedContribution(
@@ -271,6 +282,17 @@ enum UsageMerger {
                 dayProvider.totalTokens += tokens
                 day.byProvider[bucket.provider] = dayProvider
                 daily[bucket.day] = day
+
+                if let hourStart = bucket.hourStart {
+                    var hour = hourly[hourStart] ?? DailyAccumulator()
+                    hour.costUsd += bucket.costUsd
+                    hour.totalTokens += tokens
+                    var hourProvider = hour.byProvider[bucket.provider] ?? UsageProviderValue()
+                    hourProvider.costUsd += bucket.costUsd
+                    hourProvider.totalTokens += tokens
+                    hour.byProvider[bucket.provider] = hourProvider
+                    hourly[hourStart] = hour
+                }
             }
         }
 
@@ -315,6 +337,15 @@ enum UsageMerger {
             )
         }
         .sorted { $0.day < $1.day }
+        result.hourly = hourly.map { hourStart, totals in
+            UsageHourlyTotals(
+                hourStart: hourStart,
+                costUsd: totals.costUsd,
+                totalTokens: totals.totalTokens,
+                byProvider: totals.byProvider
+            )
+        }
+        .sorted { $0.hourStart < $1.hourStart }
         result.costQuality = UsageCostQuality(
             providerReportedShare: result.records == 0
                 ? 0
@@ -418,11 +449,54 @@ enum UsageWindow {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = timeZone
         formatter.dateFormat = "yyyy-MM-dd"
+        if days == 1 {
+            let untilTimeInterval = floor(now.timeIntervalSince1970 / 60) * 60
+            let untilTime = Date(timeIntervalSince1970: untilTimeInterval)
+            let sinceTime = untilTime.addingTimeInterval(-24 * 60 * 60)
+            return UsageSummaryInput(
+                sinceDay: formatter.string(from: sinceTime),
+                untilDay: formatter.string(from: untilTime),
+                timeZone: timeZone.identifier,
+                resolution: .hour,
+                sinceTime: isoString(sinceTime),
+                untilTime: isoString(untilTime)
+            )
+        }
         return UsageSummaryInput(
             sinceDay: formatter.string(from: since),
             untilDay: formatter.string(from: until),
-            timeZone: timeZone.identifier
+            timeZone: timeZone.identifier,
+            resolution: .day
         )
+    }
+
+    static func hours(in input: UsageSummaryInput) -> [String] {
+        guard let sinceValue = input.sinceTime,
+              let untilValue = input.untilTime,
+              let since = isoDate(sinceValue),
+              let until = isoDate(untilValue),
+              since < until else {
+            return []
+        }
+        var result: [String] = []
+        var cursor = since
+        while cursor < until {
+            result.append(isoString(cursor))
+            cursor = cursor.addingTimeInterval(60 * 60)
+        }
+        return result
+    }
+
+    private static func isoString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private static func isoDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
 
     static func days(in input: UsageSummaryInput) -> [String] {

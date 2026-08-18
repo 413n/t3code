@@ -55,6 +55,7 @@ public protocol FeatureClient: AnyObject {
         refresh: Bool
     ) async throws -> [FeatureWorkspaceBranch]
     func renameThread(id: String, title: String) async throws
+    func regenerateThreadTitle(id: String) async throws
     func setThreadArchived(id: String, archived: Bool) async throws
     func setThreadSettled(id: String, settled: Bool) async throws
     func setThreadSnoozed(id: String, until: Date?) async throws
@@ -140,6 +141,10 @@ public protocol FeatureClient: AnyObject {
 public extension FeatureClient {
     func backgroundSnapshot() async throws -> FeatureSnapshot {
         try await initialSnapshot()
+    }
+
+    func regenerateThreadTitle(id _: String) async throws {
+        throw FeatureCapabilityUnavailable("Thread title regeneration")
     }
 
     func loadEarlierThreadTurns(id _: String) async throws -> FeatureThreadDetail? {

@@ -94,6 +94,61 @@ public struct FeatureMessageSubmission: Sendable, Equatable {
     }
 }
 
+struct DailyUXSnoozePreset: Identifiable, Equatable {
+    enum ID: String {
+        case hour
+        case threeHours
+        case evening
+        case tomorrow
+        case nextWeek
+    }
+
+    let id: ID
+    let label: String
+    let until: Date
+}
+
+enum DailyUXSnoozePresets {
+    static func resolve(now: Date, calendar: Calendar = .current) -> [DailyUXSnoozePreset] {
+        var result = [
+            DailyUXSnoozePreset(
+                id: .hour,
+                label: "In 1 hour",
+                until: now.addingTimeInterval(60 * 60)
+            ),
+            DailyUXSnoozePreset(
+                id: .threeHours,
+                label: "In 3 hours",
+                until: now.addingTimeInterval(3 * 60 * 60)
+            ),
+        ]
+
+        if let evening = calendar.date(bySettingHour: 18, minute: 0, second: 0, of: now),
+           evening.timeIntervalSince(now) > 60 * 60 {
+            result.append(.init(id: .evening, label: "This evening", until: evening))
+        }
+
+        if let tomorrow = calendar.date(
+            bySettingHour: 9,
+            minute: 0,
+            second: 0,
+            of: calendar.date(byAdding: .day, value: 1, to: now) ?? now
+        ) {
+            result.append(.init(id: .tomorrow, label: "Tomorrow", until: tomorrow))
+        }
+
+        let weekday = calendar.component(.weekday, from: now)
+        let daysUntilMonday = (2 - weekday + 7) % 7
+        let nextMondayOffset = daysUntilMonday == 0 ? 7 : daysUntilMonday
+        if let monday = calendar.date(byAdding: .day, value: nextMondayOffset, to: now),
+           let nextWeek = calendar.date(bySettingHour: 9, minute: 0, second: 0, of: monday) {
+            result.append(.init(id: .nextWeek, label: "Next week", until: nextWeek))
+        }
+
+        return result
+    }
+}
+
 enum DailyUXCreationContext {
     static func projects(in snapshot: FeatureSnapshot) -> [FeatureProject] {
         guard !snapshot.environments.isEmpty else { return snapshot.projects }

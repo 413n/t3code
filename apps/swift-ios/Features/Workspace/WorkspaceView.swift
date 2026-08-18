@@ -240,6 +240,9 @@ public struct WorkspaceView: View {
                     renameTitle = thread.title
                     renamingThread = thread
                 },
+                onRegenerateTitle: { thread in
+                    Task { await model.regenerateThreadTitle(thread.id) }
+                },
                 onArchive: { thread, archived in
                     Task { await model.setArchived(thread.id, archived: archived) }
                 },

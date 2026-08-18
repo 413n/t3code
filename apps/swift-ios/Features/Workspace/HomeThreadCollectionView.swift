@@ -19,6 +19,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let onToggleArchive: () -> Void
     let onShowMoreSettled: () -> Void
     let onRename: (FeatureThread) -> Void
+    let onRegenerateTitle: (FeatureThread) -> Void
     let onArchive: (FeatureThread, Bool) -> Void
     let onSettle: (FeatureThread, Bool) -> Void
     let onSnooze: (FeatureThread, Date?) -> Void
@@ -390,7 +391,18 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 self?.parent.onArchive(thread, !isArchived)
             }
 
-            var actions: [UIMenuElement] = [rename, archive]
+            var actions: [UIMenuElement] = [rename]
+            if thread.supportsTitleRegeneration == true {
+                actions.append(
+                    UIAction(
+                        title: "Regenerate title",
+                        image: UIImage(systemName: "sparkles")
+                    ) { [weak self] _ in
+                        self?.parent.onRegenerateTitle(thread)
+                    }
+                )
+            }
+            actions.append(archive)
             if !isArchived {
                 if thread.canTogglePin {
                     let isPinned = thread.pinnedAt != nil
@@ -419,21 +431,33 @@ struct HomeThreadCollectionView: UIViewRepresentable {
 
                 if thread.canToggleSnooze {
                     let isSnoozed = thread.isEffectivelySnoozed(at: .now)
-                    let snooze = UIAction(
-                        title: isSnoozed ? "Unsnooze" : "Snooze 1 hour",
-                        image: UIImage(systemName: isSnoozed ? "bell" : "clock")
-                    ) { [weak self] _ in
-                        self?.parent.onSnooze(
-                            thread,
-                            isSnoozed ? nil : Date.now.addingTimeInterval(60 * 60)
+                    if isSnoozed {
+                        actions.append(
+                            UIAction(title: "Wake thread", image: UIImage(systemName: "bell")) {
+                                [weak self] _ in
+                                self?.parent.onSnooze(thread, nil)
+                            }
                         )
+                    } else {
+                        let presets = DailyUXSnoozePresets.resolve(now: .now)
+                        let children = presets.map { preset in
+                            UIAction(title: preset.label) { [weak self] _ in
+                                self?.parent.onSnooze(thread, preset.until)
+                            }
+                        }
+                        let snoozeIsDisabled = thread.state == .queued
+                            || thread.state == .waitingForApproval
+                            || thread.state == .waitingForInput
+                        if snoozeIsDisabled {
+                            children.forEach { $0.attributes = .disabled }
+                        }
+                        let snooze = UIMenu(
+                            title: "Snooze",
+                            image: UIImage(systemName: "clock"),
+                            children: children
+                        )
+                        actions.append(snooze)
                     }
-                    if thread.state == .queued
-                        || thread.state == .waitingForApproval
-                        || thread.state == .waitingForInput {
-                        snooze.attributes = .disabled
-                    }
-                    actions.append(snooze)
                 }
             }
 

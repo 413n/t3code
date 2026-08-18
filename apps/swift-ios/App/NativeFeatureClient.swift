@@ -1309,6 +1309,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         try? await refresh(client: route.client)
     }
 
+    func regenerateThreadTitle(id: String) async throws {
+        let route = try threadRoute(for: id)
+        _ = try await route.client.regenerateTitle(threadID: route.wireID)
+        try? await refresh(client: route.client)
+    }
+
     func setThreadArchived(id: String, archived: Bool) async throws {
         let route = try threadRoute(for: id)
         let cached = cachedThread(id: route.uiID)

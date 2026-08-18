@@ -236,6 +236,13 @@ public struct ThreadDetailView: View {
                 }
             }
             Section {
+                if currentThread.supportsTitleRegeneration == true {
+                    Button {
+                        Task { await model.regenerateThreadTitle(thread.id) }
+                    } label: {
+                        Label("Regenerate title", systemImage: "sparkles")
+                    }
+                }
                 if currentThread.canTogglePin, !currentThread.isArchived {
                     Button {
                         Task {
