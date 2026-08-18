@@ -1,7 +1,6 @@
 import SwiftUI
 
 struct ConnectionsView: View {
-    @SwiftUI.Environment(\.dismiss) private var dismiss
     @Bindable var model: FeatureRootModel
 
     @State private var pendingEnabledValues: [String: Bool] = [:]
@@ -15,9 +14,6 @@ struct ConnectionsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider().overlay(T3Colors.border)
-
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 28) {
                     directConnectionsSection
@@ -30,7 +26,10 @@ struct ConnectionsView: View {
             .scrollDismissesKeyboard(.interactively)
         }
         .background(T3Colors.background)
-        .toolbar(.hidden, for: .navigationBar)
+        .navigationTitle("Environments")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .t3NavigationChrome()
         .task {
             await t3ConnectController?.refresh()
         }
@@ -125,33 +124,6 @@ struct ConnectionsView: View {
         } message: {
             Text(connectionErrorMessage ?? "Something went wrong.")
         }
-    }
-
-    private var header: some View {
-        HStack(spacing: 12) {
-            Button {
-                dismiss()
-            } label: {
-                Label("Settings", systemImage: "chevron.left")
-                    .labelStyle(.titleAndIcon)
-            }
-            .frame(width: 92, alignment: .leading)
-
-            Spacer(minLength: 0)
-
-            Text("Environments")
-                .font(T3Typography.navigationTitle)
-                .foregroundStyle(T3Colors.textPrimary)
-
-            Spacer(minLength: 0)
-
-            Color.clear
-                .frame(width: 92)
-        }
-        .font(T3Typography.control)
-        .foregroundStyle(T3Colors.accent)
-        .padding(.horizontal, 20)
-        .frame(minHeight: 54)
     }
 
     private var directConnectionsSection: some View {
