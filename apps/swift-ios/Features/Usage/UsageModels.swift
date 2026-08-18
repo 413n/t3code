@@ -198,17 +198,18 @@ enum UsageMerger {
         var byProvider: [UsageProviderKind: UsageProviderValue] = [:]
     }
 
-    static func merge(
-        _ environments: [FeatureEnvironmentUsage],
-        expectedContractVersion: Int = usageContractVersion
-    ) -> MergedUsage {
+    static func merge(_ environments: [FeatureEnvironmentUsage]) -> MergedUsage {
         let available = environments.compactMap { environment -> (FeatureEnvironmentUsage, UsageSummary)? in
             guard let summary = environment.summary else { return nil }
             return (environment, summary)
         }
-        let current = available.filter { $0.1.contractVersion == expectedContractVersion }
+        let current = available.filter {
+            isCompatibleUsageContractVersion($0.1.contractVersion)
+        }
         let staleEnvironmentIDs = available.compactMap { environment, summary in
-            summary.contractVersion == expectedContractVersion ? nil : environment.environmentID
+            isCompatibleUsageContractVersion(summary.contractVersion)
+                ? nil
+                : environment.environmentID
         }
         let claims = claimSources(current)
 

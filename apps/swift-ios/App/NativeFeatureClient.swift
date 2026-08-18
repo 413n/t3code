@@ -409,7 +409,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage] {
-        let environments = try await runtime.environments()
+        let environments = try await runtime.environments().filter(\.isEnabled)
         let runtime = runtime
         let order = Dictionary(uniqueKeysWithValues: environments.enumerated().map {
             ($0.element.id, $0.offset)

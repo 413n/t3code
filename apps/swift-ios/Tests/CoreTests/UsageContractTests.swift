@@ -7,13 +7,14 @@ final class UsageContractTests: XCTestCase {
         let data = Data(
             #"""
             {
-              "contractVersion": 3,
+              "contractVersion": 4,
               "readAt": "2026-08-09T12:00:00.000Z",
               "timeZone": "America/Los_Angeles",
               "sinceDay": "2026-08-03",
               "untilDay": "2026-08-09",
               "buckets": [{
                 "day": "2026-08-09",
+                "hourStart": "2026-08-09T12:00:00.000Z",
                 "provider": "codex",
                 "model": "gpt-5.6-sol",
                 "totals": {

@@ -112,7 +112,7 @@ public struct UsageView: View {
                     Text("\(environment.label) could not report usage.")
                 }
                 ForEach(stale) { environment in
-                    Text("\(environment.label) runs an older server version and is excluded from totals.")
+                    Text("\(environment.label) uses an unsupported usage format and is excluded from totals.")
                 }
                 if !merged.duplicateSources.isEmpty {
                     Text(
@@ -350,7 +350,7 @@ public struct UsageView: View {
 
     private var hasCompatibleSummary: Bool {
         environments.contains {
-            $0.summary?.contractVersion == usageContractVersion
+            $0.summary.map { isCompatibleUsageContractVersion($0.contractVersion) } == true
         }
     }
 

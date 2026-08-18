@@ -313,6 +313,55 @@ struct UsageModelsTests {
         #expect(state.errorMessage == nil)
     }
 
+    @Test
+    func rollingServerVersionsLoadWhenAnotherEnvironmentIsOffline() throws {
+        let timeZone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-18T12:00:00Z")
+        )
+        var state = UsageLoadState(days: 30, now: now, timeZone: timeZone)
+        let request = state.begin(days: 30, now: now, timeZone: timeZone)
+        let currentServer = FeatureEnvironmentUsage(
+            environmentID: "current-server",
+            label: "Current server",
+            summary: summary(
+                contractVersion: usageContractVersion,
+                provider: .codex,
+                costUsd: 10
+            ),
+            errorMessage: nil
+        )
+        let previousServer = FeatureEnvironmentUsage(
+            environmentID: "previous-server",
+            label: "Previous server",
+            summary: summary(
+                contractVersion: minimumCompatibleUsageContractVersion,
+                provider: .claude,
+                costUsd: 20
+            ),
+            errorMessage: nil
+        )
+        let offlineServer = FeatureEnvironmentUsage(
+            environmentID: "offline-server",
+            label: "Offline server",
+            summary: nil,
+            errorMessage: "This environment could not report usage."
+        )
+
+        let received = state.receive(
+            [currentServer, previousServer, offlineServer],
+            for: request
+        )
+        #expect(received)
+
+        #expect(state.merged.costUsd == 30)
+        #expect(
+            state.merged.contributingEnvironments == ["current-server", "previous-server"]
+        )
+        #expect(state.merged.staleEnvironments.isEmpty)
+        #expect(state.environments.filter { $0.errorMessage != nil } == [offlineServer])
+    }
+
     private func summary(
         contractVersion: Int = usageContractVersion,
         provider: UsageProviderKind,
