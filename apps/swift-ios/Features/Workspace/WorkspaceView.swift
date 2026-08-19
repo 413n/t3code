@@ -567,7 +567,13 @@ public struct WorkspaceView: View {
     }
 
     private func openNewTaskOrProjectCreation() {
-        openNewTaskOrProjectCreation(initialProjectID: selectedProjectID)
+        openNewTaskOrProjectCreation(
+            initialProjectID: DailyUXCreationContext.newTaskProjectID(
+                selectedProjectID: selectedProjectID,
+                selectedThreadID: selectedThreadID,
+                threads: model.snapshot.threads
+            )
+        )
     }
 
     private func openNewTaskOrProjectCreation(initialProjectID: String?) {

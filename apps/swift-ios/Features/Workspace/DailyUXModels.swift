@@ -150,6 +150,16 @@ enum DailyUXSnoozePresets {
 }
 
 enum DailyUXCreationContext {
+    static func newTaskProjectID(
+        selectedProjectID: String?,
+        selectedThreadID: String?,
+        threads: [FeatureThread]
+    ) -> String? {
+        if let selectedProjectID { return selectedProjectID }
+        guard let selectedThreadID else { return nil }
+        return threads.first { $0.id == selectedThreadID }?.projectID
+    }
+
     static func projects(in snapshot: FeatureSnapshot) -> [FeatureProject] {
         guard !snapshot.environments.isEmpty else { return snapshot.projects }
         let availableEnvironmentIDs = Set(
