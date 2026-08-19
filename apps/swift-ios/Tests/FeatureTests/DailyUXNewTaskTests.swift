@@ -6,37 +6,6 @@ import UIKit
 @Suite("Message-first task creation")
 struct DailyUXNewTaskTests {
     @Test
-    func newTaskUsesTheOpenThreadsProjectWhenShowingAllProjects() {
-        let t3Code = rankedProject("t3code", name: "T3 Code")
-        let wat = rankedProject("wat", name: "wat")
-        let threads = [
-            rankedThread("open-thread", projectID: t3Code.id, activity: 10),
-            rankedThread("recent-thread", projectID: wat.id, activity: 20),
-        ]
-
-        #expect(
-            DailyUXCreationContext.newTaskProjectID(
-                selectedProjectID: nil,
-                selectedThreadID: "open-thread",
-                threads: threads
-            ) == t3Code.id
-        )
-    }
-
-    @Test
-    func newTaskKeepsAnExplicitProjectFilterOverTheOpenThread() {
-        let threads = [rankedThread("open-thread", projectID: "t3code", activity: 10)]
-
-        #expect(
-            DailyUXCreationContext.newTaskProjectID(
-                selectedProjectID: "wat",
-                selectedThreadID: "open-thread",
-                threads: threads
-            ) == "wat"
-        )
-    }
-
-    @Test
     func recentProjectRankingDrivesTheDefaultAndKeepsUnusedProjectsOut() {
         let alpha = rankedProject("alpha", name: "Alpha")
         let beta = rankedProject("beta", name: "Beta")
