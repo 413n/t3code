@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct FeatureComposerView: View {
     @State private var isManuallyExpanded = false
@@ -7,6 +8,8 @@ struct FeatureComposerView: View {
     @State private var pathEntries: [FeatureComposerPathEntry] = []
     @State private var isPathSearchLoading = false
     @State private var pathSearchError: String?
+    @State private var textSelectionRequest: FeatureComposerTextSelectionRequest?
+    @State private var pasteErrorMessage: String?
     @Binding private var text: String
     @Binding private var selection: FeatureSelection?
     @Binding private var attachments: [FeatureDraftAttachment]
@@ -16,7 +19,7 @@ struct FeatureComposerView: View {
     private let materializesDefaultSelection: Bool
     private let isSending: Bool
     private let isWorking: Bool
-    private let focused: FocusState<Bool>.Binding
+    @Binding private var focused: Bool
     private let contextUsage: Double?
     private let forceExpanded: Bool
     private let pendingApprovals: [FeatureApproval]
@@ -25,6 +28,7 @@ struct FeatureComposerView: View {
     private let powerFeatures: FeatureComposerPowerFeatures
     private let onSend: () -> Void
     private let onStop: () -> Void
+    private let onDismissKeyboard: (() -> Void)?
     private let onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)?
     private let onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)?
 
@@ -37,7 +41,7 @@ struct FeatureComposerView: View {
         materializesDefaultSelection: Bool = true,
         isSending: Bool,
         isWorking: Bool,
-        focused: FocusState<Bool>.Binding,
+        focused: Binding<Bool>,
         onSend: @escaping () -> Void,
         onStop: @escaping () -> Void,
         contextUsage: Double? = nil,
@@ -46,6 +50,7 @@ struct FeatureComposerView: View {
         pendingUserInputs: [FeatureUserInput] = [],
         isResolvingRequest: Bool = false,
         powerFeatures: FeatureComposerPowerFeatures = .disabled,
+        onDismissKeyboard: (() -> Void)? = nil,
         onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)? = nil,
         onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)? = nil
     ) {
@@ -57,7 +62,7 @@ struct FeatureComposerView: View {
         self.materializesDefaultSelection = materializesDefaultSelection
         self.isSending = isSending
         self.isWorking = isWorking
-        self.focused = focused
+        _focused = focused
         self.onSend = onSend
         self.onStop = onStop
         self.contextUsage = contextUsage
@@ -66,6 +71,7 @@ struct FeatureComposerView: View {
         self.pendingUserInputs = pendingUserInputs
         self.isResolvingRequest = isResolvingRequest
         self.powerFeatures = powerFeatures
+        self.onDismissKeyboard = onDismissKeyboard
         self.onApprovalDecision = onApprovalDecision
         self.onUserInputSubmit = onUserInputSubmit
     }
@@ -104,9 +110,9 @@ struct FeatureComposerView: View {
                 )
                 .ignoresSafeArea()
             }
-            .onChange(of: focused.wrappedValue) {
+            .onChange(of: focused) {
                 if FeatureComposerCollapsePolicy.shouldCollapse(
-                    isFocused: focused.wrappedValue,
+                    isFocused: focused,
                     textIsEmpty: textIsEmpty,
                     attachmentsAreEmpty: attachments.isEmpty,
                     isAttachmentFlowActive: isAttachmentFlowActive,
@@ -117,6 +123,17 @@ struct FeatureComposerView: View {
             }
             .task(id: pathSearchRequest) {
                 await updatePathSearch()
+            }
+            .alert(
+                "Couldn’t paste image",
+                isPresented: Binding(
+                    get: { pasteErrorMessage != nil },
+                    set: { if !$0 { pasteErrorMessage = nil } }
+                )
+            ) {
+                Button("OK") { pasteErrorMessage = nil }
+            } message: {
+                Text(pasteErrorMessage ?? "")
             }
     }
 
@@ -161,7 +178,7 @@ struct FeatureComposerView: View {
                 isManuallyExpanded = true
                 Task { @MainActor in
                     await Task.yield()
-                    focused.wrappedValue = true
+                    focused = true
                 }
             } label: {
                 Text(isWorking ? "Message to queue…" : "Ask anything…")
@@ -188,26 +205,41 @@ struct FeatureComposerView: View {
                 FeatureAttachmentStrip(attachments: $attachments)
                     .padding(.horizontal, 12)
                     .padding(.top, 3)
+                    .padding(.bottom, 8)
 
                 Divider()
                     .overlay(T3Colors.separator)
                     .padding(.horizontal, 13)
             }
 
-            TextField(
-                isWorking ? "Message to queue…" : "Ask anything…",
-                text: $text,
-                axis: .vertical
-            )
-                .font(T3Typography.composer)
-                .modifier(FeatureComposerGrowingTextInput())
-                .focused(focused)
-                // Return is always editing input. Sending is deliberately button-only.
-                .submitLabel(.return)
+            // Return is always editing input. Sending is deliberately
+            // button-only, which is UITextView's native return behavior.
+            let placeholder = isWorking ? "Message to queue…" : "Ask anything…"
+            ZStack(alignment: .topLeading) {
+                FeatureComposerTextInput(
+                    text: $text,
+                    focused: $focused,
+                    placeholder: placeholder,
+                    acceptsImages: imagesAllowed,
+                    selectionRequest: textSelectionRequest,
+                    onPasteImages: loadPastedImages,
+                    onDismissKeyboard: onDismissKeyboard
+                )
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
-                .padding(.bottom, 7)
-                .frame(minHeight: 62, alignment: .top)
+
+                if text.isEmpty {
+                    Text(placeholder)
+                        .font(T3Typography.composer)
+                        .foregroundStyle(T3Colors.textTertiary)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 14)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.bottom, 7)
+            .frame(minHeight: 62, alignment: .top)
 
             if !attachments.isEmpty, !imagesAllowed {
                 Label("Choose a model that accepts images", systemImage: "exclamationmark.circle")
@@ -297,7 +329,7 @@ struct FeatureComposerView: View {
     private var isExpanded: Bool {
         forceExpanded
             || isManuallyExpanded
-            || focused.wrappedValue
+            || focused
             || !textIsEmpty
             || !attachments.isEmpty
             || attachmentPreparation.isPreparing
@@ -427,6 +459,13 @@ struct FeatureComposerView: View {
         case let .path(entry):
             replacement = FeatureComposerFileLinkSerializer.markdownLink(for: entry.path) + " "
         }
+        textSelectionRequest = FeatureComposerTextSelectionRequest(
+            location: FeatureComposerTextSelectionPolicy.cursorLocation(
+                afterReplacing: trigger.range,
+                in: text,
+                with: replacement
+            )
+        )
         text = FeatureComposerTriggerParser.replacing(
             trigger.range,
             in: text,
@@ -436,7 +475,7 @@ struct FeatureComposerView: View {
         pathSearchError = nil
         Task { @MainActor in
             await Task.yield()
-            focused.wrappedValue = true
+            focused = true
         }
     }
 
@@ -448,13 +487,45 @@ struct FeatureComposerView: View {
             onSend()
         }
     }
-}
 
-struct FeatureComposerGrowingTextInput: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .lineLimit(1...)
-            .layoutPriority(1)
+    /// Attaches images arriving from the text view's paste menu through the
+    /// same preparation pipeline the attachment picker uses, so sending stays
+    /// blocked until every pasted image is processed.
+    private func loadPastedImages(_ providers: [NSItemProvider]) {
+        guard imagesAllowed, !providers.isEmpty else { return }
+
+        let remaining = FeatureImageAttachmentLimits.maximumCount
+            - attachments.count
+            - attachmentPreparation.pendingItemCount
+        guard remaining > 0 else {
+            pasteErrorMessage = "You can attach up to eight images."
+            return
+        }
+        if providers.count > remaining {
+            pasteErrorMessage =
+                "Some images were not attached because the eight-image limit was reached."
+        }
+
+        let accepted = Array(providers.prefix(remaining))
+        let firstOrdinal = attachments.count + attachmentPreparation.pendingItemCount + 1
+        let operation = attachmentPreparation.begin(itemCount: accepted.count)
+        Task { @MainActor in
+            defer { attachmentPreparation.finish(operation) }
+            for (offset, provider) in accepted.enumerated() {
+                do {
+                    let data = try await FeatureImageItemProviderLoader.data(from: provider)
+                    let attachment = try await Task.detached(priority: .userInitiated) {
+                        try FeatureImageProcessor.attachment(
+                            from: data,
+                            ordinal: firstOrdinal + offset
+                        )
+                    }.value
+                    attachments.append(attachment)
+                } catch {
+                    pasteErrorMessage = error.localizedDescription
+                }
+            }
+        }
     }
 }
 

@@ -4,6 +4,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
+enum FeatureImageAttachmentLimits {
+    /// Shared by every attachment entry point (picker, camera, files, and
+    /// paste), so their in-flight reservations count against the same cap.
+    static let maximumCount = 8
+}
+
 struct FeatureAttachmentPreparationState: Equatable {
     struct Operation: Hashable {
         fileprivate let id: UUID
@@ -60,7 +66,7 @@ struct FeatureImageAttachmentPicker: View {
         attachments: Binding<[FeatureDraftAttachment]>,
         preparationState: Binding<FeatureAttachmentPreparationState>,
         isFlowActive: Binding<Bool>,
-        maximumCount: Int = 8,
+        maximumCount: Int = FeatureImageAttachmentLimits.maximumCount,
         isEnabled: Bool = true
     ) {
         _attachments = attachments
@@ -289,7 +295,19 @@ struct FeatureImageAttachmentPicker: View {
 private struct FeaturePhotoLibraryItem: @unchecked Sendable {
     let provider: NSItemProvider
 
+    @MainActor
     func loadData() async throws -> Data {
+        try await FeatureImageItemProviderLoader.data(from: provider)
+    }
+}
+
+/// Loads raw image bytes from an `NSItemProvider`, shared by the photo
+/// library picker and the composer's paste path. Main-actor isolated because
+/// providers arrive from main-actor UI callbacks and are not `Sendable`; the
+/// provider does its own work off-thread.
+enum FeatureImageItemProviderLoader {
+    @MainActor
+    static func data(from provider: NSItemProvider) async throws -> Data {
         guard let typeIdentifier = provider.registeredTypeIdentifiers.first(where: { identifier in
             UTType(identifier)?.conforms(to: .image) == true
         }) else {
