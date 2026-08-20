@@ -9,7 +9,7 @@ struct FeatureComposerView: View {
     @State private var isPathSearchLoading = false
     @State private var pathSearchError: String?
     @State private var textSelectionRequest: FeatureComposerTextSelectionRequest?
-    @State private var pasteErrorMessage: String?
+    @State private var imageIntakeErrorMessage: String?
     @Binding private var text: String
     @Binding private var selection: FeatureSelection?
     @Binding private var attachments: [FeatureDraftAttachment]
@@ -125,15 +125,15 @@ struct FeatureComposerView: View {
                 await updatePathSearch()
             }
             .alert(
-                "Couldn’t paste image",
+                "Couldn’t add image",
                 isPresented: Binding(
-                    get: { pasteErrorMessage != nil },
-                    set: { if !$0 { pasteErrorMessage = nil } }
+                    get: { imageIntakeErrorMessage != nil },
+                    set: { if !$0 { imageIntakeErrorMessage = nil } }
                 )
             ) {
-                Button("OK") { pasteErrorMessage = nil }
+                Button("OK") { imageIntakeErrorMessage = nil }
             } message: {
-                Text(pasteErrorMessage ?? "")
+                Text(imageIntakeErrorMessage ?? "")
             }
     }
 
@@ -170,6 +170,13 @@ struct FeatureComposerView: View {
                 .stroke(T3Colors.inputBorder, lineWidth: 1)
         }
         .clipShape(composerShape)
+        .modifier(
+            FeatureComposerImageDrop(
+                isEnabled: imagesAllowed,
+                shape: composerShape,
+                onDropImages: attachDroppedImages
+            )
+        )
     }
 
     private var collapsedComposer: some View {
@@ -222,7 +229,7 @@ struct FeatureComposerView: View {
                     placeholder: placeholder,
                     acceptsImages: imagesAllowed,
                     selectionRequest: textSelectionRequest,
-                    onPasteImages: loadPastedImages,
+                    onPasteImages: attachImageProviders,
                     onDismissKeyboard: onDismissKeyboard
                 )
                 .padding(.horizontal, 16)
@@ -488,44 +495,58 @@ struct FeatureComposerView: View {
         }
     }
 
-    /// Attaches images arriving from the text view's paste menu through the
-    /// same preparation pipeline the attachment picker uses, so sending stays
-    /// blocked until every pasted image is processed.
-    private func loadPastedImages(_ providers: [NSItemProvider]) {
+    /// Attaches images arriving from the text view's paste menu or a drag
+    /// from another app through the same preparation pipeline the attachment
+    /// picker uses, so sending stays blocked until every image is processed.
+    private func attachImageProviders(_ providers: [NSItemProvider]) {
         guard imagesAllowed, !providers.isEmpty else { return }
 
-        let remaining = FeatureImageAttachmentLimits.maximumCount
-            - attachments.count
-            - attachmentPreparation.pendingItemCount
-        guard remaining > 0 else {
-            pasteErrorMessage = "You can attach up to eight images."
+        guard let plan = FeatureComposerImageIntakePlan.forProviders(
+            providerCount: providers.count,
+            attachmentCount: attachments.count,
+            pendingCount: attachmentPreparation.pendingItemCount
+        ) else {
+            imageIntakeErrorMessage = "You can attach up to eight images."
             return
         }
-        if providers.count > remaining {
-            pasteErrorMessage =
+        if plan.droppedCount > 0 {
+            imageIntakeErrorMessage =
                 "Some images were not attached because the eight-image limit was reached."
         }
 
-        let accepted = Array(providers.prefix(remaining))
-        let firstOrdinal = attachments.count + attachmentPreparation.pendingItemCount + 1
+        let accepted = Array(providers.prefix(plan.acceptedCount))
+        // Begin every provider request while the paste or drop callback still
+        // owns access to its item providers. Image processing can finish
+        // asynchronously after the callback returns.
+        let loads = accepted.map { provider in
+            Result { try FeatureImageItemProviderLoader.start(from: provider) }
+        }
         let operation = attachmentPreparation.begin(itemCount: accepted.count)
         Task { @MainActor in
             defer { attachmentPreparation.finish(operation) }
-            for (offset, provider) in accepted.enumerated() {
+            for (offset, load) in loads.enumerated() {
                 do {
-                    let data = try await FeatureImageItemProviderLoader.data(from: provider)
+                    let data = try await load.get().data()
                     let attachment = try await Task.detached(priority: .userInitiated) {
                         try FeatureImageProcessor.attachment(
                             from: data,
-                            ordinal: firstOrdinal + offset
+                            ordinal: plan.firstOrdinal + offset
                         )
                     }.value
                     attachments.append(attachment)
                 } catch {
-                    pasteErrorMessage = error.localizedDescription
+                    imageIntakeErrorMessage = error.localizedDescription
                 }
             }
         }
+    }
+
+    /// A drop is refused outright when images are not accepted, so the drag
+    /// session shows the system's "not allowed" badge instead of a dead drop.
+    private func attachDroppedImages(_ providers: [NSItemProvider]) -> Bool {
+        guard imagesAllowed, !providers.isEmpty else { return false }
+        attachImageProviders(providers)
+        return true
     }
 }
 

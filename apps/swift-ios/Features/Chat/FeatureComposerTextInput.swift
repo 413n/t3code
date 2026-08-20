@@ -266,6 +266,19 @@ final class FeatureComposerUITextView: UITextView {
         return super.canPerformAction(action, withSender: sender)
     }
 
+    // Drops are the other client of the paste configuration: while editing,
+    // UIKit offers the text view any drag it says it can paste. Declining
+    // image drags leaves them to the composer surface, so one target owns
+    // the session and the highlight; when the text view wins instead, the
+    // image vanishes into UITextView's text-only default and the surface's
+    // highlight never hears that the session ended.
+    override func canPaste(_ itemProviders: [NSItemProvider]) -> Bool {
+        let holdsImage = itemProviders.contains {
+            $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+        }
+        return holdsImage ? false : super.canPaste(itemProviders)
+    }
+
     // When the pasteboard holds images, only the images attach. Any text
     // riding along (a copied web image usually brings its URL) is dropped on
     // purpose: Slack and X do the same, and inserting a stray URL next to an

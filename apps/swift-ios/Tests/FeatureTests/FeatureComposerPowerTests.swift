@@ -100,6 +100,27 @@ struct FeatureComposerPowerTests {
     }
 
     @Test
+    @MainActor
+    func textViewDeclinesImageDropsSoTheComposerSurfaceOwnsThem() {
+        let textView = FeatureComposerUITextView()
+        textView.acceptsImages = true
+
+        let image = NSItemProvider()
+        image.registerDataRepresentation(
+            forTypeIdentifier: UTType.png.identifier,
+            visibility: .all
+        ) { completion in
+            completion(Data([0x89, 0x50, 0x4E, 0x47]), nil)
+            return nil
+        }
+        let text = NSItemProvider(object: "caption" as NSString)
+
+        #expect(!textView.canPaste([image]))
+        #expect(!textView.canPaste([text, image]))
+        #expect(textView.canPaste([text]))
+    }
+
+    @Test
     func downwardDragDismissalRespectsDraftScrolling() {
         #expect(FeatureComposerDragDismissPolicy.shouldDismiss(
             translationX: 2, translationY: 20, isScrollable: false, isAtTop: true
