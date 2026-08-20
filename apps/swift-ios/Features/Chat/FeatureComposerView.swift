@@ -80,6 +80,11 @@ struct FeatureComposerView: View {
         composerSurface
             .overlay(alignment: .top) {
                 if showsCommandMenu, let trigger = composerTrigger {
+                    // Offset by the menu's deterministic height so it sits
+                    // fully above the composer and the active `$`/`@`/`/`
+                    // token stays readable while typing. An alignment-guide
+                    // override here never actually moved the menu, which
+                    // left it covering the text entry.
                     FeatureComposerCommandPopover(
                         triggerKind: trigger.kind,
                         items: commandMenuItems,
@@ -88,11 +93,11 @@ struct FeatureComposerView: View {
                         pathSearchAvailable: powerFeatures.searchPaths != nil,
                         onSelect: selectCommandItem
                     )
-                    .alignmentGuide(.top) { dimensions in
-                        // Keep the menu clear of the text entry surface so the
-                        // active `$`/`@`/`/` token remains readable while typing.
-                        dimensions[.bottom] + 24
-                    }
+                    .offset(
+                        y: -(FeatureComposerCommandPopover.height(
+                            forItemCount: commandMenuItems.count
+                        ) + 12)
+                    )
                 }
             }
             .padding(.horizontal, 12)
