@@ -39,14 +39,22 @@ private final class PullRequestsModel {
     var errorMessage: String?
 
     private let client: any FeatureClient
+    private var loadGeneration: UInt64 = 0
 
     init(client: any FeatureClient) {
         self.client = client
     }
 
     func load(invalidate: Bool = false) async {
+        loadGeneration &+= 1
+        let generation = loadGeneration
         isLoading = true
         errorMessage = nil
+        defer {
+            if loadGeneration == generation {
+                isLoading = false
+            }
+        }
         do {
             if invalidate { try await client.invalidatePullRequests(nil) }
             let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -63,7 +71,9 @@ private final class PullRequestsModel {
                     query: trimmedQuery.isEmpty ? nil : trimmedQuery
                 )
             )
+            guard !Task.isCancelled, loadGeneration == generation else { return }
             environments = result
+            var seenRowIDs = Set<String>()
             allRows = result.flatMap { environment in
                 (environment.result?.entries ?? []).map {
                     FeaturePullRequestRow(
@@ -73,12 +83,13 @@ private final class PullRequestsModel {
                     )
                 }
             }
+            .filter { seenRowIDs.insert($0.id).inserted }
             .sorted { $0.entry.updatedAt > $1.entry.updatedAt }
             applyLocalFilters()
         } catch {
+            guard loadGeneration == generation, !(error is CancellationError) else { return }
             errorMessage = error.localizedDescription
         }
-        isLoading = false
     }
 
     func applyLocalFilters() {
@@ -375,6 +386,7 @@ private final class PullRequestDetailModel {
     var detail: PullRequestDetail?
     var activity: PullRequestActivity?
     var diffFiles: [PullRequestDiffFile] = []
+    var isDiffIncomplete = false
     var isLoading = true
     var isLoadingDiff = false
     var isActing = false
@@ -409,13 +421,13 @@ private final class PullRequestDetailModel {
         isLoadingDiff = true
         do {
             var cursor: String?
-            var patch = ""
+            var pagination = PullRequestDiffPagination()
             repeat {
                 let page = try await client.pullRequestDiff(target, cursor: cursor)
-                patch += page.patch
-                cursor = page.nextCursor
+                cursor = pagination.append(page)
             } while cursor != nil
-            diffFiles = PullRequestDiffParser.parse(patch)
+            diffFiles = PullRequestDiffParser.parse(pagination.patch)
+            isDiffIncomplete = pagination.isIncomplete
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -445,7 +457,8 @@ private final class PullRequestDetailModel {
         await mutate { try await client.commentOnPullRequest(target, body: body) }
     }
 
-    func review(verdict: PullRequestReviewVerdict, body: String) async {
+    func review(verdict: PullRequestReviewVerdict, body: String) async -> Bool {
+        var submitted = false
         await mutate {
             try await client.submitPullRequestReview(
                 target,
@@ -454,7 +467,9 @@ private final class PullRequestDetailModel {
                 comments: reviewDrafts
             )
             reviewDrafts = []
+            submitted = true
         }
+        return submitted
     }
 
     func reply(threadID: String, body: String) async {
@@ -526,6 +541,13 @@ private enum PullRequestDetailTab: String, CaseIterable {
 }
 
 private struct PullRequestDetailView: View {
+    private struct PendingAction: Identifiable {
+        let id = UUID()
+        let action: PullRequestAction
+        var mergeMethod: PullRequestMergeMethod?
+        var updateMethod: PullRequestUpdateMethod?
+    }
+
     @Bindable var rootModel: FeatureRootModel
     let row: FeaturePullRequestRow
     @State private var model: PullRequestDetailModel
@@ -534,6 +556,7 @@ private struct PullRequestDetailView: View {
     @State private var reviewSheet = false
     @State private var reviewerSheet = false
     @State private var notice: String?
+    @State private var pendingAction: PendingAction?
 
     init(rootModel: FeatureRootModel, row: FeaturePullRequestRow) {
         self.rootModel = rootModel
@@ -602,6 +625,28 @@ private struct PullRequestDetailView: View {
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
         )) { Button("OK") {} } message: { Text(model.errorMessage ?? "") }
+        .alert(
+            "Confirm pull request action",
+            isPresented: Binding(
+                get: { pendingAction != nil },
+                set: { if !$0 { pendingAction = nil } }
+            ),
+            presenting: pendingAction
+        ) { pending in
+            Button(pending.action.label, role: .destructive) {
+                pendingAction = nil
+                Task {
+                    await model.run(
+                        pending.action,
+                        mergeMethod: pending.mergeMethod,
+                        updateMethod: pending.updateMethod
+                    )
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingAction = nil }
+        } message: { pending in
+            Text("This action will \(pending.action.label.lowercased()).")
+        }
     }
 
     private func detailHeader(_ detail: PullRequestDetail) -> some View {
@@ -628,13 +673,21 @@ private struct PullRequestDetailView: View {
     private func tabContent(_ detail: PullRequestDetail) -> some View {
         switch tab {
         case .summary:
-            PullRequestSummaryView(detail: detail, activity: model.activity, model: model)
+            PullRequestSummaryView(
+                detail: detail,
+                activity: model.activity,
+                model: model,
+                onUpdateBranch: { method in
+                    pendingAction = PendingAction(action: .updateBranch, updateMethod: method)
+                }
+            )
         case .conversation:
             PullRequestActivityView(activity: model.activity, model: model)
         case .files:
             PullRequestFilesView(
                 files: model.diffFiles,
                 isLoading: model.isLoadingDiff,
+                isIncomplete: model.isDiffIncomplete,
                 drafts: $model.reviewDrafts,
                 canComment: detail.capabilities.review.inlineComment
                     && detail.viewerPermissions.comment,
@@ -676,7 +729,11 @@ private struct PullRequestDetailView: View {
                        action != .merge,
                        action != .updateBranch {
                         Button(action.label, systemImage: action.systemImage) {
-                            Task { await model.run(action) }
+                            if action == .close || action == .enableAutoMerge {
+                                pendingAction = PendingAction(action: action)
+                            } else {
+                                Task { await model.run(action) }
+                            }
                         }
                     }
                 }
@@ -685,7 +742,7 @@ private struct PullRequestDetailView: View {
                     Menu("Merge pull request") {
                         ForEach(availableMergeMethods(detail), id: \.self) { method in
                             Button(method.label) {
-                                Task { await model.run(.merge, mergeMethod: method) }
+                                pendingAction = PendingAction(action: .merge, mergeMethod: method)
                             }
                         }
                     }
@@ -751,6 +808,7 @@ private struct PullRequestSummaryView: View {
     let detail: PullRequestDetail
     let activity: PullRequestActivity?
     @Bindable var model: PullRequestDetailModel
+    let onUpdateBranch: (PullRequestUpdateMethod) -> Void
 
     var body: some View {
         ScrollView {
@@ -769,7 +827,7 @@ private struct PullRequestSummaryView: View {
                         Menu("Update") {
                             ForEach(detail.viewerPermissions.updateMethods ?? [], id: \.self) { method in
                                 Button(method.rawValue.capitalized) {
-                                    Task { await model.run(.updateBranch, updateMethod: method) }
+                                    onUpdateBranch(method)
                                 }
                             }
                         }
@@ -987,6 +1045,7 @@ private struct PullRequestReactionsView: View {
 private struct PullRequestFilesView: View {
     let files: [PullRequestDiffFile]
     let isLoading: Bool
+    let isIncomplete: Bool
     @Binding var drafts: [PullRequestReviewCommentDraft]
     let canComment: Bool
     let sendToAgent: (PullRequestDiffLine, PullRequestDiffFile) -> Void
@@ -995,6 +1054,14 @@ private struct PullRequestFilesView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
+                if isIncomplete {
+                    Label(
+                        "Some changes are missing from this diff.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(T3Typography.supportingStrong)
+                    .foregroundStyle(T3Colors.warning)
+                }
                 if isLoading {
                     ProgressView("Loading diff…")
                         .frame(maxWidth: .infinity)
@@ -1097,8 +1164,13 @@ private struct PullRequestReviewSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Submit") {
-                        Task { await model.review(verdict: verdict, body: reviewBody); dismiss() }
+                        Task {
+                            if await model.review(verdict: verdict, body: reviewBody) {
+                                dismiss()
+                            }
+                        }
                     }
+                    .disabled(model.isActing)
                 }
             }
             .onAppear {
@@ -1253,6 +1325,25 @@ private struct PullRequestDiffSelection: Identifiable {
     let line: PullRequestDiffLine
 }
 
+struct PullRequestDiffPagination {
+    private(set) var patch = ""
+    private(set) var isIncomplete = false
+    private var seenCursors = Set<String>()
+
+    mutating func append(_ page: PullRequestDiffResult) -> String? {
+        patch += page.patch
+        isIncomplete = isIncomplete || page.truncated
+            || !(page.omittedFileStats ?? []).isEmpty
+
+        guard let cursor = page.nextCursor, !cursor.isEmpty else { return nil }
+        guard seenCursors.insert(cursor).inserted else {
+            isIncomplete = true
+            return nil
+        }
+        return cursor
+    }
+}
+
 enum PullRequestDiffParser {
     static func parse(_ patch: String) -> [PullRequestDiffFile] {
         var files: [PullRequestDiffFile] = []
@@ -1271,6 +1362,9 @@ enum PullRequestDiffParser {
         }
 
         for raw in patch.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            if raw == "\\ No newline at end of file" {
+                continue
+            }
             if raw.hasPrefix("diff --git ") {
                 finish()
                 let parts = raw.split(separator: " ")

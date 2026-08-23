@@ -37,10 +37,12 @@ public final class FeatureRootModel {
     public private(set) var isLoading = true
     public private(set) var isPerformingAction = false
     public private(set) var isManagingConnections = false
+    private(set) var isSigningOutT3Connect = false
     public var errorMessage: String?
 
     let client: any FeatureClient
     private let outboxStore: FeatureOutboxStore
+    private let draftStore: FeatureComposerDraftStore
     private var pendingSubmissionsByID: [String: FeatureQueuedSubmission] = [:]
     private var pendingThreadsByID: [String: FeatureThread] = [:]
     private var pendingCompletionSubmissionIDs: Set<String> = []
@@ -57,10 +59,12 @@ public final class FeatureRootModel {
 
     public init(
         client: any FeatureClient,
-        outboxStore: FeatureOutboxStore = .shared
+        outboxStore: FeatureOutboxStore = .shared,
+        draftStore: FeatureComposerDraftStore = .shared
     ) {
         self.client = client
         self.outboxStore = outboxStore
+        self.draftStore = draftStore
     }
 
     public func start() async {
@@ -122,20 +126,108 @@ public final class FeatureRootModel {
     }
 
     public func removeEnvironment(_ id: String) async {
+        var logicalProjectIDs = Set<String>(snapshot.projects.compactMap { project in
+            guard project.environmentID == id, project.repositoryIdentity != nil else {
+                return nil
+            }
+            return DailyUXCreationContext.logicalProjectID(for: project, in: snapshot)
+        })
+        let remainingLogicalProjectIDs = Set<String>(snapshot.projects.compactMap { project in
+            guard project.environmentID != id, project.repositoryIdentity != nil else {
+                return nil
+            }
+            return DailyUXCreationContext.logicalProjectID(for: project, in: snapshot)
+        })
+        logicalProjectIDs.subtract(remainingLogicalProjectIDs)
         await stopOutboxDrain()
         await perform {
             try await client.removeEnvironment(id: id)
+            var cleanupError: (any Error)?
             do {
                 try await outboxStore.removeAll(environmentID: id)
                 removePendingSubmissions(environmentID: id)
             } catch {
                 markPendingSubmissionsForDiscard(environmentID: id)
-                errorMessage = "Environment removed, but its queued messages could not be cleared: \(error.localizedDescription)"
+                cleanupError = error
+            }
+            do {
+                try await draftStore.removeDrafts(
+                    environmentID: id,
+                    logicalProjectIDs: logicalProjectIDs
+                )
+            } catch {
+                cleanupError = cleanupError ?? error
+            }
+            if let cleanupError {
+                errorMessage = "Environment removed, but its queued messages or drafts could not be cleared: \(cleanupError.localizedDescription)"
             }
             install(try await client.initialSnapshot())
             clearDetails()
         }
         scheduleOutboxDrain()
+    }
+
+    public func signOutT3Connect() async {
+        guard let capability = client as? any T3ConnectCapable else { return }
+        isSigningOutT3Connect = true
+        defer { isSigningOutT3Connect = false }
+        let removedEnvironmentIDs = snapshot.environments
+            .filter { $0.source == .t3Connect }
+            .map(\.id)
+        let removedEnvironmentIDSet = Set(removedEnvironmentIDs)
+        let groupedProjects = Dictionary(
+            grouping: snapshot.projects.filter { $0.repositoryIdentity != nil },
+            by: \.environmentID
+        )
+        let retainedLogicalProjectIDs = Set<String>(snapshot.projects.compactMap { project in
+            guard project.repositoryIdentity != nil,
+                  !removedEnvironmentIDSet.contains(project.environmentID) else {
+                return nil
+            }
+            return DailyUXCreationContext.logicalProjectID(for: project, in: snapshot)
+        })
+        let logicalProjectIDs = removedEnvironmentIDs.reduce(into: [String: Set<String>]()) {
+            result, environmentID in
+            let projectIDs = Set((groupedProjects[environmentID] ?? []).map {
+                DailyUXCreationContext.logicalProjectID(for: $0, in: snapshot)
+            })
+            result[environmentID] = projectIDs.subtracting(retainedLogicalProjectIDs)
+        }
+
+        await stopOutboxDrain()
+        await capability.signOutT3Connect()
+        for environmentID in removedEnvironmentIDs {
+            var cleanupError: (any Error)?
+            do {
+                try await outboxStore.removeAll(environmentID: environmentID)
+            } catch {
+                cleanupError = error
+            }
+            removePendingSubmissions(environmentID: environmentID)
+            do {
+                try await draftStore.removeDrafts(
+                    environmentID: environmentID,
+                    logicalProjectIDs: logicalProjectIDs[environmentID] ?? []
+                )
+            } catch {
+                cleanupError = cleanupError ?? error
+            }
+            if let cleanupError {
+                errorMessage = "Could not clear saved T3 Connect data: \(cleanupError.localizedDescription)"
+            }
+        }
+        clearDetails()
+        await reload()
+        scheduleOutboxDrain()
+    }
+
+    func removeManagedEnvironmentsAfterAccountChange() async {
+        let managedIDs = snapshot.environments
+            .filter { $0.source == .t3Connect }
+            .map(\.id)
+        for id in managedIDs {
+            await removeEnvironment(id)
+        }
     }
 
     @discardableResult
@@ -266,7 +358,8 @@ public final class FeatureRootModel {
                 if isEnvironmentConnected(project.environmentID) {
                     scheduleOutboxRetry()
                 }
-                return pendingThreadsByID[threadID]
+                return snapshot.threads.first { $0.id == threadID }
+                    ?? pendingThreadsByID[threadID]
             }
             let discarded = await discardQueuedSubmission(queued)
             if !discarded {
@@ -302,6 +395,13 @@ public final class FeatureRootModel {
     }
 
     public func setArchived(_ id: String, archived: Bool) async {
+        if archived,
+           let thread = snapshot.threads.first(where: { $0.id == id }),
+           [.queued, .working, .monitoring, .waitingForApproval, .waitingForInput]
+               .contains(thread.state) {
+            errorMessage = "This thread is still active. Stop it before archiving."
+            return
+        }
         let environment = currentEnvironmentIdentity
         await perform {
             try await client.setThreadArchived(id: id, archived: archived)
@@ -311,6 +411,12 @@ public final class FeatureRootModel {
     }
 
     public func setSettled(_ id: String, settled: Bool) async {
+        if settled,
+           let thread = snapshot.threads.first(where: { $0.id == id }),
+           !thread.canSettleNow {
+            errorMessage = "This thread still needs attention. Resolve or stop it first."
+            return
+        }
         let environment = currentEnvironmentIdentity
         await perform {
             try await client.setThreadSettled(id: id, settled: settled)
@@ -542,6 +648,25 @@ public final class FeatureRootModel {
     }
 
     public func cancelTurn(threadID: String) async {
+        if pendingSubmissionsByID.values.contains(where: {
+            $0.threadID == threadID && $0.creation != nil
+        }) {
+            await stopOutboxDrain()
+            let queued = pendingSubmissionsByID.values.filter { $0.threadID == threadID }
+            for submission in queued {
+                if !(await discardQueuedSubmission(submission)) {
+                    scheduleOutboxRetry()
+                }
+            }
+            if pendingThreadsByID[threadID] == nil,
+               snapshot.threads.contains(where: { $0.id == threadID }) {
+                await perform {
+                    try await client.cancelTurn(threadID: threadID)
+                }
+            }
+            scheduleOutboxDrain()
+            return
+        }
         await perform {
             try await client.cancelTurn(threadID: threadID)
         }
@@ -670,15 +795,17 @@ public final class FeatureRootModel {
                 scheduleOutboxDrain()
             }
         case let .thread(value):
-            acknowledgeAuthoritativeThread(value.id)
+            pendingThreadsByID.removeValue(forKey: value.id)
             upsert(value)
         case let .threadRemoved(id):
             removeThread(id: id)
             removeDetail(id: id)
         case let .detail(value):
+            pendingThreadsByID.removeValue(forKey: value.thread.id)
             store(value)
             upsert(value.thread)
         case let .detailDelta(value, delta):
+            pendingThreadsByID.removeValue(forKey: value.thread.id)
             store(value, delta: delta)
             upsert(value.thread)
         case let .failure(message):
@@ -737,7 +864,7 @@ public final class FeatureRootModel {
         var value = value
         let authoritativeThreadIDs = Set(value.threads.map(\.id))
         for id in authoritativeThreadIDs {
-            acknowledgeAuthoritativeThread(id)
+            pendingThreadsByID.removeValue(forKey: id)
         }
         for pending in pendingThreadsByID.values where !authoritativeThreadIDs.contains(pending.id) {
             value.threads.append(pending)
@@ -957,7 +1084,10 @@ public final class FeatureRootModel {
         for submission in submissions {
             if let creation = submission.creation {
                 if snapshot.threads.contains(where: { $0.id == submission.threadID }) {
-                    await discardRestoredSubmission(submission)
+                    pendingSubmissionsByID[submission.id] = submission
+                    if let detail = details[submission.threadID] {
+                        store(addingPendingMessages(to: detail))
+                    }
                     continue
                 }
                 guard let project = snapshot.projects.first(where: {
@@ -1121,14 +1251,6 @@ public final class FeatureRootModel {
         return result
     }
 
-    private func acknowledgeAuthoritativeThread(_ id: String) {
-        guard pendingThreadsByID[id] != nil,
-              let submission = pendingSubmissionsByID.values.first(where: {
-                  $0.threadID == id && $0.creation != nil
-              }) else { return }
-        scheduleQueuedSubmissionCompletion(submission)
-    }
-
     private func acknowledgeDeliveredMessages(_ messages: [FeatureMessage]) {
         // Runs on every detail publish; skip the full message-ID scan in the
         // common case where nothing is waiting in the outbox.
@@ -1140,7 +1262,7 @@ public final class FeatureRootModel {
             .filter { $0.state != .queued }
             .map(\.id))
         let delivered = pendingSubmissionsByID.values.filter {
-            $0.creation == nil && messageIDs.contains($0.identity.messageID)
+            messageIDs.contains($0.identity.messageID)
         }
         for submission in delivered {
             scheduleQueuedSubmissionCompletion(submission)
@@ -1299,7 +1421,11 @@ public final class FeatureRootModel {
             switch FeatureOutboxPolicy.decision(
                 for: submission,
                 snapshot: policySnapshot,
-                pendingCreationThreadIDs: Set(pendingThreadsByID.keys)
+                pendingCreationThreadIDs: Set(
+                    pendingSubmissionsByID.values.compactMap {
+                        $0.creation == nil ? nil : $0.threadID
+                    }
+                )
             ) {
             case .discard:
                 if !(await discardQueuedSubmission(submission)) {

@@ -1273,8 +1273,10 @@ public actor EnvironmentRuntime {
         let previousEnvironment = try await environmentStore.load()
             .first(where: { $0.id == environment.id })
         let previousActiveID = try await environmentStore.activeEnvironmentID()
-        let previousCredential = try await credentialStore.credential(for: environment.id)
-        try await credentialStore.setCredential(credential, for: environment.id)
+        let previousCredential = try await credentialStore.swapCredential(
+            credential,
+            for: environment.id
+        )
         do {
             try await environmentStore.upsert(environment)
             try await environmentStore.setActiveEnvironment(id: environment.id)
@@ -1283,12 +1285,16 @@ public actor EnvironmentRuntime {
             var rollbackErrors: [String] = []
             do {
                 if let previousCredential {
-                    try await credentialStore.setCredential(
+                    _ = try await credentialStore.replaceCredential(
                         previousCredential,
+                        ifMatching: credential,
                         for: environment.id
                     )
                 } else {
-                    try await credentialStore.removeCredential(for: environment.id)
+                    _ = try await credentialStore.removeCredential(
+                        ifMatching: credential,
+                        for: environment.id
+                    )
                 }
             } catch {
                 rollbackErrors.append("credential: \(error.localizedDescription)")
@@ -1741,7 +1747,7 @@ public enum OrchestrationCommands {
                 "type": .string("thread.snooze"),
                 "commandId": .string(commandID),
                 "threadId": .string(threadID),
-                "snoozedUntil": .string(iso8601.string(from: until)),
+                "snoozedUntil": .string(iso8601.format(until)),
             ])
         }
         return .object([
@@ -1803,10 +1809,9 @@ public enum OrchestrationCommands {
     }
 
     public static func now() -> String {
-        iso8601.string(from: Date())
+        iso8601.format(Date())
     }
 
-    /// ISO8601DateFormatter is expensive to construct and thread-safe to use;
-    /// `now()` runs as the default argument of nearly every outbound command.
-    static let iso8601 = ISO8601DateFormatter()
+    /// Commands are built on several actors, so their shared formatter must be Sendable.
+    private static let iso8601 = Date.ISO8601FormatStyle()
 }

@@ -43,4 +43,60 @@ struct PullRequestDiffTests {
         #expect(file.oldPath == "Old.swift")
         #expect(file.path == "New.swift")
     }
+
+    @Test
+    func missingNewlineMarkersDoNotChangeReviewLineNumbers() throws {
+        let patch = """
+        diff --git a/App.swift b/App.swift
+        --- a/App.swift
+        +++ b/App.swift
+        @@ -1,2 +1,2 @@
+        -old
+        \\ No newline at end of file
+        +new
+        \\ No newline at end of file
+         context
+        """
+
+        let file = try #require(PullRequestDiffParser.parse(patch).first)
+
+        #expect(file.lines.count == 4)
+        #expect(file.lines[1].position == .deleted(1))
+        #expect(file.lines[2].position == .added(1))
+        #expect(file.lines[3].oldLine == 2)
+        #expect(file.lines[3].newLine == 2)
+    }
+
+    @Test
+    func repeatedDiffCursorsStopPaginationAndMarkDiffIncomplete() {
+        var pagination = PullRequestDiffPagination()
+
+        #expect(pagination.append(
+            PullRequestDiffResult(
+                patch: "first",
+                truncated: false,
+                nextCursor: "first-cursor",
+                omittedFileStats: nil
+            )
+        ) == "first-cursor")
+        #expect(pagination.append(
+            PullRequestDiffResult(
+                patch: "second",
+                truncated: false,
+                nextCursor: "second-cursor",
+                omittedFileStats: nil
+            )
+        ) == "second-cursor")
+        #expect(pagination.append(
+            PullRequestDiffResult(
+                patch: "third",
+                truncated: false,
+                nextCursor: "first-cursor",
+                omittedFileStats: nil
+            )
+        ) == nil)
+
+        #expect(pagination.patch == "firstsecondthird")
+        #expect(pagination.isIncomplete)
+    }
 }
