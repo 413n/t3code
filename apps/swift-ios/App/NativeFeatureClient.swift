@@ -467,8 +467,24 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
     {
+        try await pullRequestLists(input, inEnvironment: nil)
+    }
+
+    func pullRequestLists(
+        _ input: PullRequestListInput,
+        environmentID: String
+    ) async throws -> [FeaturePullRequestEnvironmentList] {
+        try await pullRequestLists(input, inEnvironment: environmentID)
+    }
+
+    private func pullRequestLists(
+        _ input: PullRequestListInput,
+        inEnvironment environmentID: String?
+    ) async throws -> [FeaturePullRequestEnvironmentList] {
         let environments = try await runtime.environments().filter {
-            $0.isEnabled && $0.descriptor?.capabilities.pullRequests == true
+            $0.isEnabled
+                && $0.descriptor?.capabilities.pullRequests == true
+                && (environmentID == nil || $0.id == environmentID)
         }
         let runtime = runtime
         return await withTaskGroup(of: FeaturePullRequestEnvironmentList.self) { group in
@@ -476,30 +492,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 group.addTask {
                     let probe = await runtime.ephemeralClient(for: environment)
                     do {
-                        var result = try await probe.pullRequests(input)
-                        var visitedCursors = Set<String>()
-                        while !result.nextCursors.isEmpty {
-                            try Task.checkCancellation()
-                            let cursorIdentity = result.nextCursors
-                                .sorted { $0.key < $1.key }
-                                .map { "\($0.key)=\($0.value)" }
-                                .joined(separator: "&")
-                            guard visitedCursors.insert(cursorIdentity).inserted else { break }
-                            let next = try await probe.pullRequests(
-                                PullRequestListInput(
-                                    state: input.state,
-                                    involvement: input.involvement,
-                                    filters: input.filters,
-                                    projectId: input.projectId,
-                                    projectIds: input.projectIds,
-                                    host: input.host,
-                                    limit: input.limit,
-                                    cursors: result.nextCursors,
-                                    query: input.query
-                                )
-                            )
-                            result = result.appending(next)
-                        }
+                        let result = try await probe.pullRequests(input)
                         await probe.disconnect()
                         return FeaturePullRequestEnvironmentList(
                             environmentID: environment.id,
@@ -1003,18 +996,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ) async -> Bool {
         let environment = client.environment
         let generation = environmentGeneration
-        guard let shell = try? await client.shellSnapshot(),
-              isKnownClient(client, environmentID: environment.id, generation: generation),
-              shell.projects.contains(where: {
+        guard let fetchedShell = try? await client.shellSnapshot(),
+              isKnownClient(client, environmentID: environment.id, generation: generation) else {
+            return false
+        }
+        let shell = newestShell(fetchedShell, for: environment)
+        guard shell.projects.contains(where: {
                   $0.id == projectID
                     || ProjectCreationPath.normalizedForComparison($0.workspaceRoot)
                         == ProjectCreationPath.normalizedForComparison(path)
               }) else {
             return false
-        }
-        shellsByEnvironmentID[environment.id] = shell
-        if activeEnvironment?.id == environment.id {
-            latestShell = shell
         }
         rebuildEntityIndexes((try? await runtime.environments()) ?? [environment])
         await emitSnapshot(shell, environment: environment)
@@ -1120,14 +1112,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         } else {
             refreshedShell = try? await client.shellSnapshot()
         }
-        if let shell = refreshedShell {
+        if let refreshedShell {
             guard isKnownClient(client, environmentID: environment.id, generation: generation) else {
                 throw CancellationError()
             }
-            shellsByEnvironmentID[environment.id] = shell
-            if activeEnvironment?.id == environment.id {
-                latestShell = shell
-            }
+            let shell = newestShell(refreshedShell, for: environment)
             await emitSnapshot(shell, environment: environment)
             if let created = shell.threads.first(where: { $0.id == pending.threadID }) {
                 provisionalThreadRoutes[FeatureScopedID.thread(
@@ -1359,14 +1348,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         removePendingBootstrap(identity: pending.identity)
         // Dispatch acceptance is the commit point. A dropped refresh must not
         // turn a successful first turn into a retry that creates a duplicate.
-        if let shell = try? await client.shellSnapshot() {
+        if let refreshedShell = try? await client.shellSnapshot() {
             guard isKnownClient(client, environmentID: environment.id, generation: generation) else {
                 throw CancellationError()
             }
-            shellsByEnvironmentID[environment.id] = shell
-            if activeEnvironment?.id == environment.id {
-                latestShell = shell
-            }
+            let shell = newestShell(refreshedShell, for: environment)
             await emitSnapshot(shell, environment: environment)
             if let created = shell.threads.first(where: { $0.id == pending.threadID }) {
                 provisionalThreadRoutes[FeatureScopedID.thread(
@@ -2715,6 +2701,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                   self.isCurrentSession(client: activeClient, generation: generation) else {
                 return
             }
+            self.lastShellEventAt = nil
             self.emitConnection(
                 .reconnecting,
                 detail: "Live updates paused. Refreshing over HTTP."
@@ -3446,6 +3433,24 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             }
         }
         rebuildEntityIndexes(savedEnvironments)
+    }
+
+    private func newestShell(
+        _ candidate: OrchestrationShellSnapshot,
+        for environment: Environment
+    ) -> OrchestrationShellSnapshot {
+        let latest: OrchestrationShellSnapshot
+        if let cached = shellsByEnvironmentID[environment.id],
+           cached.snapshotSequence > candidate.snapshotSequence {
+            latest = cached
+        } else {
+            latest = candidate
+            shellsByEnvironmentID[environment.id] = candidate
+        }
+        if activeEnvironment?.id == environment.id {
+            latestShell = latest
+        }
+        return latest
     }
 
     private func rebuildEntityIndexes(_ environments: [Environment]) {

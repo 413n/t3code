@@ -90,6 +90,10 @@ public protocol FeatureClient: AnyObject {
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage]
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
+    func pullRequestLists(
+        _ input: PullRequestListInput,
+        environmentID: String
+    ) async throws -> [FeaturePullRequestEnvironmentList]
     func pullRequestDetail(_ target: FeaturePullRequestTarget) async throws -> PullRequestDetail
     func pullRequestActivity(_ target: FeaturePullRequestTarget) async throws
         -> PullRequestActivity
@@ -217,6 +221,12 @@ public extension FeatureClient {
         -> [FeaturePullRequestEnvironmentList]
     {
         []
+    }
+    func pullRequestLists(
+        _ input: PullRequestListInput,
+        environmentID: String
+    ) async throws -> [FeaturePullRequestEnvironmentList] {
+        throw FeatureCapabilityUnavailable("Environment-specific pull request pagination")
     }
     func pullRequestDetail(_ target: FeaturePullRequestTarget) async throws -> PullRequestDetail {
         throw FeatureCapabilityUnavailable("Pull requests")

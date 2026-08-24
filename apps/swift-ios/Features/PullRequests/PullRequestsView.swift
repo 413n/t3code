@@ -22,7 +22,7 @@ struct FeaturePullRequestRow: Identifiable, Equatable {
 
 @MainActor
 @Observable
-private final class PullRequestsModel {
+final class PullRequestsModel {
     var rows: [FeaturePullRequestRow] = []
     private var allRows: [FeaturePullRequestRow] = []
     var environments: [FeaturePullRequestEnvironmentList] = []
@@ -36,10 +36,12 @@ private final class PullRequestsModel {
     var hostFilter: String?
     var projectFilter: String?
     var isLoading = false
+    var isLoadingMore = false
     var errorMessage: String?
 
     private let client: any FeatureClient
     private var loadGeneration: UInt64 = 0
+    private var loadedInput: PullRequestListInput?
 
     init(client: any FeatureClient) {
         self.client = client
@@ -49,6 +51,7 @@ private final class PullRequestsModel {
         loadGeneration &+= 1
         let generation = loadGeneration
         isLoading = true
+        isLoadingMore = false
         errorMessage = nil
         defer {
             if loadGeneration == generation {
@@ -63,32 +66,108 @@ private final class PullRequestsModel {
                 review: reviewFilter,
                 checks: checksFilter
             )
-            let result = try await client.pullRequestLists(
-                PullRequestListInput(
-                    state: state,
-                    involvement: involvement,
-                    filters: filters == PullRequestListFilters() ? nil : filters,
-                    query: trimmedQuery.isEmpty ? nil : trimmedQuery
-                )
+            let input = PullRequestListInput(
+                state: state,
+                involvement: involvement,
+                filters: filters == PullRequestListFilters() ? nil : filters,
+                query: trimmedQuery.isEmpty ? nil : trimmedQuery
             )
+            let result = try await client.pullRequestLists(input)
             guard !Task.isCancelled, loadGeneration == generation else { return }
+            loadedInput = input
             environments = result
-            var seenRowIDs = Set<String>()
-            allRows = result.flatMap { environment in
-                (environment.result?.entries ?? []).map {
-                    FeaturePullRequestRow(
-                        environmentID: environment.environmentID,
-                        environmentName: environment.environmentName,
-                        entry: $0
-                    )
-                }
-            }
-            .filter { seenRowIDs.insert($0.id).inserted }
-            .sorted { $0.entry.updatedAt > $1.entry.updatedAt }
-            applyLocalFilters()
+            updateRows()
         } catch {
             guard loadGeneration == generation, !(error is CancellationError) else { return }
             errorMessage = error.localizedDescription
+        }
+    }
+
+    var hasMorePages: Bool {
+        environments.contains { environment in
+            (environmentFilter == nil || environment.environmentID == environmentFilter)
+                && environment.result?.nextCursors.isEmpty == false
+        }
+    }
+
+    func loadMore() async {
+        guard !isLoading, !isLoadingMore, let loadedInput else { return }
+
+        let pending = environments.compactMap { environment -> (String, [String: String])? in
+            guard environmentFilter == nil || environment.environmentID == environmentFilter,
+                  let cursors = environment.result?.nextCursors,
+                  !cursors.isEmpty else {
+                return nil
+            }
+            return (environment.environmentID, cursors)
+        }
+        guard !pending.isEmpty else { return }
+
+        let generation = loadGeneration
+        isLoadingMore = true
+        defer {
+            if loadGeneration == generation {
+                isLoadingMore = false
+            }
+        }
+
+        for (environmentID, cursors) in pending {
+            guard !Task.isCancelled, loadGeneration == generation else { return }
+
+            let input = PullRequestListInput(
+                state: loadedInput.state,
+                involvement: loadedInput.involvement,
+                filters: loadedInput.filters,
+                projectId: loadedInput.projectId,
+                projectIds: loadedInput.projectIds,
+                host: loadedInput.host,
+                limit: loadedInput.limit,
+                cursors: cursors,
+                query: loadedInput.query
+            )
+
+            do {
+                let pages = try await client.pullRequestLists(
+                    input,
+                    environmentID: environmentID
+                )
+                guard !Task.isCancelled, loadGeneration == generation else { return }
+                guard let page = pages.first(where: { $0.environmentID == environmentID }),
+                      let index = environments.firstIndex(where: {
+                          $0.environmentID == environmentID
+                      }) else {
+                    continue
+                }
+
+                let previous = environments[index]
+                let result: PullRequestListResult? = if let pageResult = page.result {
+                    previous.result?.appending(pageResult) ?? pageResult
+                } else {
+                    previous.result
+                }
+                environments[index] = FeaturePullRequestEnvironmentList(
+                    environmentID: environmentID,
+                    environmentName: page.environmentName,
+                    result: result,
+                    errorMessage: page.errorMessage
+                )
+                updateRows()
+            } catch {
+                guard loadGeneration == generation,
+                      !(error is CancellationError),
+                      let index = environments.firstIndex(where: {
+                          $0.environmentID == environmentID
+                      }) else {
+                    return
+                }
+                let previous = environments[index]
+                environments[index] = FeaturePullRequestEnvironmentList(
+                    environmentID: environmentID,
+                    environmentName: previous.environmentName,
+                    result: previous.result,
+                    errorMessage: error.localizedDescription
+                )
+            }
         }
     }
 
@@ -119,6 +198,22 @@ private final class PullRequestsModel {
             result["\(row.environmentID):\(row.entry.projectId)"] = row.entry.projectTitle
         }
         return values.sorted { $0.value < $1.value }
+    }
+
+    private func updateRows() {
+        var seenRowIDs = Set<String>()
+        allRows = environments.flatMap { environment in
+            (environment.result?.entries ?? []).map {
+                FeaturePullRequestRow(
+                    environmentID: environment.environmentID,
+                    environmentName: environment.environmentName,
+                    entry: $0
+                )
+            }
+        }
+        .filter { seenRowIDs.insert($0.id).inserted }
+        .sorted { $0.entry.updatedAt > $1.entry.updatedAt }
+        applyLocalFilters()
     }
 }
 
@@ -330,6 +425,23 @@ public struct PullRequestsView: View {
                         systemImage: "arrow.triangle.pull",
                         description: Text("Try another state, involvement, or search.")
                     )
+                    .listRowBackground(Color.clear)
+                }
+
+                if model.hasMorePages {
+                    Button {
+                        Task { await model.loadMore() }
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if model.isLoadingMore {
+                                ProgressView()
+                            }
+                            Text(model.isLoadingMore ? "Loading more..." : "Load more")
+                            Spacer()
+                        }
+                    }
+                    .disabled(model.isLoading || model.isLoadingMore)
                     .listRowBackground(Color.clear)
                 }
             }
