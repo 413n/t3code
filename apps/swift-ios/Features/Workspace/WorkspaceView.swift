@@ -30,9 +30,9 @@ public struct WorkspaceView: View {
     @State private var selectedProjectID: String?
     @State private var searchText = ""
     @State private var isSearching = false
-    @State private var isSnoozedExpanded = false
-    @State private var isSettledExpanded = true
-    @State private var isArchiveExpanded = false
+    @AppStorage("t3.swiftui.home.snoozedExpanded") private var isSnoozedExpanded = false
+    @AppStorage("t3.swiftui.home.settledExpanded") private var isSettledExpanded = true
+    @AppStorage("t3.swiftui.home.archiveExpanded") private var isArchiveExpanded = false
     @State private var settledLimit = 12
     @State private var showingNewTask = false
     @State private var newTaskInitialProjectID: String?

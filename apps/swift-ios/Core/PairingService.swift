@@ -127,7 +127,12 @@ public actor PairingService {
             ),
             URLQueryItem(name: "client_device_type", value: "mobile"),
             URLQueryItem(name: "client_os", value: "iOS"),
+            URLQueryItem(name: "client_surface", value: "mobile"),
         ]
+        if let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+           !appVersion.isEmpty {
+            fields.append(URLQueryItem(name: "client_app_version", value: appVersion))
+        }
         if let clientLabel, !clientLabel.isEmpty {
             fields.append(URLQueryItem(name: "client_label", value: clientLabel))
         }

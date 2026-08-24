@@ -584,7 +584,10 @@ struct DailyUXSidebarIndex {
         let available = visible.filter { !$0.isEffectivelySnoozed(at: now) }
 
         pinned = available
-            .filter { $0.pinnedAt != nil }
+            .filter {
+                $0.pinnedAt != nil
+                    && !($0.canToggleSettlement && $0.isEffectivelySettled(at: now))
+            }
             .sorted(by: Self.creationOrder)
 
         active = available
@@ -607,8 +610,7 @@ struct DailyUXSidebarIndex {
 
         settled = available
             .filter {
-                $0.pinnedAt == nil
-                    && $0.canToggleSettlement
+                $0.canToggleSettlement
                     && $0.isEffectivelySettled(at: now)
             }
             .sorted { lhs, rhs in

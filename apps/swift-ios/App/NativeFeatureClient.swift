@@ -24,7 +24,8 @@ private struct T3ConnectManagedCleanupError: LocalizedError {
 /// Composes the transport-focused Core layer with the UI-focused Features layer.
 @MainActor
 final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
-    FeatureProjectCreationClient, FeatureWorkspaceAssetResolving, T3ConnectCapable
+    FeatureProjectCreationClient, FeatureWorkspaceAssetResolving,
+    FeatureFeedbackSubmitting, T3ConnectCapable
 {
     private static let maximumRetainedThreadDetails = 6
     private static let t3ConnectLogger = Logger(
@@ -808,6 +809,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return try await route.client.resolvedAssetURL(
             resource: .workspaceFile(threadID: route.wireID, path: path)
         )
+    }
+
+    func submitCodexFeedback(threadID: String, reason: String?) async throws -> String {
+        let route = try threadRoute(for: threadID)
+        return try await route.client.uploadFeedback(
+            threadID: route.wireID,
+            reason: reason
+        ).feedbackId
     }
 
     func cachedProjectFavicon(
@@ -1872,15 +1881,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             throw NativeFeatureClientError.approvalNotFound
         }
         let route = try threadRoute(for: request.threadID)
-        let wireDecision = switch decision {
-        case .allowOnce: "accept"
-        case .allowForSession: "acceptForSession"
-        case .deny: "decline"
-        }
         _ = try await route.client.respondToApproval(
             threadID: route.wireID,
             requestID: request.wireID,
-            decision: wireDecision
+            decision: decision.wireValue
         )
         approvalRoutes[id] = nil
         removeCachedApproval(id: id, threadID: route.uiID)
@@ -4708,19 +4712,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         switch activity.kind {
         case "approval.requested":
-            let kind: FeatureApprovalKind = switch activity.payload["requestKind"]?.stringValue {
-            case "command": .command
-            case "file-read": .fileRead
-            case "file-change": .fileChange
-            default: .other
-            }
+            let kind = Self.approvalKind(activity.payload)
+            let appName = activity.payload["appName"]?.stringValue
             let approval = FeatureApproval(
                 id: uiRequestID,
                 wireID: requestID,
                 threadID: threadID,
                 kind: kind,
-                title: activity.summary,
-                detail: activity.payload["detail"]?.stringValue ?? activity.summary
+                title: appName ?? activity.summary,
+                detail: activity.payload["detail"]?.stringValue ?? activity.summary,
+                appName: appName,
+                options: Self.approvalOptions(activity.payload)
             )
             cache.approvals.removeAll { $0.id == uiRequestID }
             cache.approvals.append(approval)
@@ -4875,14 +4877,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 FeatureScopedID.approval(environmentID: environment.id, wireID: $0)
             }
             if activity.kind == "approval.requested", let requestID {
-                let requestKind = activity.payload["requestKind"]?.stringValue
-                let kind: FeatureApprovalKind = switch requestKind {
-                case "command": .command
-                case "file-read": .fileRead
-                case "file-change": .fileChange
-                default: .other
-                }
+                let kind = Self.approvalKind(activity.payload)
                 let detail = activity.payload["detail"]?.stringValue ?? activity.summary
+                let appName = activity.payload["appName"]?.stringValue
                 let uiRequestID = FeatureScopedID.approval(
                     environmentID: environment.id,
                     wireID: requestID
@@ -4892,8 +4889,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     wireID: requestID,
                     threadID: threadID,
                     kind: kind,
-                    title: activity.summary,
-                    detail: detail
+                    title: appName ?? activity.summary,
+                    detail: detail,
+                    appName: appName,
+                    options: Self.approvalOptions(activity.payload)
                 )
                 approvalRoutes[uiRequestID] = PendingRequestRoute(
                     threadID: threadID,
@@ -4911,6 +4910,30 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             }
         }
         return open.values.sorted { $0.id < $1.id }
+    }
+
+    private static func approvalKind(_ payload: JSONValue) -> FeatureApprovalKind {
+        switch payload["requestKind"]?.stringValue {
+        case "command": .command
+        case "file-read": .fileRead
+        case "file-change": .fileChange
+        case "mcp-elicitation": .mcpElicitation
+        default: .other
+        }
+    }
+
+    private static func approvalOptions(_ payload: JSONValue) -> [FeatureApprovalOption]? {
+        guard case let .array(values)? = payload["options"] else { return nil }
+        let options = values.compactMap { value -> FeatureApprovalOption? in
+            guard let wireDecision = value["decision"]?.stringValue,
+                  let decision = FeatureApprovalDecision(wireValue: wireDecision),
+                  let label = value["label"]?.stringValue,
+                  !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return FeatureApprovalOption(decision: decision, label: label)
+        }
+        return options.isEmpty ? nil : options
     }
 
     private func pendingUserInputs(

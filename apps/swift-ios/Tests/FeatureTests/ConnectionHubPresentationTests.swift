@@ -74,6 +74,22 @@ struct ConnectionHubPresentationTests {
         #expect(rows[2].linkedEnvironment == nil)
     }
 
+    @Test
+    func directlySavedMachineDoesNotHideItsT3ConnectEntry() {
+        let direct = environment(id: "same-machine", source: .direct)
+        let linked = cloudEnvironment(id: "same-machine", name: "Big O", isOnline: true)
+
+        let directRows = ConnectionHubPresentation.directEnvironments(in: [direct])
+        let managedRows = ConnectionHubPresentation.t3ConnectEnvironments(
+            saved: [direct],
+            linked: [linked]
+        )
+
+        #expect(directRows.map(\.id) == ["same-machine"])
+        #expect(managedRows.map(\.id) == ["same-machine"])
+        #expect(managedRows.first?.savedEnvironment == nil)
+    }
+
     @Test(
         arguments: [
             (FeatureConnection.State.connected, ConnectionHubStatus.online),

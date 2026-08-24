@@ -404,8 +404,20 @@ public enum FeatureApprovalKind: String, Sendable, Codable {
     case command
     case fileRead
     case fileChange
+    case mcpElicitation
     case patch
     case other
+}
+
+public struct FeatureApprovalOption: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public var id: FeatureApprovalDecision { decision }
+    public let decision: FeatureApprovalDecision
+    public let label: String
+
+    public init(decision: FeatureApprovalDecision, label: String) {
+        self.decision = decision
+        self.label = label
+    }
 }
 
 public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Codable {
@@ -416,6 +428,8 @@ public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Coda
     public var kind: FeatureApprovalKind
     public var title: String
     public var detail: String
+    public var appName: String?
+    public var options: [FeatureApprovalOption]?
 
     public init(
         id: String,
@@ -423,7 +437,9 @@ public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Coda
         threadID: String,
         kind: FeatureApprovalKind,
         title: String,
-        detail: String
+        detail: String,
+        appName: String? = nil,
+        options: [FeatureApprovalOption]? = nil
     ) {
         self.id = id
         self.wireID = wireID
@@ -431,6 +447,8 @@ public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Coda
         self.kind = kind
         self.title = title
         self.detail = detail
+        self.appName = appName
+        self.options = options
     }
 }
 
@@ -967,7 +985,30 @@ public struct FeatureSnapshot: Sendable, Equatable, Codable {
 public enum FeatureApprovalDecision: String, Sendable, Codable {
     case allowOnce
     case allowForSession
+    case allowAlways
     case deny
+    case cancel
+
+    init?(wireValue: String) {
+        switch wireValue {
+        case "accept": self = .allowOnce
+        case "acceptForSession": self = .allowForSession
+        case "acceptAlways": self = .allowAlways
+        case "decline": self = .deny
+        case "cancel": self = .cancel
+        default: return nil
+        }
+    }
+
+    var wireValue: String {
+        switch self {
+        case .allowOnce: "accept"
+        case .allowForSession: "acceptForSession"
+        case .allowAlways: "acceptAlways"
+        case .deny: "decline"
+        case .cancel: "cancel"
+        }
+    }
 }
 
 public enum FeatureEvent: Sendable {

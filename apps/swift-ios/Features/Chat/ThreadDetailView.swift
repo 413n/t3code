@@ -19,6 +19,10 @@ public struct ThreadDetailView: View {
     @State private var isSending = false
     @State private var isLoading = true
     @State private var sendFailed = false
+    @State private var feedbackMessages: [FeatureMessage] = []
+    @State private var feedbackRevision: UInt64 = 0
+    @State private var feedbackAlertMessage: String?
+    @State private var feedbackIdentifier: String?
     @State private var didRestoreDraft = false
     @State private var draftSaveTask: Task<Void, Never>?
     @State private var toolSurface: FeatureThreadToolSurface?
@@ -121,6 +125,22 @@ public struct ThreadDetailView: View {
             Button("OK") { composerFocused = true }
         } message: {
             Text("Your draft is still here. Check your connection and try again.")
+        }
+        .alert(
+            feedbackIdentifier == nil ? "Could not send feedback" : "Feedback sent to OpenAI",
+            isPresented: Binding(
+                get: { feedbackAlertMessage != nil },
+                set: { if !$0 { feedbackAlertMessage = nil; feedbackIdentifier = nil } }
+            )
+        ) {
+            if let feedbackIdentifier {
+                Button("Copy ID") {
+                    UIPasteboard.general.string = feedbackIdentifier
+                }
+            }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(feedbackAlertMessage ?? "")
         }
         .background {
             ThreadBackSwipeGestureView(
@@ -362,8 +382,9 @@ public struct ThreadDetailView: View {
             } else {
                 FeatureTranscriptCollectionView(
                     threadID: thread.id,
-                    messages: detail.messages,
-                    renderUpdate: model.detailRenderUpdates[thread.id],
+                    messages: timelineMessages(detail.messages),
+                    imageContext: markdownImageContext,
+                    renderUpdate: timelineRenderUpdate,
                     dynamicTypeSize: dynamicTypeSize,
                     isWorking: isWorking,
                     activeSubagentCount: detail.activeSubagentCount,
@@ -435,6 +456,42 @@ public struct ThreadDetailView: View {
         return DailyUXCreationContext.providers(for: project, in: model.snapshot)
     }
 
+    private var timelineRenderUpdate: FeatureDetailRenderUpdate? {
+        guard !feedbackMessages.isEmpty else {
+            return model.detailRenderUpdates[thread.id]
+        }
+        let revision = model.detailRevisions[thread.id] ?? 0
+        return FeatureDetailRenderUpdate(
+            baseRevision: revision,
+            revision: (UInt64.max / 2) &+ revision &+ feedbackRevision,
+            change: .full
+        )
+    }
+
+    private func timelineMessages(_ messages: [FeatureMessage]) -> [FeatureMessage] {
+        guard !feedbackMessages.isEmpty else { return messages }
+        return (messages + feedbackMessages).sorted {
+            if $0.createdAt == $1.createdAt {
+                return $0.id < $1.id
+            }
+            return $0.createdAt < $1.createdAt
+        }
+    }
+
+    private var markdownImageContext: MarkdownImageContext? {
+        guard let resolver = model.client as? any FeatureWorkspaceAssetResolving,
+              let project = model.snapshot.projects.first(where: {
+                  $0.id == currentThread.projectID
+              }) else {
+            return nil
+        }
+        return MarkdownImageContext(
+            threadID: currentThread.id,
+            workspaceRoot: currentThread.worktreePath ?? project.path,
+            resolver: resolver
+        )
+    }
+
     private func dismissKeyboard() {
         guard composerFocused else { return }
         composerFocused = false
@@ -451,6 +508,15 @@ public struct ThreadDetailView: View {
         let pendingAttachments = attachments
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !pendingAttachments.isEmpty else {
+            return
+        }
+        if pendingAttachments.isEmpty,
+           let command = FeatureCodexFeedbackCommand.parse(message),
+           let providerID = currentThread.providerID,
+           threadProviders.first(where: { $0.id == providerID })?.driver == "codex"
+               || currentThread.providerName?.lowercased() == "codex",
+           let submitter = model.client as? any FeatureFeedbackSubmitting {
+            sendFeedback(command, message: message, submitter: submitter)
             return
         }
         draftSaveTask?.cancel()
@@ -493,6 +559,69 @@ public struct ThreadDetailView: View {
                 persistDraftImmediately()
             }
         }
+    }
+
+    private func sendFeedback(
+        _ command: FeatureCodexFeedbackCommand,
+        message: String,
+        submitter: any FeatureFeedbackSubmitting
+    ) {
+        guard detail?.messages.isEmpty == false else {
+            feedbackAlertMessage = "Send a message before you submit feedback."
+            return
+        }
+
+        let identifier = UUID().uuidString
+        let createdAt = Date()
+        let assistantID = "\(identifier):feedback"
+        feedbackMessages.append(FeatureMessage(
+            id: identifier,
+            role: .user,
+            text: message,
+            createdAt: createdAt
+        ))
+        feedbackMessages.append(FeatureMessage(
+            id: assistantID,
+            role: .assistant,
+            text: "Sending feedback to OpenAI...",
+            createdAt: createdAt.addingTimeInterval(0.001)
+        ))
+        feedbackRevision &+= 1
+        draftSaveTask?.cancel()
+        draft = ""
+        composerFocused = false
+        isSending = true
+
+        Task {
+            defer { isSending = false }
+            do {
+                let identifier = try await submitter.submitCodexFeedback(
+                    threadID: thread.id,
+                    reason: command.reason
+                )
+                updateFeedbackMessage(
+                    id: assistantID,
+                    text: "Feedback sent to OpenAI.\n\nThread ID: `\(identifier)`"
+                )
+                feedbackIdentifier = identifier
+                feedbackAlertMessage = "Thread ID: \(identifier)"
+                try? await draftStore.removeDraft(for: draftKey)
+            } catch {
+                let detail = error.localizedDescription
+                updateFeedbackMessage(
+                    id: assistantID,
+                    text: "Could not send feedback to OpenAI.\n\n\(detail)"
+                )
+                feedbackIdentifier = nil
+                feedbackAlertMessage = detail
+            }
+        }
+    }
+
+    private func updateFeedbackMessage(id: String, text: String) {
+        guard let index = feedbackMessages.firstIndex(where: { $0.id == id }) else { return }
+        feedbackMessages[index].text = text
+        feedbackRevision &+= 1
     }
 
     private var draftKey: String {
@@ -660,6 +789,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
     let threadID: String
     let messages: [FeatureMessage]
+    let imageContext: MarkdownImageContext?
     let renderUpdate: FeatureDetailRenderUpdate?
     let dynamicTypeSize: DynamicTypeSize
     let isWorking: Bool
@@ -695,6 +825,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         context.coordinator.update(
             threadID: threadID,
             messages: messages,
+            imageContext: imageContext,
             renderUpdate: renderUpdate,
             dynamicTypeSize: dynamicTypeSize,
             isWorking: isWorking,
@@ -745,6 +876,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var messagesByID: [String: FeatureMessage] = [:]
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
+        private var currentImageContext: MarkdownImageContext?
         private var currentDetailRevision: UInt64?
         private var currentDynamicTypeSize: DynamicTypeSize?
         private var currentIsWorking = false
@@ -795,7 +927,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 }
 
                 cell.contentConfiguration = UIHostingConfiguration {
-                    FeatureMessageView(message: message)
+                    FeatureMessageView(message: message, imageContext: self?.currentImageContext)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .margins(.all, 0)
@@ -819,6 +951,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         func update(
             threadID: String,
             messages: [FeatureMessage],
+            imageContext: MarkdownImageContext?,
             renderUpdate: FeatureDetailRenderUpdate?,
             dynamicTypeSize: DynamicTypeSize,
             isWorking: Bool,
@@ -836,6 +969,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             self.onDismissKeyboard = onDismissKeyboard
 
             let threadChanged = currentThreadID != threadID
+            let imageContextChanged = currentImageContext != imageContext
             let typeSizeChanged = currentDynamicTypeSize != dynamicTypeSize
             let revisionChanged = currentDetailRevision != renderUpdate?.revision
             let workingChanged = currentIsWorking != isWorking
@@ -844,7 +978,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 || currentIsMonitoring != isMonitoring
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
                 || currentIsLoadingEarlier != isLoadingEarlier
-            guard threadChanged || typeSizeChanged || revisionChanged || workingChanged
+            guard threadChanged || imageContextChanged || typeSizeChanged || revisionChanged || workingChanged
                 || workingDetailChanged || loadEarlierChanged else { return }
 
             let incremental = !threadChanged
@@ -853,10 +987,11 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let state = incremental ?? fullState(messages: messages)
             let newIDs = state.ids
             let idsChanged = state.idsChanged
-            let changedIDs = typeSizeChanged
+            let changedIDs = typeSizeChanged || imageContextChanged
                 ? newIDs
                 : state.changedIDs
 
+            currentImageContext = imageContext
             currentDetailRevision = renderUpdate?.revision
             currentDynamicTypeSize = dynamicTypeSize
             currentIsWorking = isWorking
@@ -1759,6 +1894,7 @@ private enum FeatureAttachmentThumbnailError: Error {
 
 struct FeatureMessageView: View {
     let message: FeatureMessage
+    var imageContext: MarkdownImageContext? = nil
 
     var body: some View {
         switch message.role {
@@ -1770,7 +1906,8 @@ struct FeatureMessageView: View {
                     if !message.text.isEmpty {
                         MarkdownMessageView(
                             message.text,
-                            isStreaming: message.state == .streaming
+                            isStreaming: message.state == .streaming,
+                            imageContext: imageContext
                         )
                     }
                 }
@@ -1804,7 +1941,8 @@ struct FeatureMessageView: View {
                 if !message.text.isEmpty {
                     MarkdownMessageView(
                         message.text,
-                        isStreaming: message.state == .streaming
+                        isStreaming: message.state == .streaming,
+                        imageContext: imageContext
                     )
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }

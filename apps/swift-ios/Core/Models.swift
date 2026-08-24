@@ -99,6 +99,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
     public struct Capabilities: Codable, Equatable, Sendable {
         public let repositoryIdentity: Bool
         public let connectionProbe: Bool?
+        public let attachmentUploads: Bool?
         public let pullRequests: Bool?
         public let threadSettlement: Bool?
         public let threadSnooze: Bool?
@@ -110,6 +111,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         private enum CodingKeys: String, CodingKey {
             case repositoryIdentity
             case connectionProbe
+            case attachmentUploads
             case pullRequests
             case threadSettlement
             case threadSnooze
@@ -124,6 +126,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             repositoryIdentity =
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
             connectionProbe = try container.decodeIfPresent(Bool.self, forKey: .connectionProbe)
+            attachmentUploads = try container.decodeIfPresent(Bool.self, forKey: .attachmentUploads)
             pullRequests = try container.decodeIfPresent(Bool.self, forKey: .pullRequests)
             threadSettlement = try container.decodeIfPresent(Bool.self, forKey: .threadSettlement)
             threadSnooze = try container.decodeIfPresent(Bool.self, forKey: .threadSnooze)
@@ -145,6 +148,10 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
     public let platform: Platform
     public let serverVersion: String
     public let capabilities: Capabilities
+}
+
+public struct ProviderUploadFeedbackResult: Codable, Equatable, Sendable {
+    public let feedbackId: String
 }
 
 public enum EnvironmentCredentialAuthorizationMethod: String, Codable, Sendable {

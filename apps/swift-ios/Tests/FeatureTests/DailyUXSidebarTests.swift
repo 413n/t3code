@@ -122,7 +122,7 @@ struct DailyUXSidebarTests {
     }
 
     @Test
-    func pinPromotesSettledThreadsButSnoozeStillWins() {
+    func settledAndSnoozedThreadsStayInTheirShelvesWhenPinned() {
         var pinnedSettled = thread(
             id: "pinned-settled",
             created: -100,
@@ -142,10 +142,10 @@ struct DailyUXSidebarTests {
 
         let index = makeIndex([pinnedSettled, pinnedSnoozed])
 
-        #expect(index.pinned.map(\.id) == ["pinned-settled"])
+        #expect(index.pinned.isEmpty)
         #expect(index.snoozed.map(\.id) == ["pinned-snoozed"])
         #expect(index.active.isEmpty)
-        #expect(index.settled.isEmpty)
+        #expect(index.settled.map(\.id) == ["pinned-settled"])
         #expect(DailyUXSidebarRefresh.nextBoundary(for: [pinnedSettled], after: now) == nil)
     }
 

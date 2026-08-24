@@ -43,6 +43,65 @@ struct MarkdownDocumentTests {
     }
 
     @Test
+    func separatesMarkdownImagesFromSurroundingParagraphText() {
+        let document = MarkdownDocument(
+            parsing: "Before ![Build result](images/result.png) after\n\n![Preview](<shot one.png> \"Title\")"
+        )
+
+        #expect(
+            document.blocks == [
+                .paragraph("Before"),
+                .image(MarkdownImage(source: "images/result.png", alternativeText: "Build result")),
+                .paragraph("after"),
+                .image(MarkdownImage(source: "<shot one.png>", alternativeText: "Preview")),
+            ]
+        )
+    }
+
+    @Test
+    func markdownImageSourcesDistinguishRemoteAndWorkspaceImages() {
+        #expect(
+            MarkdownImageSource.classify("https://example.com/image.png", workspaceRoot: "/repo")
+                == .direct(URL(string: "https://example.com/image.png")!)
+        )
+        #expect(
+            MarkdownImageSource.classify("//cdn.example.com/image.png")
+                == .direct(URL(string: "https://cdn.example.com/image.png")!)
+        )
+        #expect(
+            MarkdownImageSource.classify("images/result.png", workspaceRoot: "/workspace/project")
+                == .workspaceFile("/workspace/project/images/result.png")
+        )
+        #expect(
+            MarkdownImageSource.classify(
+                "images/result.png",
+                workspaceRoot: #"C:\Users\theo\project"#
+            ) == .workspaceFile(#"C:\Users\theo\project\images\result.png"#)
+        )
+        #expect(
+            MarkdownImageSource.classify("file:///workspace/project/image%20one.png")
+                == .workspaceFile("/workspace/project/image one.png")
+        )
+        #expect(
+            MarkdownImageSource.classify("file://server/share/image.png")
+                == .workspaceFile(#"\\server\share\image.png"#)
+        )
+        #expect(
+            MarkdownImageSource.classify("/C:/Users/theo/image.png")
+                == .workspaceFile("C:/Users/theo/image.png")
+        )
+    }
+
+    @Test
+    func markdownImageSourcesRejectUnsafeAndUnresolvedDestinations() {
+        for source in ["", "#image", "?image=1", "image.png", "~/image.png",
+                       "javascript:alert(1)", "ftp://example.com/image.png",
+                       "content://media/image/1"] {
+            #expect(MarkdownImageSource.classify(source) == .blocked)
+        }
+    }
+
+    @Test
     func preservesNestedStructureInsideQuotesAndLists() {
         let document = MarkdownDocument(
             parsing: """

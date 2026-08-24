@@ -24,7 +24,7 @@ struct FeatureComposerCommandPopover: View {
                             Button {
                                 onSelect(item)
                             } label: {
-                                FeatureComposerCommandRow(item: item)
+                                FeatureComposerCommandRow(item: item, triggerKind: triggerKind)
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(accessibilityLabel(for: item))
@@ -92,6 +92,7 @@ struct FeatureComposerCommandPopover: View {
 
 private struct FeatureComposerCommandRow: View {
     let item: FeatureComposerMenuItem
+    let triggerKind: FeatureComposerTriggerKind
 
     var body: some View {
         HStack(spacing: 10) {
@@ -100,7 +101,7 @@ private struct FeatureComposerCommandRow: View {
                 .foregroundStyle(T3Colors.textTertiary)
                 .frame(width: 17)
 
-            Text(item.label)
+            Text(displayLabel)
                 .font(T3Typography.control)
                 .foregroundStyle(T3Colors.textPrimary)
                 .lineLimit(1)
@@ -125,8 +126,15 @@ private struct FeatureComposerCommandRow: View {
         switch item {
         case .modelCommand, .model: return "cpu"
         case .providerCommand: return "terminal"
-        case .skill: return "shippingbox"
+        case let .skill(skill): return skill.source.systemImage
         case let .path(entry): return entry.kind == .directory ? "folder" : "doc"
         }
+    }
+
+    private var displayLabel: String {
+        if triggerKind == .slashCommand, case let .skill(skill) = item {
+            return "/skill:\(skill.displayName ?? skill.name)"
+        }
+        return item.label
     }
 }

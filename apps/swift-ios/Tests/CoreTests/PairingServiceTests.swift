@@ -40,6 +40,8 @@ final class PairingServiceTests: XCTestCase {
         let form = String(data: requests[1].httpBody!, encoding: .utf8)!
         XCTAssertTrue(form.contains("subject_token=pair-once"))
         XCTAssertTrue(form.contains("client_device_type=mobile"))
+        XCTAssertTrue(form.contains("client_surface=mobile"))
+        XCTAssertTrue(form.contains("client_app_version="))
         // Omitting scope accepts the exact grant carried by the one-time link.
         // Requesting administrative scopes consumes ordinary links and then
         // fails with scope_not_granted.
