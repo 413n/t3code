@@ -862,6 +862,37 @@ struct HomeThreadRowContext: Equatable {
     }
 }
 
+struct HomeThreadPullRequestPresentation: Equatable {
+    enum State: String {
+        case open
+        case merged
+        case closed
+    }
+
+    let number: Int
+    let state: State
+
+    var label: String { "#\(number)" }
+
+    var accessibilityLabel: String {
+        "Pull request #\(number), \(state.rawValue)"
+    }
+
+    static func resolve(
+        thread: FeatureThread,
+        status: FeatureSourceControlStatus
+    ) -> Self? {
+        guard let branch = thread.branch?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !branch.isEmpty,
+              status.branch == branch,
+              let pullRequest = status.pullRequest,
+              let state = State(rawValue: pullRequest.state.lowercased()) else {
+            return nil
+        }
+        return Self(number: pullRequest.number, state: state)
+    }
+}
+
 struct FeatureThreadRow: View {
     enum Style: Equatable {
         case rich
@@ -871,15 +902,18 @@ struct FeatureThreadRow: View {
     let thread: FeatureThread
     private let context: HomeThreadRowContext
     private let projectFaviconClient: (any FeatureClient)?
+    private let onPullRequestChange: (HomeThreadPullRequestPresentation?) -> Void
     let isSelected: Bool
     let style: Style
     let now: Date
     let allowsMultilineTitle: Bool
+    @State private var pullRequest: HomeThreadPullRequestPresentation?
 
     init(
         thread: FeatureThread,
         context: HomeThreadRowContext,
         projectFaviconClient: (any FeatureClient)? = nil,
+        onPullRequestChange: @escaping (HomeThreadPullRequestPresentation?) -> Void = { _ in },
         isSelected: Bool = false,
         style: Style = .rich,
         now: Date = .now,
@@ -888,6 +922,7 @@ struct FeatureThreadRow: View {
         self.thread = thread
         self.context = context
         self.projectFaviconClient = projectFaviconClient
+        self.onPullRequestChange = onPullRequestChange
         self.isSelected = isSelected
         self.style = style
         self.now = now
@@ -902,6 +937,9 @@ struct FeatureThreadRow: View {
             .accessibilityHint("Opens task")
             .accessibilityIdentifier("thread-\(thread.id)")
             .accessibilityAddTraits(isSelected ? .isSelected : [])
+            .task(id: pullRequestObservationID) {
+                await observePullRequest()
+            }
     }
 
     @ViewBuilder
@@ -955,6 +993,9 @@ struct FeatureThreadRow: View {
                     }
                     .foregroundStyle(environmentColor)
                 }
+                if let pullRequest {
+                    pullRequestIndicator(pullRequest)
+                }
                 if thread.pinnedAt != nil {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 9, weight: .semibold))
@@ -987,6 +1028,9 @@ struct FeatureThreadRow: View {
                 .foregroundStyle(T3Colors.textSecondary)
                 .lineLimit(allowsMultilineTitle ? 2 : 1)
             Spacer(minLength: 8)
+            if let pullRequest {
+                pullRequestIndicator(pullRequest)
+            }
             if thread.pinnedAt != nil {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9, weight: .semibold))
@@ -1087,6 +1131,57 @@ struct FeatureThreadRow: View {
         context.environmentLabel
     }
 
+    private var pullRequestObservationID: String? {
+        guard projectFaviconClient != nil,
+              let branch = thread.branch?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !branch.isEmpty else {
+            return nil
+        }
+        return "\(thread.id)\u{0}\(branch)"
+    }
+
+    @MainActor
+    private func observePullRequest() async {
+        guard pullRequestObservationID != nil,
+              let projectFaviconClient else {
+            pullRequest = nil
+            onPullRequestChange(nil)
+            return
+        }
+
+        for await status in projectFaviconClient.sourceControlStatusEvents(threadID: thread.id) {
+            guard !Task.isCancelled else { return }
+            let next = HomeThreadPullRequestPresentation.resolve(
+                thread: thread,
+                status: status
+            )
+            guard next != pullRequest else { continue }
+            pullRequest = next
+            onPullRequestChange(next)
+        }
+    }
+
+    private func pullRequestIndicator(_ pullRequest: HomeThreadPullRequestPresentation) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: "arrow.triangle.pull")
+                .font(.system(size: 10, weight: .semibold))
+            Text(pullRequest.label)
+                .font(T3Typography.homeMetadata.monospacedDigit().weight(.medium))
+                .lineLimit(1)
+        }
+        .foregroundStyle(pullRequestColor(pullRequest.state))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(pullRequest.accessibilityLabel)
+    }
+
+    private func pullRequestColor(_ state: HomeThreadPullRequestPresentation.State) -> Color {
+        switch state {
+        case .open: T3Colors.success
+        case .merged: T3Colors.syntaxKeyword
+        case .closed: T3Colors.danger
+        }
+    }
+
     private var projectBadge: some View {
         ProjectBadge(
             name: context.projectName,
@@ -1112,6 +1207,9 @@ struct FeatureThreadRow: View {
             values.append("for \(duration)")
         }
         values.append("Branch \(branchLabel)")
+        if let pullRequest {
+            values.append(pullRequest.accessibilityLabel)
+        }
         if let environmentLabel {
             values.append("on \(environmentLabel)")
         }

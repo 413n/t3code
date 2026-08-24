@@ -81,6 +81,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
         private var dataSource: UICollectionViewDiffableDataSource<Section, HomeCollectionItem.ID>?
         private var registration: UICollectionView.CellRegistration<HomeCollectionCell, HomeCollectionItem.ID>?
         private var itemsByID: [HomeCollectionItem.ID: HomeCollectionItem] = [:]
+        private var pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation] = [:]
         private var selectedThreadID: String?
         private weak var collectionView: UICollectionView?
         private var timer: Timer?
@@ -127,6 +128,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 seenIdentifiers.insert(item.id).inserted
             }
             itemsByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+            pullRequestsByThreadID = pullRequestsByThreadID.filter {
+                itemsByID[.thread($0.key)] != nil
+            }
             // After items land: picks 1 Hz when a working thread is present,
             // 60s otherwise, and is a no-op when the interval is unchanged.
             startTimer()
@@ -322,7 +326,19 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                     item: item,
                     projectFaviconClient: parent.projectFaviconClient,
                     isSelected: identifier.threadID == selectedThreadID,
-                    now: now
+                    now: now,
+                    onPullRequestChange: { [weak self, weak cell] pullRequest in
+                        guard let self,
+                              let cell,
+                              let threadID = identifier.threadID else {
+                            return
+                        }
+                        self.updatePullRequestAccessibility(
+                            pullRequest,
+                            threadID: threadID,
+                            cell: cell
+                        )
+                    }
                 )
             }
             .margins(.all, 0)
@@ -408,6 +424,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 status += " for \(duration)"
             }
             var values = [status, "Project \(context.projectName)"]
+            if let pullRequest = pullRequestsByThreadID[thread.id] {
+                values.append(pullRequest.accessibilityLabel)
+            }
             if thread.pinnedAt != nil {
                 values.append("Pinned")
             }
@@ -423,6 +442,24 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 values.append("on \(environment)")
             }
             return values.joined(separator: ". ")
+        }
+
+        private func updatePullRequestAccessibility(
+            _ pullRequest: HomeThreadPullRequestPresentation?,
+            threadID: String,
+            cell: HomeCollectionCell
+        ) {
+            guard case let .thread(thread, context, _, _, _) = itemsByID[.thread(threadID)],
+                  let indexPath = dataSource?.indexPath(for: .thread(threadID)),
+                  collectionView?.cellForItem(at: indexPath) === cell else {
+                return
+            }
+            if let pullRequest {
+                pullRequestsByThreadID[threadID] = pullRequest
+            } else {
+                pullRequestsByThreadID.removeValue(forKey: threadID)
+            }
+            cell.accessibilityValue = threadAccessibilityValue(thread, context: context)
         }
 
         private func threadAccessibilityActions(
@@ -955,6 +992,7 @@ private struct HomeCollectionCellContent: View {
     let projectFaviconClient: any FeatureClient
     let isSelected: Bool
     let now: Date
+    let onPullRequestChange: (HomeThreadPullRequestPresentation?) -> Void
 
     @ViewBuilder
     var body: some View {
@@ -964,6 +1002,7 @@ private struct HomeCollectionCellContent: View {
                 thread: thread,
                 context: context,
                 projectFaviconClient: projectFaviconClient,
+                onPullRequestChange: onPullRequestChange,
                 isSelected: isSelected,
                 style: style,
                 now: now,

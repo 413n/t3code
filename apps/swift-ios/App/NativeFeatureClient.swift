@@ -79,6 +79,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var projectFaviconRefreshTasks: [
         FeatureProjectFaviconCacheKey: Task<Data?, Never>
     ] = [:]
+    private var sourceControlMonitors: [
+        NativeSourceControlMonitorKey: NativeSourceControlMonitor
+    ] = [:]
     private var pendingBootstrapSubmissions: [PendingBootstrapSubmission] = []
     private var pendingTurnSubmissions: [String: PendingTurnSubmission] = [:]
     private var attachmentHydrationTasks: [
@@ -2078,6 +2081,117 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return NativeWorkspaceMapper.sourceControl(
             try await route.client.refreshVCSStatus(cwd: context.cwd)
         )
+    }
+
+    func sourceControlStatusEvents(threadID: String) -> AsyncStream<FeatureSourceControlStatus> {
+        let stream = AsyncStream<FeatureSourceControlStatus>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+
+        guard let route = try? threadRoute(for: threadID),
+              let context = try? workspaceContext(route: route) else {
+            stream.continuation.finish()
+            return stream.stream
+        }
+
+        let key = NativeSourceControlMonitorKey(
+            environmentID: route.environmentID,
+            workingDirectory: URL(fileURLWithPath: context.cwd).standardizedFileURL.path
+        )
+        let subscriberID = UUID()
+        let monitor: NativeSourceControlMonitor
+
+        if let existing = sourceControlMonitors[key] {
+            monitor = existing
+        } else {
+            monitor = NativeSourceControlMonitor()
+            sourceControlMonitors[key] = monitor
+        }
+
+        monitor.continuations[subscriberID] = stream.continuation
+        if let latest = monitor.latestStatus {
+            stream.continuation.yield(latest)
+        }
+        stream.continuation.onTermination = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.removeSourceControlSubscriber(subscriberID, for: key)
+            }
+        }
+
+        if monitor.task == nil {
+            let monitorID = monitor.id
+            monitor.task = Task { [weak self] in
+                await self?.observeSourceControlStatus(
+                    client: route.client,
+                    key: key,
+                    monitorID: monitorID
+                )
+            }
+        }
+
+        return stream.stream
+    }
+
+    private func observeSourceControlStatus(
+        client: T3Client,
+        key: NativeSourceControlMonitorKey,
+        monitorID: UUID
+    ) async {
+        let events = await client.vcsStatusEvents(cwd: key.workingDirectory)
+        var local: VCSLocalStatus?
+        var remote: VCSRemoteStatus?
+
+        do {
+            for try await event in events {
+                guard !Task.isCancelled,
+                      sourceControlMonitors[key]?.id == monitorID else {
+                    break
+                }
+
+                switch event {
+                case let .snapshot(nextLocal, nextRemote):
+                    local = nextLocal
+                    remote = nextRemote
+                case let .localUpdated(nextLocal):
+                    if local?.refName != nextLocal.refName {
+                        remote = nil
+                    }
+                    local = nextLocal
+                case let .remoteUpdated(nextRemote):
+                    remote = nextRemote
+                }
+
+                guard let local else { continue }
+                let status = NativeWorkspaceMapper.sourceControl(
+                    local: local,
+                    remote: remote
+                )
+                guard let monitor = sourceControlMonitors[key],
+                      monitor.id == monitorID,
+                      monitor.latestStatus != status else {
+                    continue
+                }
+                monitor.latestStatus = status
+                monitor.continuations.values.forEach { $0.yield(status) }
+            }
+        } catch {
+            // Existing rows keep their last known PR until the next subscription.
+        }
+
+        guard sourceControlMonitors[key]?.id == monitorID else { return }
+        let monitor = sourceControlMonitors.removeValue(forKey: key)
+        monitor?.continuations.values.forEach { $0.finish() }
+    }
+
+    private func removeSourceControlSubscriber(
+        _ subscriberID: UUID,
+        for key: NativeSourceControlMonitorKey
+    ) {
+        guard let monitor = sourceControlMonitors[key] else { return }
+        monitor.continuations.removeValue(forKey: subscriberID)
+        guard monitor.continuations.isEmpty else { return }
+        monitor.task?.cancel()
+        sourceControlMonitors.removeValue(forKey: key)
     }
 
     func performSourceControlAction(
@@ -6096,6 +6210,19 @@ private struct NativeThreadRoute {
     let wireID: String
     let environmentID: String
     let client: T3Client
+}
+
+private struct NativeSourceControlMonitorKey: Hashable {
+    let environmentID: String
+    let workingDirectory: String
+}
+
+@MainActor
+private final class NativeSourceControlMonitor {
+    let id = UUID()
+    var latestStatus: FeatureSourceControlStatus?
+    var continuations: [UUID: AsyncStream<FeatureSourceControlStatus>.Continuation] = [:]
+    var task: Task<Void, Never>?
 }
 
 private struct ProvisionalThreadRoute {
