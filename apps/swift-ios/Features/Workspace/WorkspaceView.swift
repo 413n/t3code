@@ -258,6 +258,7 @@ public struct WorkspaceView: View {
                 query: searchText,
                 selectedThreadID: selectedThreadID,
                 forceRichRows: dynamicTypeSize.isAccessibilitySize,
+                hapticsEnabled: model.snapshot.settings.hapticsEnabled,
                 isSnoozedExpanded: isSnoozedExpanded,
                 isSettledExpanded: isSettledExpanded,
                 isArchiveExpanded: isArchiveExpanded,
@@ -277,8 +278,8 @@ public struct WorkspaceView: View {
                 onArchive: { thread, archived in
                     Task { await model.setArchived(thread.id, archived: archived) }
                 },
-                onSettle: { thread, settled in
-                    Task { await model.setSettled(thread.id, settled: settled) }
+                onSettle: { thread, settled, completion in
+                    Task { completion(await model.setSettled(thread.id, settled: settled)) }
                 },
                 onSnooze: { thread, until in
                     Task { await model.setSnoozed(thread.id, until: until) }

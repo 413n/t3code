@@ -9,6 +9,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let query: String
     let selectedThreadID: String?
     let forceRichRows: Bool
+    let hapticsEnabled: Bool
     let isSnoozedExpanded: Bool
     let isSettledExpanded: Bool
     let isArchiveExpanded: Bool
@@ -21,7 +22,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let onRename: (FeatureThread) -> Void
     let onRegenerateTitle: (FeatureThread) -> Void
     let onArchive: (FeatureThread, Bool) -> Void
-    let onSettle: (FeatureThread, Bool) -> Void
+    let onSettle: (FeatureThread, Bool, @escaping (Bool) -> Void) -> Void
     let onSnooze: (FeatureThread, Date?) -> Void
     let onPin: (FeatureThread, Bool) -> Void
     let onDelete: (FeatureThread) -> Void
@@ -60,6 +61,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
 
     static func dismantleUIView(_ collectionView: UICollectionView, coordinator: Coordinator) {
         coordinator.invalidateTimer()
+        coordinator.cancelPendingSwipeActions()
         collectionView.delegate = nil
     }
 
@@ -67,6 +69,12 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     final class Coordinator: NSObject, UICollectionViewDelegate {
         private enum Section: Hashable {
             case main
+        }
+
+        private struct PendingSwipeCompletion {
+            let id: UUID
+            let settled: Bool
+            let finish: (Bool) -> Void
         }
 
         private var parent: HomeThreadCollectionView
@@ -78,6 +86,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
         private var timer: Timer?
         private var timerTick = 0
         private var timerInterval: TimeInterval = 0
+        private var pendingSwipeCompletions: [String: PendingSwipeCompletion] = [:]
 
         init(parent: HomeThreadCollectionView) {
             self.parent = parent
@@ -125,6 +134,19 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             guard let dataSource else { return }
             let currentIdentifiers = dataSource.snapshot().itemIdentifiers
             let newIdentifiers = items.map(\.id)
+            let resolvedSwipeIDs = pendingSwipeCompletions.keys.filter { threadID in
+                guard let pending = pendingSwipeCompletions[threadID] else { return false }
+                guard case let .thread(thread, _, _, _, _) = itemsByID[.thread(threadID)] else {
+                    return true
+                }
+                return thread.isSettled == pending.settled
+            }
+            let resolvedSwipeCompletions = resolvedSwipeIDs.compactMap {
+                pendingSwipeCompletions.removeValue(forKey: $0)
+            }
+            let finishSwipes = {
+                resolvedSwipeCompletions.forEach { $0.finish(true) }
+            }
 
             if currentIdentifiers == newIdentifiers {
                 let changed = newIdentifiers.filter { previousItems[$0] != itemsByID[$0] }
@@ -135,13 +157,26 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 if !identifiers.isEmpty {
                     var snapshot = dataSource.snapshot()
                     snapshot.reconfigureItems(identifiers)
-                    dataSource.apply(snapshot, animatingDifferences: false)
+                    dataSource.apply(
+                        snapshot,
+                        animatingDifferences: false,
+                        completion: finishSwipes
+                    )
+                } else {
+                    finishSwipes()
                 }
             } else {
                 var snapshot = NSDiffableDataSourceSnapshot<Section, HomeCollectionItem.ID>()
                 snapshot.appendSections([.main])
                 snapshot.appendItems(newIdentifiers, toSection: .main)
-                dataSource.apply(snapshot, animatingDifferences: false)
+                let shouldAnimate = !resolvedSwipeCompletions.isEmpty
+                    && !currentIdentifiers.isEmpty
+                    && collectionView.window != nil
+                dataSource.apply(
+                    snapshot,
+                    animatingDifferences: shouldAnimate,
+                    completion: finishSwipes
+                )
             }
 
             synchronizeSelection(in: collectionView)
@@ -150,6 +185,11 @@ struct HomeThreadCollectionView: UIViewRepresentable {
         func invalidateTimer() {
             timer?.invalidate()
             timer = nil
+        }
+
+        func cancelPendingSwipeActions() {
+            pendingSwipeCompletions.values.forEach { $0.finish(false) }
+            pendingSwipeCompletions.removeAll()
         }
 
         func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
@@ -215,14 +255,45 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 style: action.style,
                 title: action.title
             ) { [weak self] _, _, finish in
-                self?.perform(action.intent, for: thread)
-                finish(true)
+                guard let self else {
+                    finish(false)
+                    return
+                }
+                self.performSwipe(action, for: thread, finish: finish)
             }
             contextualAction.image = UIImage(systemName: action.systemImage)
             if let backgroundColor = action.backgroundColor {
                 contextualAction.backgroundColor = backgroundColor
             }
             return contextualAction
+        }
+
+        func performSwipe(
+            _ action: HomeThreadSwipeAction,
+            for thread: FeatureThread,
+            finish: @escaping (Bool) -> Void
+        ) {
+            if case let .setSettled(settled) = action.intent {
+                pendingSwipeCompletions.removeValue(forKey: thread.id)?.finish(false)
+                let completionID = UUID()
+                pendingSwipeCompletions[thread.id] = PendingSwipeCompletion(
+                    id: completionID,
+                    settled: settled,
+                    finish: finish
+                )
+                PlatformHapticEngine.shared.selection(enabled: parent.hapticsEnabled)
+                parent.onSettle(thread, settled) { [weak self] succeeded in
+                    guard !succeeded,
+                          let self,
+                          self.pendingSwipeCompletions[thread.id]?.id == completionID else {
+                        return
+                    }
+                    self.pendingSwipeCompletions.removeValue(forKey: thread.id)?.finish(false)
+                }
+            } else {
+                perform(action.intent, for: thread)
+                finish(true)
+            }
         }
 
         /// Swipe actions reuse the same closures the context menu does, so a
@@ -236,7 +307,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             case let .setPinned(pinned):
                 parent.onPin(thread, pinned)
             case let .setSettled(settled):
-                parent.onSettle(thread, settled)
+                parent.onSettle(thread, settled) { _ in }
             }
         }
 
@@ -259,6 +330,8 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
             cell.accessories = []
             cell.tintColor = T3Colors.uiTextPrimary
+            cell.clipsToBounds = true
+            cell.contentView.clipsToBounds = true
             cell.contentView.accessibilityElementsHidden = true
             configureAccessibility(cell, item: item)
         }
@@ -383,7 +456,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                         isSettled ? "Reopen" : "Settle",
                         systemImage: isSettled ? "arrow.counterclockwise" : "checkmark"
                     ) { coordinator in
-                        coordinator.parent.onSettle(thread, !isSettled)
+                        coordinator.parent.onSettle(thread, !isSettled) { _ in }
                     })
                 }
 
@@ -506,7 +579,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                                 systemName: isSettled ? "arrow.counterclockwise" : "checkmark"
                             )
                         ) { [weak self] _ in
-                            self?.parent.onSettle(thread, !isSettled)
+                            self?.parent.onSettle(thread, !isSettled) { _ in }
                         }
                     )
                 }
