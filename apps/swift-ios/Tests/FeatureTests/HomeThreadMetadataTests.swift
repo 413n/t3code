@@ -379,6 +379,92 @@ struct HomeThreadMetadataTests {
     }
 
     @Test
+    func threadMenuOpensDurablePullRequestsInTheNativeDetailView() throws {
+        let linked = ThreadLinkedPullRequest(
+            projectId: "project-wire",
+            repository: "pingdotgg/t3code",
+            number: 5178,
+            url: "https://github.com/pingdotgg/t3code/pull/5178"
+        )
+        let thread = FeatureThread(
+            id: "thread",
+            projectID: "environment:project-wire",
+            environmentID: "studio",
+            environmentName: "Studio",
+            title: "Native client",
+            linkedPullRequest: linked
+        )
+
+        let destination = try #require(ThreadPullRequestDestination.resolve(
+            thread: thread,
+            project: nil,
+            branchPullRequest: nil
+        ))
+
+        #expect(destination.number == 5178)
+        #expect(destination.target?.environmentID == "studio")
+        #expect(destination.target?.environmentName == "Studio")
+        #expect(destination.target?.reference.projectId == "project-wire")
+        #expect(destination.target?.reference.repository == "pingdotgg/t3code")
+    }
+
+    @Test
+    func threadMenuOpensBranchPullRequestsWithoutADurableLink() throws {
+        let project = FeatureProject(
+            id: "scoped-project",
+            wireID: "project-wire",
+            environmentID: "studio",
+            name: "T3 Code",
+            path: "/work/t3code"
+        )
+        let thread = FeatureThread(
+            id: "thread",
+            projectID: project.id,
+            environmentID: "studio",
+            environmentName: "Studio",
+            title: "Native client",
+            branch: "feature/native"
+        )
+        let pullRequest = FeaturePullRequest(
+            number: 42,
+            title: "Native client",
+            state: "open",
+            url: URL(string: "https://github.com/pingdotgg/t3code/pull/42")
+        )
+
+        let destination = try #require(ThreadPullRequestDestination.resolve(
+            thread: thread,
+            project: project,
+            branchPullRequest: pullRequest
+        ))
+
+        #expect(destination.number == 42)
+        #expect(destination.target?.reference.projectId == "project-wire")
+        #expect(destination.target?.reference.repository == "pingdotgg/t3code")
+    }
+
+    @Test
+    func threadMenuFallsBackToBrowserWhenThePullRequestCannotBeRoutedNatively() throws {
+        let url = try #require(URL(string: "https://example.com/reviews/42"))
+        let thread = FeatureThread(id: "thread", projectID: "missing", title: "Task")
+        let pullRequest = FeaturePullRequest(number: 42, title: "Task", state: "open", url: url)
+
+        let destination = try #require(ThreadPullRequestDestination.resolve(
+            thread: thread,
+            project: nil,
+            branchPullRequest: pullRequest
+        ))
+
+        #expect(destination.target == nil)
+        #expect(destination.url == url)
+        #expect(ThreadPullRequestDestination.resolve(
+            thread: thread,
+            project: nil,
+            branchPullRequest: nil
+        ) == nil)
+    }
+
+    @Test
     func liveSourceControlSnapshotsCarryPullRequestsAndClearMissingRemoteState() {
         let local = VCSLocalStatus(
             isRepo: true,
