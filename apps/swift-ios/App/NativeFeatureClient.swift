@@ -2614,6 +2614,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             interactionMode: thread.interactionMode,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
+            linkedPullRequest: thread.linkedPullRequest,
             latestTurn: thread.latestTurn,
             createdAt: thread.createdAt,
             updatedAt: thread.updatedAt,
@@ -4217,6 +4218,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             title: thread.title,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
+            linkedPullRequest: thread.linkedPullRequest,
             createdAt: parseDate(thread.createdAt),
             updatedAt: parseDate(thread.updatedAt),
             state: Self.resolveThreadState(
@@ -4249,6 +4251,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             supportsSnooze: environment.descriptor?.capabilities.threadSnooze,
             supportsPinning: environment.descriptor?.capabilities.threadPinning,
             supportsTitleRegeneration: environment.descriptor?.capabilities.threadTitleRegeneration,
+            supportsPullRequestLinking: environment.descriptor?.capabilities.threadPullRequestLinking,
             attentionAt: failureDate(
                 latestTurn: thread.latestTurn,
                 session: thread.session
@@ -4287,6 +4290,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             preview: previewText(thread.messages.last?.text),
             branch: thread.branch,
             worktreePath: thread.worktreePath,
+            linkedPullRequest: thread.linkedPullRequest,
             createdAt: parseDate(thread.createdAt),
             updatedAt: parseDate(thread.updatedAt),
             state: Self.resolveThreadState(
@@ -4319,6 +4323,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             supportsSnooze: environment.descriptor?.capabilities.threadSnooze,
             supportsPinning: environment.descriptor?.capabilities.threadPinning,
             supportsTitleRegeneration: environment.descriptor?.capabilities.threadTitleRegeneration,
+            supportsPullRequestLinking: environment.descriptor?.capabilities.threadPullRequestLinking,
             attentionAt: failureDate(
                 latestTurn: thread.latestTurn,
                 session: thread.session
@@ -4575,6 +4580,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             interactionMode: loaded.interactionMode,
             branch: loaded.branch,
             worktreePath: loaded.worktreePath,
+            linkedPullRequest: loaded.linkedPullRequest,
             latestTurn: loaded.latestTurn,
             createdAt: loaded.createdAt,
             updatedAt: loaded.updatedAt,
@@ -5882,6 +5888,8 @@ enum NativeThreadDetailReducer {
         let result: NativeThreadDetailReductionResult
         var renderMutation = NativeDetailRenderMutation.metadata
         switch type {
+        case "thread.meta-updated":
+            result = reduceMetadata(payload: payload, occurredAt: occurredAt, thread: thread)
         case "thread.message-sent":
             result = reduceMessage(
                 payload: payload,
@@ -5916,6 +5924,37 @@ enum NativeThreadDetailReducer {
             result: result,
             renderMutation: renderMutation
         )
+    }
+
+    private static func reduceMetadata(
+        payload: JSONValue,
+        occurredAt: String,
+        thread: OrchestrationThread
+    ) -> NativeThreadDetailReductionResult {
+        guard case let .object(values) = payload,
+              let rawLink = values["linkedPullRequest"] else {
+            return .refresh
+        }
+        guard !["title", "modelSelection", "branch", "worktreePath"].contains(where: {
+            values[$0] != nil
+        }) else {
+            return .refresh
+        }
+        let linkedPullRequest: ThreadLinkedPullRequest?
+        if rawLink == .null {
+            linkedPullRequest = nil
+        } else {
+            guard let decoded = try? rawLink.decode(ThreadLinkedPullRequest.self) else {
+                return .refresh
+            }
+            linkedPullRequest = decoded
+        }
+        var updated = replacing(
+            thread,
+            updatedAt: payload["updatedAt"]?.stringValue ?? occurredAt
+        )
+        updated.linkedPullRequest = linkedPullRequest
+        return .updated(updated)
     }
 
     private static func reduceMessage(
@@ -6155,6 +6194,7 @@ enum NativeThreadDetailReducer {
             interactionMode: thread.interactionMode,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
+            linkedPullRequest: thread.linkedPullRequest,
             latestTurn: latestTurn ?? thread.latestTurn,
             createdAt: thread.createdAt,
             updatedAt: updatedAt,

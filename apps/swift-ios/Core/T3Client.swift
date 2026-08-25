@@ -1,5 +1,26 @@
 import Foundation
 
+enum MobileClientMetadata {
+    static var osMajorVersion: Int {
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+    }
+
+    static var deviceModel: String {
+        if let simulatedModel = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"],
+           !simulatedModel.isEmpty {
+            return simulatedModel
+        }
+        var system = utsname()
+        uname(&system)
+        let machineSize = MemoryLayout.size(ofValue: system.machine)
+        return withUnsafePointer(to: &system.machine) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: machineSize) {
+                String(cString: $0)
+            }
+        }
+    }
+}
+
 public actor T3Client {
     public let environment: Environment
     private let api: EnvironmentAPI
@@ -37,9 +58,21 @@ public actor T3Client {
                 $0.name == "wsTicket"
                     || $0.name == "clientSurface"
                     || $0.name == "clientAppVersion"
+                    || $0.name == "clientOs"
+                    || $0.name == "clientOsMajorVersion"
+                    || $0.name == "clientDeviceModel"
             }
             query.append(URLQueryItem(name: "wsTicket", value: ticket.ticket))
             query.append(URLQueryItem(name: "clientSurface", value: "mobile"))
+            query.append(URLQueryItem(name: "clientOs", value: "iOS"))
+            query.append(URLQueryItem(
+                name: "clientOsMajorVersion",
+                value: String(MobileClientMetadata.osMajorVersion)
+            ))
+            let deviceModel = MobileClientMetadata.deviceModel
+            if !deviceModel.isEmpty {
+                query.append(URLQueryItem(name: "clientDeviceModel", value: deviceModel))
+            }
             if let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
                !appVersion.isEmpty {
                 query.append(URLQueryItem(name: "clientAppVersion", value: appVersion))

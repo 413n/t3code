@@ -891,6 +891,18 @@ struct HomeThreadPullRequestPresentation: Equatable {
         }
         return Self(number: pullRequest.number, state: state)
     }
+
+    static func resolve(
+        linkedPullRequest: ThreadLinkedPullRequest,
+        detail: PullRequestDetail
+    ) -> Self? {
+        guard detail.number == linkedPullRequest.number,
+              detail.repository.caseInsensitiveCompare(linkedPullRequest.repository) == .orderedSame,
+              let state = State(rawValue: detail.state.rawValue) else {
+            return nil
+        }
+        return Self(number: detail.number, state: state)
+    }
 }
 
 struct FeatureThreadRow: View {
@@ -1132,7 +1144,11 @@ struct FeatureThreadRow: View {
     }
 
     private var pullRequestObservationID: String? {
-        guard projectFaviconClient != nil,
+        guard projectFaviconClient != nil else { return nil }
+        if let linked = thread.linkedPullRequest {
+            return "\(thread.id)\u{0}\(linked.projectId)\u{0}\(linked.repository)\u{0}\(linked.number)"
+        }
+        guard
               let branch = thread.branch?.trimmingCharacters(in: .whitespacesAndNewlines),
               !branch.isEmpty else {
             return nil
@@ -1146,6 +1162,36 @@ struct FeatureThreadRow: View {
               let projectFaviconClient else {
             pullRequest = nil
             onPullRequestChange(nil)
+            return
+        }
+
+        if let linked = thread.linkedPullRequest,
+           let environmentID = thread.environmentID {
+            let target = FeaturePullRequestTarget(
+                environmentID: environmentID,
+                environmentName: thread.environmentName ?? environmentID,
+                reference: PullRequestRef(
+                    projectId: linked.projectId,
+                    repository: linked.repository,
+                    number: linked.number
+                )
+            )
+            while !Task.isCancelled {
+                if let detail = try? await projectFaviconClient.pullRequestDetail(target),
+                   let next = HomeThreadPullRequestPresentation.resolve(
+                       linkedPullRequest: linked,
+                       detail: detail
+                   ),
+                   next != pullRequest {
+                    pullRequest = next
+                    onPullRequestChange(next)
+                }
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                } catch {
+                    return
+                }
+            }
             return
         }
 

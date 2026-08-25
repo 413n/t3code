@@ -6,6 +6,41 @@ import UIKit
 @Suite("Chat Markdown")
 struct MarkdownDocumentTests {
     @Test
+    func workspaceFileLinksResolveRelativeAbsoluteAndSpacedPaths() throws {
+        #expect(
+            MarkdownWorkspaceFileLink.relativePath(
+                for: try #require(URL(string: "docs/My%20Folder/checklist.xml")),
+                workspaceRoot: "/workspace/project"
+            ) == "docs/My Folder/checklist.xml"
+        )
+        #expect(
+            MarkdownWorkspaceFileLink.relativePath(
+                for: try #require(URL(string: "Updated%20cutover%20checklist.md")),
+                workspaceRoot: "/workspace/project"
+            ) == "Updated cutover checklist.md"
+        )
+        #expect(
+            MarkdownWorkspaceFileLink.relativePath(
+                for: try #require(URL(string: "file:///workspace/project/src/main.swift#L18")),
+                workspaceRoot: "/workspace/project"
+            ) == "src/main.swift"
+        )
+    }
+
+    @Test
+    func workspaceFileLinksRejectExternalAndEscapedPaths() throws {
+        for value in ["https://example.com/file.md", "javascript:alert(1)", "../private.md",
+                      "file:///other/project/file.md"] {
+            #expect(
+                MarkdownWorkspaceFileLink.relativePath(
+                    for: try #require(URL(string: value)),
+                    workspaceRoot: "/workspace/project"
+                ) == nil
+            )
+        }
+    }
+
+    @Test
     func separatesHeadingsParagraphsAndListKinds() {
         let document = MarkdownDocument(
             parsing: """

@@ -116,6 +116,52 @@ enum MarkdownImageSource: Equatable, Sendable {
     }
 }
 
+enum MarkdownWorkspaceFileLink {
+    static func relativePath(for url: URL, workspaceRoot: String) -> String? {
+        let raw = url.absoluteString.removingPercentEncoding ?? url.absoluteString
+        let lowercase = raw.lowercased()
+        if lowercase.hasPrefix("http://") || lowercase.hasPrefix("https://")
+            || lowercase.hasPrefix("data:") || lowercase.hasPrefix("javascript:") {
+            return nil
+        }
+
+        var path = url.isFileURL ? url.path : raw
+        if let suffix = path.firstIndex(where: { $0 == "#" || $0 == "?" }) {
+            path = String(path[..<suffix])
+        }
+        path = path.replacingOccurrences(
+            of: #":\d+(?::\d+)?$"#,
+            with: "",
+            options: .regularExpression
+        )
+        guard !path.isEmpty, path.contains("/") || path.contains("\\") || path.contains(".") else {
+            return nil
+        }
+
+        let normalizedRoot = workspaceRoot.replacingOccurrences(of: "\\", with: "/")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let normalizedPath = path.replacingOccurrences(of: "\\", with: "/")
+        if normalizedPath.hasPrefix("/") || normalizedPath.range(
+            of: #"^[A-Za-z]:/"#,
+            options: .regularExpression
+        ) != nil {
+            let absolute = normalizedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard absolute == normalizedRoot || absolute.hasPrefix(normalizedRoot + "/") else {
+                return nil
+            }
+            path = String(absolute.dropFirst(normalizedRoot.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        } else {
+            path = normalizedPath
+            if path.hasPrefix("./") {
+                path = String(path.dropFirst(2))
+            }
+        }
+        guard !path.isEmpty, !path.split(separator: "/").contains("..") else { return nil }
+        return path
+    }
+}
+
 struct MarkdownTable: Equatable, Sendable {
     let header: [String]
     let alignments: [MarkdownTableAlignment]

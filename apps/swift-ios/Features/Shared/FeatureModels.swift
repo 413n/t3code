@@ -198,6 +198,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var preview: String?
     public var branch: String?
     public var worktreePath: String?
+    public var linkedPullRequest: ThreadLinkedPullRequest?
     public var createdAt: Date
     public var updatedAt: Date
     public var state: FeatureThreadState
@@ -217,6 +218,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var supportsSnooze: Bool?
     public var supportsPinning: Bool?
     public var supportsTitleRegeneration: Bool?
+    public var supportsPullRequestLinking: Bool?
     public var attentionAt: Date?
     public var workingStartedAt: Date?
     public var latestTurnCompletedAt: Date?
@@ -233,6 +235,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         preview: String? = nil,
         branch: String? = nil,
         worktreePath: String? = nil,
+        linkedPullRequest: ThreadLinkedPullRequest? = nil,
         createdAt: Date = .now,
         updatedAt: Date = .now,
         state: FeatureThreadState = .idle,
@@ -252,6 +255,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         supportsSnooze: Bool? = nil,
         supportsPinning: Bool? = nil,
         supportsTitleRegeneration: Bool? = nil,
+        supportsPullRequestLinking: Bool? = nil,
         attentionAt: Date? = nil,
         workingStartedAt: Date? = nil,
         latestTurnCompletedAt: Date? = nil,
@@ -267,6 +271,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.preview = preview
         self.branch = branch
         self.worktreePath = worktreePath
+        self.linkedPullRequest = linkedPullRequest
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.state = state
@@ -286,6 +291,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.supportsSnooze = supportsSnooze
         self.supportsPinning = supportsPinning
         self.supportsTitleRegeneration = supportsTitleRegeneration
+        self.supportsPullRequestLinking = supportsPullRequestLinking
         self.attentionAt = attentionAt
         self.workingStartedAt = workingStartedAt
         self.latestTurnCompletedAt = latestTurnCompletedAt

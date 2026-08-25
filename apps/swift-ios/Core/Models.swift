@@ -105,6 +105,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public let threadSnooze: Bool?
         public let threadPinning: Bool?
         public let threadTitleRegeneration: Bool?
+        public let threadPullRequestLinking: Bool?
         public let serverSelfUpdate: String?
         public let serverSelfUpdateProgress: Bool?
 
@@ -117,6 +118,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case threadSnooze
             case threadPinning
             case threadTitleRegeneration
+            case threadPullRequestLinking
             case serverSelfUpdate
             case serverSelfUpdateProgress
         }
@@ -134,6 +136,10 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             threadTitleRegeneration = try container.decodeIfPresent(
                 Bool.self,
                 forKey: .threadTitleRegeneration
+           )
+            threadPullRequestLinking = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .threadPullRequestLinking
             )
             serverSelfUpdate = try container.decodeIfPresent(String.self, forKey: .serverSelfUpdate)
             serverSelfUpdateProgress = try container.decodeIfPresent(
@@ -393,6 +399,20 @@ public enum OrchestrationBackgroundLiveness: String, Codable, Equatable, Sendabl
     case monitoring
 }
 
+public struct ThreadLinkedPullRequest: Codable, Equatable, Hashable, Sendable {
+    public let projectId: String
+    public let repository: String
+    public let number: Int
+    public let url: String
+
+    public init(projectId: String, repository: String, number: Int, url: String) {
+        self.projectId = projectId
+        self.repository = repository
+        self.number = number
+        self.url = url
+    }
+}
+
 public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let projectId: String
@@ -402,6 +422,7 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let interactionMode: InteractionMode
     public let branch: String?
     public let worktreePath: String?
+    public var linkedPullRequest: ThreadLinkedPullRequest? = nil
     public let latestTurn: OrchestrationLatestTurn?
     public let createdAt: String
     public let updatedAt: String
@@ -475,6 +496,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     public let interactionMode: InteractionMode
     public let branch: String?
     public let worktreePath: String?
+    public var linkedPullRequest: ThreadLinkedPullRequest? = nil
     public let latestTurn: OrchestrationLatestTurn?
     public let createdAt: String
     public let updatedAt: String

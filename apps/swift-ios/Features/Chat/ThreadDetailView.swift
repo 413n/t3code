@@ -5,6 +5,7 @@ import UIKit
 public struct ThreadDetailView: View {
     @SwiftUI.Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @SwiftUI.Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @SwiftUI.Environment(\.openURL) private var parentOpenURL
     @SwiftUI.Environment(\.scenePhase) private var scenePhase
 
     @Bindable var model: FeatureRootModel
@@ -99,6 +100,8 @@ public struct ThreadDetailView: View {
                     switch surface {
                     case .files:
                         FeatureFilesView(client: model.client, threadID: thread.id)
+                    case let .file(path):
+                        FeatureFilesView(client: model.client, threadID: thread.id, initialPath: path)
                     case .review:
                         FeatureReviewView(client: model.client, threadID: thread.id)
                     case .sourceControl:
@@ -149,6 +152,18 @@ public struct ThreadDetailView: View {
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .environment(\.openURL, OpenURLAction { url in
+            guard let workspaceRoot = markdownImageContext?.workspaceRoot,
+                  let path = MarkdownWorkspaceFileLink.relativePath(
+                      for: url,
+                      workspaceRoot: workspaceRoot
+                  ) else {
+                parentOpenURL(url)
+                return .handled
+            }
+            toolSurface = .file(path)
+            return .handled
+        })
     }
 
     private var detail: FeatureThreadDetail? {
@@ -715,13 +730,22 @@ private struct FeatureThreadOpeningView: View {
     }
 }
 
-private enum FeatureThreadToolSurface: String, Identifiable {
+private enum FeatureThreadToolSurface: Identifiable {
     case files
+    case file(String)
     case review
     case sourceControl
     case terminal
 
-    var id: String { rawValue }
+    var id: String {
+        switch self {
+        case .files: "files"
+        case let .file(path): "file:\(path)"
+        case .review: "review"
+        case .sourceControl: "sourceControl"
+        case .terminal: "terminal"
+        }
+    }
 }
 
 /// Merges a stored draft with edits made while that draft was loading. Each

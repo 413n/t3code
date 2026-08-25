@@ -2272,6 +2272,50 @@ struct FeatureRootModelTests {
         #expect(reduction.result == .refresh)
         #expect(reduction.renderMutation == .full)
     }
+
+    @Test
+    func linkedPullRequestUpdatesDoNotReloadTheEntireThread() throws {
+        let thread = orchestrationThread()
+        let link = ThreadLinkedPullRequest(
+            projectId: thread.projectId,
+            repository: "pingdotgg/t3code",
+            number: 5178,
+            url: "https://github.com/pingdotgg/t3code/pull/5178"
+        )
+        let event = orchestrationEvent(
+            type: "thread.meta-updated",
+            sequence: 7,
+            payload: [
+                "threadId": .string(thread.id),
+                "linkedPullRequest": try JSONValue.encode(link),
+                "updatedAt": .string("2026-08-25T12:00:00Z"),
+            ]
+        )
+
+        let reduction = NativeThreadDetailReducer.apply(event, to: thread)
+
+        guard case let .updated(updated) = reduction.result else {
+            Issue.record("Expected the linked pull request to update without a full refresh")
+            return
+        }
+        #expect(updated.linkedPullRequest == link)
+        #expect(reduction.renderMutation == .metadata)
+
+        let unlink = orchestrationEvent(
+            type: "thread.meta-updated",
+            sequence: 8,
+            payload: [
+                "threadId": .string(thread.id),
+                "linkedPullRequest": .null,
+                "updatedAt": .string("2026-08-25T12:01:00Z"),
+            ]
+        )
+        guard case let .updated(unlinked) = NativeThreadDetailReducer.apply(unlink, to: updated).result else {
+            Issue.record("Expected the pull request link to clear")
+            return
+        }
+        #expect(unlinked.linkedPullRequest == nil)
+    }
 }
 
 @MainActor

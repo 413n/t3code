@@ -3,6 +3,11 @@ import XCTest
 
 @MainActor
 final class TransportReliabilityTests: XCTestCase {
+    func testMobileClientMetadataIncludesOSVersionAndDeviceModel() {
+        XCTAssertGreaterThan(MobileClientMetadata.osMajorVersion, 0)
+        XCTAssertFalse(MobileClientMetadata.deviceModel.isEmpty)
+    }
+
     func testHTTPPolicyOffersGzipWithoutOverwritingCallerPreference() {
         var request = URLRequest(url: URL(string: "https://studio.example/api")!)
         let prepared = HTTPRequestPolicy.prepare(request)
@@ -200,6 +205,19 @@ final class TransportReliabilityTests: XCTestCase {
 
         let httpRequests = await transport.requests
         XCTAssertEqual(httpRequests.map(\.url?.path), ["/api/auth/websocket-ticket"])
+
+        let socketURLs = await connection.connectionURLs()
+        let socketURL = try XCTUnwrap(socketURLs.first)
+        let metadata = Dictionary(
+            uniqueKeysWithValues: (URLComponents(url: socketURL, resolvingAgainstBaseURL: false)?
+                .queryItems ?? []).compactMap { item in
+                    item.value.map { (item.name, $0) }
+                }
+        )
+        XCTAssertEqual(metadata["clientSurface"], "mobile")
+        XCTAssertEqual(metadata["clientOs"], "iOS")
+        XCTAssertEqual(metadata["clientOsMajorVersion"], String(MobileClientMetadata.osMajorVersion))
+        XCTAssertEqual(metadata["clientDeviceModel"], MobileClientMetadata.deviceModel)
     }
 
     func testModernServersUploadImageBytesBeforeDispatchingTheTurn() async throws {
@@ -621,8 +639,9 @@ private actor RecordingHTTPTransport: HTTPTransport {
 private struct StaticWebSocketConnector: WebSocketConnecting {
     let connection: RecordingWebSocketConnection
 
-    func connect(to _: URL) async throws -> any WebSocketConnection {
-        connection
+    func connect(to url: URL) async throws -> any WebSocketConnection {
+        await connection.recordConnectionURL(url)
+        return connection
     }
 }
 
@@ -634,6 +653,7 @@ private struct FailingWebSocketConnector: WebSocketConnecting {
 
 private actor RecordingWebSocketConnection: WebSocketConnection {
     private var recordedRequests: [JSONValue] = []
+    private var recordedConnectionURLs: [URL] = []
     private var queuedResponses: [Data] = []
     private var receiver: CheckedContinuation<Data, Error>?
 
@@ -681,6 +701,14 @@ private actor RecordingWebSocketConnection: WebSocketConnection {
 
     func requests() -> [JSONValue] {
         recordedRequests
+    }
+
+    func recordConnectionURL(_ url: URL) {
+        recordedConnectionURLs.append(url)
+    }
+
+    func connectionURLs() -> [URL] {
+        recordedConnectionURLs
     }
 
     private func enqueue(_ data: Data) {
