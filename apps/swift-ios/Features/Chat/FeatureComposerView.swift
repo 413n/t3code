@@ -253,6 +253,7 @@ struct FeatureComposerView: View {
             }
             .padding(.bottom, 7)
             .frame(minHeight: 62, alignment: .top)
+            .clipped()
 
             if !attachments.isEmpty, !imagesAllowed {
                 Label("Choose a model that accepts images", systemImage: "exclamationmark.circle")
@@ -274,6 +275,8 @@ struct FeatureComposerView: View {
             }
 
             composerFooter
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
         }
     }
 

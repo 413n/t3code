@@ -1334,6 +1334,11 @@ struct FeatureRootModelTests {
             input.bounds.height >= 100,
             "Expected room for more than two visible lines; got \(input.bounds.height) points"
         )
+        let inputFrame = input.convert(input.bounds, to: window)
+        #expect(
+            inputFrame.maxY <= window.bounds.height - 44,
+            "The text editor overlaps the composer controls: editor frame \(inputFrame), viewport \(window.bounds)"
+        )
     }
 
     @Test

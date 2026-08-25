@@ -39,6 +39,49 @@ struct FeatureComposerPowerTests {
     }
 
     @Test
+    func composerTextInputReservesRoomForControlsInAConstrainedViewport() {
+        #expect(
+            FeatureComposerTextInputSizing.height(
+                fittingHeight: 440,
+                lineHeight: 22,
+                availableHeight: 150
+            ) == 150
+        )
+        #expect(
+            FeatureComposerTextInputSizing.height(
+                fittingHeight: 440,
+                lineHeight: 22,
+                availableHeight: 80
+            ) == 110
+        )
+    }
+
+    @Test
+    @MainActor
+    func longComposerDraftStaysClippedAndScrollsToItsLastLine() {
+        let textView = FeatureComposerUITextView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 110)
+        )
+        textView.configureComposerViewport()
+        textView.font = UIFont.preferredFont(forTextStyle: .body)
+        textView.text = (1...40).map { "A long pasted draft line \($0)" }
+            .joined(separator: "\n")
+        textView.layoutIfNeeded()
+        textView.selectedRange = NSRange(location: textView.text.utf16.count, length: 0)
+        textView.scrollSelectionIntoView()
+        textView.layoutIfNeeded()
+
+        #expect(textView.clipsToBounds)
+        #expect(textView.contentOverflows)
+        if let selection = textView.selectedTextRange {
+            let caret = textView.caretRect(for: selection.end)
+            #expect(caret.maxY <= textView.contentOffset.y + textView.bounds.height)
+        } else {
+            Issue.record("Expected a visible selection at the end of the pasted draft")
+        }
+    }
+
+    @Test
     func replacementCursorLandsAfterInsertedTextInUTF16() {
         // "🧪 " occupies three characters but four UTF-16 units; the caret
         // location must count the latter or it drifts on emoji-bearing drafts.
