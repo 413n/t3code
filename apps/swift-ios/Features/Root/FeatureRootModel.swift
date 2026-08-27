@@ -18,6 +18,11 @@ struct FeatureDetailRenderUpdate: Equatable {
     let change: FeatureDetailRenderChange
 }
 
+enum FeatureThreadLoadState: Equatable {
+    case loading
+    case failed(String)
+}
+
 @MainActor
 @Observable
 public final class FeatureRootModel {
@@ -27,11 +32,13 @@ public final class FeatureRootModel {
         let id: UUID
         let settled: Bool
         let settledAt: Date?
+        let unsettledAt: Date?
 
         func apply(to thread: inout FeatureThread) {
             thread.isSettled = settled
             thread.keepsActive = !settled
             thread.settledAt = settledAt
+            thread.unsettledAt = unsettledAt
             if settled {
                 thread.pinnedAt = nil
             }
@@ -40,6 +47,7 @@ public final class FeatureRootModel {
 
     public private(set) var snapshot = FeatureSnapshot()
     public private(set) var details: [String: FeatureThreadDetail] = [:]
+    private(set) var detailLoadStates: [String: FeatureThreadLoadState] = [:]
     /// Advances whenever a Home presentation input changes.
     public private(set) var homePresentationRevision: UInt64 = 0
     /// Advances when a Home-visible thread is inserted, removed, or changed.
@@ -67,6 +75,7 @@ public final class FeatureRootModel {
     private var detailLoadGeneration: UInt64 = 0
     private var detailLoadRevisions: [String: UInt64] = [:]
     private var detailLoadRequestRevision: UInt64 = 0
+    private var activeDetailLoadRequests: [String: UInt64] = [:]
     private var storedDetailLoadRequestRevisions: [String: UInt64] = [:]
     private var detailMetadataRevisions: [String: UInt64] = [:]
     private var outboxDrainTask: Task<Void, Never>?
@@ -437,10 +446,12 @@ public final class FeatureRootModel {
         }
 
         let environment = currentEnvironmentIdentity
+        let now = Date.now
         let mutation = PendingSettlementMutation(
             id: UUID(),
             settled: settled,
-            settledAt: settled ? Date.now : nil
+            settledAt: settled ? now : nil,
+            unsettledAt: settled ? nil : now
         )
         pendingSettlementMutations[id] = mutation
         mutateThread(id: id) { mutation.apply(to: &$0) }
@@ -459,6 +470,7 @@ public final class FeatureRootModel {
             $0.isSettled = previous.isSettled
             $0.keepsActive = previous.keepsActive
             $0.settledAt = previous.settledAt
+            $0.unsettledAt = previous.unsettledAt
             $0.pinnedAt = previous.pinnedAt
         }
         return false
@@ -533,6 +545,16 @@ public final class FeatureRootModel {
         let threadBeforeLoad = snapshot.threads.first { $0.id == id }
         detailLoadRequestRevision &+= 1
         let loadRequestRevision = detailLoadRequestRevision
+        activeDetailLoadRequests[id] = loadRequestRevision
+        detailLoadStates[id] = .loading
+        defer {
+            if activeDetailLoadRequests[id] == loadRequestRevision {
+                activeDetailLoadRequests[id] = nil
+                if detailLoadStates[id] == .loading {
+                    detailLoadStates[id] = nil
+                }
+            }
+        }
         do {
             var detail = try await client.loadThread(id: id)
             guard currentEnvironmentIdentity == environment else {
@@ -559,8 +581,15 @@ public final class FeatureRootModel {
             upsert(detail.thread)
             return detail
         } catch {
-            if !Self.isBenignCancellation(error) {
-                errorMessage = error.localizedDescription
+            if !Self.isBenignCancellation(error),
+               activeDetailLoadRequests[id] == loadRequestRevision,
+               detailLoadGeneration == loadGenerationBeforeLoad,
+               detailLoadRevisions[id] == loadRevisionBeforeLoad,
+               currentEnvironmentIdentity == environment {
+                detailLoadStates[id] = .failed(error.localizedDescription)
+                if details[id] == nil {
+                    errorMessage = error.localizedDescription
+                }
             }
             return details[id]
         }
@@ -1051,6 +1080,8 @@ public final class FeatureRootModel {
             detailRecency.removeAll { $0 == id }
         }
         storedDetailLoadRequestRevisions.removeValue(forKey: id)
+        activeDetailLoadRequests.removeValue(forKey: id)
+        detailLoadStates.removeValue(forKey: id)
         bumpDetailLoadRevision(id: id)
         bumpDetailRevision(id: id, change: .full)
     }
@@ -1059,6 +1090,8 @@ public final class FeatureRootModel {
         detailLoadGeneration &+= 1
         detailLoadRevisions.removeAll()
         storedDetailLoadRequestRevisions.removeAll()
+        activeDetailLoadRequests.removeAll()
+        detailLoadStates.removeAll()
         detailMetadataRevisions.removeAll()
         let hadDetails = !details.isEmpty
         details.removeAll()

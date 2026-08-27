@@ -595,7 +595,11 @@ struct DailyUXSidebarIndex {
                 $0.pinnedAt == nil
                     && !($0.canToggleSettlement && $0.isEffectivelySettled(at: now))
             }
-            .sorted(by: Self.creationOrder)
+            .sorted { lhs, rhs in
+                let leftAnchor = max(lhs.createdAt, lhs.unsettledAt ?? lhs.createdAt)
+                let rightAnchor = max(rhs.createdAt, rhs.unsettledAt ?? rhs.createdAt)
+                return leftAnchor == rightAnchor ? lhs.id < rhs.id : leftAnchor > rightAnchor
+            }
 
         snoozed = visible
             .filter { $0.isEffectivelySnoozed(at: now) }

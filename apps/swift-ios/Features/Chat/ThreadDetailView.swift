@@ -78,10 +78,10 @@ public struct ThreadDetailView: View {
         .task(id: thread.id) {
             let restoreBaseline = composerDraft
             let restoreKey = draftKey
-            isLoading = detail == nil
+            isLoading = true
             _ = await model.detail(for: thread.id, force: true)
-            await restoreDraft(from: restoreBaseline, key: restoreKey)
             isLoading = false
+            await restoreDraft(from: restoreBaseline, key: restoreKey)
         }
         .task(id: pullRequestObservationID) {
             await observeThreadPullRequest()
@@ -89,6 +89,13 @@ public struct ThreadDetailView: View {
         .onChange(of: draft) { scheduleDraftSave() }
         .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
+        .onChange(of: threadConnectionState) { _, state in
+            if state == .connected,
+               case .failed = model.detailLoadStates[thread.id],
+               !isLoading {
+                reloadThread()
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {
                 persistDraftBeforeLeaving()
@@ -401,10 +408,48 @@ public struct ThreadDetailView: View {
     }
 
     private func reloadThread() {
-        isLoading = detail == nil
+        isLoading = true
         Task {
             _ = await model.detail(for: thread.id, force: true)
             isLoading = false
+        }
+    }
+
+    private var threadConnectionState: FeatureConnection.State? {
+        guard let environmentID = currentThread.environmentID else { return nil }
+        return model.snapshot.environments.first { $0.id == environmentID }?.connectionState
+    }
+
+    private var refreshPresentation: ThreadRefreshPresentation? {
+        ThreadRefreshPresentation.resolve(
+            loadState: model.detailLoadStates[thread.id],
+            connectionState: threadConnectionState,
+            isOpening: isLoading
+        )
+    }
+
+    @ViewBuilder
+    private var refreshStatus: some View {
+        if let refreshPresentation {
+            HStack(spacing: 8) {
+                Label(refreshPresentation.title, systemImage: refreshPresentation.systemImage)
+                    .font(T3Typography.supporting)
+                    .foregroundStyle(T3Colors.textSecondary)
+                Spacer(minLength: 4)
+                if refreshPresentation.canRetry {
+                    Button(action: reloadThread) {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .font(T3Typography.control)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(T3Colors.accent)
+                    .frame(minHeight: T3Metrics.minimumTapTarget)
+                    .accessibilityIdentifier("thread-refresh-retry")
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+            .accessibilityIdentifier("thread-refresh-status")
         }
     }
 
@@ -465,32 +510,36 @@ public struct ThreadDetailView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            FeatureComposerView(
-                text: $draft,
-                selection: $selection,
-                attachments: $attachments,
-                providers: threadProviders,
-                threadSelection: currentSelection,
-                materializesDefaultSelection: false,
-                isSending: isSending,
-                isWorking: detail.thread.state == .working || detail.thread.state == .queued,
-                focused: $composerFocused,
-                onSend: send,
-                onStop: {
-                    Task { await model.cancelTurn(threadID: thread.id) }
-                },
-                pendingApprovals: detail.approvals,
-                pendingUserInputs: detail.userInputs,
-                isResolvingRequest: model.isPerformingAction,
-                powerFeatures: composerPowerFeatures,
-                onDismissKeyboard: dismissKeyboard,
-                onApprovalDecision: { id, decision in
-                    Task { await model.resolveApproval(id, decision: decision) }
-                },
-                onUserInputSubmit: { id, answers in
-                    Task { await model.resolveUserInput(id, answers: answers) }
-                }
-            )
+            VStack(spacing: 0) {
+                refreshStatus
+                FeatureComposerView(
+                    text: $draft,
+                    selection: $selection,
+                    attachments: $attachments,
+                    providers: threadProviders,
+                    threadSelection: currentSelection,
+                    materializesDefaultSelection: false,
+                    isSending: isSending,
+                    isWorking: detail.thread.state == .working || detail.thread.state == .queued,
+                    focused: $composerFocused,
+                    onSend: send,
+                    onStop: {
+                        Task { await model.cancelTurn(threadID: thread.id) }
+                    },
+                    pendingApprovals: detail.approvals,
+                    pendingUserInputs: detail.userInputs,
+                    isResolvingRequest: model.isPerformingAction,
+                    powerFeatures: composerPowerFeatures,
+                    onDismissKeyboard: dismissKeyboard,
+                    onApprovalDecision: { id, decision in
+                        Task { await model.resolveApproval(id, decision: decision) }
+                    },
+                    onUserInputSubmit: { id, answers in
+                        Task { await model.resolveUserInput(id, answers: answers) }
+                    }
+                )
+            }
+            .background(T3Colors.background)
         }
     }
 
@@ -762,6 +811,46 @@ public struct ThreadDetailView: View {
         )
     }
 
+}
+
+enum ThreadRefreshPresentation: Equatable {
+    case loading
+    case reconnecting
+    case offline
+    case failed
+
+    var title: String {
+        switch self {
+        case .loading: "Updating thread..."
+        case .reconnecting: "Reconnecting..."
+        case .offline: "Computer offline"
+        case .failed: "Could not update thread"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .loading: "hourglass"
+        case .reconnecting: "wifi"
+        case .offline, .failed: "wifi.exclamationmark"
+        }
+    }
+
+    var canRetry: Bool { self == .offline || self == .failed }
+
+    static func resolve(
+        loadState: FeatureThreadLoadState?,
+        connectionState: FeatureConnection.State?,
+        isOpening: Bool
+    ) -> Self? {
+        if isOpening || loadState == .loading { return .loading }
+        if case .failed = loadState { return .failed }
+        switch connectionState {
+        case .connecting, .reconnecting: return .reconnecting
+        case .disconnected: return .offline
+        case .connected, nil: return nil
+        }
+    }
 }
 
 private struct FeatureThreadOpeningView: View {

@@ -59,6 +59,18 @@ struct DailyUXSidebarTests {
     }
 
     @Test
+    func reopenedThreadsReturnToTheTopWithoutReorderingOnOrdinaryActivity() {
+        var reopened = thread(id: "old", created: -1_000, updated: -5)
+        reopened.unsettledAt = now.addingTimeInterval(-10)
+        let newer = thread(id: "new", created: -100, updated: 0, state: .working)
+
+        #expect(makeIndex([newer, reopened]).active.map(\.id) == ["old", "new"])
+
+        reopened.unsettledAt = now.addingTimeInterval(-2_000)
+        #expect(makeIndex([newer, reopened]).active.map(\.id) == ["new", "old"])
+    }
+
+    @Test
     func settledUsesExplicitStateOrThreeDayRestingAge() {
         let explicitlySettled = thread(
             id: "explicit",

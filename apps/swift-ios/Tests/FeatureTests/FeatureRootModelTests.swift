@@ -1383,6 +1383,70 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func cachedThreadRefreshShowsLoadingThenRetryWithoutHidingMessages() async throws {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "cached", projectID: "project", title: "Cached thread")
+        let cached = FeatureThreadDetail(
+            thread: thread,
+            messages: [.init(id: "user", role: .user, text: "Do the task")]
+        )
+        client.threadDetail = cached
+        let model = testRootModel(client: client)
+        _ = await model.detail(for: thread.id)
+
+        let started = AsyncStream<Void>.makeStream()
+        var response: CheckedContinuation<FeatureThreadDetail, any Error>?
+        client.loadThreadHandler = { _ in
+            try await withCheckedThrowingContinuation { continuation in
+                response = continuation
+                started.continuation.yield()
+            }
+        }
+        let refresh = Task { await model.detail(for: thread.id, force: true) }
+        var requests = started.stream.makeAsyncIterator()
+        await requests.next()
+        #expect(model.detailLoadStates[thread.id] == .loading)
+        #expect(model.details[thread.id] == cached)
+
+        response?.resume(throwing: URLError(.notConnectedToInternet))
+        #expect(await refresh.value == cached)
+        guard case .failed = model.detailLoadStates[thread.id] else {
+            Issue.record("Expected an inline retry state for the cached thread")
+            return
+        }
+        #expect(model.errorMessage == nil)
+        #expect(model.details[thread.id]?.messages.first?.text == "Do the task")
+
+        client.loadThreadHandler = nil
+        _ = await model.detail(for: thread.id, force: true)
+        #expect(model.detailLoadStates[thread.id] == nil)
+    }
+
+    @Test
+    func threadRefreshPresentationShowsConnectionLossEvenWithCachedContent() {
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .connected, isOpening: true
+        ) == .loading)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: .loading, connectionState: .connected, isOpening: false
+        ) == .loading)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .reconnecting, isOpening: false
+        ) == .reconnecting)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .disconnected, isOpening: false
+        ) == .offline)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: .failed("Offline"), connectionState: .connected, isOpening: false
+        ) == .failed)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .connected, isOpening: false
+        ) == nil)
+        #expect(ThreadRefreshPresentation.failed.canRetry)
+        #expect(!ThreadRefreshPresentation.loading.canRetry)
+    }
+
+    @Test
     func testCancelledDetailRefreshKeepsCachedContentWithoutAlert() async {
         let client = FeatureClientStub()
         let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Thread")
@@ -1401,6 +1465,7 @@ struct FeatureRootModelTests {
 
         #expect(refreshed == detail)
         #expect(model.errorMessage == nil)
+        #expect(model.detailLoadStates[thread.id] == nil)
     }
 
     @Test
@@ -1616,8 +1681,12 @@ struct FeatureRootModelTests {
             continuation.resume(returning: index == 1 ? initial : refreshed)
             if index == 1 {
                 _ = await initialLoad.value
+                if completionOrder.first == 1 {
+                    #expect(model.detailLoadStates[thread.id] == .loading)
+                }
             } else {
                 _ = await refresh.value
+                #expect(model.detailLoadStates[thread.id] == nil)
             }
         }
 

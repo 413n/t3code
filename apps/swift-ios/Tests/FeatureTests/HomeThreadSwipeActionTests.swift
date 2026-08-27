@@ -491,6 +491,41 @@ struct HomeThreadSwipeActionTests {
     }
 
     @Test
+    func reopeningImmediatelyMovesTheThreadToTheTopAndRestoresItsOrderOnFailure() async throws {
+        let client = SwipeSettlementClientStub()
+        var older = thread(id: "older")
+        older.createdAt = now.addingTimeInterval(-1_000)
+        older.isSettled = true
+        older.settledAt = now.addingTimeInterval(-20)
+        let newer = thread(id: "newer")
+        client.snapshot = snapshot(threads: [older, newer])
+        let model = testRootModel(client: client)
+        await model.reload()
+
+        let started = AsyncStream<Void>.makeStream()
+        var response: CheckedContinuation<Void, any Error>?
+        client.beforeSettlementResponse = { _ in
+            try await withCheckedThrowingContinuation { continuation in
+                response = continuation
+                started.continuation.yield()
+            }
+        }
+
+        let reopening = Task { await model.setSettled(older.id, settled: false) }
+        var requests = started.stream.makeAsyncIterator()
+        await requests.next()
+
+        #expect(presentation(for: model).active.map(\.id) == ["older", "newer"])
+        #expect(model.snapshot.threads.first(where: { $0.id == older.id })?.unsettledAt != nil)
+        response?.resume(throwing: SwipeSettlementFailure.offline)
+        #expect(!(await reopening.value))
+        #expect(presentation(for: model).active.map(\.id) == ["newer"])
+        let restored = try #require(model.snapshot.threads.first(where: { $0.id == older.id }))
+        #expect(restored.unsettledAt == older.unsettledAt)
+        #expect(restored.settledAt == older.settledAt)
+    }
+
+    @Test
     func anOlderFailedSettlementCannotUndoANewerReopen() async {
         let client = SwipeSettlementClientStub()
         let active = thread(id: "active")
@@ -515,12 +550,15 @@ struct HomeThreadSwipeActionTests {
 
         await model.setSettled(active.id, settled: false)
         #expect(model.snapshot.threads.first?.isSettled == false)
+        let reopenedAt = model.snapshot.threads.first?.unsettledAt
+        #expect(reopenedAt != nil)
 
         delayedResponse?.resume(throwing: SwipeSettlementFailure.offline)
         #expect(!(await settlement.value))
 
         #expect(model.snapshot.threads.first?.isSettled == false)
         #expect(model.snapshot.threads.first?.keepsActive == true)
+        #expect(model.snapshot.threads.first?.unsettledAt == reopenedAt)
         #expect(client.settlementRequests == [
             SettlementRequest(id: active.id, settled: true),
             SettlementRequest(id: active.id, settled: false),
