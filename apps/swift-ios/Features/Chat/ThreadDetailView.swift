@@ -117,8 +117,6 @@ public struct ThreadDetailView: View {
                         FeatureReviewView(client: model.client, threadID: thread.id)
                     case .sourceControl:
                         FeatureSourceControlView(client: model.client, threadID: thread.id)
-                    case let .pullRequest(target):
-                        PullRequestDetailView(rootModel: model, target: target)
                     case .terminal:
                         FeatureTerminalView(client: model.client, threadID: thread.id)
                     }
@@ -288,11 +286,7 @@ public struct ThreadDetailView: View {
             Section("Thread") {
                 if let pullRequest = currentPullRequest {
                     Button {
-                        if let target = pullRequest.target {
-                            toolSurface = .pullRequest(target)
-                        } else if let url = pullRequest.url {
-                            parentOpenURL(url)
-                        }
+                        parentOpenURL(pullRequest.url)
                     } label: {
                         Label("Open pull request #\(pullRequest.number)", systemImage: "arrow.triangle.pull")
                     }
@@ -375,10 +369,8 @@ public struct ThreadDetailView: View {
     }
 
     private var currentPullRequest: ThreadPullRequestDestination? {
-        let project = model.snapshot.projects.first { $0.id == currentThread.projectID }
         return ThreadPullRequestDestination.resolve(
             thread: currentThread,
-            project: project,
             branchPullRequest: branchPullRequest
         )
     }
@@ -874,7 +866,6 @@ private enum FeatureThreadToolSurface: Identifiable {
     case file(String)
     case review
     case sourceControl
-    case pullRequest(FeaturePullRequestTarget)
     case terminal
 
     var id: String {
@@ -883,8 +874,6 @@ private enum FeatureThreadToolSurface: Identifiable {
         case let .file(path): "file:\(path)"
         case .review: "review"
         case .sourceControl: "sourceControl"
-        case let .pullRequest(target):
-            "pullRequest:\(target.environmentID):\(target.reference.repository):\(target.reference.number)"
         case .terminal: "terminal"
         }
     }
@@ -892,66 +881,20 @@ private enum FeatureThreadToolSurface: Identifiable {
 
 struct ThreadPullRequestDestination: Equatable {
     let number: Int
-    let target: FeaturePullRequestTarget?
-    let url: URL?
+    let url: URL
 
     static func resolve(
         thread: FeatureThread,
-        project: FeatureProject?,
         branchPullRequest: FeaturePullRequest?
     ) -> Self? {
-        if let linked = thread.linkedPullRequest {
-            let environmentID = thread.environmentID ?? project?.environmentID
-            let target = environmentID.map {
-                FeaturePullRequestTarget(
-                    environmentID: $0,
-                    environmentName: thread.environmentName ?? $0,
-                    reference: PullRequestRef(
-                        projectId: linked.projectId,
-                        repository: linked.repository,
-                        number: linked.number
-                    )
-                )
-            }
-            return Self(number: linked.number, target: target, url: URL(string: linked.url))
+        if let linked = thread.linkedPullRequest,
+           let url = URL(string: linked.url) {
+            return Self(number: linked.number, url: url)
         }
 
-        guard let pullRequest = branchPullRequest else { return nil }
-        let environmentID = thread.environmentID ?? project?.environmentID
-        let repository = pullRequest.url.flatMap(repositoryFromPullRequestURL)
-            ?? project?.repositoryIdentity?.canonicalKey.split(separator: "/", maxSplits: 1)
-                .dropFirst().first.map(String.init)
-        let target: FeaturePullRequestTarget?
-        if let environmentID, let project, let repository {
-            target = FeaturePullRequestTarget(
-                environmentID: environmentID,
-                environmentName: thread.environmentName ?? environmentID,
-                reference: PullRequestRef(
-                    projectId: project.wireID ?? project.id,
-                    repository: repository,
-                    number: pullRequest.number
-                )
-            )
-        } else {
-            target = nil
-        }
-        guard target != nil || pullRequest.url != nil else { return nil }
-        return Self(number: pullRequest.number, target: target, url: pullRequest.url)
-    }
-
-    private static func repositoryFromPullRequestURL(_ url: URL) -> String? {
-        let parts = url.path.split(separator: "/")
-        guard let marker = parts.firstIndex(where: {
-            ["pull", "pulls", "pull-requests", "merge_requests"].contains(String($0))
-        }), marker > 0 else {
-            return nil
-        }
-        var repository = Array(parts[..<marker])
-        if repository.last == "-" {
-            repository.removeLast()
-        }
-        guard repository.count >= 2 else { return nil }
-        return repository.joined(separator: "/")
+        guard let pullRequest = branchPullRequest,
+              let url = pullRequest.url else { return nil }
+        return Self(number: pullRequest.number, url: url)
     }
 }
 

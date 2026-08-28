@@ -379,7 +379,7 @@ struct HomeThreadMetadataTests {
     }
 
     @Test
-    func threadMenuOpensDurablePullRequestsInTheNativeDetailView() throws {
+    func threadMenuOpensDurablePullRequestURL() throws {
         let linked = ThreadLinkedPullRequest(
             projectId: "project-wire",
             repository: "pingdotgg/t3code",
@@ -397,15 +397,11 @@ struct HomeThreadMetadataTests {
 
         let destination = try #require(ThreadPullRequestDestination.resolve(
             thread: thread,
-            project: nil,
             branchPullRequest: nil
         ))
 
         #expect(destination.number == 5178)
-        #expect(destination.target?.environmentID == "studio")
-        #expect(destination.target?.environmentName == "Studio")
-        #expect(destination.target?.reference.projectId == "project-wire")
-        #expect(destination.target?.reference.repository == "pingdotgg/t3code")
+        #expect(destination.url.absoluteString == "https://github.com/pingdotgg/t3code/pull/5178")
     }
 
     @Test
@@ -434,33 +430,36 @@ struct HomeThreadMetadataTests {
 
         let destination = try #require(ThreadPullRequestDestination.resolve(
             thread: thread,
-            project: project,
             branchPullRequest: pullRequest
         ))
 
         #expect(destination.number == 42)
-        #expect(destination.target?.reference.projectId == "project-wire")
-        #expect(destination.target?.reference.repository == "pingdotgg/t3code")
+        #expect(destination.url == pullRequest.url)
     }
 
     @Test
-    func threadMenuFallsBackToBrowserWhenThePullRequestCannotBeRoutedNatively() throws {
+    func threadMenuRequiresPullRequestURL() throws {
         let url = try #require(URL(string: "https://example.com/reviews/42"))
         let thread = FeatureThread(id: "thread", projectID: "missing", title: "Task")
         let pullRequest = FeaturePullRequest(number: 42, title: "Task", state: "open", url: url)
 
         let destination = try #require(ThreadPullRequestDestination.resolve(
             thread: thread,
-            project: nil,
             branchPullRequest: pullRequest
         ))
 
-        #expect(destination.target == nil)
         #expect(destination.url == url)
         #expect(ThreadPullRequestDestination.resolve(
             thread: thread,
-            project: nil,
             branchPullRequest: nil
+        ) == nil)
+        #expect(ThreadPullRequestDestination.resolve(
+            thread: thread,
+            branchPullRequest: FeaturePullRequest(
+                number: 42,
+                title: "Task",
+                state: "open"
+            )
         ) == nil)
     }
 
