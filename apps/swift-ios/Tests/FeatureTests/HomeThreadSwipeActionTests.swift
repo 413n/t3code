@@ -10,6 +10,21 @@ struct HomeThreadSwipeActionTests {
     private let now = Date(timeIntervalSince1970: 20_000)
 
     @Test
+    func backKeepsTheMostRecentlyOpenedThreadHighlighted() {
+        var selection = WorkspaceThreadSelection()
+        selection.open("first")
+        selection.close()
+        #expect(selection.selectedID == nil)
+        #expect(selection.highlightedID == "first")
+
+        selection.open("second")
+        #expect(selection.selectedID == "second")
+        #expect(selection.highlightedID == "second")
+        selection.close()
+        #expect(selection.highlightedID == "second")
+    }
+
+    @Test
     func settlementOwnsTheEdgeSlotSoAFullSwipeSettles() {
         let active = thread(id: "active")
         let actions = HomeThreadSwipeAction.trailingActions(
