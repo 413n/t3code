@@ -988,7 +988,7 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
     func makeUIView(context: Context) -> UICollectionView {
         let collectionView = BottomAnchoredTranscriptCollectionView(
             frame: .zero,
-            collectionViewLayout: TranscriptCollectionViewLayout()
+            collectionViewLayout: Self.makeLayout()
         )
         collectionView.backgroundColor = T3Colors.uiBackground
         collectionView.alwaysBounceVertical = true
@@ -1009,6 +1009,25 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
         coordinator.cancelPendingWork()
         collectionView.prefetchDataSource = nil
         collectionView.delegate = nil
+    }
+
+    static func makeLayout() -> UICollectionViewLayout {
+        UICollectionViewCompositionalLayout { _, environment in
+            let width = environment.container.effectiveContentSize.width
+            let sideInset = max(18, (width - T3Metrics.readingWidth) / 2)
+            let itemSize = NSCollectionLayoutSize(
+                widthDimension: .fractionalWidth(1),
+                heightDimension: .estimated(120)
+            )
+            let item = NSCollectionLayoutItem(layoutSize: itemSize)
+            let group = NSCollectionLayoutGroup.vertical(layoutSize: itemSize, subitems: [item])
+            let section = NSCollectionLayoutSection(group: group)
+            section.interGroupSpacing = 22
+            section.contentInsets = NSDirectionalEdgeInsets(
+                top: 18, leading: sideInset, bottom: 14, trailing: sideInset
+            )
+            return section
+        }
     }
 
     @MainActor
@@ -1094,8 +1113,6 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 }
                 .margins(.all, 0)
                 cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
-                cell.clipsToBounds = true
-                cell.contentView.clipsToBounds = true
                 cell.accessibilityIdentifier = "message-cell-\(messageID)"
             }
 
@@ -1115,9 +1132,6 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
             }
             collectionView.prefetchDataSource = self
             collectionView.delegate = self
-            (collectionView.collectionViewLayout as? TranscriptCollectionViewLayout)?.itemIDsProvider = { [weak self] in
-                self?.dataSource?.snapshot().itemIdentifiers ?? []
-            }
         }
 
         func update(
@@ -1125,7 +1139,10 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
             in collectionView: UICollectionView,
             completion: (() -> Void)? = nil
         ) {
-            guard let dataSource else { completion?(); return }
+            guard let dataSource else {
+                completion?()
+                return
+            }
             onLoadEarlier = parent.onLoadEarlier
             onDismissKeyboard = parent.onDismissKeyboard
 
@@ -1159,7 +1176,10 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
                 || currentIsLoadingEarlier != isLoadingEarlier
             guard threadChanged || imageContextChanged || typeSizeChanged || revisionChanged || workingChanged
-                || workingDetailChanged || loadEarlierChanged else { completion?(); return }
+                || workingDetailChanged || loadEarlierChanged else {
+                completion?()
+                return
+            }
 
             let incremental = !threadChanged
                 ? incrementalState(messages: messages, renderUpdate: renderUpdate)
@@ -1181,7 +1201,10 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
             currentCanLoadEarlier = canLoadEarlier
             currentIsLoadingEarlier = isLoadingEarlier
             guard threadChanged || idsChanged || !changedIDs.isEmpty || workingChanged
-                || workingDetailChanged || loadEarlierChanged else { completion?(); return }
+                || workingDetailChanged || loadEarlierChanged else {
+                completion?()
+                return
+            }
 
             if threadChanged {
                 cancelAllMarkdownPrefetches()
@@ -1267,7 +1290,7 @@ struct FeatureTranscriptCollectionView: UIViewRepresentable {
             }
 
             if threadChanged || typeSizeChanged || imageContextChanged {
-                (collectionView.collectionViewLayout as? TranscriptCollectionViewLayout)?.resetMeasurements()
+                collectionView.collectionViewLayout.invalidateLayout()
             }
             updateGeneration &+= 1
             let generation = updateGeneration

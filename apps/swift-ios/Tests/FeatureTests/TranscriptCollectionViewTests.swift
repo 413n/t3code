@@ -22,60 +22,57 @@ struct TranscriptCollectionViewTests {
     }
 
     @Test
-    func heightsFollowMessageIDsWhenEarlierTurnsArrive() throws {
-        let layout = TranscriptCollectionViewLayout()
-        let collectionView = collection(layout: layout)
-        layout.setItems(["first", "second"])
-        layout.prepare()
-        try measure(item: 0, height: 680, in: layout)
-        layout.prepare()
-        #expect(layout.layoutAttributesForItem(at: index(0))?.size.height == 680)
+    func longMarkdownRemainsInsideItsCellAfterScrolling() async {
+        let coordinator = FeatureTranscriptCollectionView.Coordinator()
+        let collectionView = collection()
+        let controller = UIViewController()
+        let window = UIWindow(frame: collectionView.frame)
+        window.overrideUserInterfaceStyle = .dark
+        window.rootViewController = controller
+        controller.view.addSubview(collectionView)
+        window.makeKeyAndVisible()
+        coordinator.connect(to: collectionView)
+        defer {
+            coordinator.cancelPendingWork()
+            window.isHidden = true
+        }
+        let messages = (0..<30).map { item in
+            FeatureMessage(
+                id: "long-\(item)", role: .assistant,
+                text: """
+                I am checking the real provider data in the app, including the model list and configuration for message \(item).
 
-        layout.setItems(["earlier", "first", "second"])
-        layout.prepare()
-        #expect(layout.layoutAttributesForItem(at: index(1))?.size.height == 680)
-        #expect(layout.layoutAttributesForItem(at: index(2))?.frame.minY == 862)
+                \(String(repeating: "This paragraph must keep every line visible while the collection recycles its cells. ", count: item % 5 + 1))
 
-        #expect(!layout.shouldInvalidateLayout(
-            forBoundsChange: CGRect(x: 0, y: 500, width: 390, height: 700)
-        ))
-        collectionView.bounds.size.width = 430
-        layout.prepare()
-        #expect(layout.layoutAttributesForItem(at: index(1))?.size.height == 120)
+                - Keep the model and configuration frame heights stable.
+                - Fix the footer divider and test the rendered result.
+                - All checks pass on `example-commit`.
+                """
+            )
+        }
+        await update(transcript(count: 0, messages: messages), coordinator: coordinator, in: collectionView)
+        for item in [24, 0, 15, 29] {
+            collectionView.scrollToItem(at: index(item), at: .top, animated: false)
+            collectionView.layoutIfNeeded()
+            #expect(!collectionView.visibleCells.isEmpty)
+            for cell in collectionView.visibleCells {
+                // Correct row frames do not prove the text fits. Check the
+                // rendered descendants after cells have been reused.
+                let renderedText = textViews(in: cell.contentView).filter { !$0.text.isEmpty }
+                #expect(!renderedText.isEmpty)
+                for textView in renderedText {
+                    let frame = textView.convert(textView.bounds, to: cell.contentView)
+                    #expect(frame.minY >= -1, "Text starts above its cell: \(cell.accessibilityIdentifier ?? "unknown")")
+                    #expect(frame.maxY <= cell.contentView.bounds.height + 1,
+                            "Text extends below its cell: \(cell.accessibilityIdentifier ?? "unknown")")
+                }
+            }
+        }
     }
 
-    @Test
-    func aResizeAboveTheReaderAdjustsTheOffsetButOneBelowDoesNot() throws {
-        let layout = TranscriptCollectionViewLayout()
-        let collectionView = collection(layout: layout)
-        layout.setItems((0..<20).map(String.init))
-        layout.prepare()
-        collectionView.contentOffset.y = 500
-
-        let above = try measure(item: 0, height: 220, in: layout)
-        #expect(above.contentOffsetAdjustment.y == 100)
-        layout.prepare()
-        let below = try measure(item: 10, height: 240, in: layout)
-        #expect(below.contentOffsetAdjustment.y == 0)
-    }
-
-    @Test
-    func largeHistoryOnlyReturnsVisibleFramesAndReusesMeasuredHeights() throws {
-        let layout = TranscriptCollectionViewLayout()
-        let collectionView = collection(layout: layout)
-        layout.setItems((0..<5_000).map(String.init))
-        layout.prepare()
-        try measure(item: 2_500, height: 480, in: layout)
-        layout.prepare()
-        let anchor = try #require(layout.layoutAttributesForItem(at: index(2_500)))
-        let viewport = CGRect(x: 0, y: anchor.frame.minY, width: 390, height: 700)
-        let visible = try #require(layout.layoutAttributesForElements(in: viewport))
-        #expect(visible.count < 10)
-        #expect(visible.first?.indexPath.item == 2_500)
-        #expect(visible.first?.size.height == 480)
-        layout.prepare()
-        #expect(layout.layoutAttributesForItem(at: index(2_500))?.frame == anchor.frame)
-        #expect(collectionView.bounds.width == 390)
+    private func textViews(in view: UIView) -> [UITextView] {
+        if let textView = view as? UITextView { return [textView] }
+        return view.subviews.flatMap(textViews(in:))
     }
 
     @Test
@@ -97,7 +94,7 @@ struct TranscriptCollectionViewTests {
         let coordinator = FeatureTranscriptCollectionView.Coordinator()
         let collectionView = DraggingTranscriptCollectionView(
             frame: CGRect(x: 0, y: 0, width: 390, height: 700),
-            collectionViewLayout: TranscriptCollectionViewLayout()
+            collectionViewLayout: FeatureTranscriptCollectionView.makeLayout()
         )
         coordinator.connect(to: collectionView)
         defer { coordinator.cancelPendingWork() }
@@ -176,7 +173,7 @@ struct TranscriptCollectionViewTests {
         let coordinator = FeatureTranscriptCollectionView.Coordinator()
         let collectionView = BottomAnchoredTranscriptCollectionView(
             frame: CGRect(x: 0, y: 0, width: 390, height: 700),
-            collectionViewLayout: TranscriptCollectionViewLayout()
+            collectionViewLayout: FeatureTranscriptCollectionView.makeLayout()
         )
         coordinator.connect(to: collectionView)
         defer { coordinator.cancelPendingWork() }
@@ -195,10 +192,10 @@ struct TranscriptCollectionViewTests {
         #expect(!collectionView.maintainsBottomAnchor)
     }
 
-    private func collection(layout: UICollectionViewLayout = TranscriptCollectionViewLayout()) -> UICollectionView {
+    private func collection() -> UICollectionView {
         UICollectionView(
             frame: CGRect(x: 0, y: 0, width: 390, height: 700),
-            collectionViewLayout: layout
+            collectionViewLayout: FeatureTranscriptCollectionView.makeLayout()
         )
     }
 
@@ -216,20 +213,6 @@ struct TranscriptCollectionViewTests {
 
     private func index(_ item: Int) -> IndexPath {
         IndexPath(item: item, section: 0)
-    }
-
-    @discardableResult
-    private func measure(
-        item: Int, height: CGFloat, in layout: TranscriptCollectionViewLayout
-    ) throws -> UICollectionViewLayoutInvalidationContext {
-        let original = try #require(layout.layoutAttributesForItem(at: index(item)))
-        let preferred = try #require(original.copy() as? UICollectionViewLayoutAttributes)
-        preferred.size.height = height
-        let context = layout.invalidationContext(
-            forPreferredLayoutAttributes: preferred, withOriginalAttributes: original
-        )
-        layout.invalidateLayout(with: context)
-        return context
     }
 
     private func transcript(
