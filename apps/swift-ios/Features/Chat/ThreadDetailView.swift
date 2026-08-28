@@ -48,7 +48,8 @@ public struct ThreadDetailView: View {
     }
 
     public var body: some View {
-        Group {
+        // Keep one toolbar owner while the loading content becomes a transcript.
+        VStack(spacing: 0) {
             if let detail {
                 timeline(detail)
             } else if isLoading {
@@ -63,6 +64,7 @@ public struct ThreadDetailView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(T3Colors.background)
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(false)
@@ -250,6 +252,10 @@ public struct ThreadDetailView: View {
         .accessibilityAddTraits(
             currentThread.hasLiveWorkingDuration ? .updatesFrequently : []
         )
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
     }
 
     @ViewBuilder
@@ -953,7 +959,7 @@ enum FeatureComposerDraftRestoration {
 
 /// A recycled transcript surface. SwiftUI still owns each message's rendering,
 /// while UIKit keeps offscreen messages out of the active view hierarchy.
-private struct FeatureTranscriptCollectionView: UIViewRepresentable {
+struct FeatureTranscriptCollectionView: UIViewRepresentable {
     private static let workingIndicatorID = "__t3-working-indicator__"
     private static let loadEarlierID = "__t3-load-earlier__"
 
@@ -982,7 +988,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     func makeUIView(context: Context) -> UICollectionView {
         let collectionView = BottomAnchoredTranscriptCollectionView(
             frame: .zero,
-            collectionViewLayout: Self.makeLayout()
+            collectionViewLayout: TranscriptCollectionViewLayout()
         )
         collectionView.backgroundColor = T3Colors.uiBackground
         collectionView.alwaysBounceVertical = true
@@ -996,47 +1002,13 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     }
 
     func updateUIView(_ collectionView: UICollectionView, context: Context) {
-        context.coordinator.update(
-            threadID: threadID,
-            messages: messages,
-            imageContext: imageContext,
-            renderUpdate: renderUpdate,
-            dynamicTypeSize: dynamicTypeSize,
-            isWorking: isWorking,
-            activeSubagentCount: activeSubagentCount,
-            backgroundWorkIsActive: backgroundWorkIsActive,
-            isMonitoring: isMonitoring,
-            canLoadEarlier: canLoadEarlier,
-            isLoadingEarlier: isLoadingEarlier,
-            onLoadEarlier: onLoadEarlier,
-            onDismissKeyboard: onDismissKeyboard,
-            in: collectionView
-        )
+        context.coordinator.update(self, in: collectionView)
     }
 
-    private static func makeLayout() -> UICollectionViewLayout {
-        UICollectionViewCompositionalLayout { _, environment in
-            let width = environment.container.effectiveContentSize.width
-            let sideInset = max(18, (width - T3Metrics.readingWidth) / 2)
-            let itemSize = NSCollectionLayoutSize(
-                widthDimension: .fractionalWidth(1),
-                heightDimension: .estimated(120)
-            )
-            let item = NSCollectionLayoutItem(layoutSize: itemSize)
-            let group = NSCollectionLayoutGroup.vertical(
-                layoutSize: itemSize,
-                subitems: [item]
-            )
-            let section = NSCollectionLayoutSection(group: group)
-            section.interGroupSpacing = 22
-            section.contentInsets = NSDirectionalEdgeInsets(
-                top: 18,
-                leading: sideInset,
-                bottom: 14,
-                trailing: sideInset
-            )
-            return section
-        }
+    static func dismantleUIView(_ collectionView: UICollectionView, coordinator: Coordinator) {
+        coordinator.cancelPendingWork()
+        collectionView.prefetchDataSource = nil
+        collectionView.delegate = nil
     }
 
     @MainActor
@@ -1062,57 +1034,80 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var markdownPrefetches: [String: MarkdownPrefetch] = [:]
         private var onLoadEarlier: (() -> Void)?
         private var onDismissKeyboard: (() -> Void)?
+        private var pendingUpdate: FeatureTranscriptCollectionView?
+        private var updateGeneration: UInt64 = 0
+        private var expandedWorkLogIDs = Set<String>()
 
         deinit {
             markdownPrefetches.values.forEach { $0.task.cancel() }
         }
 
         func connect(to collectionView: UICollectionView) {
-            let registration = UICollectionView.CellRegistration<UICollectionViewCell, String> {
+            let loadEarlierRegistration = UICollectionView.CellRegistration<UICollectionViewCell, String> {
+                [weak self] cell, _, _ in
+                cell.contentConfiguration = UIHostingConfiguration {
+                    FeatureLoadEarlierTurnsButton(
+                        isLoading: self?.currentIsLoadingEarlier == true,
+                        onLoad: { self?.onLoadEarlier?() }
+                    )
+                }
+                .margins(.all, 0)
+                cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
+                cell.accessibilityIdentifier = "load-earlier-turns"
+            }
+            let workingRegistration = UICollectionView.CellRegistration<UICollectionViewCell, String> {
+                [weak self] cell, _, _ in
+                cell.contentConfiguration = UIHostingConfiguration {
+                    FeatureThreadWorkingIndicator(
+                        activeSubagentCount: self?.currentActiveSubagentCount ?? 0,
+                        backgroundWorkIsActive: self?.currentBackgroundWorkIsActive == true,
+                        isMonitoring: self?.currentIsMonitoring == true
+                    )
+                }
+                .margins(.all, 0)
+                cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
+                cell.accessibilityIdentifier = "thread-working-indicator"
+            }
+            let messageRegistration = UICollectionView.CellRegistration<UICollectionViewCell, String> {
                 [weak self] cell, _, messageID in
-                if messageID == FeatureTranscriptCollectionView.loadEarlierID {
-                    cell.contentConfiguration = UIHostingConfiguration {
-                        FeatureLoadEarlierTurnsButton(
-                            isLoading: self?.currentIsLoadingEarlier == true,
-                            onLoad: { self?.onLoadEarlier?() }
-                        )
-                    }
-                    .margins(.all, 0)
-                    cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
-                    cell.accessibilityIdentifier = "load-earlier-turns"
-                    return
-                }
-                if messageID == FeatureTranscriptCollectionView.workingIndicatorID {
-                    cell.contentConfiguration = UIHostingConfiguration {
-                        FeatureThreadWorkingIndicator(
-                            activeSubagentCount: self?.currentActiveSubagentCount ?? 0,
-                            backgroundWorkIsActive: self?.currentBackgroundWorkIsActive == true,
-                            isMonitoring: self?.currentIsMonitoring == true
-                        )
-                    }
-                    .margins(.all, 0)
-                    cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
-                    cell.accessibilityIdentifier = "thread-working-indicator"
-                    return
-                }
                 guard let message = self?.messagesByID[messageID] else {
                     cell.contentConfiguration = nil
                     return
                 }
 
                 cell.contentConfiguration = UIHostingConfiguration {
-                    FeatureMessageView(message: message, imageContext: self?.currentImageContext)
+                    FeatureMessageView(
+                        message: message,
+                        imageContext: self?.currentImageContext,
+                        isWorkLogExpanded: self?.expandedWorkLogIDs.contains(messageID) == true,
+                        onToggleWorkLog: { [weak self, weak collectionView] in
+                            guard let self, let collectionView else { return }
+                            self.toggleWorkLog(messageID, in: collectionView)
+                        }
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .id(messageID)
+                        .transaction { transaction in
+                            transaction.animation = nil
+                            transaction.disablesAnimations = true
+                        }
                 }
                 .margins(.all, 0)
                 cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
+                cell.clipsToBounds = true
+                cell.contentView.clipsToBounds = true
                 cell.accessibilityIdentifier = "message-cell-\(messageID)"
             }
 
             dataSource = UICollectionViewDiffableDataSource<Section, String>(
                 collectionView: collectionView
             ) { collectionView, indexPath, messageID in
-                collectionView.dequeueConfiguredReusableCell(
+                let registration = switch messageID {
+                case FeatureTranscriptCollectionView.loadEarlierID: loadEarlierRegistration
+                case FeatureTranscriptCollectionView.workingIndicatorID: workingRegistration
+                default: messageRegistration
+                }
+                return collectionView.dequeueConfiguredReusableCell(
                     using: registration,
                     for: indexPath,
                     item: messageID
@@ -1120,27 +1115,38 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             }
             collectionView.prefetchDataSource = self
             collectionView.delegate = self
+            (collectionView.collectionViewLayout as? TranscriptCollectionViewLayout)?.itemIDsProvider = { [weak self] in
+                self?.dataSource?.snapshot().itemIdentifiers ?? []
+            }
         }
 
         func update(
-            threadID: String,
-            messages: [FeatureMessage],
-            imageContext: MarkdownImageContext?,
-            renderUpdate: FeatureDetailRenderUpdate?,
-            dynamicTypeSize: DynamicTypeSize,
-            isWorking: Bool,
-            activeSubagentCount: Int,
-            backgroundWorkIsActive: Bool,
-            isMonitoring: Bool,
-            canLoadEarlier: Bool,
-            isLoadingEarlier: Bool,
-            onLoadEarlier: @escaping () -> Void,
-            onDismissKeyboard: @escaping () -> Void,
-            in collectionView: UICollectionView
+            _ parent: FeatureTranscriptCollectionView,
+            in collectionView: UICollectionView,
+            completion: (() -> Void)? = nil
         ) {
-            guard let dataSource else { return }
-            self.onLoadEarlier = onLoadEarlier
-            self.onDismissKeyboard = onDismissKeyboard
+            guard let dataSource else { completion?(); return }
+            onLoadEarlier = parent.onLoadEarlier
+            onDismissKeyboard = parent.onDismissKeyboard
+
+            if currentThreadID == parent.threadID,
+               collectionView.isDragging || collectionView.isDecelerating {
+                pendingUpdate = parent
+                completion?()
+                return
+            }
+            pendingUpdate = nil
+            let threadID = parent.threadID
+            let messages = parent.messages
+            let imageContext = parent.imageContext
+            let renderUpdate = parent.renderUpdate
+            let dynamicTypeSize = parent.dynamicTypeSize
+            let isWorking = parent.isWorking
+            let activeSubagentCount = parent.activeSubagentCount
+            let backgroundWorkIsActive = parent.backgroundWorkIsActive
+            let isMonitoring = parent.isMonitoring
+            let canLoadEarlier = parent.canLoadEarlier
+            let isLoadingEarlier = parent.isLoadingEarlier
 
             let threadChanged = currentThreadID != threadID
             let imageContextChanged = currentImageContext != imageContext
@@ -1153,7 +1159,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
                 || currentIsLoadingEarlier != isLoadingEarlier
             guard threadChanged || imageContextChanged || typeSizeChanged || revisionChanged || workingChanged
-                || workingDetailChanged || loadEarlierChanged else { return }
+                || workingDetailChanged || loadEarlierChanged else { completion?(); return }
 
             let incremental = !threadChanged
                 ? incrementalState(messages: messages, renderUpdate: renderUpdate)
@@ -1175,10 +1181,11 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             currentCanLoadEarlier = canLoadEarlier
             currentIsLoadingEarlier = isLoadingEarlier
             guard threadChanged || idsChanged || !changedIDs.isEmpty || workingChanged
-                || workingDetailChanged || loadEarlierChanged else { return }
+                || workingDetailChanged || loadEarlierChanged else { completion?(); return }
 
             if threadChanged {
                 cancelAllMarkdownPrefetches()
+                expandedWorkLogIDs.removeAll()
             } else {
                 var invalidatedIDs = Set(changedIDs)
                 if idsChanged, !state.isAppendOnly {
@@ -1187,16 +1194,11 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 cancelMarkdownPrefetches(for: invalidatedIDs)
             }
 
-            let wasNearBottom = isNearBottom(collectionView)
-            let lastIDChanged = orderedIDs.last != newIDs.last || workingChanged
             let isInitialLoad = currentThreadID == nil || threadChanged
             let previousIDs = orderedIDs
-            let prependedMessages = !threadChanged
-                && newIDs.count > previousIDs.count
-                && Array(newIDs.suffix(previousIDs.count)) == previousIDs
-            let shouldFollowBottom = isInitialLoad || wasNearBottom
-            let prependAnchor = !shouldFollowBottom
-                && (prependedMessages || (loadEarlierChanged && !canLoadEarlier))
+            let shouldFollowBottom = isInitialLoad
+                || (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor == true
+            let readingAnchor = !shouldFollowBottom
                 ? visibleAnchor(in: collectionView, dataSource: dataSource)
                 : nil
 
@@ -1206,7 +1208,10 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             }
             orderedIDs = newIDs
             (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor =
-                isInitialLoad || wasNearBottom
+                shouldFollowBottom
+            if idsChanged {
+                expandedWorkLogIDs.formIntersection(newIDs)
+            }
 
             var snapshot: NSDiffableDataSourceSnapshot<Section, String>
             if threadChanged || loadEarlierChanged {
@@ -1261,17 +1266,50 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 snapshot.reconfigureItems(reconfiguredIDs)
             }
 
-            dataSource.apply(snapshot, animatingDifferences: false) {
-                [weak self, weak collectionView] in
-                guard let self, let collectionView else { return }
-                DispatchQueue.main.async {
-                    if shouldFollowBottom {
-                        self.scrollToBottom(
-                            collectionView,
-                            animated: !isInitialLoad && lastIDChanged
-                        )
-                    } else if let prependAnchor {
-                        self.restore(prependAnchor, in: collectionView, dataSource: dataSource)
+            if threadChanged || typeSizeChanged || imageContextChanged {
+                (collectionView.collectionViewLayout as? TranscriptCollectionViewLayout)?.resetMeasurements()
+            }
+            updateGeneration &+= 1
+            let generation = updateGeneration
+            UIView.performWithoutAnimation {
+                dataSource.apply(snapshot, animatingDifferences: false) {
+                    [weak self, weak collectionView] in
+                    defer { completion?() }
+                    guard let self, let collectionView,
+                          self.updateGeneration == generation,
+                          !collectionView.isDragging, !collectionView.isDecelerating else { return }
+                    UIView.performWithoutAnimation {
+                        if shouldFollowBottom {
+                            self.scrollToBottom(collectionView)
+                        } else if let readingAnchor {
+                            self.restore(readingAnchor, in: collectionView, dataSource: dataSource)
+                        }
+                    }
+                }
+            }
+        }
+
+        func toggleWorkLog(_ messageID: String, in collectionView: UICollectionView) {
+            guard let dataSource, messagesByID[messageID]?.role == .tool else { return }
+            var snapshot = dataSource.snapshot()
+            guard snapshot.indexOfItem(messageID) != nil else { return }
+            if !expandedWorkLogIDs.insert(messageID).inserted {
+                expandedWorkLogIDs.remove(messageID)
+            }
+            // A log is an explicit reading action. Keep its header in place,
+            // even when it is the final message in a running thread.
+            (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor = false
+            let anchor = visibleAnchor(in: collectionView, dataSource: dataSource)
+            updateGeneration &+= 1
+            let generation = updateGeneration
+            snapshot.reconfigureItems([messageID])
+            UIView.performWithoutAnimation {
+                dataSource.apply(snapshot, animatingDifferences: false) { [weak self, weak collectionView] in
+                    guard let self, let collectionView, let anchor,
+                          self.updateGeneration == generation,
+                          !collectionView.isDragging, !collectionView.isDecelerating else { return }
+                    UIView.performWithoutAnimation {
+                        self.restore(anchor, in: collectionView, dataSource: dataSource)
                     }
                 }
             }
@@ -1407,8 +1445,23 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             _ collectionView: UICollectionView,
             prefetchItemsAt indexPaths: [IndexPath]
         ) {
-            for indexPath in indexPaths where orderedIDs.indices.contains(indexPath.item) {
-                let messageID = orderedIDs[indexPath.item]
+            prefetchMessages(at: indexPaths)
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            willDisplay cell: UICollectionViewCell,
+            forItemAt indexPath: IndexPath
+        ) {
+            // UIKit does not prefetch every first-screen or fast-fling row.
+            // Warm a small window on both sides without parsing history on the UI thread.
+            let count = collectionView.numberOfItems(inSection: indexPath.section)
+            let range = min(count, max(0, indexPath.item - 6))..<min(count, indexPath.item + 7)
+            prefetchMessages(at: range.map { IndexPath(item: $0, section: 0) })
+        }
+
+        private func prefetchMessages(at indexPaths: [IndexPath]) {
+            for messageID in messageIDs(at: indexPaths) {
                 guard markdownPrefetches[messageID] == nil,
                       let message = messagesByID[messageID],
                       !message.text.isEmpty,
@@ -1439,10 +1492,15 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             _ collectionView: UICollectionView,
             cancelPrefetchingForItemsAt indexPaths: [IndexPath]
         ) {
-            let messageIDs = indexPaths.compactMap { indexPath in
-                orderedIDs.indices.contains(indexPath.item) ? orderedIDs[indexPath.item] : nil
+            cancelMarkdownPrefetches(for: Set(messageIDs(at: indexPaths)))
+        }
+
+        func messageIDs(at indexPaths: [IndexPath]) -> [String] {
+            indexPaths.compactMap { indexPath in
+                guard let id = dataSource?.itemIdentifier(for: indexPath),
+                      messagesByID[id] != nil else { return nil }
+                return id
             }
-            cancelMarkdownPrefetches(for: Set(messageIDs))
         }
 
         private func finishMarkdownPrefetch(
@@ -1464,17 +1522,20 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             markdownPrefetches.removeAll(keepingCapacity: true)
         }
 
+        func cancelPendingWork() {
+            updateGeneration &+= 1
+            pendingUpdate = nil
+            cancelAllMarkdownPrefetches()
+        }
+
         private func isNearBottom(_ collectionView: UICollectionView) -> Bool {
             let visibleBottom = collectionView.contentOffset.y
                 + collectionView.bounds.height
                 - collectionView.adjustedContentInset.bottom
-            return collectionView.contentSize.height - visibleBottom < 120
+            return collectionView.contentSize.height - visibleBottom < 24
         }
 
-        private func scrollToBottom(
-            _ collectionView: UICollectionView,
-            animated: Bool
-        ) {
+        private func scrollToBottom(_ collectionView: UICollectionView) {
             collectionView.layoutIfNeeded()
             let geometry = TranscriptViewportGeometry(
                 contentHeight: collectionView.contentSize.height,
@@ -1483,11 +1544,12 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 bottomInset: collectionView.adjustedContentInset.bottom
             )
             let target = CGPoint(x: collectionView.contentOffset.x, y: geometry.bottomOffset)
-            collectionView.setContentOffset(target, animated: animated)
+            collectionView.setContentOffset(target, animated: false)
             (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor = true
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            updateGeneration &+= 1
             (scrollView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor = false
             onDismissKeyboard?()
         }
@@ -1502,10 +1564,13 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         }
 
         private func updateBottomAnchor(for scrollView: UIScrollView) {
-            guard let collectionView = scrollView as? BottomAnchoredTranscriptCollectionView else {
-                return
+            guard let collectionView = scrollView as? UICollectionView else { return }
+            if let transcript = collectionView as? BottomAnchoredTranscriptCollectionView {
+                transcript.maintainsBottomAnchor = isNearBottom(collectionView)
             }
-            collectionView.maintainsBottomAnchor = isNearBottom(collectionView)
+            if let pendingUpdate {
+                update(pendingUpdate, in: collectionView)
+            }
         }
     }
 }
@@ -1852,7 +1917,7 @@ private struct ThreadBackSwipeGestureView: UIViewRepresentable {
 /// Self-sizing hosted Markdown can change the transcript height after a snapshot finishes,
 /// while presenting the keyboard changes the viewport without changing the content at all.
 /// Preserve the visual bottom only while the reader is already following the latest turn.
-private final class BottomAnchoredTranscriptCollectionView: UICollectionView {
+final class BottomAnchoredTranscriptCollectionView: UICollectionView {
     var maintainsBottomAnchor = false
 
     private var lastLaidOutGeometry: TranscriptViewportGeometry?
@@ -2069,6 +2134,8 @@ private enum FeatureAttachmentThumbnailError: Error {
 struct FeatureMessageView: View {
     let message: FeatureMessage
     var imageContext: MarkdownImageContext? = nil
+    var isWorkLogExpanded = false
+    var onToggleWorkLog: () -> Void = {}
 
     var body: some View {
         switch message.role {
@@ -2124,20 +2191,34 @@ struct FeatureMessageView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityIdentifier("message-\(message.id)")
         case .tool:
-            DisclosureGroup {
-                Text(message.text)
-                    .font(T3Typography.tool)
-                    .foregroundStyle(T3Colors.textSecondary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
-                    .padding(.top, 8)
-            } label: {
-                Label(message.toolName ?? "Tool output", systemImage: "terminal")
+            VStack(alignment: .leading, spacing: 0) {
+                Button(action: onToggleWorkLog) {
+                    HStack(spacing: 8) {
+                        Label(message.toolName ?? "Tool output", systemImage: "terminal")
+                        Spacer(minLength: 8)
+                        Image(systemName: isWorkLogExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold))
+                    }
                     .font(T3Typography.tool.weight(.medium))
                     .foregroundStyle(T3Colors.textSecondary)
+                    .frame(minHeight: T3Metrics.minimumTapTarget)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(isWorkLogExpanded ? "Expanded" : "Collapsed")
+                .accessibilityIdentifier("work-log-toggle-\(message.id)")
+
+                if isWorkLogExpanded {
+                    Text(message.text)
+                        .font(T3Typography.tool)
+                        .foregroundStyle(T3Colors.textSecondary)
+                        .lineSpacing(3)
+                        .textSelection(.enabled)
+                        .padding(.top, 8)
+                        .transition(.identity)
+                }
             }
             .padding(.vertical, 6)
-            .frame(minHeight: T3Metrics.minimumTapTarget)
             .accessibilityIdentifier("message-\(message.id)")
         case .system:
             Text(message.text)

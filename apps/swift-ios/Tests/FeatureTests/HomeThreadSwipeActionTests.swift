@@ -732,6 +732,39 @@ struct HomeThreadSwipeActionTests {
         #expect(cell.contentView.clipsToBounds)
     }
 
+    @Test
+    func selectionUpdatesWhenOtherRowsArriveInTheSameSnapshot() throws {
+        let client = SwipeSettlementClientStub()
+        let first = thread(id: "first")
+        let second = thread(id: "second")
+        let initial = threadList(
+            client: client, snapshot: snapshot(threads: [first, second]), selectedThreadID: first.id
+        )
+        let coordinator = initial.makeCoordinator()
+        let collectionView = testCollectionView()
+        coordinator.configure(collectionView)
+        collectionView.layoutIfNeeded()
+        defer {
+            coordinator.invalidateTimer()
+            coordinator.cancelPendingSwipeActions()
+        }
+        let firstCell = try #require(collectionView.visibleCells.first {
+            $0.accessibilityLabel == first.title
+        })
+        #expect(firstCell.accessibilityTraits.contains(.selected))
+
+        let updated = threadList(
+            client: client,
+            snapshot: snapshot(threads: [first, second, thread(id: "arrived")]),
+            selectedThreadID: second.id
+        )
+        coordinator.update(parent: updated, collectionView: collectionView)
+        collectionView.layoutIfNeeded()
+        let selected = collectionView.visibleCells.filter { $0.accessibilityTraits.contains(.selected) }
+        #expect(selected.count == 1)
+        #expect(selected.first?.accessibilityLabel == second.title)
+    }
+
     private func presentation(for model: FeatureRootModel) -> HomePresentation {
         HomePresentation(
             snapshot: model.snapshot,
@@ -759,6 +792,7 @@ struct HomeThreadSwipeActionTests {
         client: SwipeSettlementClientStub,
         snapshot: FeatureSnapshot,
         query: String = "",
+        selectedThreadID: String? = nil,
         settlementResult: Bool = true,
         onSettle: @escaping (FeatureThread, Bool) -> Void = { _, _ in }
     ) -> HomeThreadCollectionView {
@@ -771,7 +805,7 @@ struct HomeThreadSwipeActionTests {
             ),
             projectFaviconClient: client,
             query: query,
-            selectedThreadID: nil,
+            selectedThreadID: selectedThreadID,
             forceRichRows: false,
             hapticsEnabled: false,
             isSnoozedExpanded: false,

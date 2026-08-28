@@ -154,7 +154,8 @@ struct HomeThreadCollectionView: UIViewRepresentable {
 
             if currentIdentifiers == newIdentifiers {
                 let changed = newIdentifiers.filter { previousItems[$0] != itemsByID[$0] }
-                let selectionChanged = [previousSelection, selectedThreadID]
+                let selectionChanged = (previousSelection != selectedThreadID
+                    ? [previousSelection, selectedThreadID] : [])
                     .compactMap { $0.map(HomeCollectionItem.ID.thread) }
                     .filter { newIdentifiers.contains($0) }
                 let identifiers = Array(Set(changed + selectionChanged))
@@ -173,13 +174,28 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 var snapshot = NSDiffableDataSourceSnapshot<Section, HomeCollectionItem.ID>()
                 snapshot.appendSections([.main])
                 snapshot.appendItems(newIdentifiers, toSection: .main)
+                // Retained rows also need fresh content when another row moves,
+                // arrives, or leaves in the same update.
+                let retained = Set(currentIdentifiers)
+                let selectionChanged = previousSelection != selectedThreadID
+                    ? Set([previousSelection, selectedThreadID].compactMap { $0 }) : []
+                snapshot.reconfigureItems(newIdentifiers.filter { identifier in
+                    retained.contains(identifier)
+                        && (previousItems[identifier] != itemsByID[identifier]
+                            || identifier.threadID.map(selectionChanged.contains) == true)
+                })
                 let shouldAnimate = !resolvedSwipeCompletions.isEmpty
                     && !currentIdentifiers.isEmpty
                     && collectionView.window != nil
                 dataSource.apply(
                     snapshot,
                     animatingDifferences: shouldAnimate,
-                    completion: finishSwipes
+                    completion: { [weak self, weak collectionView] in
+                        if let collectionView {
+                            self?.synchronizeSelection(in: collectionView)
+                        }
+                        finishSwipes()
+                    }
                 )
             }
 

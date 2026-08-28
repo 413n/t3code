@@ -17,6 +17,22 @@ struct FeatureWorkspaceNavigationRequest: Equatable, Sendable {
     }
 }
 
+struct WorkspaceThreadSelection: Equatable {
+    private(set) var selectedID: String?
+    private(set) var lastOpenedID: String?
+
+    var highlightedID: String? { selectedID ?? lastOpenedID }
+
+    mutating func open(_ id: String) {
+        selectedID = id
+        lastOpenedID = id
+    }
+
+    mutating func close() {
+        selectedID = nil
+    }
+}
+
 public struct WorkspaceView: View {
     @SwiftUI.Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -26,7 +42,7 @@ public struct WorkspaceView: View {
     private let submitNewTask: (NewTaskRequest) async -> FeatureThread?
     private let submitMessage: (FeatureMessageSubmission) async -> Bool
 
-    @State private var selectedThreadID: String?
+    @State private var threadSelection = WorkspaceThreadSelection()
     @State private var selectedProjectID: String?
     @State private var searchText = ""
     @State private var isSearching = false
@@ -256,7 +272,7 @@ public struct WorkspaceView: View {
                 presentation: presentation,
                 projectFaviconClient: model.client,
                 query: searchText,
-                selectedThreadID: selectedThreadID,
+                selectedThreadID: threadSelection.highlightedID,
                 forceRichRows: dynamicTypeSize.isAccessibilitySize,
                 hapticsEnabled: model.snapshot.settings.hapticsEnabled,
                 isSnoozedExpanded: isSnoozedExpanded,
@@ -587,18 +603,20 @@ public struct WorkspaceView: View {
         return model.snapshot.threads.contains { $0.id == selectedThreadID }
     }
 
+    private var selectedThreadID: String? { threadSelection.selectedID }
+
     private var selectedProjectIsAvailable: Bool {
         guard let selectedProjectID else { return true }
         return model.snapshot.projects.contains { $0.id == selectedProjectID }
     }
 
     private func openThread(_ id: String) {
-        selectedThreadID = id
+        threadSelection.open(id)
         preferredCompactColumn = .detail
     }
 
     private func closeSelectedThread() {
-        selectedThreadID = nil
+        threadSelection.close()
         preferredCompactColumn = .sidebar
     }
 
