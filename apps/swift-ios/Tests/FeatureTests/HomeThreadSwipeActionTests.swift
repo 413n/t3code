@@ -823,6 +823,8 @@ struct HomeThreadSwipeActionTests {
             selectedThreadID: selectedThreadID,
             forceRichRows: false,
             hapticsEnabled: false,
+            settings: snapshot.settings,
+            pullRequestsByThreadID: [:],
             isSnoozedExpanded: false,
             isSettledExpanded: false,
             isArchiveExpanded: false,
@@ -841,7 +843,8 @@ struct HomeThreadSwipeActionTests {
             },
             onSnooze: { _, _ in },
             onPin: { _, _ in },
-            onDelete: { _ in }
+            onDelete: { _ in },
+            onPullRequestChange: { _, _, _ in }
         )
     }
 

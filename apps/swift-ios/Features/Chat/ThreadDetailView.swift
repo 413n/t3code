@@ -317,8 +317,8 @@ public struct ThreadDetailView: View {
                         )
                     }
                 }
-                if currentThread.canSettleNow, !currentThread.isArchived {
-                    let isSettled = currentThread.isEffectivelySettled(at: .now)
+                let isSettled = model.isEffectivelySettled(currentThread)
+                if (isSettled || currentThread.canSettleNow()), !currentThread.isArchived {
                     Button {
                         Task { await model.setSettled(thread.id, settled: !isSettled) }
                     } label: {
@@ -380,26 +380,59 @@ public struct ThreadDetailView: View {
     }
 
     private var pullRequestObservationID: String? {
-        guard currentThread.linkedPullRequest == nil,
-              let branch = currentThread.branch,
-              !branch.isEmpty else {
-            return nil
-        }
-        return "\(currentThread.id):\(branch)"
+        currentThread.pullRequestObservationIdentity
     }
 
     @MainActor
     private func observeThreadPullRequest() async {
-        guard pullRequestObservationID != nil else {
+        guard let observationIdentity = pullRequestObservationID else {
             branchPullRequest = nil
             return
         }
+
+        if let linked = currentThread.linkedPullRequest,
+           let environmentID = currentThread.environmentID {
+            let target = FeaturePullRequestTarget(
+                environmentID: environmentID,
+                environmentName: currentThread.environmentName ?? environmentID,
+                reference: PullRequestRef(
+                    projectId: linked.projectId,
+                    repository: linked.repository,
+                    number: linked.number
+                )
+            )
+            while !Task.isCancelled {
+                if let detail = try? await model.client.pullRequestDetail(target),
+                   let presentation = HomeThreadPullRequestPresentation.resolve(
+                       linkedPullRequest: linked,
+                       detail: detail
+                   ) {
+                    model.updatePullRequest(
+                        presentation,
+                        threadID: currentThread.id,
+                        observationIdentity: observationIdentity
+                    )
+                }
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                } catch {
+                    return
+                }
+            }
+            return
+        }
+
         for await status in model.client.sourceControlStatusEvents(threadID: thread.id) {
             guard !Task.isCancelled else { return }
             let next = status.branch == currentThread.branch ? status.pullRequest : nil
             if next != branchPullRequest {
                 branchPullRequest = next
             }
+            model.updatePullRequest(
+                HomeThreadPullRequestPresentation.resolve(thread: currentThread, status: status),
+                threadID: currentThread.id,
+                observationIdentity: observationIdentity
+            )
         }
     }
 

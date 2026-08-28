@@ -1542,6 +1542,48 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func failedSettlementKeepsNewerActivityFacts() async {
+        let client = FeatureClientStub()
+        var thread = FeatureThread(
+            id: "thread-1",
+            projectID: "project-1",
+            title: "Thread",
+            supportsSettlement: true,
+            settlementFacts: FeatureThreadSettlementFacts()
+        )
+        client.snapshot = FeatureSnapshot(threads: [thread])
+        client.settlementError = URLError(.notConnectedToInternet)
+        let model = testRootModel(client: client)
+        await model.reload()
+
+        client.beforeSettlementReturn = {
+            thread.settlementFacts?.sessionStatus = "running"
+            thread.settlementFacts?.hasPendingApprovals = true
+            await withCheckedContinuation { continuation in
+                withObservationTracking {
+                    _ = model.snapshot.threads.first?.settlementFacts?.sessionStatus
+                } onChange: {
+                    continuation.resume()
+                }
+                client.emit(.thread(thread))
+            }
+        }
+        let run = Task { await model.start() }
+
+        #expect(!(await model.setSettled(thread.id, settled: true)))
+        client.finishEvents()
+        await run.value
+
+        guard let restored = model.snapshot.threads.first else {
+            Issue.record("Expected the thread after settlement rollback")
+            return
+        }
+        #expect(restored.settlementFacts?.settlementOverride == nil)
+        #expect(restored.settlementFacts?.sessionStatus == "running")
+        #expect(restored.settlementFacts?.hasPendingApprovals == true)
+    }
+
+    @Test
     func testResolveUserInputForwardsTypedAnswersAndClearsTheRequest() async {
         let client = FeatureClientStub()
         let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Thread")
@@ -2032,6 +2074,47 @@ struct FeatureRootModelTests {
         await model.reload()
 
         #expect(model.homePresentationRevision == catalogRevision + 1)
+
+        let preferencesRevision = model.homePresentationRevision
+        client.snapshot.settings.autoSettleAfterDays = nil
+        await model.reload()
+        #expect(model.homePresentationRevision == preferencesRevision + 1)
+    }
+
+    @Test
+    func stalePullRequestResponseCannotReplaceANewBranchIdentity() async throws {
+        let client = FeatureClientStub()
+        var thread = FeatureThread(
+            id: "thread",
+            projectID: "project",
+            environmentID: "studio",
+            title: "Task",
+            branch: "feature/old",
+            worktreePath: "/repo"
+        )
+        client.snapshot = FeatureSnapshot(threads: [thread])
+        let model = testRootModel(client: client)
+        await model.reload()
+
+        let oldIdentity = try #require(thread.pullRequestObservationIdentity)
+        model.updatePullRequest(
+            HomeThreadPullRequestPresentation(number: 1, state: .merged, updatedAt: .now),
+            threadID: thread.id,
+            observationIdentity: oldIdentity
+        )
+        #expect(model.pullRequestsByThreadID[thread.id]?.number == 1)
+
+        thread.branch = "feature/new"
+        client.snapshot.threads = [thread]
+        await model.reload()
+        #expect(model.pullRequestsByThreadID[thread.id] == nil)
+
+        model.updatePullRequest(
+            HomeThreadPullRequestPresentation(number: 1, state: .closed, updatedAt: .now),
+            threadID: thread.id,
+            observationIdentity: oldIdentity
+        )
+        #expect(model.pullRequestsByThreadID[thread.id] == nil)
     }
 
     @Test
@@ -2343,6 +2426,64 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func detailReducerAppliesServerSettlementEvents() {
+        let thread = orchestrationThread()
+        let settled = orchestrationEvent(
+            type: "thread.settled",
+            sequence: 4,
+            payload: [
+                "threadId": .string(thread.id),
+                "settledAt": .string("2026-07-31T20:00:03Z"),
+                "updatedAt": .string("2026-07-31T20:00:03Z"),
+            ]
+        )
+
+        guard case let .updated(settledThread) = NativeThreadDetailReducer
+            .apply(settled, to: thread).result else {
+            Issue.record("Expected a settled thread")
+            return
+        }
+        #expect(settledThread.settledOverride == "settled")
+        #expect(settledThread.settledAt == "2026-07-31T20:00:03Z")
+        #expect(settledThread.unsettledAt == nil)
+
+        let unsettled = orchestrationEvent(
+            type: "thread.unsettled",
+            sequence: 5,
+            payload: [
+                "threadId": .string(thread.id),
+                "reason": .string("user"),
+                "updatedAt": .string("2026-07-31T20:00:04Z"),
+            ]
+        )
+        guard case let .updated(activeThread) = NativeThreadDetailReducer
+            .apply(unsettled, to: settledThread).result else {
+            Issue.record("Expected an active thread")
+            return
+        }
+        #expect(activeThread.settledOverride == "active")
+        #expect(activeThread.settledAt == nil)
+        #expect(activeThread.unsettledAt == "2026-07-31T20:00:04Z")
+
+        let activityReset = orchestrationEvent(
+            type: "thread.unsettled",
+            sequence: 6,
+            payload: [
+                "threadId": .string(thread.id),
+                "reason": .string("activity"),
+                "updatedAt": .string("2026-07-31T20:00:05Z"),
+            ]
+        )
+        guard case let .updated(resetThread) = NativeThreadDetailReducer
+            .apply(activityReset, to: activeThread).result else {
+            Issue.record("Expected an activity reset")
+            return
+        }
+        #expect(resetThread.settledOverride == nil)
+        #expect(resetThread.unsettledAt == "2026-07-31T20:00:04Z")
+    }
+
+    @Test
     func linkedPullRequestUpdatesDoNotReloadTheEntireThread() throws {
         let thread = orchestrationThread()
         let link = ThreadLinkedPullRequest(
@@ -2495,6 +2636,8 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var signOutCallCount = 0
     var startTaskError: (any Error)?
     var sendMessageError: (any Error)?
+    var settlementError: (any Error)?
+    var beforeSettlementReturn: (() async -> Void)?
     var enabledEnvironmentID: String?
     var environmentEnabledValue: Bool?
     var removedEnvironmentID: String?
@@ -2654,6 +2797,10 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
 
     func cancelTurn(threadID: String) async throws {
         cancelTurnCallCount += 1
+    }
+    func setThreadSettled(id: String, settled: Bool) async throws {
+        await beforeSettlementReturn?()
+        if let settlementError { throw settlementError }
     }
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws {}
     func resolveUserInput(
