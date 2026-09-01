@@ -167,13 +167,9 @@ public enum FeatureRuntimeMode: String, CaseIterable, Sendable, Codable {
     case automatic
     case fullAccess
 
-    /// Mobile is a build surface. Legacy modes remain decodable for server
-    /// history, but every command originating here uses full access.
-    public static let allCases: [FeatureRuntimeMode] = [.fullAccess]
-
-    public var mobileNormalized: FeatureRuntimeMode {
-        .fullAccess
-    }
+    /// Mobile offers the two current modes. Legacy modes remain distinct so
+    /// existing threads keep their exact server permission.
+    public static let allCases: [FeatureRuntimeMode] = [.automatic, .fullAccess]
 }
 
 public enum FeatureInteractionMode: String, CaseIterable, Sendable, Codable {

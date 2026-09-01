@@ -42,8 +42,8 @@ public struct NewTaskRequest: Sendable, Equatable {
         projectID: String,
         prompt: String,
         selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
+        runtimeMode: FeatureRuntimeMode = .fullAccess,
+        interactionMode: FeatureInteractionMode = .standard,
         workspaceMode: FeatureWorkspaceMode = .local,
         branch: String? = nil,
         worktreePath: String? = nil,
@@ -53,7 +53,7 @@ public struct NewTaskRequest: Sendable, Equatable {
         self.projectID = projectID
         self.prompt = prompt
         self.selection = selection
-        self.runtimeMode = runtimeMode.mobileNormalized
+        self.runtimeMode = runtimeMode
         self.interactionMode = interactionMode.mobileNormalized
         self.workspaceMode = workspaceMode
         self.branch = Self.nonEmpty(branch)
@@ -1147,6 +1147,40 @@ struct DailyUXModelCatalog {
 }
 
 enum DailyUXModelOptions {
+    static func reasoningDescriptor(
+        for model: FeatureModel
+    ) -> FeatureModelOptionDescriptor? {
+        model.options.first(where: isReasoningDescriptor)
+    }
+
+    static func advancedDescriptors(
+        for model: FeatureModel
+    ) -> [FeatureModelOptionDescriptor] {
+        model.options.filter { !isReasoningDescriptor($0) }
+    }
+
+    static func undescribedSelections(
+        for model: FeatureModel,
+        selections: [FeatureModelOptionSelection]
+    ) -> [FeatureModelOptionSelection] {
+        let describedIDs = Set(model.options.map(\.id))
+        return selections.filter { !describedIDs.contains($0.id) }
+    }
+
+    static func isSupportedValue(
+        _ value: FeatureModelOptionValue,
+        for descriptor: FeatureModelOptionDescriptor
+    ) -> Bool {
+        switch (descriptor.kind, value) {
+        case let (.select, .string(choiceID)):
+            return descriptor.choices.contains { $0.id == choiceID }
+        case (.boolean, .boolean):
+            return true
+        case (.select, .boolean), (.boolean, .string):
+            return false
+        }
+    }
+
     static func initialSelection(
         projectDefault: FeatureSelection?,
         appDefault: FeatureSelection?,
@@ -1244,6 +1278,7 @@ enum DailyUXModelOptions {
             switch value {
             case let .string(choiceID):
                 return descriptor.choices.first(where: { $0.id == choiceID })?.label
+                    ?? choiceID
             case let .boolean(isEnabled):
                 return isEnabled ? descriptor.label : nil
             }
@@ -1257,22 +1292,28 @@ enum DailyUXModelOptions {
         for model: FeatureModel,
         selections: [FeatureModelOptionSelection]
     ) -> String? {
-        guard let descriptor = model.options.first(where: { descriptor in
-            let searchable = "\(descriptor.id) \(descriptor.label)".lowercased()
-            return searchable.contains("reason")
-                || searchable.contains("effort")
-                || searchable.contains("thinking")
-                || searchable.contains("thought")
-        }), let value = value(for: descriptor, in: selections) else {
+        guard let descriptor = reasoningDescriptor(for: model),
+              let value = value(for: descriptor, in: selections) else {
             return nil
         }
 
         switch value {
         case let .string(choiceID):
             return descriptor.choices.first(where: { $0.id == choiceID })?.label
+                ?? choiceID
         case let .boolean(isEnabled):
             return isEnabled ? descriptor.label : nil
         }
+    }
+
+    private static func isReasoningDescriptor(
+        _ descriptor: FeatureModelOptionDescriptor
+    ) -> Bool {
+        let searchable = "\(descriptor.id) \(descriptor.label)".lowercased()
+        return searchable.contains("reason")
+            || searchable.contains("effort")
+            || searchable.contains("thinking")
+            || searchable.contains("thought")
     }
 
     static func supportsImages(

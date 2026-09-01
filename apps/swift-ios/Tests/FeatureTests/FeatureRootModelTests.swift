@@ -946,6 +946,119 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func sendPreservesTheThreadAutomaticPermission() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(
+            id: "thread-1",
+            projectID: "project-1",
+            environmentID: "environment-1",
+            title: "Thread",
+            runtimeMode: .automatic
+        )
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .connected),
+            environments: [
+                .init(
+                    id: "environment-1",
+                    name: "Studio",
+                    endpoint: "https://studio.example",
+                    isActive: true,
+                    connectionState: .connected
+                ),
+            ],
+            threads: [thread]
+        )
+        let model = testRootModel(client: client)
+        await model.reload()
+
+        let sent = await model.sendMessage(
+            threadID: thread.id,
+            text: "Use the saved permission",
+            selection: nil
+        )
+
+        #expect(sent)
+        #expect(client.sentRuntimeModes == [.automatic])
+    }
+
+    @Test
+    func runtimeModeUpdatesAfterSuccessAndStaysPutAfterFailure() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(
+            id: "thread-1",
+            projectID: "project-1",
+            environmentID: "environment-1",
+            title: "Thread",
+            runtimeMode: .fullAccess
+        )
+        client.snapshot = FeatureSnapshot(threads: [thread])
+        let model = testRootModel(client: client)
+        await model.reload()
+
+        await model.setRuntimeMode(thread.id, mode: .automatic)
+
+        #expect(client.setRuntimeModeCalls == [.automatic])
+        #expect(model.snapshot.threads.first?.runtimeMode == .automatic)
+
+        client.runtimeModeError = FeatureCapabilityUnavailable("Permission update failed")
+        await model.setRuntimeMode(thread.id, mode: .fullAccess)
+
+        #expect(client.setRuntimeModeCalls == [.automatic, .fullAccess])
+        #expect(model.snapshot.threads.first?.runtimeMode == .automatic)
+    }
+
+    @Test
+    func restoredOutboxRetryPreservesAutomaticPermission() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-permission-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let thread = FeatureThread(
+            id: "thread-1",
+            wireID: "thread-wire",
+            projectID: "project-1",
+            environmentID: "environment-1",
+            title: "Thread",
+            runtimeMode: .fullAccess
+        )
+        try await store.enqueue(FeatureQueuedSubmission(
+            environmentID: "environment-1",
+            identity: .init(threadID: "thread-wire"),
+            threadID: thread.id,
+            text: "Retry with Automatic",
+            selection: nil,
+            runtimeMode: .automatic,
+            interactionMode: .standard,
+            attachments: []
+        ))
+        let delivery = AsyncStream<Void>.makeStream()
+        let client = FeatureClientStub()
+        client.beforeSendMessage = { delivery.continuation.yield() }
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .connected),
+            environments: [
+                .init(
+                    id: "environment-1",
+                    name: "Studio",
+                    endpoint: "https://studio.example",
+                    isActive: true,
+                    connectionState: .connected
+                ),
+            ],
+            threads: [thread]
+        )
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: store)
+
+        await model.start()
+        _ = await delivery.stream.first { _ in true }
+        delivery.continuation.finish()
+        await model.disconnect()
+
+        #expect(client.sentRuntimeModes == [.automatic])
+    }
+
+    @Test
     func loadingEarlierTurnsPrependsHistoryAndClearsTheCursor() async {
         let client = FeatureClientStub()
         let thread = FeatureThread(
@@ -2632,10 +2745,13 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var startedFromOrigin = false
     var createThreadCallCount = 0
     var sendMessageCallCount = 0
+    var sentRuntimeModes: [FeatureRuntimeMode] = []
+    var setRuntimeModeCalls: [FeatureRuntimeMode] = []
     var cancelTurnCallCount = 0
     var signOutCallCount = 0
     var startTaskError: (any Error)?
     var sendMessageError: (any Error)?
+    var runtimeModeError: (any Error)?
     var settlementError: (any Error)?
     var beforeSettlementReturn: (() async -> Void)?
     var enabledEnvironmentID: String?
@@ -2767,6 +2883,10 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
 
     func renameThread(id: String, title: String) async throws {}
     func setThreadArchived(id: String, archived: Bool) async throws {}
+    func setRuntimeMode(id: String, mode: FeatureRuntimeMode) async throws {
+        setRuntimeModeCalls.append(mode)
+        if let runtimeModeError { throw runtimeModeError }
+    }
     func deleteThread(id: String) async throws {}
 
     func loadThread(id: String) async throws -> FeatureThreadDetail {
@@ -2793,6 +2913,18 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         try beforeSendMessage?()
         if let sendMessageError { throw sendMessageError }
         sentText = text
+    }
+
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments _: [FeatureUploadAttachment],
+        identity _: FeatureSubmissionIdentity
+    ) async throws {
+        sentRuntimeModes.append(runtimeMode)
+        try await sendMessage(threadID: threadID, text: text, selection: selection)
     }
 
     func cancelTurn(threadID: String) async throws {

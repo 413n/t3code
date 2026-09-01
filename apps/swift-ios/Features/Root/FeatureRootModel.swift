@@ -363,7 +363,7 @@ public final class FeatureRootModel {
                 projectID: request.projectID,
                 prompt: prompt,
                 selection: request.selection,
-                runtimeMode: request.runtimeMode.mobileNormalized,
+                runtimeMode: request.runtimeMode,
                 interactionMode: request.interactionMode.mobileNormalized,
                 workspaceMode: request.workspaceMode,
                 branch: request.branch,
@@ -541,11 +541,14 @@ public final class FeatureRootModel {
     }
 
     public func setRuntimeMode(_ id: String, mode: FeatureRuntimeMode) async {
-        let mode = mode.mobileNormalized
-        let environment = currentEnvironmentIdentity
+        guard let environmentID = snapshot.threads.first(where: { $0.id == id })?.environmentID else {
+            return
+        }
         await perform {
             try await client.setRuntimeMode(id: id, mode: mode)
-            guard currentEnvironmentIdentity == environment else { return }
+            guard snapshot.threads.first(where: { $0.id == id })?.environmentID == environmentID else {
+                return
+            }
             mutateThread(id: id) { $0.runtimeMode = mode }
         }
     }
@@ -718,6 +721,7 @@ public final class FeatureRootModel {
                 threadID: submission.threadID,
                 text: trimmed,
                 selection: submission.selection,
+                runtimeMode: queued.runtimeMode,
                 attachments: uploads,
                 identity: identity
             )
@@ -1311,8 +1315,8 @@ public final class FeatureRootModel {
             providerID: submission.selection?.providerID,
             providerName: provider?.name,
             modelID: submission.selection?.modelID,
-            runtimeMode: .fullAccess,
-            interactionMode: .standard
+            runtimeMode: submission.runtimeMode,
+            interactionMode: submission.interactionMode
         )
         pendingThreadsByID[thread.id] = thread
         upsert(thread)
@@ -1588,8 +1592,8 @@ public final class FeatureRootModel {
                             projectID: creation.projectID,
                             prompt: submission.text,
                             selection: submission.selection,
-                            runtimeMode: .fullAccess,
-                            interactionMode: .standard,
+                            runtimeMode: submission.runtimeMode,
+                            interactionMode: submission.interactionMode,
                             workspaceMode: creation.workspaceMode,
                             branch: creation.branch,
                             worktreePath: creation.worktreePath,
@@ -1612,6 +1616,7 @@ public final class FeatureRootModel {
                             threadID: submission.threadID,
                             text: submission.text,
                             selection: submission.selection,
+                            runtimeMode: submission.runtimeMode,
                             attachments: submission.uploads,
                             identity: submission.identity
                         )

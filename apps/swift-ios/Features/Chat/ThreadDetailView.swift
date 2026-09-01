@@ -302,6 +302,36 @@ public struct ThreadDetailView: View {
                         Label("Regenerate title", systemImage: "sparkles")
                     }
                 }
+                Menu {
+                    if !FeatureRuntimeMode.allCases.contains(currentThread.runtimeMode) {
+                        Section("Current") {
+                            Button {} label: {
+                                Label(
+                                    runtimeModeLabel(currentThread.runtimeMode),
+                                    systemImage: "checkmark"
+                                )
+                            }
+                            .disabled(true)
+                        }
+                    }
+                    ForEach(FeatureRuntimeMode.allCases, id: \.self) { mode in
+                        Button {
+                            guard currentThread.runtimeMode != mode else {
+                                return
+                            }
+                            Task { await model.setRuntimeMode(thread.id, mode: mode) }
+                        } label: {
+                            if currentThread.runtimeMode == mode {
+                                Label(runtimeModeLabel(mode), systemImage: "checkmark")
+                            } else {
+                                Text(runtimeModeLabel(mode))
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Permissions", systemImage: "checkmark.shield")
+                }
+                .disabled(model.isPerformingAction)
                 if currentThread.canTogglePin, !currentThread.isArchived {
                     Button {
                         Task {
@@ -370,6 +400,15 @@ public struct ThreadDetailView: View {
         .accessibilityLabel("Thread actions")
         .accessibilityHint("Shows thread actions and workspace tools")
         .accessibilityIdentifier("thread-actions-menu")
+    }
+
+    private func runtimeModeLabel(_ mode: FeatureRuntimeMode) -> String {
+        switch mode {
+        case .approvalRequired: "Supervised"
+        case .autoAcceptEdits: "Auto-accept edits"
+        case .automatic: "Automatic"
+        case .fullAccess: "Full access"
+        }
     }
 
     private var currentPullRequest: ThreadPullRequestDestination? {

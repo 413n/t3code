@@ -101,7 +101,7 @@ public struct FeatureQueuedSubmission: Identifiable, Sendable, Equatable, Codabl
         self.threadID = threadID
         self.text = text
         self.selection = selection
-        self.runtimeMode = runtimeMode.mobileNormalized
+        self.runtimeMode = runtimeMode
         self.interactionMode = interactionMode.mobileNormalized
         self.attachments = attachments.map(FeatureQueuedAttachment.init)
         self.creation = creation
@@ -198,7 +198,11 @@ public actor FeatureOutboxStore {
             cached = []
             throw error
         }
-        cached = document.submissions.sorted {
+        cached = document.submissions.map { submission in
+            var submission = submission
+            submission.interactionMode = submission.interactionMode.mobileNormalized
+            return submission
+        }.sorted {
             $0.identity.createdAt < $1.identity.createdAt
         }
         return cached ?? []

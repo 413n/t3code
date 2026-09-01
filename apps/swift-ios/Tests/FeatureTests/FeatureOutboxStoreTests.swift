@@ -36,9 +36,33 @@ struct FeatureOutboxStoreTests {
 
         #expect(restored.count == 1)
         #expect(restored[0].identity == identity)
-        #expect(restored[0].runtimeMode == .fullAccess)
+        #expect(restored[0].runtimeMode == .automatic)
         #expect(restored[0].interactionMode == .standard)
         #expect(restored[0].attachments.first?.data == Data([0x01, 0x02]))
+    }
+
+    @Test
+    func restorePreservesLegacyPermission() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-feature-outbox-legacy-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        var submission = FeatureQueuedSubmission(
+            environmentID: "environment-1",
+            identity: FeatureSubmissionIdentity(),
+            threadID: "thread-scoped",
+            text: "Retry this",
+            selection: nil,
+            runtimeMode: .automatic,
+            interactionMode: .standard,
+            attachments: []
+        )
+        submission.runtimeMode = .autoAcceptEdits
+        try await store.enqueue(submission)
+
+        let restored = try await FeatureOutboxStore(fileURL: store.fileURL).submissions()
+
+        #expect(restored.first?.runtimeMode == .autoAcceptEdits)
     }
 
     @Test

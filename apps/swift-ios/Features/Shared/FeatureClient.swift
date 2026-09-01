@@ -81,6 +81,14 @@ public protocol FeatureClient: AnyObject {
         attachments: [FeatureUploadAttachment],
         identity: FeatureSubmissionIdentity
     ) async throws
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity
+    ) async throws
     func cancelTurn(threadID: String) async throws
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws
@@ -425,6 +433,26 @@ public extension FeatureClient {
             text: text,
             selection: selection,
             attachments: attachments
+        )
+    }
+
+    /// Durable submissions carry the modes that were active when the user
+    /// sent them. Older clients can ignore them, while native retries preserve
+    /// the original permission instead of reading a later thread value.
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity
+    ) async throws {
+        try await sendMessage(
+            threadID: threadID,
+            text: text,
+            selection: selection,
+            attachments: attachments,
+            identity: identity
         )
     }
 

@@ -98,7 +98,7 @@ final class NativeRetryIdentityTests: XCTestCase {
         )!
         let client = NativeFeatureClient(runtime: runtime, settingsStore: settings)
         let initial = try await client.initialSnapshot()
-        XCTAssertEqual(initial.threads.first?.runtimeMode, .automatic)
+        XCTAssertEqual(initial.threads.first?.runtimeMode, .approvalRequired)
         XCTAssertEqual(initial.threads.first?.interactionMode, .standard)
         await connection.waitUntilConnected()
 
@@ -162,8 +162,12 @@ final class NativeRetryIdentityTests: XCTestCase {
             retriedBootstrap["message"]?["messageId"]
         )
         XCTAssertNotEqual(initialBootstrap["threadId"], retriedBootstrap["threadId"])
-        for command in commands {
-            XCTAssertEqual(command["runtimeMode"]?.stringValue, "full-access")
+        for command in turnCommands {
+            XCTAssertEqual(command["runtimeMode"]?.stringValue, "approval-required")
+            XCTAssertEqual(command["interactionMode"]?.stringValue, "default")
+        }
+        for command in bootstrapCommands {
+            XCTAssertEqual(command["runtimeMode"]?.stringValue, "auto-accept-edits")
             XCTAssertEqual(command["interactionMode"]?.stringValue, "default")
         }
         await client.disconnect()

@@ -1390,7 +1390,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             providerName: providerDisplayName(model.instanceId),
             modelID: model.model,
             modelOptions: mapOptionSelections(model.options),
-            runtimeMode: runtimeMode.mobileNormalized,
+            runtimeMode: runtimeMode,
             interactionMode: interactionMode.mobileNormalized
         )
     }
@@ -1752,6 +1752,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             threadID: threadID,
             text: text,
             selection: selection,
+            runtimeMode: nil,
             attachments: attachments,
             submissionIdentity: nil
         )
@@ -1768,6 +1769,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             threadID: threadID,
             text: text,
             selection: selection,
+            runtimeMode: nil,
+            attachments: attachments,
+            submissionIdentity: identity
+        )
+    }
+
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity
+    ) async throws {
+        try await sendMessageResolved(
+            threadID: threadID,
+            text: text,
+            selection: selection,
+            runtimeMode: runtimeMode,
             attachments: attachments,
             submissionIdentity: identity
         )
@@ -1777,6 +1797,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         threadID: String,
         text: String,
         selection: FeatureSelection?,
+        runtimeMode requestedRuntimeMode: FeatureRuntimeMode?,
         attachments: [FeatureUploadAttachment],
         submissionIdentity: FeatureSubmissionIdentity?
     ) async throws {
@@ -1790,7 +1811,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         let model = selection.map(coreModelSelection)
         let uploads = try makeUploadAttachments(attachments)
-        let runtimeMode = coreRuntimeMode(mapRuntimeMode(shellThread.runtimeMode))
+        let runtimeMode = coreRuntimeMode(
+            requestedRuntimeMode ?? mapRuntimeMode(shellThread.runtimeMode)
+        )
         let interactionMode = InteractionMode.default
         let signature = TurnSubmissionSignature(
             text: text,
@@ -5141,13 +5164,20 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func mapRuntimeMode(_ mode: RuntimeMode) -> FeatureRuntimeMode {
         switch mode {
-        case .approvalRequired, .autoAcceptEdits, .auto: .automatic
+        case .approvalRequired: .approvalRequired
+        case .autoAcceptEdits: .autoAcceptEdits
+        case .auto: .automatic
         case .fullAccess: .fullAccess
         }
     }
 
     private func coreRuntimeMode(_ mode: FeatureRuntimeMode) -> RuntimeMode {
-        mode.mobileNormalized == .fullAccess ? .fullAccess : .auto
+        switch mode {
+        case .approvalRequired: .approvalRequired
+        case .autoAcceptEdits: .autoAcceptEdits
+        case .automatic: .auto
+        case .fullAccess: .fullAccess
+        }
     }
 
     private func mapInteractionMode(_: InteractionMode) -> FeatureInteractionMode {

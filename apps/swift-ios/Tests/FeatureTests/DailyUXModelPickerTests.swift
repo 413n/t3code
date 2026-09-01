@@ -335,28 +335,188 @@ struct DailyUXModelPickerTests {
     }
 
     @Test
-    func lockedThreadRejectsPersistedCrossProviderOverride() {
-        let inherited = FeatureSelection(providerID: "claude", modelID: "claude-opus-5")
-        let staleDefault = FeatureSelection(providerID: "codex", modelID: "gpt-5.6-sol")
+    func unlockedThreadRejectsCrossProviderOverrideAndAllowsSameProviderModel() {
+        let inherited = FeatureSelection(providerID: "codex", modelID: "gpt-5.6-sol")
+        let crossProvider = FeatureSelection(providerID: "claude", modelID: "claude-opus-5")
+        let sameProvider = FeatureSelection(providerID: "codex", modelID: "gpt-5.6-terra")
         let providers = [
             FeatureProvider(
                 id: "codex",
                 name: "Codex",
-                models: [.init(id: "gpt-5.6-sol", name: "Sol", isDefault: true)]
+                models: [
+                    .init(id: "gpt-5.6-sol", name: "Sol", isDefault: true),
+                    .init(id: "gpt-5.6-terra", name: "Terra"),
+                ]
             ),
             FeatureProvider(
                 id: "claude",
                 name: "Claude",
-                requiresNewThreadForModelChange: true,
                 models: [.init(id: "claude-opus-5", name: "Opus 5")]
             ),
         ]
 
         #expect(
             ThreadComposerModelSelectionPolicy.explicitSelection(
-                staleDefault,
+                crossProvider,
                 inherited: inherited,
                 providers: providers
+            ) == nil
+        )
+        #expect(
+            ThreadComposerModelSelectionPolicy.explicitSelection(
+                sameProvider,
+                inherited: inherited,
+                providers: providers
+            )?.modelID == "gpt-5.6-terra"
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                crossProvider,
+                providers: providers,
+                inheriting: inherited,
+                allowsProviderChange: false
+            ) == nil
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                sameProvider,
+                providers: providers,
+                inheriting: inherited,
+                allowsProviderChange: false
+            )?.modelID == "gpt-5.6-terra"
+        )
+    }
+
+    @Test
+    func lockedProviderRejectsAChangeToAnotherModel() {
+        let inherited = FeatureSelection(providerID: "claude", modelID: "opus")
+        let alternate = FeatureSelection(providerID: "claude", modelID: "sonnet")
+        let configured = FeatureSelection(
+            providerID: "claude",
+            modelID: "opus",
+            options: [.init(id: "reasoningEffort", value: .string("high"))]
+        )
+        let provider = FeatureProvider(
+            id: "claude",
+            name: "Claude",
+            requiresNewThreadForModelChange: true,
+            models: [
+                .init(
+                    id: "opus",
+                    name: "Opus",
+                    options: [
+                        .init(
+                            id: "reasoningEffort",
+                            label: "Reasoning effort",
+                            kind: .select,
+                            choices: [.init(id: "high", label: "High")]
+                        ),
+                    ]
+                ),
+                .init(id: "sonnet", name: "Sonnet"),
+            ]
+        )
+
+        #expect(
+            ThreadComposerModelSelectionPolicy.explicitSelection(
+                alternate,
+                inherited: inherited,
+                providers: [provider]
+            ) == nil
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                alternate,
+                providers: [provider],
+                inheriting: inherited,
+                allowsProviderChange: false
+            ) == nil
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                configured,
+                providers: [provider],
+                inheriting: inherited,
+                allowsProviderChange: false
+            ) == configured
+        )
+    }
+
+    @Test
+    func pickerShowsAllProvidersForNewTasksAndOnlyTheThreadProviderOtherwise() {
+        let providers = [
+            FeatureProvider(
+                id: "codex",
+                name: "Codex",
+                models: [.init(id: "sol", name: "Sol")]
+            ),
+            FeatureProvider(
+                id: "claude",
+                name: "Claude",
+                models: [.init(id: "opus", name: "Opus")]
+            ),
+        ]
+
+        #expect(
+            ThreadComposerModelSelectionPolicy.pickerProviders(
+                providers,
+                inherited: nil,
+                allowsProviderChange: true
+            ).map(\.id) == ["codex", "claude"]
+        )
+        #expect(
+            ThreadComposerModelSelectionPolicy.pickerProviders(
+                providers,
+                inherited: .init(providerID: "codex", modelID: "sol"),
+                allowsProviderChange: false
+            ).map(\.id) == ["codex"]
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                .init(providerID: "claude", modelID: "opus"),
+                providers: providers,
+                inheriting: nil,
+                allowsProviderChange: true
+            )?.providerID == "claude"
+        )
+    }
+
+    @Test
+    func missingInheritedProviderDoesNotUseAnotherProviderCatalog() {
+        let inherited = FeatureSelection(providerID: "claude", modelID: "opus")
+        let codex = FeatureProvider(
+            id: "codex",
+            name: "Codex",
+            models: [.init(id: "sol", name: "Sol", isDefault: true)]
+        )
+
+        #expect(
+            ThreadComposerModelSelectionPolicy.pickerProviders(
+                [codex],
+                inherited: inherited,
+                allowsProviderChange: false
+            ).isEmpty
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                .init(providerID: "codex", modelID: "sol"),
+                providers: [codex],
+                inheriting: nil,
+                allowsProviderChange: false
+            ) == nil
+        )
+        #expect(
+            ThreadComposerModelSelectionPolicy.pickerProviders(
+                [codex],
+                inherited: nil,
+                allowsProviderChange: false
+            ).isEmpty
+        )
+        #expect(
+            ThreadComposerModelSelectionPolicy.resolvedSelection(
+                explicit: nil,
+                inherited: inherited,
+                providers: [codex]
             ) == nil
         )
     }
@@ -430,6 +590,232 @@ struct DailyUXModelPickerTests {
             )?.options == [
                 .init(id: "effort", value: .string("high")),
             ]
+        )
+    }
+
+    @Test
+    func configurationSeedsFromTheEffectiveSavedThreadSelection() {
+        let model = FeatureModel(
+            id: "gpt-5.6-sol",
+            name: "Sol",
+            options: [
+                .init(
+                    id: "reasoningEffort",
+                    label: "Reasoning effort",
+                    kind: .select,
+                    choices: [
+                        .init(id: "low", label: "Low"),
+                        .init(id: "high", label: "High"),
+                    ]
+                ),
+                .init(id: "fast", label: "Fast", kind: .boolean),
+            ]
+        )
+        let provider = FeatureProvider(id: "codex", name: "Codex", models: [model])
+        let inherited = FeatureSelection(
+            providerID: "codex",
+            modelID: model.id,
+            options: [
+                .init(id: "reasoningEffort", value: .string("high")),
+                .init(id: "fast", value: .boolean(true)),
+            ]
+        )
+        let effective = ThreadComposerModelSelectionPolicy.resolvedSelection(
+            explicit: nil,
+            inherited: inherited,
+            providers: [provider]
+        )
+
+        let configured = ProviderModelConfiguration.selection(
+            for: DailyUXModelOption(provider: provider, model: model),
+            preserving: effective
+        )
+
+        #expect(configured == inherited)
+    }
+
+    @Test
+    func explicitDraftOptionsWinOverTheInheritedThreadOptions() {
+        let model = FeatureModel(
+            id: "gpt-5.6-sol",
+            name: "Sol",
+            options: [
+                .init(
+                    id: "reasoningEffort",
+                    label: "Reasoning effort",
+                    kind: .select,
+                    choices: [
+                        .init(id: "low", label: "Low"),
+                        .init(id: "high", label: "High"),
+                    ]
+                ),
+            ]
+        )
+        let provider = FeatureProvider(id: "codex", name: "Codex", models: [model])
+        let inherited = FeatureSelection(
+            providerID: "codex",
+            modelID: model.id,
+            options: [.init(id: "reasoningEffort", value: .string("low"))]
+        )
+        let explicit = FeatureSelection(
+            providerID: "codex",
+            modelID: model.id,
+            options: [.init(id: "reasoningEffort", value: .string("high"))]
+        )
+
+        let effective = ThreadComposerModelSelectionPolicy.resolvedSelection(
+            explicit: explicit,
+            inherited: inherited,
+            providers: [provider]
+        )
+
+        #expect(effective == explicit)
+    }
+
+    @Test
+    func unsupportedValuesAndUndescribedOptionsRemainVisibleAndPreserved() {
+        let model = FeatureModel(
+            id: "gpt-5.6-sol",
+            name: "Sol",
+            options: [
+                .init(
+                    id: "reasoningEffort",
+                    label: "Reasoning effort",
+                    kind: .select,
+                    choices: [
+                        .init(id: "low", label: "Low"),
+                        .init(id: "high", label: "High"),
+                    ]
+                ),
+            ]
+        )
+        let saved = [
+            FeatureModelOptionSelection(
+                id: "reasoningEffort",
+                value: .string("environment-custom")
+            ),
+            FeatureModelOptionSelection(id: "providerFlag", value: .boolean(true)),
+        ]
+        let descriptor = DailyUXModelOptions.reasoningDescriptor(for: model)
+
+        #expect(descriptor?.choices.map(\.id) == ["low", "high"])
+        #expect(
+            descriptor.map {
+                DailyUXModelOptions.isSupportedValue(saved[0].value, for: $0)
+            } == false
+        )
+        #expect(
+            DailyUXModelOptions.undescribedSelections(
+                for: model,
+                selections: saved
+            ).map(\.id) == ["providerFlag"]
+        )
+        #expect(
+            DailyUXModelOptions.reasoningSummary(for: model, selections: saved)
+                == "environment-custom"
+        )
+    }
+
+    @Test
+    func changingReasoningPreservesNonreasoningAndUndescribedOptions() {
+        let selections = [
+            FeatureModelOptionSelection(id: "reasoningEffort", value: .string("low")),
+            FeatureModelOptionSelection(id: "fast", value: .boolean(true)),
+            FeatureModelOptionSelection(id: "providerFlag", value: .string("keep")),
+        ]
+
+        let updated = DailyUXModelOptions.updating(
+            selections,
+            id: "reasoningEffort",
+            value: .string("high")
+        )
+
+        #expect(updated.first { $0.id == "reasoningEffort" }?.value == .string("high"))
+        #expect(updated.first { $0.id == "fast" }?.value == .boolean(true))
+        #expect(updated.first { $0.id == "providerFlag" }?.value == .string("keep"))
+    }
+
+    @Test
+    func modelDraftCachePreservesOptionsWhenReturningToASelection() {
+        let reasoning = FeatureModelOptionDescriptor(
+            id: "reasoningEffort",
+            label: "Reasoning effort",
+            kind: .select,
+            choices: [
+                .init(id: "low", label: "Low", isDefault: true),
+                .init(id: "high", label: "High"),
+            ]
+        )
+        let modelA = FeatureModel(id: "model-a", name: "Model A", options: [reasoning])
+        let modelB = FeatureModel(id: "model-b", name: "Model B", options: [reasoning])
+        let provider = FeatureProvider(id: "codex", name: "Codex", models: [modelA, modelB])
+        let savedA = FeatureSelection(
+            providerID: provider.id,
+            modelID: modelA.id,
+            options: [
+                .init(id: reasoning.id, value: .string("high")),
+                .init(id: "providerFlag", value: .boolean(true)),
+            ]
+        )
+        let optionA = DailyUXModelOption(provider: provider, model: modelA)
+        let optionB = DailyUXModelOption(provider: provider, model: modelB)
+        let selectedB = ProviderModelDraftPolicy.selection(
+            for: optionB,
+            cached: nil,
+            current: savedA,
+            committed: savedA
+        )
+
+        let returnedA = ProviderModelDraftPolicy.selection(
+            for: optionA,
+            cached: savedA,
+            current: selectedB,
+            committed: savedA
+        )
+
+        #expect(returnedA == savedA)
+    }
+
+    @Test
+    func liveSelectionChangesAndUnavailableModelsInvalidateEditedDrafts() {
+        let modelA = FeatureModel(id: "model-a", name: "Model A")
+        let modelB = FeatureModel(id: "model-b", name: "Model B")
+        let provider = FeatureProvider(
+            id: "codex",
+            name: "Codex",
+            requiresNewThreadForModelChange: true,
+            models: [modelA, modelB]
+        )
+        let selectionA = FeatureSelection(providerID: provider.id, modelID: modelA.id)
+        let selectionB = FeatureSelection(providerID: provider.id, modelID: modelB.id)
+
+        #expect(
+            ProviderModelDraftPolicy.canKeepEditedDraft(
+                base: selectionA,
+                currentCommitted: selectionB,
+                draft: selectionA,
+                providers: [provider],
+                inheriting: nil,
+                allowsProviderChange: true
+            ) == false
+        )
+        #expect(
+            ProviderModelDraftPolicy.canKeepEditedDraft(
+                base: selectionA,
+                currentCommitted: selectionA,
+                draft: selectionA,
+                providers: [],
+                inheriting: nil,
+                allowsProviderChange: true
+            ) == false
+        )
+        #expect(
+            ProviderModelDraftPolicy.validated(
+                selectionB,
+                providers: [provider],
+                inheriting: selectionA,
+                allowsProviderChange: false
+            ) == nil
         )
     }
 
