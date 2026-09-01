@@ -1060,7 +1060,7 @@ enum ThreadComposerModelSelectionPolicy {
         providers: [FeatureProvider]
     ) -> FeatureSelection? {
         explicitSelection(explicit, inherited: inherited, providers: providers)
-            ?? ProviderModelSelectionResolver.validated(inherited, in: providers)
+            ?? preservedSelection(inherited, providers: providers)
     }
 
     static func explicitSelection(
@@ -1069,18 +1069,79 @@ enum ThreadComposerModelSelectionPolicy {
         providers: [FeatureProvider]
     ) -> FeatureSelection? {
         guard let explicit, let inherited else { return nil }
-        guard let validated = ProviderModelSelectionResolver.validated(explicit, in: providers)
-        else {
+        guard explicit.providerID == inherited.providerID else { return nil }
+        let inheritedProvider = providers.first { $0.id == inherited.providerID }
+        if inheritedProvider?.requiresNewThreadForModelChange == true,
+           explicit.modelID != inherited.modelID {
             return nil
         }
 
-        guard validated.providerID == inherited.providerID else { return nil }
-        let inheritedProvider = providers.first { $0.id == inherited.providerID }
-        if inheritedProvider?.requiresNewThreadForModelChange == true,
-           validated.modelID != inherited.modelID {
-            return nil
+        // An environment refresh can briefly remove a provider or a custom
+        // model from discovery. Keep an existing override until discovery can
+        // validate it again. Applying a new choice still uses the stricter
+        // ProviderModelDraftPolicy validation path.
+        return ProviderModelSelectionResolver.validated(explicit, in: providers)
+            ?? explicit
+    }
+
+    private static func preservedSelection(
+        _ selection: FeatureSelection?,
+        providers: [FeatureProvider]
+    ) -> FeatureSelection? {
+        guard var selection else { return nil }
+        guard let model = providers
+            .first(where: { $0.id == selection.providerID })?
+            .models.first(where: { $0.id == selection.modelID }) else {
+            return selection
         }
-        return validated
+        selection.options = ProviderModelConfiguration.materializedOptions(
+            for: model,
+            preserving: selection.options
+        )
+        return selection
+    }
+}
+
+/// Existing threads use their saved environment and provider instance as the
+/// catalog identity. Project rows and provider discovery can be temporarily
+/// absent, but neither should make the thread's saved model disappear.
+enum ThreadComposerProviderCatalog {
+    static func providers(
+        for thread: FeatureThread,
+        in snapshot: FeatureSnapshot
+    ) -> [FeatureProvider] {
+        let environmentID = thread.environmentID
+            ?? snapshot.projects.first(where: { $0.id == thread.projectID })?.environmentID
+        var providers = environmentID.flatMap {
+            snapshot.providersByEnvironment?[$0]
+        } ?? []
+
+        guard let providerID = thread.providerID,
+              let modelID = thread.modelID else {
+            return providers
+        }
+
+        let savedModel = FeatureModel(id: modelID, name: modelID)
+        if let providerIndex = providers.firstIndex(where: { $0.id == providerID }) {
+            guard !providers[providerIndex].models.contains(where: { $0.id == modelID }) else {
+                return providers
+            }
+            providers[providerIndex].models.append(savedModel)
+            return providers
+        }
+
+        let providerName = thread.providerName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedProviderName = providerName.flatMap { name in
+            name.isEmpty ? nil : name
+        } ?? providerID
+        providers.append(FeatureProvider(
+            id: providerID,
+            name: resolvedProviderName,
+            isAvailable: false,
+            models: [savedModel]
+        ))
+        return providers
     }
 }
 

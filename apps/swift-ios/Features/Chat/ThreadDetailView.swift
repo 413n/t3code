@@ -634,8 +634,10 @@ public struct ThreadDetailView: View {
     }
 
     private var threadProviders: [FeatureProvider] {
-        let project = model.snapshot.projects.first { $0.id == currentThread.projectID }
-        return DailyUXCreationContext.providers(for: project, in: model.snapshot)
+        ThreadComposerProviderCatalog.providers(
+            for: currentThread,
+            in: model.snapshot
+        )
     }
 
     private var timelineRenderUpdate: FeatureDetailRenderUpdate? {
