@@ -220,6 +220,7 @@ struct FeatureComposerView: View {
                     .padding(.horizontal, 12)
                     .padding(.top, 3)
                     .padding(.bottom, 8)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Divider()
                     .overlay(T3Colors.separator)
@@ -253,6 +254,7 @@ struct FeatureComposerView: View {
             }
             .padding(.bottom, 7)
             .frame(minHeight: 62, alignment: .top)
+            .layoutPriority(1)
             .clipped()
 
             if !attachments.isEmpty, !imagesAllowed {

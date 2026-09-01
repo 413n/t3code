@@ -52,8 +52,102 @@ struct FeatureComposerPowerTests {
                 fittingHeight: 440,
                 lineHeight: 22,
                 availableHeight: 80
-            ) == 110
+            ) == 80
         )
+        #expect(
+            FeatureComposerTextInputSizing.height(
+                fittingHeight: 440,
+                lineHeight: 22,
+                availableHeight: 0
+            ) == 0
+        )
+    }
+
+    @Test
+    @MainActor
+    func compressedComposerViewportKeepsItsLastLineAboveTheFooter() throws {
+        let textView = FeatureComposerUITextView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 1)
+        )
+        textView.configureComposerViewport()
+        textView.font = UIFont.preferredFont(forTextStyle: .body)
+        textView.text = (1...30).map { "Attachment draft line \($0)" }
+            .joined(separator: "\n")
+        textView.selectedRange = NSRange(location: textView.text.utf16.count, length: 0)
+
+        let measured = textView.sizeThatFits(
+            CGSize(width: 320, height: CGFloat.greatestFiniteMagnitude)
+        )
+        let font = try #require(textView.font)
+        let keyboardAndAttachmentBound: CGFloat = 80
+        let viewportHeight = FeatureComposerTextInputSizing.height(
+            fittingHeight: measured.height,
+            lineHeight: font.lineHeight,
+            availableHeight: keyboardAndAttachmentBound
+        )
+        textView.frame.size.height = viewportHeight
+        textView.setNeedsLayout()
+        textView.layoutIfNeeded()
+        textView.scrollSelectionIntoView()
+
+        #expect(textView.bounds.height == keyboardAndAttachmentBound)
+        #expect(textView.contentOverflows)
+        let selection = try #require(textView.selectedTextRange)
+        let caret = textView.caretRect(for: selection.end)
+        let visibleTop = textView.contentOffset.y
+        let visibleBottom = visibleTop + textView.bounds.height
+        #expect(caret.minY >= visibleTop)
+        #expect(caret.maxY <= visibleBottom - 1)
+    }
+
+    @Test
+    @MainActor
+    func uiTextViewMeasurementGrowsBeforeTheViewportCap() throws {
+        let textView = FeatureComposerUITextView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 1)
+        )
+        textView.configureComposerViewport()
+        textView.font = UIFont.preferredFont(forTextStyle: .body)
+        let font = try #require(textView.font)
+
+        textView.text = "First line\nSecond line"
+        let shortMeasurement = textView.sizeThatFits(
+            CGSize(width: 320, height: CGFloat.greatestFiniteMagnitude)
+        )
+        textView.text = (1...8).map { "Draft line \($0)" }.joined(separator: "\n")
+        let tallMeasurement = textView.sizeThatFits(
+            CGSize(width: 320, height: CGFloat.greatestFiniteMagnitude)
+        )
+
+        let shortHeight = FeatureComposerTextInputSizing.height(
+            fittingHeight: shortMeasurement.height,
+            lineHeight: font.lineHeight,
+            availableHeight: 400
+        )
+        let tallHeight = FeatureComposerTextInputSizing.height(
+            fittingHeight: tallMeasurement.height,
+            lineHeight: font.lineHeight,
+            availableHeight: 400
+        )
+
+        #expect(tallHeight > shortHeight)
+        #expect(tallHeight == tallMeasurement.height)
+    }
+
+    @Test
+    func newTaskUsesCompactContextForDraftsAndAttachments() {
+        #expect(!NewThreadComposerLayout.usesCompactContext(
+            prompt: "", isFocused: false, hasAttachments: false
+        ))
+        #expect(NewThreadComposerLayout.usesCompactContext(
+            prompt: "", isFocused: true, hasAttachments: false
+        ))
+        #expect(NewThreadComposerLayout.usesCompactContext(
+            prompt: "A draft", isFocused: false, hasAttachments: false
+        ))
+        #expect(NewThreadComposerLayout.usesCompactContext(
+            prompt: "", isFocused: false, hasAttachments: true
+        ))
     }
 
     @Test

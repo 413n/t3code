@@ -163,6 +163,7 @@ struct FeatureComposerTextInput: UIViewRepresentable {
 /// the attachment pipeline. Text-only pastes fall through to UIKit untouched.
 final class FeatureComposerUITextView: UITextView {
     private static let bottomEditingInset: CGFloat = 10
+    private var lastLaidOutBoundsSize = CGSize.zero
 
     func configureComposerViewport() {
         clipsToBounds = true
@@ -175,6 +176,7 @@ final class FeatureComposerUITextView: UITextView {
     }
 
     func scrollSelectionIntoView() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
         scrollRangeToVisible(selectedRange)
         guard let selection = selectedTextRange else { return }
 
@@ -288,9 +290,16 @@ final class FeatureComposerUITextView: UITextView {
     }
 
     override func layoutSubviews() {
+        let viewportChanged = lastLaidOutBoundsSize != bounds.size
+        lastLaidOutBoundsSize = bounds.size
         super.layoutSubviews()
         if !contentOverflows, contentOffset.y != 0 {
             contentOffset.y = 0
+        } else if viewportChanged, isFirstResponder {
+            // `sizeThatFits` receives a proposal. The final UIKit viewport can
+            // still differ after the footer and attachments take their space.
+            // Recheck the caret against these actual bounds once per resize.
+            scrollSelectionIntoView()
         }
     }
 
@@ -416,22 +425,22 @@ enum FeatureComposerTextSelectionPolicy {
 }
 
 /// The editor grows with its content, then scrolls when it reaches the line
-/// cap or the space above the composer controls. A five-line minimum prevents
-/// SwiftUI's repeated height proposals from collapsing the editor.
+/// cap or the space above the composer controls. A finite SwiftUI proposal is
+/// a hard bound. Returning a larger minimum makes the parent clip the editor
+/// under its fixed footer.
 enum FeatureComposerTextInputSizing {
     static let maximumLines: CGFloat = 12
-    static let minimumVisibleLines: CGFloat = 5
 
     static func height(
         fittingHeight: CGFloat,
         lineHeight: CGFloat,
         availableHeight: CGFloat? = nil
     ) -> CGFloat {
-        let maximumHeight = lineHeight * maximumLines
-        guard let availableHeight, availableHeight.isFinite, availableHeight > 0 else {
-            return min(fittingHeight, maximumHeight)
+        let maximumHeight = max(0, lineHeight * maximumLines)
+        let contentHeight = max(0, fittingHeight)
+        guard let availableHeight, availableHeight.isFinite else {
+            return min(contentHeight, maximumHeight)
         }
-        let visibleHeight = max(availableHeight, lineHeight * minimumVisibleLines)
-        return min(fittingHeight, maximumHeight, visibleHeight)
+        return min(contentHeight, maximumHeight, max(0, availableHeight))
     }
 }

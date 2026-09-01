@@ -64,7 +64,7 @@ public struct NewThreadView: View {
                 if creationProjects.isEmpty {
                     noProjects
                         .padding(.top, 82)
-                } else {
+                } else if !usesCompactProjectContext {
                     hero
                         .padding(.top, 82)
                 }
@@ -74,6 +74,10 @@ public struct NewThreadView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if !creationProjects.isEmpty {
                 VStack(spacing: 0) {
+                    if usesCompactProjectContext {
+                        compactProjectContext
+                    }
+
                     if let submissionValidationError {
                         Label(submissionValidationError, systemImage: "exclamationmark.circle")
                             .font(T3Typography.supporting)
@@ -212,6 +216,14 @@ public struct NewThreadView: View {
         .presentationDragIndicator(.visible)
     }
 
+    private var usesCompactProjectContext: Bool {
+        NewThreadComposerLayout.usesCompactContext(
+            prompt: prompt,
+            isFocused: promptFocused,
+            hasAttachments: !attachments.isEmpty
+        )
+    }
+
     private var topBar: some View {
         HStack {
             Button("Cancel") { dismiss() }
@@ -269,47 +281,89 @@ public struct NewThreadView: View {
             .foregroundStyle(T3Colors.textPrimary)
             .multilineTextAlignment(.center)
 
-            Menu {
-                ForEach(creationEnvironments) { environment in
-                    Button {
-                        selectEnvironment(environment.id)
-                    } label: {
-                        if environment.id == selectedProject?.environmentID {
-                            Label(environmentLabel(environment), systemImage: "checkmark")
-                        } else {
-                            Text(environmentLabel(environment))
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "server.rack")
-                        .font(.system(size: 11, weight: .medium))
-                    Text(environmentName)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let environmentStatus {
-                        Text(environmentStatus)
-                            .foregroundStyle(T3Colors.warning)
-                    }
-                    if creationEnvironments.count > 1 {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 8, weight: .bold))
-                    }
-                }
-                .font(T3Typography.supporting)
-                .foregroundStyle(T3Colors.textSecondary)
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(isSubmitting || creationEnvironments.count < 2)
-            .accessibilityLabel("Environment")
-            .accessibilityValue(environmentAccessibilityValue)
+            environmentPicker
         }
         .padding(.horizontal, 24)
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .contain)
+    }
+
+    private var compactProjectContext: some View {
+        HStack(spacing: 12) {
+            Button {
+                presentPicker(.project)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 11, weight: .medium))
+                    Text(
+                        selectedProjectGroup?.name
+                            ?? selectedProject?.name
+                            ?? "Choose project"
+                    )
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(T3Typography.supporting)
+                .foregroundStyle(T3Colors.textPrimary)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isSubmitting)
+            .layoutPriority(1)
+            .accessibilityLabel("Choose project")
+            .accessibilityValue(
+                selectedProjectGroup?.name ?? selectedProject?.name ?? "Not selected"
+            )
+
+            Spacer(minLength: 0)
+
+            environmentPicker
+        }
+        .padding(.horizontal, 18)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var environmentPicker: some View {
+        Menu {
+            ForEach(creationEnvironments) { environment in
+                Button {
+                    selectEnvironment(environment.id)
+                } label: {
+                    if environment.id == selectedProject?.environmentID {
+                        Label(environmentLabel(environment), systemImage: "checkmark")
+                    } else {
+                        Text(environmentLabel(environment))
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 11, weight: .medium))
+                Text(environmentName)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let environmentStatus {
+                    Text(environmentStatus)
+                        .foregroundStyle(T3Colors.warning)
+                }
+                if creationEnvironments.count > 1 {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+            }
+            .font(T3Typography.supporting)
+            .foregroundStyle(T3Colors.textSecondary)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isSubmitting || creationEnvironments.count < 2)
+        .accessibilityLabel("Environment")
+        .accessibilityValue(environmentAccessibilityValue)
     }
 
     private var noProjects: some View {
@@ -1023,6 +1077,19 @@ public struct NewThreadView: View {
         let rhsRank = rhs.isCurrent ? 0 : rhs.isDefault ? 1 : rhs.isRemote ? 3 : 2
         if lhsRank != rhsRank { return lhsRank < rhsRank }
         return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+}
+
+enum NewThreadComposerLayout {
+    /// The full prompt is useful before editing starts. Once a draft needs
+    /// room, a compact row keeps the project and environment visible while the
+    /// editor uses the rest of the hero's space.
+    static func usesCompactContext(
+        prompt: String,
+        isFocused: Bool,
+        hasAttachments: Bool
+    ) -> Bool {
+        !prompt.isEmpty || isFocused || hasAttachments
     }
 }
 
