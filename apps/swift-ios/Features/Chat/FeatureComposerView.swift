@@ -755,17 +755,20 @@ struct FeatureComposerView: View {
         case let .path(entry):
             replacement = FeatureComposerFileLinkSerializer.markdownLink(for: entry.path) + " "
         }
-        textSelectionRequest = FeatureComposerTextSelectionRequest(
-            location: FeatureComposerTextSelectionPolicy.cursorLocation(
-                afterReplacing: trigger.range,
-                in: text,
-                with: replacement
-            )
+        let nextCursorLocation = FeatureComposerTextSelectionPolicy.cursorLocation(
+            afterReplacing: trigger.range,
+            in: text,
+            with: replacement
         )
         text = FeatureComposerTriggerParser.replacing(
             trigger.range,
             in: text,
             with: replacement
+        )
+        // Publish the text first so the representable cannot consume and clamp
+        // this request against the pre-replacement draft.
+        textSelectionRequest = FeatureComposerTextSelectionRequest(
+            location: nextCursorLocation
         )
         pathEntries = []
         pathSearchError = nil
