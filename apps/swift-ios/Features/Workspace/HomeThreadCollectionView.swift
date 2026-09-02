@@ -261,9 +261,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 .trailingActions(
                     for: thread,
                     isArchived: isArchived,
-                    at: .now,
-                    settings: parent.settings,
-                    pullRequest: parent.pullRequestsByThreadID[thread.id]
+                    at: .now
                 )
             let configuration = UISwipeActionsConfiguration(
                 actions: actions.map { contextualAction($0, for: thread) }
@@ -472,11 +470,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 values.append("Archived")
             } else if thread.isEffectivelySnoozed(at: .now) {
                 values.append("Snoozed")
-            } else if thread.isEffectivelySettled(
-                at: .now,
-                settings: parent.settings,
-                pullRequest: parent.pullRequestsByThreadID[thread.id]
-            ) {
+            } else if thread.isEffectivelySettled() {
                 values.append("Settled")
             }
             values.append("Provider \(context.providerName)")
@@ -529,11 +523,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                     })
                 }
 
-                let isSettled = thread.isEffectivelySettled(
-                    at: .now,
-                    settings: parent.settings,
-                    pullRequest: parent.pullRequestsByThreadID[thread.id]
-                )
+                let isSettled = thread.isEffectivelySettled()
                 if isSettled || thread.canSettleNow() {
                     actions.append(accessibilityAction(
                         isSettled ? "Reopen" : "Settle",
@@ -653,11 +643,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                         }
                     )
                 }
-                let isSettled = thread.isEffectivelySettled(
-                    at: .now,
-                    settings: parent.settings,
-                    pullRequest: parent.pullRequestsByThreadID[thread.id]
-                )
+                let isSettled = thread.isEffectivelySettled()
                 if isSettled || thread.canSettleNow() {
                     statusActions.append(
                         UIAction(
@@ -895,17 +881,11 @@ enum HomeThreadSwipeAction: Equatable {
     static func trailingActions(
         for thread: FeatureThread,
         isArchived: Bool,
-        at now: Date,
-        settings: FeatureSettings = .init(),
-        pullRequest: HomeThreadPullRequestPresentation? = nil
+        at now: Date
     ) -> [HomeThreadSwipeAction] {
         guard !isArchived else { return [.restore, .delete] }
 
-        let isSettled = thread.isEffectivelySettled(
-            at: now,
-            settings: settings,
-            pullRequest: pullRequest
-        )
+        let isSettled = thread.isEffectivelySettled()
         let settlement: HomeThreadSwipeAction? = isSettled
             ? .reopen
             : (thread.canSettleNow(at: now) ? .settle : nil)

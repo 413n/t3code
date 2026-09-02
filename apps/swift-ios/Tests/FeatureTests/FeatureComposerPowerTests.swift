@@ -408,6 +408,73 @@ struct FeatureComposerPowerTests {
     }
 
     @Test
+    func skillMenusDedupeEnabledNamesBeforeSearchAndSorting() throws {
+        let skills = [
+            FeatureProviderSkill(name: " deploy ", displayName: "First deploy", isEnabled: false),
+            FeatureProviderSkill(name: "Deploy", displayName: "Enabled deploy"),
+            FeatureProviderSkill(name: " DEPLOY ", displayName: "Duplicate matching search"),
+            FeatureProviderSkill(name: "review", displayName: "Review"),
+        ]
+        let allSkillsTrigger = try #require(FeatureComposerTriggerParser.detect(in: "$"))
+        let searchedSkillsTrigger = try #require(
+            FeatureComposerTriggerParser.detect(in: "$matching")
+        )
+        let searchedSlashTrigger = try #require(
+            FeatureComposerTriggerParser.detect(in: "/skill:matching")
+        )
+
+        let allItems = FeatureComposerMenuBuilder.items(
+            trigger: allSkillsTrigger,
+            providers: [],
+            currentSelection: nil,
+            threadSelection: nil,
+            powerFeatures: FeatureComposerPowerFeatures(skills: skills),
+            pathEntries: []
+        )
+        let searchedItems = FeatureComposerMenuBuilder.items(
+            trigger: searchedSkillsTrigger,
+            providers: [],
+            currentSelection: nil,
+            threadSelection: nil,
+            powerFeatures: FeatureComposerPowerFeatures(skills: skills),
+            pathEntries: []
+        )
+        let searchedSlashItems = FeatureComposerMenuBuilder.items(
+            trigger: searchedSlashTrigger,
+            providers: [],
+            currentSelection: nil,
+            threadSelection: nil,
+            powerFeatures: FeatureComposerPowerFeatures(skills: skills),
+            pathEntries: []
+        )
+
+        #expect(allItems.map(\.label) == ["Enabled deploy", "Review"])
+        #expect(searchedItems.isEmpty)
+        #expect(searchedSlashItems.isEmpty)
+    }
+
+    @Test
+    func slashCommandsUseNormalizedNamesAndAllEnabledSkillsForSuppression() throws {
+        let trigger = try #require(FeatureComposerTriggerParser.detect(in: "/"))
+        let items = FeatureComposerMenuBuilder.items(
+            trigger: trigger,
+            providers: [],
+            currentSelection: nil,
+            threadSelection: nil,
+            powerFeatures: FeatureComposerPowerFeatures(
+                slashCommands: [
+                    FeatureProviderSlashCommand(name: " DEPLOY "),
+                    FeatureProviderSlashCommand(name: " MODEL "),
+                ],
+                skills: [FeatureProviderSkill(name: "deploy", displayName: "Release project")]
+            ),
+            pathEntries: []
+        )
+
+        #expect(items.map(\.label) == ["/model", "Release project"])
+    }
+
+    @Test
     func slashSkillPrefixFiltersSkillsWithoutProviderCommands() throws {
         let trigger = try #require(FeatureComposerTriggerParser.detect(in: "/skill:fix"))
         let items = FeatureComposerMenuBuilder.items(
@@ -551,6 +618,36 @@ struct FeatureComposerPowerTests {
         } else {
             Issue.record("Expected a model menu item")
         }
+    }
+
+    @Test
+    func establishedThreadsKeepModelChoicesOnTheirProvider() throws {
+        let currentProvider = FeatureProvider(
+            id: "codex",
+            name: "Codex",
+            models: [
+                FeatureModel(id: "current", name: "Current"),
+                FeatureModel(id: "other", name: "Other"),
+            ]
+        )
+        let otherProvider = FeatureProvider(
+            id: "claude",
+            name: "Claude",
+            models: [FeatureModel(id: "sonnet", name: "Sonnet")]
+        )
+        let selection = FeatureSelection(providerID: "codex", modelID: "current")
+        let trigger = try #require(FeatureComposerTriggerParser.detect(in: "/model"))
+
+        let items = FeatureComposerMenuBuilder.items(
+            trigger: trigger,
+            providers: [currentProvider, otherProvider],
+            currentSelection: selection,
+            threadSelection: selection,
+            powerFeatures: .disabled,
+            pathEntries: []
+        )
+
+        #expect(items.map(\.label) == ["Current", "Other"])
     }
 
     @Test

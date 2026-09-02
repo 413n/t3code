@@ -9,7 +9,9 @@ struct MarkdownDocument: Equatable, Sendable {
     let blocks: [MarkdownBlock]
 
     init(parsing source: String) {
-        var parser = MarkdownBlockParser(source: source)
+        var parser = MarkdownBlockParser(
+            source: CodexMarkdownDirectives.replacingFileCitations(in: source)
+        )
         blocks = parser.parse()
     }
 
@@ -28,6 +30,7 @@ indirect enum MarkdownBlock: Equatable, Sendable {
     case table(MarkdownTable)
     case codeBlock(language: String?, code: String)
     case thematicBreak
+    case artifactTemplate(CodexArtifactTemplate)
 }
 
 struct MarkdownImage: Equatable, Sendable {
@@ -118,16 +121,21 @@ enum MarkdownImageSource: Equatable, Sendable {
 
 enum MarkdownWorkspaceFileLink {
     static func relativePath(for url: URL, workspaceRoot: String) -> String? {
-        let raw = url.absoluteString.removingPercentEncoding ?? url.absoluteString
+        let raw = url.absoluteString
         let lowercase = raw.lowercased()
         if lowercase.hasPrefix("http://") || lowercase.hasPrefix("https://")
             || lowercase.hasPrefix("data:") || lowercase.hasPrefix("javascript:") {
             return nil
         }
 
-        var path = url.isFileURL ? url.path : raw
-        if let suffix = path.firstIndex(where: { $0 == "#" || $0 == "?" }) {
-            path = String(path[..<suffix])
+        var path: String
+        if url.isFileURL {
+            // URL.path is decoded and already excludes a real query or fragment.
+            path = url.path
+        } else {
+            let pathEnd = raw.firstIndex(where: { $0 == "#" || $0 == "?" }) ?? raw.endIndex
+            let encodedPath = String(raw[..<pathEnd])
+            path = encodedPath.removingPercentEncoding ?? encodedPath
         }
         path = path.replacingOccurrences(
             of: #":\d+(?::\d+)?$"#,
@@ -211,6 +219,12 @@ private struct MarkdownBlockParser {
 
             if let fence = fenceMarker(in: lines[index]) {
                 blocks.append(parseCodeBlock(opening: fence))
+                continue
+            }
+
+            if let template = CodexMarkdownDirectives.artifactTemplate(from: lines[index]) {
+                blocks.append(.artifactTemplate(template))
+                index += 1
                 continue
             }
 
@@ -553,7 +567,8 @@ private struct MarkdownBlockParser {
     }
 
     private func isBlockStarter(_ line: String) -> Bool {
-        fenceMarker(in: line) != nil
+        if CodexMarkdownDirectives.artifactTemplate(from: line) != nil { return true }
+        return fenceMarker(in: line) != nil
             || atxHeading(in: line) != nil
             || blockquoteContent(in: line) != nil
             || listMarker(in: line) != nil

@@ -10,6 +10,11 @@ public protocol FeatureClient: AnyObject {
     func backgroundSnapshot() async throws -> FeatureSnapshot
     func events() -> AsyncStream<FeatureEvent>
 
+    func preuploadAttachment(
+        _ attachment: FeatureUploadAttachment,
+        environmentID: String
+    ) async throws -> FeatureUploadedAttachmentReference?
+
     func pair(endpoint: String, token: String?) async throws
     func setEnvironmentEnabled(id: String, enabled: Bool) async throws
     func removeEnvironment(id: String) async throws
@@ -94,6 +99,11 @@ public protocol FeatureClient: AnyObject {
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws
 
     func saveSettings(_ settings: FeatureSettings) async throws
+    func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
+    func updateAutomaticSettlement(
+        environmentID: String,
+        change: FeatureAutomaticSettlementChange
+    ) async throws -> FeatureAutomaticSettlementSettings
 
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage]
     func pullRequestLists(_ input: PullRequestListInput) async throws
@@ -201,6 +211,15 @@ public protocol FeatureClient: AnyObject {
 }
 
 public extension FeatureClient {
+    func preuploadAttachment(
+        _ attachment: FeatureUploadAttachment,
+        environmentID: String
+    ) async throws -> FeatureUploadedAttachmentReference? {
+        nil
+    }
+}
+
+public extension FeatureClient {
     func backgroundSnapshot() async throws -> FeatureSnapshot {
         try await initialSnapshot()
     }
@@ -222,6 +241,15 @@ public extension FeatureClient {
     func setEnvironmentEnabled(id: String, enabled: Bool) async throws {}
     func removeEnvironment(id: String) async throws {}
     func disconnect() async {}
+    func refreshProviders(environmentID _: String) async throws -> [FeatureProvider] {
+        throw FeatureCapabilityUnavailable("Provider refresh")
+    }
+    func updateAutomaticSettlement(
+        environmentID _: String,
+        change _: FeatureAutomaticSettlementChange
+    ) async throws -> FeatureAutomaticSettlementSettings {
+        throw FeatureCapabilityUnavailable("Automatic settlement settings")
+    }
     func addProject(path: String) async throws {}
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage] {
         []

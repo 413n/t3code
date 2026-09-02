@@ -2187,11 +2187,81 @@ struct FeatureRootModelTests {
         await model.reload()
 
         #expect(model.homePresentationRevision == catalogRevision + 1)
+    }
 
-        let preferencesRevision = model.homePresentationRevision
-        client.snapshot.settings.autoSettleAfterDays = nil
+    @Test
+    func providerRefreshRoutesOnlyToChosenEnvironment() async {
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(providersByEnvironment: [
+            "left": [.init(id: "old-left", name: "Old left")],
+            "right": [.init(id: "old-right", name: "Old right")],
+        ])
+        client.refreshedProviders = [.init(id: "new-left", name: "New left")]
+        let model = testRootModel(client: client)
         await model.reload()
-        #expect(model.homePresentationRevision == preferencesRevision + 1)
+
+        let didRefresh = await model.refreshProviders(environmentID: "left")
+
+        #expect(didRefresh)
+        #expect(client.refreshedProviderEnvironmentID == "left")
+        #expect(model.snapshot.providersByEnvironment?["left"] == client.refreshedProviders)
+        #expect(
+            model.snapshot.providersByEnvironment?["right"]
+                == [.init(id: "old-right", name: "Old right")]
+        )
+    }
+
+    @Test
+    func automaticSettlementUpdatesRemainEnvironmentScopedAndFailuresKeepVisibleValues() async {
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            preferencesByEnvironment: [
+                "left": .init(
+                    automaticSettlement: .init(onMerge: true, afterDays: 3)
+                ),
+                "right": .init(
+                    automaticSettlement: .init(onMerge: false, afterDays: 7.5)
+                ),
+            ]
+        )
+        let model = testRootModel(client: client)
+        await model.reload()
+
+        client.automaticSettlementResult = .init(onMerge: false, afterDays: 3)
+        let didUpdate = await model.updateAutomaticSettlement(
+            environmentID: "left",
+            change: .onMerge(false)
+        )
+
+        #expect(didUpdate)
+        #expect(client.automaticSettlementEnvironmentID == "left")
+        #expect(client.automaticSettlementChange == .onMerge(false))
+        #expect(
+            model.snapshot.preferencesByEnvironment?["left"]?.automaticSettlement
+                == FeatureAutomaticSettlementSettings(onMerge: false, afterDays: 3)
+        )
+        #expect(
+            model.snapshot.preferencesByEnvironment?["right"]?.automaticSettlement
+                == FeatureAutomaticSettlementSettings(onMerge: false, afterDays: 7.5)
+        )
+
+        client.automaticSettlementError = FeatureCapabilityUnavailable(
+            "Automatic settlement settings"
+        )
+        let didFail = await model.updateAutomaticSettlement(
+            environmentID: "right",
+            change: .afterDays(nil)
+        )
+
+        #expect(!didFail)
+        #expect(
+            model.snapshot.preferencesByEnvironment?["right"]?.automaticSettlement
+                == FeatureAutomaticSettlementSettings(onMerge: false, afterDays: 7.5)
+        )
+        #expect(
+            model.errorMessage
+                == "Automatic settlement settings is not supported by this environment."
+        )
     }
 
     @Test
@@ -2766,6 +2836,15 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var resolvedInputID: String?
     var resolvedInputAnswers: [String: FeatureInputAnswer]?
     var savedSettings: [FeatureSettings] = []
+    var refreshedProviderEnvironmentID: String?
+    var refreshedProviders: [FeatureProvider] = []
+    var automaticSettlementEnvironmentID: String?
+    var automaticSettlementChange: FeatureAutomaticSettlementChange?
+    var automaticSettlementResult = FeatureAutomaticSettlementSettings(
+        onMerge: true,
+        afterDays: 3
+    )
+    var automaticSettlementError: (any Error)?
     lazy var t3ConnectController = T3ConnectController(
         resolution: .unavailable(reason: "T3 Connect is disabled in feature tests.")
     )
@@ -2944,5 +3023,18 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     }
     func saveSettings(_ settings: FeatureSettings) async throws {
         savedSettings.append(settings)
+    }
+    func refreshProviders(environmentID: String) async throws -> [FeatureProvider] {
+        refreshedProviderEnvironmentID = environmentID
+        return refreshedProviders
+    }
+    func updateAutomaticSettlement(
+        environmentID: String,
+        change: FeatureAutomaticSettlementChange
+    ) async throws -> FeatureAutomaticSettlementSettings {
+        automaticSettlementEnvironmentID = environmentID
+        automaticSettlementChange = change
+        if let automaticSettlementError { throw automaticSettlementError }
+        return automaticSettlementResult
     }
 }

@@ -97,11 +97,17 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
     }
 
     public struct Capabilities: Codable, Equatable, Sendable {
+        public struct FileAttachments: Codable, Equatable, Sendable {
+            public let maxUploadBytes: Int
+        }
+
         public let repositoryIdentity: Bool
         public let connectionProbe: Bool?
         public let attachmentUploads: Bool?
+        public let fileAttachments: FileAttachments?
         public let pullRequests: Bool?
         public let threadSettlement: Bool?
+        public let threadAutoSettlement: Bool?
         public let threadSnooze: Bool?
         public let threadPinning: Bool?
         public let threadTitleRegeneration: Bool?
@@ -113,8 +119,10 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case repositoryIdentity
             case connectionProbe
             case attachmentUploads
+            case fileAttachments
             case pullRequests
             case threadSettlement
+            case threadAutoSettlement
             case threadSnooze
             case threadPinning
             case threadTitleRegeneration
@@ -129,8 +137,16 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
             connectionProbe = try container.decodeIfPresent(Bool.self, forKey: .connectionProbe)
             attachmentUploads = try container.decodeIfPresent(Bool.self, forKey: .attachmentUploads)
+            fileAttachments = try container.decodeIfPresent(
+                FileAttachments.self,
+                forKey: .fileAttachments
+            )
             pullRequests = try container.decodeIfPresent(Bool.self, forKey: .pullRequests)
             threadSettlement = try container.decodeIfPresent(Bool.self, forKey: .threadSettlement)
+            threadAutoSettlement = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .threadAutoSettlement
+            )
             threadSnooze = try container.decodeIfPresent(Bool.self, forKey: .threadSnooze)
             threadPinning = try container.decodeIfPresent(Bool.self, forKey: .threadPinning)
             threadTitleRegeneration = try container.decodeIfPresent(

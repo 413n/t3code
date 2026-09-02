@@ -698,7 +698,7 @@ public struct WorkspaceView: View {
 
 private extension FeatureDraftAttachment {
     var uploadValue: FeatureUploadAttachment {
-        FeatureUploadAttachment(data: data, name: filename, mimeType: mimeType)
+        FeatureUploadAttachment(self)
     }
 }
 

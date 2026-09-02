@@ -302,7 +302,8 @@ private actor ConcurrentBootstrapWebSocketConnection: WebSocketConnection {
             connectionWaiters.forEach { $0.resume() }
             connectionWaiters.removeAll()
         }
-        if request["tag"]?.stringValue == RPCMethod.serverGetConfig.rawValue,
+        if request["tag"]?.stringValue == RPCMethod.serverGetConfig.rawValue
+            || request["tag"]?.stringValue == RPCMethod.subscribeServerConfig.rawValue,
            let response = try retryConfigResponse(for: request) {
             enqueue(response)
             return
@@ -564,7 +565,8 @@ private actor AmbiguousDispatchWebSocketConnection: WebSocketConnection {
             connectionWaiters.forEach { $0.resume() }
             connectionWaiters.removeAll()
         }
-        if request["tag"]?.stringValue == RPCMethod.serverGetConfig.rawValue,
+        if request["tag"]?.stringValue == RPCMethod.serverGetConfig.rawValue
+            || request["tag"]?.stringValue == RPCMethod.subscribeServerConfig.rawValue,
            let response = try retryConfigResponse(for: request) {
             enqueue(response)
             return
@@ -627,7 +629,8 @@ private actor PartialBootstrapWebSocketConnection: WebSocketConnection {
         }
         guard request["tag"]?.stringValue == RPCMethod.dispatchCommand.rawValue,
               let payload = request["payload"] else {
-            if request["tag"]?.stringValue == RPCMethod.serverGetConfig.rawValue,
+            if request["tag"]?.stringValue == RPCMethod.serverGetConfig.rawValue
+                || request["tag"]?.stringValue == RPCMethod.subscribeServerConfig.rawValue,
                let response = try retryConfigResponse(for: request) {
                 enqueue(response)
             }
@@ -686,13 +689,26 @@ private actor PartialBootstrapWebSocketConnection: WebSocketConnection {
 
 private func retryConfigResponse(for request: JSONValue) throws -> Data? {
     guard case let .number(requestID)? = request["id"] else { return nil }
+    let config = JSONValue.object(["providers": .array([])])
+    if request["tag"]?.stringValue == RPCMethod.subscribeServerConfig.rawValue {
+        return try JSONEncoder.t3.encode(
+            JSONValue.object([
+                "_tag": .string("Chunk"),
+                "requestId": .number(requestID),
+                "values": .array([.object([
+                    "type": .string("snapshot"),
+                    "config": config,
+                ])]),
+            ])
+        )
+    }
     return try JSONEncoder.t3.encode(
         JSONValue.object([
             "_tag": .string("Exit"),
             "requestId": .number(requestID),
             "exit": .object([
                 "_tag": .string("Success"),
-                "value": .object(["providers": .array([])]),
+                "value": config,
             ]),
         ])
     )

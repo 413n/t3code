@@ -1,7 +1,13 @@
+import AVFoundation
 import SwiftUI
 import UIKit
 
+struct FeatureModelRefreshError: LocalizedError {
+    var errorDescription: String? { "Couldn’t refresh models." }
+}
+
 struct FeatureComposerView: View {
+    @SwiftUI.Environment(\.scenePhase) private var scenePhase
     @State private var isManuallyExpanded = false
     @State private var isAttachmentFlowActive = false
     @State private var isModelPickerPresented = false
@@ -12,11 +18,21 @@ struct FeatureComposerView: View {
     @State private var pathSearchError: String?
     @State private var textSelectionRequest: FeatureComposerTextSelectionRequest?
     @State private var imageIntakeErrorMessage: String?
+    @State private var textRevision: UInt64 = 0
+    @State private var textObservation = FeatureComposerTextObservation()
+    @State private var voiceInputController = FeatureVoiceInputController()
     @Binding private var text: String
     @Binding private var selection: FeatureSelection?
     @Binding private var attachments: [FeatureDraftAttachment]
 
     private let providers: [FeatureProvider]
+    private let draftOwnerID: String
+    private let environmentID: String?
+    private let draftStorageKey: String?
+    private let environmentIsConnected: Bool
+    private let attachmentUploads: FeatureAttachmentUploadCoordinator
+    private let attachmentPreferences: FeatureEnvironmentPreferences
+    private let onRefreshModels: (() async throws -> Void)?
     private let threadSelection: FeatureSelection?
     private let materializesDefaultSelection: Bool
     private let isSending: Bool
@@ -38,6 +54,12 @@ struct FeatureComposerView: View {
         text: Binding<String>,
         selection: Binding<FeatureSelection?>,
         attachments: Binding<[FeatureDraftAttachment]>,
+        draftOwnerID: String,
+        environmentID: String?,
+        draftStorageKey: String?,
+        environmentIsConnected: Bool,
+        attachmentUploads: FeatureAttachmentUploadCoordinator,
+        attachmentPreferences: FeatureEnvironmentPreferences,
         providers: [FeatureProvider],
         threadSelection: FeatureSelection?,
         materializesDefaultSelection: Bool = true,
@@ -54,11 +76,19 @@ struct FeatureComposerView: View {
         powerFeatures: FeatureComposerPowerFeatures = .disabled,
         onDismissKeyboard: (() -> Void)? = nil,
         onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)? = nil,
-        onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)? = nil
+        onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)? = nil,
+        onRefreshModels: (() async throws -> Void)? = nil
     ) {
         _text = text
         _selection = selection
         _attachments = attachments
+        self.draftOwnerID = draftOwnerID
+        self.environmentID = environmentID
+        self.draftStorageKey = draftStorageKey
+        self.environmentIsConnected = environmentIsConnected
+        self.attachmentUploads = attachmentUploads
+        self.attachmentPreferences = attachmentPreferences
+        self.onRefreshModels = onRefreshModels
         self.providers = providers
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
@@ -131,6 +161,35 @@ struct FeatureComposerView: View {
             .task(id: pathSearchRequest) {
                 await updatePathSearch()
             }
+            .onAppear {
+                synchronizeVoiceDraft(ownerChanged: false)
+            }
+            .onDisappear {
+                voiceInputController.cancel()
+            }
+            .onChange(of: text) {
+                textRevision &+= 1
+                synchronizeVoiceDraft(ownerChanged: false)
+            }
+            .onChange(of: draftOwnerID) {
+                synchronizeVoiceDraft(ownerChanged: true)
+            }
+            .onChange(of: voiceInputController.pendingCommit?.id) {
+                applyPendingVoiceCommit()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background {
+                    voiceInputController.appMovedToBackground()
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: AVAudioSession.interruptionNotification
+            )) { notification in
+                guard let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
+                        as? UInt,
+                      AVAudioSession.InterruptionType(rawValue: rawType) == .began else { return }
+                voiceInputController.recordingWasInterrupted()
+            }
             .alert(
                 "Couldn’t add image",
                 isPresented: Binding(
@@ -179,7 +238,7 @@ struct FeatureComposerView: View {
         .clipShape(composerShape)
         .modifier(
             FeatureComposerImageDrop(
-                isEnabled: imagesAllowed,
+                isEnabled: imagesAllowed && !voiceInputController.isBusy,
                 shape: composerShape,
                 onDropImages: attachDroppedImages
             )
@@ -208,6 +267,11 @@ struct FeatureComposerView: View {
 
             submitButton
                 .padding(.trailing, 7)
+
+            if voiceInputController.isSupported {
+                voiceInputButton
+                    .padding(.trailing, 3)
+            }
         }
         .padding(.leading, 14)
         .padding(.vertical, 7)
@@ -235,7 +299,9 @@ struct FeatureComposerView: View {
                     focused: $focused,
                     placeholder: composerPlaceholder,
                     acceptsImages: imagesAllowed,
+                    isReadOnly: voiceInputController.isBusy,
                     selectionRequest: textSelectionRequest,
+                    onSelectionChange: handleTextSelectionChange,
                     onPasteImages: attachImageProviders,
                     onDismissKeyboard: onDismissKeyboard
                 )
@@ -257,8 +323,8 @@ struct FeatureComposerView: View {
             .layoutPriority(1)
             .clipped()
 
-            if !attachments.isEmpty, !imagesAllowed {
-                Label("Choose a model that accepts images", systemImage: "exclamationmark.circle")
+            if let attachmentBlocker {
+                Label(attachmentBlocker, systemImage: "exclamationmark.circle")
                     .font(T3Typography.supporting)
                     .foregroundStyle(T3Colors.warning)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -276,6 +342,14 @@ struct FeatureComposerView: View {
                     .accessibilityIdentifier("attachment-preparing")
             }
 
+            if let uploadStatus {
+                uploadStatusView(uploadStatus)
+            }
+
+            if voiceInputController.phase == .error {
+                voiceInputError
+            }
+
             composerFooter
                 .fixedSize(horizontal: false, vertical: true)
                 .layoutPriority(1)
@@ -283,12 +357,25 @@ struct FeatureComposerView: View {
     }
 
     private var composerFooter: some View {
+        Group {
+            if voiceInputController.isBusy {
+                voiceInputFooter
+            } else {
+                standardComposerFooter
+            }
+        }
+    }
+
+    private var standardComposerFooter: some View {
         HStack(spacing: 2) {
             FeatureImageAttachmentPicker(
                 attachments: $attachments,
                 preparationState: $attachmentPreparation,
                 isFlowActive: $isAttachmentFlowActive,
-                isEnabled: imagesAllowed
+                draftOwnerID: draftOwnerID,
+                environmentID: environmentID,
+                imagesAllowed: imagesAllowed,
+                maximumFileBytes: attachmentPreferences.maxFileAttachmentBytes
             )
 
             ProviderModelPicker(
@@ -297,12 +384,17 @@ struct FeatureComposerView: View {
                 style: .compact,
                 threadSelection: threadSelection,
                 materializesDefaultSelection: materializesDefaultSelection,
+                onRefresh: onRefreshModels,
                 onPresentationChange: handleModelPickerPresentation
             )
             .frame(maxWidth: 220, alignment: .leading)
             .layoutPriority(2)
 
             Spacer(minLength: 0)
+
+            if voiceInputController.isSupported {
+                voiceInputButton
+            }
 
             if let contextUsage {
                 FeatureContextMeter(usage: contextUsage)
@@ -314,6 +406,98 @@ struct FeatureComposerView: View {
         .padding(.horizontal, 7)
         .padding(.top, 2)
         .padding(.bottom, 8)
+    }
+
+    private var voiceInputButton: some View {
+        Button(action: startVoiceInput) {
+            Image(systemName: "mic")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(T3Colors.textSecondary)
+                .frame(width: T3Metrics.minimumTapTarget, height: T3Metrics.minimumTapTarget)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Start voice input")
+        .accessibilityIdentifier("voice-input-start")
+    }
+
+    private var voiceInputFooter: some View {
+        HStack(spacing: 8) {
+            voiceInputStatus
+                .font(T3Typography.supporting)
+                .foregroundStyle(T3Colors.textSecondary)
+
+            Spacer(minLength: 0)
+
+            Button("Cancel") {
+                voiceInputController.cancel()
+            }
+            .font(T3Typography.supporting)
+            .foregroundStyle(T3Colors.textSecondary)
+            .frame(minHeight: T3Metrics.minimumTapTarget)
+
+            if voiceInputController.phase == .recording {
+                Button("Stop") {
+                    voiceInputController.stop()
+                }
+                .font(T3Typography.supporting.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 34)
+                .background(T3Colors.accent, in: Capsule())
+                .frame(minHeight: T3Metrics.minimumTapTarget)
+                .accessibilityLabel("Stop recording and transcribe")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var voiceInputStatus: some View {
+        switch voiceInputController.phase {
+        case .preparing:
+            Text("Preparing")
+        case .recording:
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text("Recording \(voiceRecordingDuration(at: context.date))")
+                    .monospacedDigit()
+            }
+        case .transcribing:
+            Text("Transcribing")
+        case .idle, .error:
+            EmptyView()
+        }
+    }
+
+    private var voiceInputError: some View {
+        HStack(spacing: 8) {
+            Text(voiceInputController.errorMessage ?? "Voice input failed.")
+                .font(T3Typography.supporting)
+                .foregroundStyle(T3Colors.danger)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let action = voiceInputController.errorAction {
+                Button(action == .settings ? "Settings" : "Retry") {
+                    if action == .settings,
+                       let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    } else {
+                        startVoiceInput()
+                    }
+                }
+                .font(T3Typography.supporting.weight(.semibold))
+            }
+
+            Button("Dismiss") {
+                voiceInputController.cancel()
+            }
+            .font(T3Typography.supporting)
+            .foregroundStyle(T3Colors.textSecondary)
+        }
+        .padding(.horizontal, 15)
+        .padding(.bottom, 4)
     }
 
     private var submitButton: some View {
@@ -359,6 +543,8 @@ struct FeatureComposerView: View {
             || !textIsEmpty
             || !attachments.isEmpty
             || attachmentPreparation.isPreparing
+            || voiceInputController.isBusy
+            || voiceInputController.phase == .error
     }
 
     private var showsStop: Bool {
@@ -379,9 +565,12 @@ struct FeatureComposerView: View {
             text: text,
             attachmentCount: attachments.count,
             imagesAllowed: imagesAllowed,
+            filesAllowed: attachmentPreferences.maxFileAttachmentBytes != nil,
+            containsImages: attachments.contains { $0.mimeType.hasPrefix("image/") },
+            containsFiles: attachments.contains { !$0.mimeType.hasPrefix("image/") },
             isSending: isSending,
             preparationState: attachmentPreparation
-        )
+        ) && !uploadsBlockSend
     }
 
     private var imagesAllowed: Bool {
@@ -389,6 +578,86 @@ struct FeatureComposerView: View {
             selection: selection ?? threadSelection,
             providers: providers
         )
+    }
+
+    private var attachmentBlocker: String? {
+        if attachments.contains(where: { !$0.mimeType.hasPrefix("image/") }),
+           attachmentPreferences.maxFileAttachmentBytes == nil {
+            return "This environment does not accept file attachments"
+        }
+        if attachments.contains(where: { $0.mimeType.hasPrefix("image/") }), !imagesAllowed {
+            return "Choose a model that accepts images"
+        }
+        return nil
+    }
+
+    private struct UploadStatus {
+        var pendingCount = 0
+        var failures: [(UUID, String)] = []
+    }
+
+    private var applicableUploadStates: [(UUID, FeatureAttachmentUploadState?)] {
+        guard environmentIsConnected, let environmentID, draftStorageKey != nil else { return [] }
+        return attachments.compactMap { attachment in
+            let isImage = attachment.mimeType.hasPrefix("image/")
+            let uploadsHere = isImage
+                ? attachmentPreferences.supportsImageUploads
+                : attachmentPreferences.maxFileAttachmentBytes != nil
+            guard uploadsHere else { return nil }
+            return (
+                attachment.id,
+                attachmentUploads.state(
+                    environmentID: environmentID,
+                    attachmentID: attachment.id
+                )
+            )
+        }
+    }
+
+    private var uploadsBlockSend: Bool {
+        applicableUploadStates.contains { _, state in
+            if case .some(.ready) = state { return false }
+            return true
+        }
+    }
+
+    private var uploadStatus: UploadStatus? {
+        var result = UploadStatus()
+        for (id, state) in applicableUploadStates {
+            switch state {
+            case .some(.ready): break
+            case let .some(.failed(message)): result.failures.append((id, message))
+            case .some(.queued), .some(.uploading), .none: result.pendingCount += 1
+            }
+        }
+        return result.pendingCount == 0 && result.failures.isEmpty ? nil : result
+    }
+
+    private func uploadStatusView(_ status: UploadStatus) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if status.pendingCount > 0 {
+                Text("Uploading \(status.pendingCount) attachment\(status.pendingCount == 1 ? "" : "s")")
+            }
+            ForEach(status.failures, id: \.0) { failure in
+                HStack(spacing: 8) {
+                    Text(failure.1).lineLimit(2)
+                    Spacer(minLength: 0)
+                    Button("Retry") {
+                        guard let environmentID else { return }
+                        attachmentUploads.retry(
+                            environmentID: environmentID,
+                            attachmentID: failure.0
+                        )
+                    }
+                }
+            }
+        }
+        .font(T3Typography.supporting)
+        .foregroundStyle(status.failures.isEmpty ? T3Colors.textSecondary : T3Colors.danger)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 15)
+        .padding(.bottom, 4)
+        .accessibilityIdentifier("attachment-upload-status")
     }
 
     /// Trigger detection walks the whole draft with character indices and is
@@ -423,6 +692,7 @@ struct FeatureComposerView: View {
 
     private var showsCommandMenu: Bool {
         isExpanded
+            && !voiceInputController.isBusy
             && pendingApprovals.isEmpty
             && pendingUserInputs.isEmpty
             && composerTrigger != nil
@@ -512,6 +782,47 @@ struct FeatureComposerView: View {
                   canSend {
             onSend()
         }
+    }
+
+    private func startVoiceInput() {
+        synchronizeVoiceDraft(ownerChanged: false)
+        focused = false
+        voiceInputController.start()
+    }
+
+    private func handleTextSelectionChange(_ selection: NSRange) {
+        textObservation.selection = selection
+        voiceInputController.updateSelection(selection)
+    }
+
+    private func synchronizeVoiceDraft(ownerChanged: Bool) {
+        let snapshot = FeatureVoiceDraftSnapshot(
+            ownerID: draftOwnerID,
+            text: text,
+            revision: textRevision,
+            selection: textObservation.selection
+        )
+        if ownerChanged {
+            voiceInputController.ownerChanged(to: snapshot)
+        } else {
+            voiceInputController.updateDraft(snapshot)
+        }
+    }
+
+    private func applyPendingVoiceCommit() {
+        guard let commit = voiceInputController.pendingCommit else { return }
+        textSelectionRequest = FeatureComposerTextSelectionRequest(
+            location: commit.caretLocation
+        )
+        text = commit.text
+        voiceInputController.consumePendingCommit()
+    }
+
+    private func voiceRecordingDuration(at date: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSince(
+            voiceInputController.recordingStartedAt ?? date
+        )))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 
     private func handleModelPickerPresentation(_ isPresented: Bool) {
@@ -612,6 +923,9 @@ enum FeatureComposerSubmissionEligibility {
         text: String,
         attachmentCount: Int,
         imagesAllowed: Bool,
+        filesAllowed: Bool = false,
+        containsImages: Bool = true,
+        containsFiles: Bool = false,
         isSending: Bool,
         preparationState: FeatureAttachmentPreparationState
     ) -> Bool {
@@ -620,7 +934,8 @@ enum FeatureComposerSubmissionEligibility {
         return !isSending
             && !preparationState.isPreparing
             && (hasText || hasAttachments)
-            && (!hasAttachments || imagesAllowed)
+            && (!hasAttachments || !containsImages || imagesAllowed)
+            && (!hasAttachments || !containsFiles || filesAllowed)
     }
 }
 

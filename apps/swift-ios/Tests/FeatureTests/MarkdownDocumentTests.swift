@@ -6,6 +6,153 @@ import UIKit
 @Suite("Chat Markdown")
 struct MarkdownDocumentTests {
     @Test
+    func codexFileCitationsBecomeWorkspaceLinks() {
+        let document = MarkdownDocument(
+            parsing: #"See :codex-file-citation{path="docs/My file%#?.md" line_range_start="12"}."#
+        )
+
+        #expect(
+            document.blocks == [
+                .paragraph("See [My file%#?.md](<docs/My file%25%23%3F.md#L12>)."),
+            ]
+        )
+    }
+
+    @Test
+    func codexFileCitationsEscapeLabelsAndDestinations() {
+        let document = MarkdownDocument(
+            parsing: #":codex-file-citation{path=" reports/*draft*_[copy]`<&).txt "}"#
+        )
+
+        #expect(
+            document.blocks == [
+                .paragraph(
+                    #"[\*draft\*\_\[copy\]\`\<\&).txt](<reports/*draft*_[copy]`%3C&).txt>)"#
+                ),
+            ]
+        )
+
+        #expect(
+            CodexMarkdownDirectives.fileCitation(
+                from: ":codex-file-citation{path=\"reports/a<b>\r\n.txt\"}"
+            ) == "[a\\<b>\r\n.txt](<reports/a%3Cb%3E%0D%0A.txt>)"
+        )
+    }
+
+    @Test
+    func codexFileCitationEndIsQuoteAwareAndSupportsSingleQuotes() {
+        let document = MarkdownDocument(
+            parsing: #":codex-file-citation{path='reports/a}b file.md' line_range_start=' 9 '}"#
+        )
+
+        #expect(document.blocks == [.paragraph("[a}b file.md](<reports/a}b file.md#L9>)")])
+
+        #expect(
+            MarkdownDocument(
+                parsing: ":codex-file-citation{path=reports/unquoted.md line_range_start=3}"
+            ).blocks == [.paragraph("[unquoted.md](<reports/unquoted.md#L3>)")]
+        )
+    }
+
+    @Test
+    func codexFileCitationsStayLiteralInEscapedCodeAndReferenceLinks() {
+        let directive = #":codex-file-citation{path="src/file.swift"}"#
+        let document = MarkdownDocument(
+            parsing: """
+            \\`\(directive)\\`
+
+            [outer [nested \(directive)] label][ref]
+
+            [ref]: docs/reference.md
+            """
+        )
+
+        #expect(document.blocks[0] == .paragraph("\\`[file.swift](<src/file.swift>)\\`"))
+        #expect(document.blocks[1] == .paragraph("[outer [nested \(directive)] label][ref]"))
+    }
+
+    @Test
+    func codexFileCitationsStayLiteralInCodeAndLinks() {
+        let directive = #":codex-file-citation{path="src/file.swift" line_range_start="2"}"#
+        let document = MarkdownDocument(
+            parsing: """
+            `\(directive)`
+
+                \(directive)
+
+            ```text
+            \(directive)
+            ```
+
+            [existing \(directive)](docs/existing.md)
+            """
+        )
+
+        #expect(document.blocks[0] == .paragraph("`\(directive)`"))
+        #expect(document.blocks[1] == .paragraph("    \(directive)"))
+        #expect(document.blocks[2] == .codeBlock(language: "text", code: directive))
+        #expect(document.blocks[3] == .paragraph("[existing \(directive)](docs/existing.md)"))
+    }
+
+    @Test
+    func malformedAndIncompleteCodexDirectivesStayLiteral() {
+        let missingPath = #":codex-file-citation{line_range_start="4"}"#
+        let incomplete = #":codex-file-citation{path="src/file.swift""#
+        let invalidLine = #":codex-file-citation{path="src/file.swift" line_range_start="zero"}"#
+        let document = MarkdownDocument(parsing: "\(missingPath)\n\(incomplete)\n\(invalidLine)")
+
+        #expect(
+            document.blocks == [
+                .paragraph("\(missingPath)\n\(incomplete)\n[file.swift](<src/file.swift>)"),
+            ]
+        )
+    }
+
+    @Test
+    func parsesArtifactTemplatesInsideNestedLists() {
+        let directive = #"::artifact-template{artifact_kind="document" display_name="Release notes template" skill_directory="/templates/release notes" skill_name="artifact-template-release" gallery_kind="imagegen"}"#
+        let document = MarkdownDocument(parsing: "- Templates\n  - \(directive)")
+        guard case let .unorderedList(items) = document.blocks.first,
+              case let .unorderedList(children) = items.first?.blocks.last,
+              case let .artifactTemplate(template) = children.first?.blocks.first else {
+            Issue.record("Expected a nested artifact template")
+            return
+        }
+
+        #expect(template.displayName == "Release notes template")
+        #expect(template.kind == .document)
+        #expect(template.usePrompt == "Create a document using this $artifact-template-release about…")
+        #expect(template.useURL?.scheme == "t3code")
+    }
+
+    @Test
+    func invalidArtifactTemplateAttributesStayLiteral() {
+        for directive in [
+            #"::artifact-template{artifact_kind="video" display_name="Demo" skill_directory="/tmp" skill_name="artifact-template-demo"}"#,
+            #"::artifact-template{artifact_kind="image" display_name="Demo" skill_directory="relative" skill_name="artifact-template-demo"}"#,
+            #"::artifact-template{artifact_kind="image" display_name="Demo" skill_directory="C:\\templates" skill_name="wrong"}"#,
+            #"::artifact-template{artifact_kind="image" display_name="Demo" skill_directory="/tmp" skill_name="artifact-template-demo" gallery_kind="unknown"}"#,
+        ] {
+            #expect(MarkdownDocument(parsing: directive).blocks == [.paragraph(directive)])
+        }
+
+        let validButIndented = #"    ::artifact-template{artifact_kind="document" display_name="Demo" skill_directory="/tmp" skill_name="artifact-template-demo"}"#
+        #expect(
+            MarkdownDocument(parsing: validButIndented).blocks == [.paragraph(validButIndented)]
+        )
+    }
+
+    @Test
+    func relativeImagesCanResolveFromTheViewedSourceFile() {
+        #expect(
+            MarkdownImageSource.classify(
+                "images/preview.png",
+                workspaceRoot: "/workspace/project/docs"
+            ) == .workspaceFile("/workspace/project/docs/images/preview.png")
+        )
+    }
+
+    @Test
     func workspaceFileLinksResolveRelativeAbsoluteAndSpacedPaths() throws {
         #expect(
             MarkdownWorkspaceFileLink.relativePath(
@@ -24,6 +171,20 @@ struct MarkdownDocumentTests {
                 for: try #require(URL(string: "file:///workspace/project/src/main.swift#L18")),
                 workspaceRoot: "/workspace/project"
             ) == "src/main.swift"
+        )
+        #expect(
+            MarkdownWorkspaceFileLink.relativePath(
+                for: try #require(URL(string: "/workspace/project/src/a%23b%3Fc%25.swift#L2")),
+                workspaceRoot: "/workspace/project"
+            ) == "src/a#b?c%.swift"
+        )
+        #expect(
+            MarkdownWorkspaceFileLink.relativePath(
+                for: try #require(
+                    URL(string: "file:///workspace/project/src/a%23b%3Fc%25.swift#L2")
+                ),
+                workspaceRoot: "/workspace/project"
+            ) == "src/a#b?c%.swift"
         )
     }
 

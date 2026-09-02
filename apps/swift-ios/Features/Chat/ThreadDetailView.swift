@@ -28,6 +28,8 @@ public struct ThreadDetailView: View {
     @State private var draftSaveTask: Task<Void, Never>?
     @State private var toolSurface: FeatureThreadToolSurface?
     @State private var branchPullRequest: FeaturePullRequest?
+    @State private var linkedMediaPreview: FeatureLinkedMediaPreview?
+    @State private var linkedMediaPreviewError: String?
     // Plain state, not `FocusState`: the composer's UIKit text view owns
     // focus and mirrors it through this binding, because SwiftUI drops
     // writes to a `FocusState` no `.focused()` view registers with.
@@ -110,9 +112,18 @@ public struct ThreadDetailView: View {
                 Group {
                     switch surface {
                     case .files:
-                        FeatureFilesView(client: model.client, threadID: thread.id)
+                        FeatureFilesView(
+                            client: model.client,
+                            threadID: thread.id,
+                            workspaceRoot: markdownImageContext?.workspaceRoot
+                        )
                     case let .file(path):
-                        FeatureFilesView(client: model.client, threadID: thread.id, initialPath: path)
+                        FeatureFilesView(
+                            client: model.client,
+                            threadID: thread.id,
+                            initialPath: path,
+                            workspaceRoot: markdownImageContext?.workspaceRoot
+                        )
                     case .review:
                         FeatureReviewView(client: model.client, threadID: thread.id)
                     case .sourceControl:
@@ -164,17 +175,70 @@ public struct ThreadDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .environment(\.openURL, OpenURLAction { url in
+            if handleArtifactTemplateURL(url) { return .handled }
+            if handleTypedMediaPreviewURL(url) { return .handled }
             guard let workspaceRoot = markdownImageContext?.workspaceRoot,
                   let path = MarkdownWorkspaceFileLink.relativePath(
                       for: url,
                       workspaceRoot: workspaceRoot
                   ) else {
+                if url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https",
+                   let kind = FeatureLinkedMediaPreview.previewKind(for: url) {
+                    linkedMediaPreview = FeatureLinkedMediaPreview(
+                        source: url.isFileURL ? .file(url) : .remote(url),
+                        kind: kind,
+                        fileName: url.lastPathComponent
+                    )
+                    return .handled
+                }
+                if url.isFileURL {
+                    let path = url.path
+                    let kind = FeatureFilePreviewKind.infer(path: path)
+                    if kind == .image || kind == .video {
+                        resolveHostMedia(path: path, kind: kind)
+                        return .handled
+                    }
+                }
+                if url.scheme?.lowercased() == "t3code" { return .discarded }
                 parentOpenURL(url)
+                return .handled
+            }
+            let kind = FeatureFilePreviewKind.infer(path: path)
+            if kind == .image || kind == .video {
+                resolveHostMedia(path: path, kind: kind)
                 return .handled
             }
             toolSurface = .file(path)
             return .handled
         })
+        .fullScreenCover(item: $linkedMediaPreview) { preview in
+            NavigationStack {
+                FeatureNativeMediaPreviewView(
+                    source: preview.source,
+                    kind: preview.kind,
+                    fileName: preview.fileName
+                )
+                .navigationTitle(preview.fileName)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { linkedMediaPreview = nil }
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
+        .alert(
+            "Preview unavailable",
+            isPresented: Binding(
+                get: { linkedMediaPreviewError != nil },
+                set: { if !$0 { linkedMediaPreviewError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(linkedMediaPreviewError ?? "The file could not be opened.")
+        }
     }
 
     private var detail: FeatureThreadDetail? {
@@ -584,6 +648,14 @@ public struct ThreadDetailView: View {
                     text: $draft,
                     selection: $selection,
                     attachments: $attachments,
+                    draftOwnerID: "thread:\(currentThread.id)",
+                    environmentID: currentThread.environmentID,
+                    draftStorageKey: draftKey,
+                    environmentIsConnected: threadConnectionState == .connected,
+                    attachmentUploads: model.attachmentUploads,
+                    attachmentPreferences: currentThread.environmentID.flatMap {
+                        model.snapshot.preferencesByEnvironment?[$0]
+                    } ?? FeatureEnvironmentPreferences(),
                     providers: threadProviders,
                     threadSelection: currentSelection,
                     materializesDefaultSelection: false,
@@ -604,7 +676,8 @@ public struct ThreadDetailView: View {
                     },
                     onUserInputSubmit: { id, answers in
                         Task { await model.resolveUserInput(id, answers: answers) }
-                    }
+                    },
+                    onRefreshModels: refreshThreadEnvironmentModels
                 )
             }
             .background(T3Colors.background)
@@ -638,6 +711,13 @@ public struct ThreadDetailView: View {
             for: currentThread,
             in: model.snapshot
         )
+    }
+
+    private func refreshThreadEnvironmentModels() async throws {
+        guard let environmentID = currentThread.environmentID else { return }
+        guard await model.refreshProviders(environmentID: environmentID) else {
+            throw FeatureModelRefreshError()
+        }
     }
 
     private var timelineRenderUpdate: FeatureDetailRenderUpdate? {
@@ -676,6 +756,60 @@ public struct ThreadDetailView: View {
         )
     }
 
+    private func handleArtifactTemplateURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "t3code",
+              url.host?.lowercased() == "codex-artifact-template",
+              url.path == "/use",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.queryItems?.count == 1,
+              components.queryItems?.first?.name == "prompt",
+              let prompt = components.queryItems?.first?.value?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !prompt.isEmpty, prompt.count <= 4_096 else { return false }
+        if draft == prompt || draft.hasSuffix(" \(prompt)") || draft.hasSuffix("\n\(prompt)") {
+            composerFocused = true
+            return true
+        }
+        draft = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? prompt
+            : draft + (draft.last?.isWhitespace == true ? "" : " ") + prompt
+        composerFocused = true
+        return true
+    }
+
+    private func handleTypedMediaPreviewURL(_ url: URL) -> Bool {
+        guard let route = FeatureTypedMediaPreviewRoute.parse(url) else { return false }
+        resolveHostMedia(path: route.path, kind: route.kind)
+        return true
+    }
+
+    private func resolveHostMedia(path: String, kind: FeatureFilePreviewKind) {
+        guard let resolver = model.client as? any FeatureWorkspaceAssetResolving else {
+            linkedMediaPreviewError = "This environment cannot resolve media files."
+            return
+        }
+        let requestedThreadID = currentThread.id
+        Task {
+            do {
+                let resolved = try await resolver.mediaAssetURL(
+                    threadID: requestedThreadID,
+                    path: path
+                )
+                guard !Task.isCancelled, currentThread.id == requestedThreadID else { return }
+                linkedMediaPreview = FeatureLinkedMediaPreview(
+                    source: .remote(resolved),
+                    kind: kind,
+                    fileName: URL(fileURLWithPath: path).lastPathComponent
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, currentThread.id == requestedThreadID else { return }
+                linkedMediaPreviewError = error.localizedDescription
+            }
+        }
+    }
+
     private func dismissKeyboard() {
         guard composerFocused else { return }
         composerFocused = false
@@ -689,7 +823,13 @@ public struct ThreadDetailView: View {
 
     private func send() {
         let message = draft
-        let pendingAttachments = attachments
+        let pendingAttachments = currentThread.environmentID.map {
+            model.attachmentUploads.attachmentsForSend(
+                draftKey: draftKey,
+                environmentID: $0,
+                attachments: attachments
+            )
+        } ?? attachments
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !pendingAttachments.isEmpty else {
             return
@@ -837,6 +977,12 @@ public struct ThreadDetailView: View {
         // not pass the didRestoreDraft gate, so enqueue their first save now.
         if liveDraft != baseline {
             scheduleDraftSave()
+        } else if saved != nil, let environmentID = currentThread.environmentID {
+            model.attachmentUploads.syncOwner(
+                draftKey: key,
+                environmentID: environmentID,
+                attachments: restored.attachments
+            )
         }
     }
 
@@ -845,11 +991,19 @@ public struct ThreadDetailView: View {
         draftSaveTask?.cancel()
         let snapshot = composerDraft
         let key = draftKey
+        let environmentID = currentThread.environmentID
         draftSaveTask = Task {
             do {
                 try await Task.sleep(for: .milliseconds(220))
                 try Task.checkCancellation()
                 try await draftStore.setDraft(snapshot, for: key)
+                if let environmentID {
+                    model.attachmentUploads.syncOwner(
+                        draftKey: key,
+                        environmentID: environmentID,
+                        attachments: snapshot.attachments
+                    )
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -863,8 +1017,20 @@ public struct ThreadDetailView: View {
         draftSaveTask?.cancel()
         let snapshot = composerDraft
         let key = draftKey
+        let environmentID = currentThread.environmentID
         draftSaveTask = Task {
-            try? await draftStore.setDraft(snapshot, for: key)
+            do {
+                try await draftStore.setDraft(snapshot, for: key)
+                if let environmentID {
+                    model.attachmentUploads.syncOwner(
+                        draftKey: key,
+                        environmentID: environmentID,
+                        attachments: snapshot.attachments
+                    )
+                }
+            } catch {
+                return
+            }
         }
     }
 
@@ -2202,7 +2368,7 @@ struct FeatureMessageView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityIdentifier("message-\(message.id)")
         case .tool:
-            FeatureWorkLogView(message: message)
+            FeatureWorkLogView(message: message, imageContext: imageContext)
                 .id(message.id)
         case .system:
             Text(message.text)
@@ -2226,6 +2392,7 @@ struct FeatureMessageView: View {
 
 private struct FeatureWorkLogView: View {
     let message: FeatureMessage
+    let imageContext: MarkdownImageContext?
     @State private var isExpanded = false
 
     var body: some View {
@@ -2236,7 +2403,14 @@ private struct FeatureWorkLogView: View {
                 withTransaction(transaction) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 8) {
-                    Label(message.toolName ?? "Tool output", systemImage: "terminal")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label(message.toolName ?? "Tool output", systemImage: "terminal")
+                        if let activeWorkLabel = message.activeWorkLabel {
+                            Text(activeWorkLabel)
+                                .lineLimit(1)
+                                .foregroundStyle(T3Colors.statusRunning)
+                        }
+                    }
                     Spacer(minLength: 8)
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.caption.weight(.semibold))
@@ -2258,6 +2432,18 @@ private struct FeatureWorkLogView: View {
                     .textSelection(.enabled)
                     .padding(.top, 8)
                     .transition(.identity)
+                if FeatureWorkLogMedia.shouldRenderImages(
+                    isExpanded: isExpanded,
+                    paths: message.workLogImagePaths ?? []
+                ) {
+                    MarkdownMessageView(
+                        FeatureWorkLogMedia.markdownSource(
+                            for: message.workLogImagePaths ?? []
+                        ),
+                        imageContext: imageContext
+                    )
+                    .padding(.top, 8)
+                }
             }
         }
         .padding(.vertical, 6)
@@ -2266,6 +2452,23 @@ private struct FeatureWorkLogView: View {
             transaction.animation = nil
             transaction.disablesAnimations = true
         }
+    }
+}
+
+enum FeatureWorkLogMedia {
+    static func shouldRenderImages(isExpanded: Bool, paths: [String]) -> Bool {
+        isExpanded && !paths.isEmpty
+    }
+
+    static func markdownSource(for paths: [String]) -> String {
+        paths.prefix(8).compactMap { path in
+            guard let escaped = path.addingPercentEncoding(
+                withAllowedCharacters: .urlPathAllowed.subtracting(
+                    CharacterSet(charactersIn: "()<>[]!\\\"' #%?\n\r")
+                )
+            ) else { return nil }
+            return "![](\(escaped))"
+        }.joined(separator: "\n\n")
     }
 }
 
@@ -2345,24 +2548,20 @@ private struct FeatureMessageAttachmentsView: View {
                     )
                     .accessibilityValue(attachmentAccessibilityValue(attachment))
                     .accessibilityIdentifier("attachment-\(attachment.id)")
-                    .accessibilityAddTraits(
-                        attachment.mimeType.hasPrefix("image/") && attachment.url != nil
-                            ? .isButton
-                            : []
-                    )
+                    .accessibilityAddTraits(canPreview(attachment) ? .isButton : [])
                     .accessibilityHint(
-                        attachment.mimeType.hasPrefix("image/") && attachment.url != nil
+                        canPreview(attachment)
                             ? "Opens full-screen preview"
                             : ""
                     )
                     .accessibilityAction {
-                        if attachment.mimeType.hasPrefix("image/"), attachment.url != nil {
+                        if canPreview(attachment) {
                             previewedAttachment = attachment
                         }
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if attachment.mimeType.hasPrefix("image/"), attachment.url != nil {
+                        if canPreview(attachment) {
                             previewedAttachment = attachment
                         }
                     }
@@ -2390,6 +2589,11 @@ private struct FeatureMessageAttachmentsView: View {
         )
         return "\(attachment.name), \(size)"
     }
+
+    private func canPreview(_ attachment: FeatureMessageAttachment) -> Bool {
+        (attachment.previewData != nil && attachment.mimeType.hasPrefix("image/"))
+            || attachment.url != nil
+    }
 }
 
 private struct FeatureAttachmentPreview: View {
@@ -2398,29 +2602,16 @@ private struct FeatureAttachmentPreview: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                Color.black.ignoresSafeArea()
-                if let url = attachment.url {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case let .success(image):
-                            image
-                                .resizable()
-                                .scaledToFit()
-                        case .failure:
-                            ContentUnavailableView(
-                                "Image unavailable",
-                                systemImage: "exclamationmark.triangle"
-                            )
-                        case .empty:
-                            ProgressView()
-                        @unknown default:
-                            ProgressView()
-                        }
-                    }
-                    .padding(12)
-                }
-            }
+            FeatureNativeMediaPreviewView(
+                source: attachment.previewData.map(FeatureMediaPreviewSource.localImage)
+                    ?? attachment.url.map(FeatureMediaPreviewSource.remote)
+                    ?? .localImage(Data()),
+                kind: FeatureLinkedMediaPreview.previewKind(
+                    fileName: attachment.name,
+                    mimeType: attachment.mimeType
+                ),
+                fileName: attachment.name
+            )
             .navigationTitle(attachment.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -2431,5 +2622,28 @@ private struct FeatureAttachmentPreview: View {
             .t3NavigationChrome()
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+private struct FeatureLinkedMediaPreview: Identifiable {
+    let id = UUID()
+    let source: FeatureMediaPreviewSource
+    let kind: FeatureFilePreviewKind
+    let fileName: String
+
+    static func previewKind(for url: URL) -> FeatureFilePreviewKind? {
+        let kind = FeatureFilePreviewKind.infer(path: url.path)
+        return switch kind {
+        case .image, .pdf, .video, .document: kind
+        case .markdown, .source, .plainText: nil
+        }
+    }
+
+    static func previewKind(fileName: String, mimeType: String) -> FeatureFilePreviewKind {
+        if mimeType.hasPrefix("image/") { return .image }
+        if mimeType.hasPrefix("video/") { return .video }
+        if mimeType == "application/pdf" { return .pdf }
+        let inferred = FeatureFilePreviewKind.infer(path: fileName)
+        return inferred == .plainText ? .document : inferred
     }
 }

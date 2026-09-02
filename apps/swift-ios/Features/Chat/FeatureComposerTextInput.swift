@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import Observation
 
 /// The composer's text entry is a UIKit text view because SwiftUI's text
 /// inputs expose no paste hook on iOS: the long-press Paste menu can never
@@ -15,7 +16,9 @@ struct FeatureComposerTextInput: UIViewRepresentable {
     @Binding var focused: Bool
     let placeholder: String
     let acceptsImages: Bool
+    let isReadOnly: Bool
     let selectionRequest: FeatureComposerTextSelectionRequest?
+    let onSelectionChange: (NSRange) -> Void
     let onPasteImages: ([NSItemProvider]) -> Void
     let onDismissKeyboard: (() -> Void)?
 
@@ -27,6 +30,7 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         let textView = FeatureComposerUITextView()
         textView.delegate = context.coordinator
         textView.acceptsImages = acceptsImages
+        textView.isEditable = !isReadOnly
         textView.onPasteImages = onPasteImages
         textView.onDismissKeyboard = onDismissKeyboard
         if onDismissKeyboard != nil {
@@ -59,10 +63,16 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         textView.acceptsImages = acceptsImages
         textView.onPasteImages = onPasteImages
         textView.onDismissKeyboard = onDismissKeyboard
+        textView.isEditable = !isReadOnly
 
         let shouldApplySelection = selectionRequest.map {
             context.coordinator.lastAppliedSelectionRequestID != $0.id
         } ?? false
+        context.coordinator.isApplyingProgrammaticUpdate = true
+        defer {
+            context.coordinator.isApplyingProgrammaticUpdate = false
+            onSelectionChange(textView.selectedRange)
+        }
         if textView.text != text {
             let previousText = textView.text ?? ""
             let selectedRange = textView.selectedRange
@@ -132,15 +142,22 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         var parent: FeatureComposerTextInput
         var lastAppliedFocus: Bool?
         var lastAppliedSelectionRequestID: UUID?
+        var isApplyingProgrammaticUpdate = false
 
         init(_ parent: FeatureComposerTextInput) {
             self.parent = parent
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            guard !isApplyingProgrammaticUpdate else { return }
             guard parent.text != textView.text else { return }
             parent.text = textView.text
             (textView as? FeatureComposerUITextView)?.scrollSelectionIntoView()
+        }
+
+        func textViewDidChangeSelection(_ textView: UITextView) {
+            guard !isApplyingProgrammaticUpdate else { return }
+            parent.onSelectionChange(textView.selectedRange)
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -396,6 +413,15 @@ enum FeatureComposerPasteboardPolicy {
 struct FeatureComposerTextSelectionRequest: Equatable {
     let id = UUID()
     let location: Int
+}
+
+/// Selection changes come from `updateUIView` and UIKit delegate callbacks.
+/// Keeping this value outside Observation avoids synchronous SwiftUI state
+/// writes while the representable is updating.
+@MainActor
+@Observable
+final class FeatureComposerTextObservation {
+    @ObservationIgnored var selection = NSRange(location: 0, length: 0)
 }
 
 enum FeatureComposerTextSelectionPolicy {

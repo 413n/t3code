@@ -94,6 +94,18 @@ public struct NewThreadView: View {
                         text: $prompt,
                         selection: selectionBinding,
                         attachments: $attachments,
+                        draftOwnerID: selectedProject.map {
+                            "new-task:\($0.environmentID):\($0.id)"
+                        } ?? "new-task:unselected",
+                        environmentID: selectedProject?.environmentID,
+                        draftStorageKey: currentDraftKey,
+                        environmentIsConnected: selectedProject.flatMap { project in
+                            model.snapshot.environments.first {
+                                $0.id == project.environmentID
+                            }?.connectionState
+                        } == .connected,
+                        attachmentUploads: model.attachmentUploads,
+                        attachmentPreferences: environmentPreferences,
                         providers: creationProviders,
                         threadSelection: nil,
                         isSending: isSubmitting,
@@ -103,7 +115,8 @@ public struct NewThreadView: View {
                         onStop: {},
                         forceExpanded: true,
                         powerFeatures: composerPowerFeatures,
-                        onDismissKeyboard: { promptFocused = false }
+                        onDismissKeyboard: { promptFocused = false },
+                        onRefreshModels: refreshSelectedEnvironmentModels
                     )
                 }
                 .background(T3Colors.background)
@@ -574,6 +587,13 @@ public struct NewThreadView: View {
         )
     }
 
+    private func refreshSelectedEnvironmentModels() async throws {
+        guard let environmentID = selectedProject?.environmentID else { return }
+        guard await model.refreshProviders(environmentID: environmentID) else {
+            throw FeatureModelRefreshError()
+        }
+    }
+
     private var selectionBinding: Binding<FeatureSelection?> {
         Binding(
             get: { selection },
@@ -726,7 +746,11 @@ public struct NewThreadView: View {
                 )
                 : nil,
             startFromOrigin: startFromOrigin,
-            attachments: attachments
+            attachments: model.attachmentUploads.attachmentsForSend(
+                draftKey: draftKey ?? FeatureComposerDraftStore.newTaskKey(project: project),
+                environmentID: project.environmentID,
+                attachments: attachments
+            )
         )
 
         Task { @MainActor in
@@ -976,6 +1000,12 @@ public struct NewThreadView: View {
         restoredDraftProjectID = requestedProjectID
         if liveDraft != context.baseline {
             scheduleDraftSave()
+        } else if saved != nil {
+            model.attachmentUploads.syncOwner(
+                draftKey: key,
+                environmentID: project.environmentID,
+                attachments: restored.attachments
+            )
         }
         refreshAutomaticProjectIfNeeded()
         guard projectID == requestedProjectID else { return }
@@ -1023,12 +1053,20 @@ public struct NewThreadView: View {
         pendingDraftSaveTask?.cancel()
         draftSaveTask = nil
         let snapshot = composerDraft
+        let environmentID = selectedProject?.environmentID
         draftSaveTask = Task {
             await NewTaskDraftWriteFence.wait(pendingDraftSaveTask)
             do {
                 try await Task.sleep(for: .milliseconds(220))
                 try Task.checkCancellation()
                 try await draftStore.setDraft(snapshot, for: key)
+                if let environmentID {
+                    model.attachmentUploads.syncOwner(
+                        draftKey: key,
+                        environmentID: environmentID,
+                        attachments: snapshot.attachments
+                    )
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -1048,6 +1086,7 @@ public struct NewThreadView: View {
         let snapshot = composerDraft
         let restoreContext = draftRestoreContext
         let draftProjectID = projectID
+        let environmentID = selectedProject?.environmentID
         let needsRestoreMerge = restoredDraftProjectID != draftProjectID
         let previousSave = immediateDraftSaveTasks[key]
         previousSave?.cancel()
@@ -1061,9 +1100,31 @@ public struct NewThreadView: View {
                 let saved = try? await draftStore.draft(for: key)
                 guard !Task.isCancelled else { return }
                 let merged = restoreContext.merging(saved: saved, current: snapshot)
-                try? await draftStore.setDraft(merged, for: key)
+                do {
+                    try await draftStore.setDraft(merged, for: key)
+                    if let environmentID {
+                        model.attachmentUploads.syncOwner(
+                            draftKey: key,
+                            environmentID: environmentID,
+                            attachments: merged.attachments
+                        )
+                    }
+                } catch {
+                    return
+                }
             } else {
-                try? await draftStore.setDraft(snapshot, for: key)
+                do {
+                    try await draftStore.setDraft(snapshot, for: key)
+                    if let environmentID {
+                        model.attachmentUploads.syncOwner(
+                            draftKey: key,
+                            environmentID: environmentID,
+                            attachments: snapshot.attachments
+                        )
+                    }
+                } catch {
+                    return
+                }
             }
         }
         immediateDraftSaveTasks[key] = task

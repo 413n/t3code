@@ -414,14 +414,62 @@ public struct FeatureMessageAttachment: Identifiable, Sendable, Equatable, Hasha
 }
 
 public struct FeatureUploadAttachment: Sendable, Equatable {
-    public var data: Data
+    public let id: UUID
+    private var inlineData: Data?
+    public var ownedFile: FeatureOwnedAttachmentFile?
     public var name: String
     public var mimeType: String
+    public var uploadedReference: FeatureUploadedAttachmentReference?
 
-    public init(data: Data, name: String, mimeType: String) {
-        self.data = data
+    public init(
+        id: UUID = UUID(),
+        data: Data,
+        name: String,
+        mimeType: String,
+        uploadedReference: FeatureUploadedAttachmentReference? = nil
+    ) {
+        self.id = id
+        inlineData = data
+        ownedFile = nil
         self.name = name
         self.mimeType = mimeType
+        self.uploadedReference = uploadedReference
+    }
+
+    public init(
+        id: UUID = UUID(),
+        ownedFile: FeatureOwnedAttachmentFile,
+        name: String,
+        mimeType: String,
+        uploadedReference: FeatureUploadedAttachmentReference? = nil
+    ) {
+        self.id = id
+        inlineData = nil
+        self.ownedFile = ownedFile
+        self.name = name
+        self.mimeType = mimeType
+        self.uploadedReference = uploadedReference
+    }
+
+    public init(_ draft: FeatureDraftAttachment) {
+        id = draft.id
+        inlineData = draft.ownedFile == nil ? draft.data : nil
+        ownedFile = draft.ownedFile
+        name = draft.filename
+        mimeType = draft.mimeType
+        uploadedReference = draft.uploadedReference
+    }
+
+    public var data: Data {
+        get { inlineData ?? Data() }
+        set {
+            inlineData = newValue
+            ownedFile = nil
+        }
+    }
+
+    public var byteCount: Int {
+        inlineData?.count ?? ownedFile?.byteCount ?? 0
     }
 }
 
@@ -433,6 +481,8 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
     public var state: FeatureMessageState
     public var toolName: String?
     public var attachments: [FeatureMessageAttachment]
+    public var workLogImagePaths: [String]?
+    public var activeWorkLabel: String?
 
     public init(
         id: String,
@@ -441,7 +491,9 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
         createdAt: Date = .now,
         state: FeatureMessageState = .complete,
         toolName: String? = nil,
-        attachments: [FeatureMessageAttachment] = []
+        attachments: [FeatureMessageAttachment] = [],
+        workLogImagePaths: [String]? = nil,
+        activeWorkLabel: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -450,6 +502,8 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
         self.state = state
         self.toolName = toolName
         self.attachments = attachments
+        self.workLogImagePaths = workLogImagePaths
+        self.activeWorkLabel = activeWorkLabel
     }
 }
 
@@ -884,25 +938,19 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
     public var notificationsEnabled: Bool
     public var liveActivitiesEnabled: Bool
     public var defaultSelection: FeatureSelection?
-    public var autoSettleOnMerge: Bool
-    public var autoSettleAfterDays: Int?
 
     public init(
         appearance: FeatureAppearance = .system,
         hapticsEnabled: Bool = true,
         notificationsEnabled: Bool = true,
         liveActivitiesEnabled: Bool = true,
-        defaultSelection: FeatureSelection? = nil,
-        autoSettleOnMerge: Bool = true,
-        autoSettleAfterDays: Int? = 3
+        defaultSelection: FeatureSelection? = nil
     ) {
         self.appearance = appearance
         self.hapticsEnabled = hapticsEnabled
         self.notificationsEnabled = notificationsEnabled
         self.liveActivitiesEnabled = liveActivitiesEnabled
         self.defaultSelection = defaultSelection
-        self.autoSettleOnMerge = autoSettleOnMerge
-        self.autoSettleAfterDays = autoSettleAfterDays.map { min(90, max(1, $0)) }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -911,8 +959,6 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
         case notificationsEnabled
         case liveActivitiesEnabled
         case defaultSelection
-        case autoSettleOnMerge
-        case autoSettleAfterDays
     }
 
     public init(from decoder: any Decoder) throws {
@@ -937,18 +983,6 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
             FeatureSelection.self,
             forKey: .defaultSelection
         )
-        autoSettleOnMerge = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .autoSettleOnMerge
-        ) ?? true
-        if container.contains(.autoSettleAfterDays) {
-            autoSettleAfterDays = try container.decodeIfPresent(
-                Int.self,
-                forKey: .autoSettleAfterDays
-            ).map { min(90, max(1, $0)) }
-        } else {
-            autoSettleAfterDays = 3
-        }
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -958,12 +992,6 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
         try container.encode(notificationsEnabled, forKey: .notificationsEnabled)
         try container.encode(liveActivitiesEnabled, forKey: .liveActivitiesEnabled)
         try container.encodeIfPresent(defaultSelection, forKey: .defaultSelection)
-        try container.encode(autoSettleOnMerge, forKey: .autoSettleOnMerge)
-        if let autoSettleAfterDays {
-            try container.encode(autoSettleAfterDays, forKey: .autoSettleAfterDays)
-        } else {
-            try container.encodeNil(forKey: .autoSettleAfterDays)
-        }
     }
 }
 
@@ -978,17 +1006,26 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
     public var newWorktreesStartFromOrigin: Bool
     public var projectGroupingMode: ProjectGroupingMode
     public var projectGroupingOverrides: [String: ProjectGroupingMode]
+    public var automaticSettlement: FeatureAutomaticSettlementSettings?
+    public var supportsImageUploads: Bool
+    public var maxFileAttachmentBytes: Int?
 
     public init(
         defaultWorkspaceMode: FeatureWorkspaceMode = .local,
         newWorktreesStartFromOrigin: Bool = true,
         projectGroupingMode: ProjectGroupingMode = .repository,
-        projectGroupingOverrides: [String: ProjectGroupingMode] = [:]
+        projectGroupingOverrides: [String: ProjectGroupingMode] = [:],
+        automaticSettlement: FeatureAutomaticSettlementSettings? = nil,
+        supportsImageUploads: Bool = false,
+        maxFileAttachmentBytes: Int? = nil
     ) {
         self.defaultWorkspaceMode = defaultWorkspaceMode
         self.newWorktreesStartFromOrigin = newWorktreesStartFromOrigin
         self.projectGroupingMode = projectGroupingMode
         self.projectGroupingOverrides = projectGroupingOverrides
+        self.automaticSettlement = automaticSettlement
+        self.supportsImageUploads = supportsImageUploads
+        self.maxFileAttachmentBytes = maxFileAttachmentBytes
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -996,6 +1033,9 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         case newWorktreesStartFromOrigin
         case projectGroupingMode
         case projectGroupingOverrides
+        case automaticSettlement
+        case supportsImageUploads
+        case maxFileAttachmentBytes
     }
 
     public init(from decoder: any Decoder) throws {
@@ -1012,10 +1052,22 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
             ProjectGroupingMode.self,
             forKey: .projectGroupingMode
         ) ?? .repository
+        supportsImageUploads = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .supportsImageUploads
+        ) ?? false
+        maxFileAttachmentBytes = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxFileAttachmentBytes
+        )
         projectGroupingOverrides = try container.decodeIfPresent(
             [String: ProjectGroupingMode].self,
             forKey: .projectGroupingOverrides
         ) ?? [:]
+        automaticSettlement = try container.decodeIfPresent(
+            FeatureAutomaticSettlementSettings.self,
+            forKey: .automaticSettlement
+        )
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -1024,7 +1076,25 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         try container.encode(newWorktreesStartFromOrigin, forKey: .newWorktreesStartFromOrigin)
         try container.encode(projectGroupingMode, forKey: .projectGroupingMode)
         try container.encode(projectGroupingOverrides, forKey: .projectGroupingOverrides)
+        try container.encodeIfPresent(automaticSettlement, forKey: .automaticSettlement)
+        try container.encode(supportsImageUploads, forKey: .supportsImageUploads)
+        try container.encodeIfPresent(maxFileAttachmentBytes, forKey: .maxFileAttachmentBytes)
     }
+}
+
+public struct FeatureAutomaticSettlementSettings: Sendable, Equatable, Codable {
+    public var onMerge: Bool
+    public var afterDays: Double?
+
+    public init(onMerge: Bool, afterDays: Double?) {
+        self.onMerge = onMerge
+        self.afterDays = afterDays
+    }
+}
+
+public enum FeatureAutomaticSettlementChange: Sendable, Equatable {
+    case onMerge(Bool)
+    case afterDays(Double?)
 }
 
 public struct FeatureSnapshot: Sendable, Equatable, Codable {

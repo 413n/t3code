@@ -60,7 +60,7 @@ struct HomeThreadSwipeActionTests {
     @Test
     func settledRowsPutReopenAtTheEdge() {
         var settled = thread(id: "settled")
-        settled.isSettled = true
+        settled.settlementFacts = .init(settlementOverride: .settled)
         let settledActions = HomeThreadSwipeAction.trailingActions(
             for: settled,
             isArchived: false,
@@ -71,7 +71,7 @@ struct HomeThreadSwipeActionTests {
         #expect(HomeThreadSwipeAction.performsFullSwipe(with: settledActions))
 
         var pinnedSettled = thread(id: "pinned-settled", pinnedAt: now.addingTimeInterval(-30))
-        pinnedSettled.isSettled = true
+        pinnedSettled.settlementFacts = .init(settlementOverride: .settled)
         #expect(
             HomeThreadSwipeAction.trailingActions(
                 for: pinnedSettled,
@@ -80,7 +80,7 @@ struct HomeThreadSwipeActionTests {
             ) == [.reopen, .unpin, .delete]
         )
 
-        // A row that aged into automatic settlement reads the same way.
+        // Age alone does not settle a row. The server decides when it moves.
         var resting = thread(id: "resting")
         resting.lastActivityAt = now.addingTimeInterval(-4 * 24 * 60 * 60)
         #expect(
@@ -88,7 +88,7 @@ struct HomeThreadSwipeActionTests {
                 for: resting,
                 isArchived: false,
                 at: now
-            ) == [.reopen, .delete]
+            ) == [.settle, .delete]
         )
     }
 

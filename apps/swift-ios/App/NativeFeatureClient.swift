@@ -811,6 +811,24 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
     }
 
+    func mediaAssetURL(threadID: String, path: String) async throws -> URL {
+        let route = try threadRoute(for: threadID)
+        do {
+            return try await route.client.resolvedAssetURL(
+                resource: .mediaFile(threadID: route.wireID, path: path)
+            )
+        } catch let RPCError.remote(message)
+            where message.localizedCaseInsensitiveContains("media-file")
+                && (message.localizedCaseInsensitiveContains("schema")
+                    || message.localizedCaseInsensitiveContains("unsupported")
+                    || message.localizedCaseInsensitiveContains("unknown tag")
+                    || message.localizedCaseInsensitiveContains("unknown discriminator")) {
+            return try await route.client.resolvedAssetURL(
+                resource: .workspaceFile(threadID: route.wireID, path: path)
+            )
+        }
+    }
+
     func submitCodexFeedback(threadID: String, reason: String?) async throws -> String {
         let route = try threadRoute(for: threadID)
         return try await route.client.uploadFeedback(
@@ -1262,6 +1280,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         let title = Self.title(from: prompt, hasAttachments: !attachments.isEmpty)
         let uploads = try makeUploadAttachments(attachments)
+        if !uploads.isEmpty { _ = try await client.serverConfig() }
         let runtime = coreRuntimeMode(runtimeMode)
         let interaction = coreInteractionMode(interactionMode)
         let signature = BootstrapSubmissionSignature(
@@ -1811,6 +1830,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         let model = selection.map(coreModelSelection)
         let uploads = try makeUploadAttachments(attachments)
+        if !uploads.isEmpty { _ = try await client.serverConfig() }
         let runtimeMode = coreRuntimeMode(
             requestedRuntimeMode ?? mapRuntimeMode(shellThread.runtimeMode)
         )
@@ -1933,6 +1953,58 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func saveSettings(_ settings: FeatureSettings) async throws {
         let data = try JSONEncoder().encode(settings)
         settingsStore.set(data, forKey: Self.settingsKey)
+    }
+
+    func refreshProviders(environmentID: String) async throws -> [FeatureProvider] {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let config = try await client.refreshProviders()
+        setServerConfig(config, environmentID: environmentID)
+        if environmentID == activeEnvironment?.id { latestServerConfig = config }
+        let providers = mapConfigProviders(config.providers)
+        providerCatalogCache[environmentID] = providers
+        if let shell = shellsByEnvironmentID[environmentID] {
+            await emitSnapshot(shell)
+        }
+        return providers
+    }
+
+    func updateAutomaticSettlement(
+        environmentID: String,
+        change: FeatureAutomaticSettlementChange
+    ) async throws -> FeatureAutomaticSettlementSettings {
+        if case let .afterDays(days) = change,
+           let days,
+           !(1...90).contains(days) {
+            throw NativeFeatureClientError.invalidAutomaticSettlementDays
+        }
+
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let previous = serverConfigsByEnvironmentID[environmentID]
+        let capabilities = previous?.environment?.capabilities
+            ?? client.environment.descriptor?.capabilities
+        guard capabilities?.threadAutoSettlement == true else {
+            throw FeatureCapabilityUnavailable("Automatic settlement settings")
+        }
+
+        let serverChange: ServerSettingsChange = switch change {
+        case let .onMerge(value): .sidebarAutoSettleOnMerge(value)
+        case let .afterDays(value): .sidebarAutoSettleAfterDays(value)
+        }
+        let settings = try await client.updateSettings(serverChange)
+        let config = ServerConfigSnapshot(
+            providers: previous?.providers ?? [],
+            settings: settings,
+            threadSnapshotPagination: previous?.threadSnapshotPagination,
+            environment: previous?.environment
+        )
+        setServerConfig(config, environmentID: environmentID)
+        if environmentID == activeEnvironment?.id {
+            latestServerConfig = config
+        }
+        return FeatureAutomaticSettlementSettings(
+            onMerge: settings.sidebarAutoSettleOnMerge,
+            afterDays: settings.sidebarAutoSettleAfterDays
+        )
     }
 
     var managesServerSessions: Bool {
@@ -2495,6 +2567,23 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return client
     }
 
+    func preuploadAttachment(
+        _ attachment: FeatureUploadAttachment,
+        environmentID: String
+    ) async throws -> FeatureUploadedAttachmentReference? {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        _ = try await client.serverConfig()
+        let prepared = try await client.prepareAttachment(
+            makeUploadAttachments([attachment])[0]
+        )
+        return prepared.map {
+            FeatureUploadedAttachmentReference(
+                environmentID: $0.environmentID,
+                attachmentID: $0.attachmentID
+            )
+        }
+    }
+
     private func projectCreationClient(environmentID: String) async throws -> T3Client {
         if let client = environmentClients[environmentID] {
             return client
@@ -2934,20 +3023,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         let config = ServerConfigSnapshot(
                             providers: providers,
                             settings: previous?.settings,
-                            threadSnapshotPagination: previous?.threadSnapshotPagination
+                            threadSnapshotPagination: previous?.threadSnapshotPagination,
+                            environment: previous?.environment
+                                ?? self.latestServerConfig?.environment
                         )
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
                     case let .settingsUpdated(settings):
-                        let providers = self.serverConfigsByEnvironmentID[
+                        let previous = self.serverConfigsByEnvironmentID[
                             activeClient.environment.id
-                        ]?.providers ?? self.latestServerConfig?.providers ?? []
+                        ]
+                        let providers = previous?.providers
+                            ?? self.latestServerConfig?.providers ?? []
                         let config = ServerConfigSnapshot(
                             providers: providers,
                             settings: settings,
-                            threadSnapshotPagination: self.serverConfigsByEnvironmentID[
-                                activeClient.environment.id
-                            ]?.threadSnapshotPagination
+                            threadSnapshotPagination: previous?.threadSnapshotPagination
+                                ?? self.latestServerConfig?.threadSnapshotPagination,
+                            environment: previous?.environment
+                                ?? self.latestServerConfig?.environment
                         )
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
@@ -4165,7 +4259,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let preferencesByEnvironment = enabledEnvironments.reduce(
             into: [String: FeatureEnvironmentPreferences]()
         ) { preferences, environment in
-            guard let serverSettings = serverConfigsByEnvironmentID[environment.id]?.settings else {
+            guard let config = serverConfigsByEnvironmentID[environment.id],
+                  let serverSettings = config.settings else {
                 return
             }
             let defaultWorkspaceMode: FeatureWorkspaceMode =
@@ -4187,11 +4282,28 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     case .separate: return .separate
                     }
                 } ?? [:]
+            let capabilities = config.environment?.capabilities
+                ?? environment.descriptor?.capabilities
+            let supportsAutomaticSettlement = capabilities?.threadAutoSettlement == true
+            let supportsImageUploads = capabilities?.attachmentUploads == true
+            let maxFileAttachmentBytes = supportsImageUploads
+                ? capabilities?.fileAttachments.map {
+                    min(ManagedAttachmentFileStore.maximumBytes, max(0, $0.maxUploadBytes))
+                }
+                : nil
             preferences[environment.id] = FeatureEnvironmentPreferences(
                 defaultWorkspaceMode: defaultWorkspaceMode,
                 newWorktreesStartFromOrigin: serverSettings.newWorktreesStartFromOrigin,
                 projectGroupingMode: groupingMode,
-                projectGroupingOverrides: groupingOverrides
+                projectGroupingOverrides: groupingOverrides,
+                automaticSettlement: supportsAutomaticSettlement
+                    ? FeatureAutomaticSettlementSettings(
+                        onMerge: serverSettings.sidebarAutoSettleOnMerge,
+                        afterDays: serverSettings.sidebarAutoSettleAfterDays
+                    )
+                    : nil,
+                supportsImageUploads: supportsImageUploads,
+                maxFileAttachmentBytes: maxFileAttachmentBytes
             )
         }
         return FeatureSnapshot(
@@ -4410,9 +4522,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             cache.approvals = pendingApprovals(thread, environment: environment)
             cache.userInputs = pendingUserInputs(thread, environment: environment)
             let errors = thread.activities.compactMap(mapErrorActivity)
-            let activityMessages = (errors + collapsedWorkLogs(thread.activities))
+            let sessionIsLive = thread.session?.status == "starting"
+                || thread.session?.status == "running"
+            let activityMessages = (errors + collapsedWorkLogs(
+                thread.activities,
+                sessionIsLive: sessionIsLive
+            ))
                 .sorted { $0.createdAt < $1.createdAt }
-            seedWorkLogs(thread.activities, cache: cache)
+            seedWorkLogs(thread.activities, sessionIsLive: sessionIsLive, cache: cache)
             cache.subagents.reset(with: thread.activities)
             let messages = thread.messages.compactMap { cache.messagesByID[$0.id] }
             cache.mergedMessages = (messages + activityMessages)
@@ -4445,6 +4562,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let backgroundWorkIsActive = backgroundLiveness == .working
         let sessionIsLive = thread.session?.status == "starting"
             || thread.session?.status == "running"
+        if !sessionIsLive {
+            for (groupID, var accumulator) in cache.workLogsByGroupID
+            where accumulator.hasActiveWork {
+                accumulator.clearActiveWork()
+                cache.workLogsByGroupID[groupID] = accumulator
+                upsertMergedMessage(accumulator.message(groupID: groupID), cache: cache)
+            }
+        }
         mappedThread.state = Self.resolveThreadState(
             latestTurn: thread.latestTurn,
             session: thread.session,
@@ -4609,8 +4734,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let messages = thread.messages.map {
             mapMessage($0, environmentID: environmentID)
         }
+        let workIsLive = thread.session?.status == "starting"
+            || thread.session?.status == "running"
+            || backgroundLiveness(threadID: thread.id, environmentID: environmentID) == .working
         let activities = thread.activities.compactMap(mapErrorActivity)
-            + collapsedWorkLogs(thread.activities)
+            + collapsedWorkLogs(thread.activities, sessionIsLive: workIsLive)
         return (messages + activities).sorted { $0.createdAt < $1.createdAt }
     }
 
@@ -4719,6 +4847,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             createdAt: parseDate(activity.createdAt)
         )
         cache.workLogsByGroupID[groupID] = accumulator
+        guard accumulator.hasContent else { return }
         let message = accumulator.message(groupID: groupID)
         upsertMergedMessage(message, cache: cache)
     }
@@ -4744,6 +4873,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func seedWorkLogs(
         _ activities: [OrchestrationActivity],
+        sessionIsLive: Bool,
         cache: NativeDetailRenderCache
     ) {
         cache.workLogsByGroupID.removeAll(keepingCapacity: true)
@@ -4759,6 +4889,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 createdAt: parseDate(activity.createdAt)
             )
             cache.workLogsByGroupID[groupID] = accumulator
+        }
+        if !sessionIsLive {
+            for groupID in cache.workLogsByGroupID.keys {
+                cache.workLogsByGroupID[groupID]?.clearActiveWork()
+            }
         }
     }
 
@@ -4889,39 +5024,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     /// primary transcript message-sized while preserving a bounded, expandable
     /// summary for each turn.
     private func collapsedWorkLogs(
-        _ activities: [OrchestrationActivity]
+        _ activities: [OrchestrationActivity],
+        sessionIsLive: Bool
     ) -> [FeatureMessage] {
-        let terminalKinds = Set(["tool.completed", "task.completed", "turn.plan.updated"])
-        let completed = activities.filter {
-            $0.tone != "error" && terminalKinds.contains($0.kind)
-        }
-        let groups = Dictionary(grouping: completed) { activity in
+        let groups = Dictionary(grouping: sortedByCreation(activities).filter {
+            NativeWorkLogAccumulator.accepts($0)
+        }) { activity in
             activity.turnId ?? "unscoped"
         }
-
-        return groups.values.compactMap { unsorted in
-            let group = unsorted.sorted { $0.createdAt < $1.createdAt }
-            guard let first = group.first else { return nil }
-            let visible = group.suffix(40)
-            var lines: [String] = []
-            let hiddenCount = group.count - visible.count
-            if hiddenCount > 0 {
-                lines.append("\(hiddenCount) earlier updates hidden")
+        return groups.compactMap { groupID, group in
+            var accumulator = NativeWorkLogAccumulator()
+            for activity in group {
+                accumulator.append(
+                    activity,
+                    preview: previewText(activity.payload["detail"]?.stringValue),
+                    createdAt: parseDate(activity.createdAt)
+                )
             }
-            lines.append(
-                contentsOf: visible.map { activity in
-                    let detail = previewText(activity.payload["detail"]?.stringValue)
-                    return "• \(detail ?? activity.summary)"
-                }
-            )
-            return FeatureMessage(
-                id: "work-log-\(first.turnId ?? "unscoped")",
-                role: .tool,
-                text: lines.joined(separator: "\n"),
-                createdAt: parseDate(first.createdAt),
-                state: .complete,
-                toolName: "Work log · \(group.count)"
-            )
+            if !sessionIsLive { accumulator.clearActiveWork() }
+            return accumulator.hasContent ? accumulator.message(groupID: groupID) : nil
         }
     }
 
@@ -5609,15 +5730,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
             return detail
         }
-        let imageIDs = Set(
-            detail.messages.flatMap(\.attachments)
-                .filter { $0.mimeType.hasPrefix("image/") }
-                .map(\.id)
-        )
-        // Text-only threads refresh every couple of seconds; skip the resolve
-        // pass and the full message walk when there is nothing to hydrate.
-        guard !imageIDs.isEmpty else { return detail }
-        let missingIDs = Array(imageIDs.filter {
+        let attachmentMetadata = detail.messages.flatMap(\.attachments).reduce(
+            into: [String: (name: String, mimeType: String)]()
+        ) { metadata, attachment in
+            metadata[attachment.id] = (attachment.name, attachment.mimeType)
+        }
+        // Threads without attachments refresh every couple of seconds. Skip
+        // the resolve pass and full message walk when there is nothing to hydrate.
+        guard !attachmentMetadata.isEmpty else { return detail }
+        let missingIDs = Array(attachmentMetadata.keys.filter {
             cachedAttachmentURL(for: $0, environmentID: environmentID) == nil
         })
 
@@ -5628,7 +5749,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 group.addTask {
                     (
                         id,
-                        try? await client.resolvedAsset(resource: .attachment(id: id))
+                        try? await client.resolvedAsset(
+                            resource: .attachment(
+                                id: id,
+                                fileName: attachmentMetadata[id]?.name,
+                                mimeType: attachmentMetadata[id]?.mimeType
+                            )
+                        )
                     )
                 }
             }
@@ -5658,7 +5785,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         (
                             nextID,
                             try? await client.resolvedAsset(
-                                resource: .attachment(id: nextID)
+                                resource: .attachment(
+                                    id: nextID,
+                                    fileName: attachmentMetadata[nextID]?.name,
+                                    mimeType: attachmentMetadata[nextID]?.mimeType
+                                )
                             )
                         )
                     }
@@ -5745,15 +5876,33 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func makeUploadAttachments(
         _ attachments: [FeatureUploadAttachment]
-    ) throws -> [UploadChatImageAttachment] {
+    ) throws -> [UploadChatAttachment] {
         guard attachments.count <= 8 else {
             throw NativeFeatureClientError.tooManyAttachments
         }
         return try attachments.map {
-            try UploadChatImageAttachment(
+            let reference = $0.uploadedReference.map {
+                UploadedAttachmentReference(
+                    environmentID: $0.environmentID,
+                    attachmentID: $0.attachmentID
+                )
+            }
+            if let ownedFile = $0.ownedFile {
+                return try UploadChatAttachment(
+                    id: $0.id,
+                    fileURL: ownedFile.url,
+                    name: $0.name,
+                    mimeType: $0.mimeType,
+                    sizeBytes: ownedFile.byteCount,
+                    uploadedReference: reference
+                )
+            }
+            return try UploadChatAttachment(
+                id: $0.id,
                 data: $0.data,
                 name: $0.name,
-                mimeType: $0.mimeType
+                mimeType: $0.mimeType,
+                uploadedReference: reference
             )
         }
     }
@@ -5906,17 +6055,28 @@ private final class NativeDetailRenderCache {
     var subagents = FeatureActiveSubagentTracker()
 }
 
-private struct NativeWorkLogAccumulator {
+struct NativeWorkLogAccumulator {
     private static let terminalKinds = Set([
         "tool.completed", "task.completed", "turn.plan.updated",
+    ])
+    private static let activeKinds = Set(["tool.started", "tool.updated"])
+    private static let imageExtensions = Set([
+        "avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "tif", "tiff", "webp",
     ])
 
     private(set) var count = 0
     private var visibleLines: [String] = []
     private var createdAt = Date.distantPast
+    private var activeEntries: [String: String] = [:]
+    private var activeOrder: [String] = []
+    private var imagePaths: [String] = []
+
+    var hasActiveWork: Bool { !activeEntries.isEmpty }
+    var hasContent: Bool { count > 0 || hasActiveWork || !imagePaths.isEmpty }
 
     static func accepts(_ activity: OrchestrationActivity) -> Bool {
-        activity.tone != "error" && terminalKinds.contains(activity.kind)
+        activeKinds.contains(activity.kind)
+            || (activity.tone != "error" && terminalKinds.contains(activity.kind))
     }
 
     mutating func append(
@@ -5924,14 +6084,38 @@ private struct NativeWorkLogAccumulator {
         preview: String?,
         createdAt: Date
     ) {
-        if count == 0 {
+        if count == 0 && activeEntries.isEmpty {
             self.createdAt = createdAt
         }
-        count += 1
-        visibleLines.append("• \(preview ?? activity.summary)")
-        if visibleLines.count > 40 {
-            visibleLines.removeFirst(visibleLines.count - 40)
+        let key = Self.lifecycleKey(activity)
+        let label = activity.payload["title"]?.stringValue ?? activity.summary
+        let lifecycleStatus = activity.payload["status"]?.stringValue
+        let isTerminalUpdate = activity.kind == "tool.updated"
+            && lifecycleStatus.map { $0 != "inProgress" && $0 != "in_progress" } == true
+        if Self.activeKinds.contains(activity.kind) && !isTerminalUpdate
+            && activity.tone != "error" {
+            activeEntries[key] = label
+            activeOrder.removeAll { $0 == key }
+            activeOrder.append(key)
+        } else {
+            activeEntries[key] = nil
+            activeOrder.removeAll { $0 == key }
+            guard activity.tone != "error" else { return }
+            count += 1
+            visibleLines.append("• \(preview ?? activity.summary)")
+            if visibleLines.count > 40 {
+                visibleLines.removeFirst(visibleLines.count - 40)
+            }
         }
+        if let path = Self.viewedImagePath(activity), !imagePaths.contains(path) {
+            imagePaths.append(path)
+            if imagePaths.count > 8 { imagePaths.removeFirst(imagePaths.count - 8) }
+        }
+    }
+
+    mutating func clearActiveWork() {
+        activeEntries.removeAll(keepingCapacity: true)
+        activeOrder.removeAll(keepingCapacity: true)
     }
 
     func message(groupID: String) -> FeatureMessage {
@@ -5946,8 +6130,46 @@ private struct NativeWorkLogAccumulator {
             text: lines.joined(separator: "\n"),
             createdAt: createdAt,
             state: .complete,
-            toolName: "Work log · \(count)"
+            toolName: "Work log · \(count)",
+            workLogImagePaths: imagePaths.isEmpty ? nil : imagePaths,
+            activeWorkLabel: activeOrder.last.flatMap { activeEntries[$0] }
         )
+    }
+
+    private static func lifecycleKey(_ activity: OrchestrationActivity) -> String {
+        if let id = activity.payload["toolCallId"]?.stringValue
+            ?? activity.payload["data"]?["toolCallId"]?.stringValue {
+            return "id:\(id)"
+        }
+        let itemType = activity.payload["itemType"]?.stringValue ?? ""
+        let title = activity.payload["title"]?.stringValue ?? activity.summary
+        let detail = activity.payload["detail"]?.stringValue ?? ""
+        return "fallback:\([itemType, title, detail].map(normalizedLifecycleText).joined(separator: "|"))"
+    }
+
+    private static func normalizedLifecycleText(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(
+                of: #"\s+(complete|completed)$"#,
+                with: "",
+                options: .regularExpression
+            )
+    }
+
+    private static func viewedImagePath(_ activity: OrchestrationActivity) -> String? {
+        let itemType = normalizedLifecycleText(activity.payload["itemType"]?.stringValue ?? "")
+        let title = normalizedLifecycleText(activity.payload["title"]?.stringValue ?? activity.summary)
+        let qualifies = activity.payload["requestKind"]?.stringValue == "file-read"
+            || itemType == "image_view"
+            || (itemType == "dynamic_tool_call" && title == "read file")
+        guard qualifies,
+              let detail = activity.payload["detail"]?.stringValue,
+              !detail.contains("\n"), !detail.contains("\r") else { return nil }
+        let path = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let ext = path.split(separator: ".").last?.lowercased(),
+              imageExtensions.contains(String(ext)) else { return nil }
+        return path
     }
 }
 
@@ -6537,6 +6759,7 @@ private enum NativeFeatureClientError: LocalizedError {
     case currentDeviceUnknown
     case missingScope(String)
     case tooManyAttachments
+    case invalidAutomaticSettlementDays
 
     var errorDescription: String? {
         switch self {
@@ -6552,7 +6775,8 @@ private enum NativeFeatureClientError: LocalizedError {
         case .deviceSessionNotFound: "That device session is no longer active."
         case .currentDeviceUnknown: "This installation has not registered for device access yet."
         case .missingScope: "This connection does not have permission to manage devices."
-        case .tooManyAttachments: "You can attach up to 8 images per message."
+        case .tooManyAttachments: "You can attach up to 8 files per message."
+        case .invalidAutomaticSettlementDays: "Choose a value from 1 to 90 days."
         }
     }
 }

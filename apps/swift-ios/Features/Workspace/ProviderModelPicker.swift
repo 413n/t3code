@@ -14,8 +14,10 @@ public struct ProviderModelPicker: View {
     let threadSelection: FeatureSelection?
     let materializesDefaultSelection: Bool
     private let onPresentationChange: ((Bool) -> Void)?
+    private let onRefresh: (@MainActor () async throws -> Void)?
 
     @State private var isPresented = false
+    @State private var preservesSelectionDuringRefresh = false
 
     public init(
         providers: [FeatureProvider],
@@ -24,6 +26,7 @@ public struct ProviderModelPicker: View {
         isLoading: Bool = false,
         threadSelection: FeatureSelection? = nil,
         materializesDefaultSelection: Bool = true,
+        onRefresh: (@MainActor () async throws -> Void)? = nil,
         onPresentationChange: ((Bool) -> Void)? = nil
     ) {
         self.providers = providers
@@ -33,6 +36,7 @@ public struct ProviderModelPicker: View {
         self.isLoading = isLoading
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
+        self.onRefresh = onRefresh
         self.onPresentationChange = onPresentationChange
     }
 
@@ -93,11 +97,20 @@ public struct ProviderModelPicker: View {
                 selection: $selection,
                 isLoading: isLoading,
                 threadSelection: threadSelection,
-                materializesDefaultSelection: materializesDefaultSelection
+                materializesDefaultSelection: materializesDefaultSelection,
+                onRefresh: onRefresh.map { refresh in
+                    {
+                        preservesSelectionDuringRefresh = true
+                        defer { preservesSelectionDuringRefresh = false }
+                        try await refresh()
+                    }
+                }
             )
         }
         .onAppear(perform: materializeSelection)
-        .onChange(of: providers) { materializeSelection() }
+        .onChange(of: providers) {
+            if !preservesSelectionDuringRefresh { materializeSelection() }
+        }
         .onChange(of: selection) { materializeSelection() }
     }
 
@@ -201,6 +214,7 @@ private struct ModelPickerSheet: View {
     let isLoading: Bool
     let threadSelection: FeatureSelection?
     let materializesDefaultSelection: Bool
+    let onRefresh: (@MainActor () async throws -> Void)?
 
     @AppStorage("swift-ios.model-picker.favorites") private var favoriteStorage = ""
     @AppStorage("swift-ios.model-picker.recents") private var recentStorage = ""
@@ -212,19 +226,23 @@ private struct ModelPickerSheet: View {
     @State private var draftBaseSelection: FeatureSelection?
     @State private var modelDrafts: [String: FeatureSelection]
     @State private var hasEditedDraft = false
+    @State private var isRefreshing = false
+    @State private var refreshError: String?
 
     init(
         providers: [FeatureProvider],
         selection: Binding<FeatureSelection?>,
         isLoading: Bool,
         threadSelection: FeatureSelection?,
-        materializesDefaultSelection: Bool
+        materializesDefaultSelection: Bool,
+        onRefresh: (@MainActor () async throws -> Void)?
     ) {
         self.providers = providers
         _selection = selection
         self.isLoading = isLoading
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
+        self.onRefresh = onRefresh
         let initialSelection = Self.effectiveSelection(
             explicit: selection.wrappedValue,
             inherited: threadSelection,
@@ -267,6 +285,22 @@ private struct ModelPickerSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search models")
             .toolbar {
+                if onRefresh != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            refreshCatalog()
+                        } label: {
+                            if isRefreshing {
+                                Image(systemName: "hourglass")
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(isRefreshing)
+                        .accessibilityLabel(isRefreshing ? "Refreshing models" : "Refresh models")
+                        .accessibilityIdentifier("model-picker-refresh")
+                    }
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
@@ -289,6 +323,14 @@ private struct ModelPickerSheet: View {
                 }
             }
             .t3NavigationChrome()
+            .alert("Could not refresh models", isPresented: Binding(
+                get: { refreshError != nil },
+                set: { if !$0 { refreshError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(refreshError ?? "Try again.")
+            }
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
@@ -307,6 +349,20 @@ private struct ModelPickerSheet: View {
         .onChange(of: providers) {
             reconcileDraftSelectionWithCurrentState()
             revealSelectedLegacyModel()
+        }
+    }
+
+    private func refreshCatalog() {
+        guard let onRefresh, !isRefreshing else { return }
+        isRefreshing = true
+        refreshError = nil
+        Task {
+            do {
+                try await onRefresh()
+            } catch {
+                refreshError = error.localizedDescription
+            }
+            isRefreshing = false
         }
     }
 

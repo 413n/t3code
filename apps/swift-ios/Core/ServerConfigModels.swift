@@ -145,17 +145,75 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public let newWorktreesStartFromOrigin: Bool
     public let sidebarProjectGroupingMode: ServerProjectGroupingMode?
     public let sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]?
+    public let sidebarAutoSettleOnMerge: Bool
+    public let sidebarAutoSettleAfterDays: Double?
 
     public init(
         defaultThreadEnvMode: ServerThreadEnvironmentMode = .local,
         newWorktreesStartFromOrigin: Bool = true,
         sidebarProjectGroupingMode: ServerProjectGroupingMode? = nil,
-        sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]? = nil
+        sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]? = nil,
+        sidebarAutoSettleOnMerge: Bool = true,
+        sidebarAutoSettleAfterDays: Double? = 3
     ) {
         self.defaultThreadEnvMode = defaultThreadEnvMode
         self.newWorktreesStartFromOrigin = newWorktreesStartFromOrigin
         self.sidebarProjectGroupingMode = sidebarProjectGroupingMode
         self.sidebarProjectGroupingOverrides = sidebarProjectGroupingOverrides
+        self.sidebarAutoSettleOnMerge = sidebarAutoSettleOnMerge
+        self.sidebarAutoSettleAfterDays = sidebarAutoSettleAfterDays
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case defaultThreadEnvMode
+        case newWorktreesStartFromOrigin
+        case sidebarProjectGroupingMode
+        case sidebarProjectGroupingOverrides
+        case sidebarAutoSettleOnMerge
+        case sidebarAutoSettleAfterDays
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        defaultThreadEnvMode = try container.decodeIfPresent(
+            ServerThreadEnvironmentMode.self,
+            forKey: .defaultThreadEnvMode
+        ) ?? .local
+        newWorktreesStartFromOrigin = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .newWorktreesStartFromOrigin
+        ) ?? true
+        sidebarProjectGroupingMode = try container.decodeIfPresent(
+            ServerProjectGroupingMode.self,
+            forKey: .sidebarProjectGroupingMode
+        )
+        sidebarProjectGroupingOverrides = try container.decodeIfPresent(
+            [String: ServerProjectGroupingMode].self,
+            forKey: .sidebarProjectGroupingOverrides
+        )
+        sidebarAutoSettleOnMerge = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .sidebarAutoSettleOnMerge
+        ) ?? true
+        sidebarAutoSettleAfterDays = if container.contains(.sidebarAutoSettleAfterDays) {
+            try container.decodeIfPresent(Double.self, forKey: .sidebarAutoSettleAfterDays)
+        } else {
+            3
+        }
+    }
+}
+
+public enum ServerSettingsChange: Equatable, Sendable {
+    case sidebarAutoSettleOnMerge(Bool)
+    case sidebarAutoSettleAfterDays(Double?)
+
+    public var jsonValue: JSONValue {
+        switch self {
+        case let .sidebarAutoSettleOnMerge(value):
+            .object(["sidebarAutoSettleOnMerge": .bool(value)])
+        case let .sidebarAutoSettleAfterDays(value):
+            .object(["sidebarAutoSettleAfterDays": value.map(JSONValue.number) ?? .null])
+        }
     }
 }
 
@@ -164,19 +222,22 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
     public let providers: [ServerProviderSnapshot]
     public let settings: ServerSettingsSnapshot?
     public let threadSnapshotPagination: Bool?
+    public let environment: EnvironmentDescriptor?
 
     public init(
         providers: [ServerProviderSnapshot],
         settings: ServerSettingsSnapshot? = nil,
-        threadSnapshotPagination: Bool? = nil
+        threadSnapshotPagination: Bool? = nil,
+        environment: EnvironmentDescriptor? = nil
     ) {
         self.providers = providers
         self.settings = settings
         self.threadSnapshotPagination = threadSnapshotPagination
+        self.environment = environment
     }
 
     private enum CodingKeys: String, CodingKey {
-        case providers, settings, threadSnapshotPagination
+        case providers, settings, threadSnapshotPagination, environment
     }
 
     public init(from decoder: any Decoder) throws {
@@ -190,6 +251,7 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
             Bool.self,
             forKey: .threadSnapshotPagination
         )
+        environment = try container.decodeIfPresent(EnvironmentDescriptor.self, forKey: .environment)
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -200,6 +262,7 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
             threadSnapshotPagination,
             forKey: .threadSnapshotPagination
         )
+        try container.encodeIfPresent(environment, forKey: .environment)
     }
 }
 
@@ -252,5 +315,13 @@ public enum ServerConfigStreamEvent: Decodable, Sendable {
         default:
             self = .unrelated(type: type)
         }
+    }
+}
+
+public struct ServerRefreshProvidersResult: Codable, Equatable, Sendable {
+    public let providers: [ServerProviderSnapshot]
+
+    public init(providers: [ServerProviderSnapshot]) {
+        self.providers = providers
     }
 }
