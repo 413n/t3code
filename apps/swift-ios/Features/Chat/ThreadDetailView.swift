@@ -89,8 +89,9 @@ public struct ThreadDetailView: View {
             await observeThreadPullRequest()
         }
         .task(id: workspaceCatalogID) {
-            if let environmentID = currentThread.environmentID, let cwd = workspaceCatalogPath {
-                await model.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd)
+            if let environmentID = currentThread.environmentID, let cwd = workspaceCatalogPath,
+               let instanceID = selection?.providerID ?? currentSelection?.providerID {
+                await model.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd, instanceID: instanceID)
             }
         }
         .environment(\.providerSetupContext, currentThread.environmentID.map {
@@ -738,7 +739,7 @@ public struct ThreadDetailView: View {
     }
 
     private var workspaceCatalogID: String {
-        "\(currentThread.environmentID ?? ""):\(workspaceCatalogPath ?? "")"
+        "\(currentThread.environmentID ?? ""):\(workspaceCatalogPath ?? ""):\(selection?.providerID ?? currentSelection?.providerID ?? "")"
     }
 
     private func refreshThreadEnvironmentModels() async throws {

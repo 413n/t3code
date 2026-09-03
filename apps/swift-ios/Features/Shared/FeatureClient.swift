@@ -105,7 +105,7 @@ public protocol FeatureClient: AnyObject {
     func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws
     func sharedPreferenceMismatches(environmentID: String) -> [String]
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
-    func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider]
+    func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async throws -> [FeatureProvider]
     func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent
     func providerSetupEvents(environmentID: String, instanceID: String) -> AsyncThrowingStream<ProviderSetupEvent, Error>
     func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws
@@ -281,7 +281,7 @@ public extension FeatureClient {
     func setEnvironmentEnabled(id: String, enabled: Bool) async throws {}
     func removeEnvironment(id: String) async throws {}
     func disconnect() async {}
-    func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider] {
+    func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async throws -> [FeatureProvider] {
         throw FeatureCapabilityUnavailable("Workspace provider catalog")
     }
 

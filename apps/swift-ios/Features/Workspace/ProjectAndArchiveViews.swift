@@ -210,7 +210,7 @@ public struct AddProjectView: View {
                 }
             } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: "server.rack")
+                    Image(systemName: environment.systemImage)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(environment.name)
                             .font(T3Typography.control)

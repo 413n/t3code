@@ -1185,7 +1185,8 @@ enum ThreadComposerProviderCatalog {
             return providers
         }
 
-        let savedModel = FeatureModel(id: modelID, name: modelID)
+        // A missing catalog entry has unknown image support, not a known restriction.
+        let savedModel = FeatureModel(id: modelID, name: modelID, supportsImages: true)
         if let providerIndex = providers.firstIndex(where: { $0.id == providerID }) {
             guard !providers[providerIndex].models.contains(where: { $0.id == modelID }) else {
                 return providers

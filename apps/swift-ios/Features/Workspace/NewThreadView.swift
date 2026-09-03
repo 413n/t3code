@@ -181,9 +181,9 @@ public struct NewThreadView: View {
         .environment(\.providerSetupContext, selectedProject.map {
             ProviderSetupContext(model: model, environmentID: $0.environmentID)
         })
-        .task(id: selectedProject?.id) {
-            if let project = selectedProject {
-                await model.refreshWorkspaceProviders(environmentID: project.environmentID, cwd: project.path)
+        .task(id: "\(selectedProject?.id ?? ""):\(selection?.providerID ?? "")") {
+            if let project = selectedProject, let instanceID = selection?.providerID {
+                await model.refreshWorkspaceProviders(environmentID: project.environmentID, cwd: project.path, instanceID: instanceID)
             }
         }
         .onDisappear {
@@ -362,7 +362,7 @@ public struct NewThreadView: View {
             }
         } label: {
             HStack(spacing: 6) {
-                Image(systemName: "server.rack")
+                Image(systemName: creationEnvironments.first { $0.id == selectedProject?.environmentID }?.systemImage ?? "server.rack")
                     .font(.system(size: 11, weight: .medium))
                 Text(environmentName)
                     .lineLimit(1)

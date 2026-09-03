@@ -167,14 +167,15 @@ public actor T3Client {
         )
     }
 
-    public func refreshProviders(cwd: String? = nil, refreshModels: Bool = true) async throws -> ServerConfigSnapshot {
+    public func refreshProviders(cwd: String? = nil, instanceID: String? = nil, refreshModels: Bool = true) async throws -> ServerConfigSnapshot {
         let current = try await serverConfig()
         let generation = serverConfigGeneration
         let result: ServerRefreshProvidersResult = try await rpc.request(
             RPCMethod.serverRefreshProviders.rawValue,
             payload: .object([
                 "refreshModels": .bool(refreshModels),
-            ].merging(cwd.map { ["cwd": .string($0)] } ?? [:]) { _, new in new }),
+            ].merging(cwd.map { ["cwd": .string($0)] } ?? [:]) { _, new in new }
+                .merging(instanceID.map { ["instanceId": .string($0)] } ?? [:]) { _, new in new }),
             as: ServerRefreshProvidersResult.self
         )
         guard generation == serverConfigGeneration else { throw CancellationError() }

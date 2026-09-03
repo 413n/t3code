@@ -2089,13 +2089,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         try await refreshProviderCatalog(environmentID: environmentID, cwd: nil, refreshModels: true)
     }
 
-    func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider] {
-        try await refreshProviderCatalog(environmentID: environmentID, cwd: cwd, refreshModels: false)
+    func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async throws -> [FeatureProvider] {
+        if let config = serverConfigsByEnvironmentID[environmentID],
+           config.providers.first(where: { $0.instanceId == instanceID })?.workspaceSnapshots?.contains(where: { $0.cwd == cwd }) == true {
+            return mapConfigProviders(config.providers)
+        }
+        return try await refreshProviderCatalog(environmentID: environmentID, cwd: cwd, instanceID: instanceID, refreshModels: false)
     }
 
-    private func refreshProviderCatalog(environmentID: String, cwd: String?, refreshModels: Bool) async throws -> [FeatureProvider] {
+    private func refreshProviderCatalog(environmentID: String, cwd: String?, instanceID: String? = nil, refreshModels: Bool) async throws -> [FeatureProvider] {
         let client = try await projectCreationClient(environmentID: environmentID)
-        let config = try await client.refreshProviders(cwd: cwd, refreshModels: refreshModels)
+        let config = try await client.refreshProviders(cwd: cwd, instanceID: instanceID, refreshModels: refreshModels)
         setServerConfig(config, environmentID: environmentID)
         if environmentID == activeEnvironment?.id { latestServerConfig = config }
         let providers = mapConfigProviders(config.providers)

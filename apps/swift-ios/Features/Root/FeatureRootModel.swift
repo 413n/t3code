@@ -170,9 +170,9 @@ public final class FeatureRootModel {
         await reload()
     }
 
-    func refreshWorkspaceProviders(environmentID: String, cwd: String) async {
+    func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async {
         do {
-            let providers = try await client.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd)
+            let providers = try await client.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd, instanceID: instanceID)
             try Task.checkCancellation()
             var byEnvironment = snapshot.providersByEnvironment ?? [:]
             byEnvironment[environmentID] = providers

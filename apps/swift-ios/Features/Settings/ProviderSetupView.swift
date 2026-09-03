@@ -109,8 +109,9 @@ private struct ProviderSetupView: View {
                 }
                 if provider.setup?.canAuthenticate == true {
                     Section("Account") {
-                        if provider.authStatus == "authenticated" {
-                            Text("Signed in")
+                        if provider.authStatus == "authenticated"
+                            || (provider.isEnabled == false && provider.authStatus == "unknown") {
+                            if provider.authStatus == "authenticated" { Text("Signed in") }
                             Button("Sign out", role: .destructive) { confirmSignOut = true }
                         } else if let auth, auth.isActive {
                             if let rawURL = auth.authorizationUrl, let url = URL(string: rawURL), url.scheme == "https" {
@@ -147,6 +148,7 @@ private struct ProviderSetupView: View {
         .background(T3Colors.background)
         .navigationTitle(provider?.name ?? "Provider")
         .navigationBarTitleDisplayMode(.inline)
+        .tint(T3Colors.accent)
         .task(id: instanceID) {
             do {
                 for try await event in model.client.providerSetupEvents(environmentID: environmentID, instanceID: instanceID) {
