@@ -159,6 +159,18 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public let sidebarAutoSettleOnMerge: Bool
     public let sidebarAutoSettleAfterDays: Double?
     public var environmentIcon: String? = nil
+    public var sourceControlWritingStyle: JSONValue? = nil
+
+    public var sharedPatch: JSONValue {
+        var fields: [String: JSONValue] = [
+            "sidebarAutoSettleAfterDays": sidebarAutoSettleAfterDays.map(JSONValue.number) ?? .null,
+            "sidebarAutoSettleOnMerge": .bool(sidebarAutoSettleOnMerge),
+            "defaultThreadEnvMode": .string(defaultThreadEnvMode.rawValue),
+            "newWorktreesStartFromOrigin": .bool(newWorktreesStartFromOrigin),
+        ]
+        if let sourceControlWritingStyle { fields["sourceControlWritingStyle"] = sourceControlWritingStyle }
+        return .object(fields)
+    }
 
     public init(
         defaultThreadEnvMode: ServerThreadEnvironmentMode = .local,
@@ -184,11 +196,13 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         case sidebarAutoSettleOnMerge
         case sidebarAutoSettleAfterDays
         case environmentIcon
+        case sourceControlWritingStyle
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         environmentIcon = try container.decodeIfPresent(String.self, forKey: .environmentIcon)
+        sourceControlWritingStyle = try container.decodeIfPresent(JSONValue.self, forKey: .sourceControlWritingStyle)
         defaultThreadEnvMode = try container.decodeIfPresent(
             ServerThreadEnvironmentMode.self,
             forKey: .defaultThreadEnvMode
@@ -220,9 +234,17 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
 public enum ServerSettingsChange: Equatable, Sendable {
     case sidebarAutoSettleOnMerge(Bool)
     case sidebarAutoSettleAfterDays(Double?)
+    case defaultThreadEnvMode(ServerThreadEnvironmentMode)
+    case newWorktreesStartFromOrigin(Bool)
+    case environmentIcon(String?)
+    case sharedPreferences(JSONValue)
 
     public var jsonValue: JSONValue {
         switch self {
+        case let .defaultThreadEnvMode(value): .object(["defaultThreadEnvMode": .string(value.rawValue)])
+        case let .newWorktreesStartFromOrigin(value): .object(["newWorktreesStartFromOrigin": .bool(value)])
+        case let .environmentIcon(value): .object(["environmentIcon": value.map(JSONValue.string) ?? .null])
+        case let .sharedPreferences(value): value
         case let .sidebarAutoSettleOnMerge(value):
             .object(["sidebarAutoSettleOnMerge": .bool(value)])
         case let .sidebarAutoSettleAfterDays(value):

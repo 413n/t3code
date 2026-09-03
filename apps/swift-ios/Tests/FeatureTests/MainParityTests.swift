@@ -3,6 +3,28 @@ import Testing
 @testable import T3Code
 
 struct MainParityTests {
+    @Test func sharedPreferencesExcludeMachineSettings() throws {
+        let settings = try JSONDecoder().decode(ServerSettingsSnapshot.self, from: Data(#"{"defaultThreadEnvMode":"worktree","newWorktreesStartFromOrigin":false,"sidebarAutoSettleAfterDays":null,"sidebarAutoSettleOnMerge":false,"environmentIcon":"mac-mini","sourceControlWritingStyle":{"mode":"conventional_commits","customInstructions":"","followChangeRequestTemplates":true}}"#.utf8))
+        #expect(settings.sharedPatch["environmentIcon"] == nil)
+        #expect(settings.sharedPatch["defaultThreadEnvMode"] == .string("worktree"))
+        #expect(settings.sharedPatch["sidebarAutoSettleAfterDays"] == .null)
+        #expect(settings.sharedPatch["sourceControlWritingStyle"]?["mode"] == .string("conventional_commits"))
+    }
+
+    @Test func toolIconsRejectLocalURLsAndResolveNativeApps() {
+        let presentation = ToolActivityPresentation(payload: .object([
+            "toolSurface": .string("computer"),
+            "toolIcon": .object(["_tag": .string("native-app"), "app": .object([
+                "_tag": .string("app-id"), "appId": .string("com.apple.Safari"),
+            ])]),
+        ]))
+        #expect(presentation?.nativeApp?.appId == "com.apple.Safari")
+        let invalid = ToolActivityPresentation(payload: .object([
+            "toolIcon": .object(["_tag": .string("themed-logo"), "logoUrl": .string("file:///private/icon.png")]),
+        ]))
+        #expect(invalid == nil)
+    }
+
     @Test func externalSchemesAreNotWorkspaceFiles() throws {
         for raw in ["mailto:user@example.com", "ftp://example.com/file.txt", "custom://host/file.txt"] {
             #expect(MarkdownWorkspaceFileLink.relativePath(for: try #require(URL(string: raw)), workspaceRoot: "/repo") == nil)

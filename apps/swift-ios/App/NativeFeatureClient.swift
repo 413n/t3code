@@ -857,6 +857,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
     }
 
+    func nativeAppIconURL(threadID: String, app: ToolNativeAppReference) async throws -> URL {
+        let route = try threadRoute(for: threadID)
+        return try await route.client.resolvedAssetURL(resource: .nativeAppIcon(app))
+    }
+
     func mediaAssetURL(threadID: String, path: String) async throws -> URL {
         let route = try threadRoute(for: threadID)
         do {
@@ -2123,7 +2128,69 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         case let .onMerge(value): .sidebarAutoSettleOnMerge(value)
         case let .afterDays(value): .sidebarAutoSettleAfterDays(value)
         }
-        let settings = try await client.updateSettings(serverChange)
+        let settings = try await saveServerPreferences(client: client, environmentID: environmentID, change: serverChange)
+        await fanOutSharedPreferences(from: environmentID, change: serverChange)
+        return FeatureAutomaticSettlementSettings(
+            onMerge: settings.sidebarAutoSettleOnMerge,
+            afterDays: settings.sidebarAutoSettleAfterDays
+        )
+    }
+
+    func serverPreferences(environmentID: String) async throws -> ServerSettingsSnapshot {
+        if let settings = serverConfigsByEnvironmentID[environmentID]?.settings { return settings }
+        let client = try await projectCreationClient(environmentID: environmentID)
+        guard let settings = try await client.serverConfig().settings else {
+            throw FeatureCapabilityUnavailable("Server preferences")
+        }
+        return settings
+    }
+
+    func sharedPreferenceMismatches(environmentID: String) -> [String] {
+        guard let expected = serverConfigsByEnvironmentID[environmentID]?.settings?.sharedPatch else { return [] }
+        return sharedPreferenceTargetIDs.filter { id in
+            id != environmentID && serverConfigsByEnvironmentID[id]?.settings?.sharedPatch != expected
+        }.map { id in latestSnapshot?.environments.first { $0.id == id }?.name ?? id }
+    }
+
+    private var sharedPreferenceTargetIDs: [String] {
+        serverConfigsByEnvironmentID.keys.filter { id in
+            environmentConnectionStates[id] == .connected
+                && serverConfigsByEnvironmentID[id]?.environment?.capabilities.threadAutoSettlement == true
+                && serverConfigsByEnvironmentID[id]?.settings != nil
+        }.sorted()
+    }
+
+    func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let config = try await client.serverConfig()
+        if case .environmentIcon = change {
+            guard config.environment?.capabilities.environmentIcon == true else {
+                throw FeatureCapabilityUnavailable("Environment icons")
+            }
+        } else {
+            guard config.environment?.capabilities.threadAutoSettlement == true else {
+                throw FeatureCapabilityUnavailable("Shared preferences")
+            }
+        }
+        _ = try await saveServerPreferences(client: client, environmentID: environmentID, change: change)
+        if case .environmentIcon = change { return }
+        await fanOutSharedPreferences(from: environmentID, change: change)
+    }
+
+    private func fanOutSharedPreferences(from sourceID: String, change: ServerSettingsChange) async {
+        for id in sharedPreferenceTargetIDs where id != sourceID {
+            do {
+                let client = try await projectCreationClient(environmentID: id)
+                _ = try await saveServerPreferences(client: client, environmentID: id, change: change)
+            } catch {
+                // Keep the last real settings so the mismatch remains visible and can be retried.
+            }
+        }
+    }
+
+    private func saveServerPreferences(client: T3Client, environmentID: String, change: ServerSettingsChange) async throws -> ServerSettingsSnapshot {
+        let previous = serverConfigsByEnvironmentID[environmentID]
+        let settings = try await client.updateSettings(change)
         let config = ServerConfigSnapshot(
             providers: previous?.providers ?? [],
             settings: settings,
@@ -2135,10 +2202,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if environmentID == activeEnvironment?.id {
             latestServerConfig = config
         }
-        return FeatureAutomaticSettlementSettings(
-            onMerge: settings.sidebarAutoSettleOnMerge,
-            afterDays: settings.sidebarAutoSettleAfterDays
-        )
+        if let shell = shellsByEnvironmentID[environmentID] { await emitSnapshot(shell) }
+        return settings
     }
 
     var managesServerSessions: Bool {
@@ -4537,6 +4602,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         mapped.machineIcon = serverConfigsByEnvironmentID[environment.id]?.settings?.environmentIcon
             ?? environment.descriptor?.platform.machine
+        mapped.canCustomizeIcon = serverConfigsByEnvironmentID[environment.id]?.environment?.capabilities.environmentIcon
+            ?? environment.descriptor?.capabilities.environmentIcon
         return mapped
     }
 
@@ -6288,6 +6355,8 @@ struct NativeWorkLogAccumulator {
     private var activeEntries: [String: String] = [:]
     private var activeOrder: [String] = []
     private var imagePaths: [String] = []
+    private var toolPresentation: ToolActivityPresentation?
+    private var activePresentations: [String: ToolActivityPresentation] = [:]
 
     var hasActiveWork: Bool { !activeEntries.isEmpty }
     var hasContent: Bool { count > 0 || hasActiveWork || !imagePaths.isEmpty }
@@ -6306,6 +6375,7 @@ struct NativeWorkLogAccumulator {
             self.createdAt = createdAt
         }
         let key = Self.lifecycleKey(activity)
+        toolPresentation = ToolActivityPresentation(payload: activity.payload) ?? activePresentations[key]
         let label = activity.payload["title"]?.stringValue ?? activity.summary
         let lifecycleStatus = activity.payload["status"]?.stringValue
         let isTerminalUpdate = activity.kind == "tool.updated"
@@ -6313,10 +6383,12 @@ struct NativeWorkLogAccumulator {
         if Self.activeKinds.contains(activity.kind) && !isTerminalUpdate
             && activity.tone != "error" {
             activeEntries[key] = label
+            activePresentations[key] = toolPresentation
             activeOrder.removeAll { $0 == key }
             activeOrder.append(key)
         } else {
             activeEntries[key] = nil
+            activePresentations[key] = nil
             activeOrder.removeAll { $0 == key }
             guard activity.tone != "error" else { return }
             count += 1
@@ -6333,6 +6405,7 @@ struct NativeWorkLogAccumulator {
 
     mutating func clearActiveWork() {
         activeEntries.removeAll(keepingCapacity: true)
+        activePresentations.removeAll(keepingCapacity: true)
         activeOrder.removeAll(keepingCapacity: true)
     }
 
@@ -6342,7 +6415,7 @@ struct NativeWorkLogAccumulator {
             lines.append("\(count - visibleLines.count) earlier updates hidden")
         }
         lines.append(contentsOf: visibleLines)
-        return FeatureMessage(
+        var message = FeatureMessage(
             id: "work-log-\(groupID)",
             role: .tool,
             text: lines.joined(separator: "\n"),
@@ -6352,6 +6425,8 @@ struct NativeWorkLogAccumulator {
             workLogImagePaths: imagePaths.isEmpty ? nil : imagePaths,
             activeWorkLabel: activeOrder.last.flatMap { activeEntries[$0] }
         )
+        message.toolPresentation = activeOrder.last.flatMap { activePresentations[$0] } ?? toolPresentation
+        return message
     }
 
     private static func lifecycleKey(_ activity: OrchestrationActivity) -> String {

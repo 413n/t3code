@@ -101,6 +101,9 @@ public protocol FeatureClient: AnyObject {
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws
 
     func saveSettings(_ settings: FeatureSettings) async throws
+    func serverPreferences(environmentID: String) async throws -> ServerSettingsSnapshot
+    func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws
+    func sharedPreferenceMismatches(environmentID: String) -> [String]
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
     func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider]
     func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent
@@ -218,6 +221,14 @@ public protocol FeatureClient: AnyObject {
 }
 
 public extension FeatureClient {
+    func serverPreferences(environmentID: String) async throws -> ServerSettingsSnapshot {
+        throw FeatureCapabilityUnavailable("Server preferences")
+    }
+    func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws {
+        throw FeatureCapabilityUnavailable("Server preferences")
+    }
+    func sharedPreferenceMismatches(environmentID: String) -> [String] { [] }
+
     func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail {
         try await loadThread(id: id)
     }

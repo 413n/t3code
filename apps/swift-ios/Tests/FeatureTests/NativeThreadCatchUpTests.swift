@@ -5,6 +5,21 @@ import XCTest
 @MainActor
 @available(iOS 18.0, *)
 final class NativeThreadCatchUpTests: XCTestCase {
+    func testExplicitRetryReadsFreshSnapshotInsteadOfWarmResume() async throws {
+        let fixture = try await CatchUpFixture.make()
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        _ = try await nextThreadRequest(&requests)
+        fixture.client.releaseThread(id: fixture.firstID)
+        await fixture.http.setResponse(text: "Fresh retry", sequence: 20)
+        let detail = try await fixture.client.loadThread(id: fixture.firstID, fresh: true)
+        XCTAssertTrue(detail.messages.contains { $0.text == "Fresh retry" })
+        let reads = await fixture.http.threadRequests
+        XCTAssertEqual(reads.count, 2)
+        await fixture.client.disconnect()
+    }
+
     func testWarmNavigationResumesAfterAppliedMessagesWithoutAnotherHTTPRead() async throws {
         let fixture = try await CatchUpFixture.make()
         defer { fixture.cleanUp() }

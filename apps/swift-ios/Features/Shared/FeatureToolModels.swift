@@ -18,9 +18,14 @@ public struct FeatureCapabilityUnavailable: LocalizedError, Sendable, Equatable 
 public protocol FeatureWorkspaceAssetResolving: AnyObject {
     func workspaceAssetURL(threadID: String, path: String) async throws -> URL
     func mediaAssetURL(threadID: String, path: String) async throws -> URL
+    func nativeAppIconURL(threadID: String, app: ToolNativeAppReference) async throws -> URL
 }
 
 public extension FeatureWorkspaceAssetResolving {
+    func nativeAppIconURL(threadID: String, app: ToolNativeAppReference) async throws -> URL {
+        throw FeatureCapabilityUnavailable("Native app icons")
+    }
+
     func mediaAssetURL(threadID: String, path: String) async throws -> URL {
         try await workspaceAssetURL(threadID: threadID, path: path)
     }

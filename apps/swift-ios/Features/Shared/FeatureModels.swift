@@ -45,6 +45,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
     public var connectionState: FeatureConnection.State?
     public var connectionDetail: String?
     public var machineIcon: String? = nil
+    public var canCustomizeIcon: Bool? = nil
 
     public var systemImage: String {
         switch machineIcon {
@@ -87,6 +88,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         case connectionState
         case connectionDetail
         case machineIcon
+        case canCustomizeIcon
     }
 
     public init(from decoder: any Decoder) throws {
@@ -103,6 +105,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         )
         connectionDetail = try container.decodeIfPresent(String.self, forKey: .connectionDetail)
         machineIcon = try container.decodeIfPresent(String.self, forKey: .machineIcon)
+        canCustomizeIcon = try container.decodeIfPresent(Bool.self, forKey: .canCustomizeIcon)
     }
 }
 
@@ -498,6 +501,7 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
     public var attachments: [FeatureMessageAttachment]
     public var workLogImagePaths: [String]?
     public var activeWorkLabel: String?
+    public var toolPresentation: ToolActivityPresentation? = nil
 
     public init(
         id: String,

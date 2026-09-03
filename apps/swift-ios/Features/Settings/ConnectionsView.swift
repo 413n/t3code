@@ -284,7 +284,7 @@ struct ConnectionsView: View {
         _ item: T3ConnectEnvironmentPresentation
     ) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "cloud")
+            Image(systemName: item.savedEnvironment?.systemImage ?? "cloud")
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(T3Colors.textSecondary)
                 .frame(width: 25)
@@ -529,6 +529,11 @@ private struct ConnectionDetailView: View {
                     Text(environment.endpoint)
                         .textSelection(.enabled)
                     LabeledContent("Projects", value: "\(projectCount)")
+                    if environment.canCustomizeIcon == true || automaticSettlement != nil {
+                        NavigationLink("Preferences") {
+                            EnvironmentPreferencesView(model: model, environmentID: environmentID)
+                        }
+                    }
                 }
 
                 if let automaticSettlement {

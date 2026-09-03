@@ -2448,7 +2448,13 @@ private struct FeatureWorkLogView: View {
             } label: {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Label(message.toolName ?? "Tool output", systemImage: "terminal")
+                        HStack(spacing: 6) {
+                            FeatureToolActivityIcon(presentation: message.toolPresentation, context: imageContext)
+                            Text(message.toolName ?? "Tool output")
+                            if let source = message.toolPresentation?.sourceName {
+                                Text(source).lineLimit(1)
+                            }
+                        }
                         if let activeWorkLabel = message.activeWorkLabel {
                             Text(activeWorkLabel)
                                 .lineLimit(1)

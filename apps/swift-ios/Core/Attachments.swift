@@ -174,9 +174,15 @@ public enum AssetResource: Equatable, Sendable {
     case mediaFile(threadID: String, path: String)
     case attachment(id: String, fileName: String? = nil, mimeType: String? = nil)
     case projectFavicon(cwd: String)
+    case nativeAppIcon(ToolNativeAppReference)
 
     var jsonValue: JSONValue {
         switch self {
+        case let .nativeAppIcon(app):
+            var reference: [String: JSONValue] = ["_tag": .string(app._tag)]
+            if let id = app.appId { reference["appId"] = .string(id) }
+            if let name = app.displayName { reference["displayName"] = .string(name) }
+            return .object(["_tag": .string("native-app-icon"), "app": .object(reference)])
         case let .workspaceFile(threadID, path):
             return .object([
                 "_tag": .string("workspace-file"),
