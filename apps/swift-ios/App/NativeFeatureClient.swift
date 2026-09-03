@@ -47,6 +47,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private let fallbackPollingInterval: Duration
     private let aggregateRefreshInterval: Duration
     private let environmentShellTimeoutInterval: TimeInterval
+    private let threadSnapshotTimeoutInterval: TimeInterval
+    private let catchUpDelay: @Sendable () async throws -> Void
     private let aggregateEnvironmentLoader: @Sendable (EnvironmentRuntime) async throws -> [Environment]
     private let stream: AsyncStream<FeatureEvent>
     private let continuation: AsyncStream<FeatureEvent>.Continuation
@@ -74,6 +76,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var activeThreadID: String?
     private var activeThreadEnvironmentID: String?
     private var latestDetails: [String: FeatureThreadDetail] = [:]
+    private var threadResumeStates: [String: NativeThreadResumeState] = [:]
     private var detailRenderCaches: [String: NativeDetailRenderCache] = [:]
     private var detailCacheRecency: [String] = []
     private var attachmentURLs: [AttachmentCacheKey: CachedAttachmentURL] = [:]
@@ -106,8 +109,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var archivedRefreshTask: Task<Void, Never>?
     private var detailRefreshTask: Task<Void, Never>?
     private var detailStreamTask: Task<Void, Never>?
+    private var detailCatchUpTask: Task<Void, Never>?
+    private var detailCatchUpID: UUID?
+    private var detailCompletionReceived = false
     private var detailPublishTask: Task<Void, Never>?
-    private var passiveDetailPollingTask: Task<Void, Never>?
     private var detailRefreshPending = false
     private var detailRefreshGeneration = 0
     private var detailStreamGeneration = 0
@@ -130,6 +135,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         fallbackPollingInterval: Duration = .seconds(2),
         aggregateRefreshInterval: Duration = .seconds(20),
         environmentShellTimeoutInterval: TimeInterval = 6,
+        threadSnapshotTimeoutInterval: TimeInterval = 8,
+        catchUpDelay: @escaping @Sendable () async throws -> Void = {
+            try await Task.sleep(for: .seconds(2))
+        },
         aggregateEnvironmentLoader: @escaping @Sendable (EnvironmentRuntime) async throws -> [Environment] = {
             try await $0.environments()
         }
@@ -160,6 +169,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         self.fallbackPollingInterval = fallbackPollingInterval
         self.aggregateRefreshInterval = aggregateRefreshInterval
         self.environmentShellTimeoutInterval = environmentShellTimeoutInterval
+        self.threadSnapshotTimeoutInterval = threadSnapshotTimeoutInterval
+        self.catchUpDelay = catchUpDelay
         self.aggregateEnvironmentLoader = aggregateEnvironmentLoader
         let pair = AsyncStream<FeatureEvent>.makeStream()
         stream = pair.stream
@@ -175,8 +186,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         archivedRefreshTask?.cancel()
         detailRefreshTask?.cancel()
         detailStreamTask?.cancel()
+        detailCatchUpTask?.cancel()
         detailPublishTask?.cancel()
-        passiveDetailPollingTask?.cancel()
         attachmentHydrationTasks.values.forEach { $0.task.cancel() }
         projectFaviconRefreshTasks.values.forEach { $0.cancel() }
         continuation.finish()
@@ -218,6 +229,34 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         latestSnapshot = snapshot
         return snapshot
+    }
+
+    func resumeAfterBackground(reconnect: Bool) async {
+        let sessionGeneration = environmentGeneration
+        let selectedRoute = activeThreadID.flatMap { try? threadRoute(for: $0) }
+        if let selectedRoute {
+            retainActiveThread()
+            continuation.yield(.threadSync(id: selectedRoute.uiID, state: .catchingUp))
+        }
+        // Only wake the inbox connection and the selected thread's computer.
+        // Other saved computers must not delay foreground recovery.
+        if reconnect {
+            var wakingClients: [T3Client] = []
+            if let client { wakingClients.append(client) }
+            if let selectedRoute, !wakingClients.contains(where: { $0 === selectedRoute.client }) {
+                wakingClients.append(selectedRoute.client)
+            }
+            await withTaskGroup(of: Void.self) { group in
+                for client in wakingClients { group.addTask { await client.reconnect() } }
+            }
+        }
+        guard sessionGeneration == environmentGeneration else { return }
+        if let client { startPolling(client) }
+        if let selectedRoute, activeThreadID == selectedRoute.uiID {
+            resetDetailRefresh()
+            resetDetailStream()
+            startDetailStream(selectedRoute)
+        }
     }
 
     func backgroundSnapshot() async throws -> FeatureSnapshot {
@@ -679,14 +718,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         configurationTask?.cancel()
         aggregateRefreshTask?.cancel()
         archivedRefreshTask?.cancel()
-        passiveDetailPollingTask?.cancel()
         pollingTask = nil
         fallbackPollingTask = nil
         configurationTask = nil
         aggregateRefreshTask = nil
         aggregateRefreshID = nil
         archivedRefreshTask = nil
-        passiveDetailPollingTask = nil
         clearEnvironmentState(preserveEnvironmentSnapshots: true)
         activeEnvironment = environment
         client = newClient
@@ -705,14 +742,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         configurationTask?.cancel()
         aggregateRefreshTask?.cancel()
         archivedRefreshTask?.cancel()
-        passiveDetailPollingTask?.cancel()
         pollingTask = nil
         fallbackPollingTask = nil
         configurationTask = nil
         aggregateRefreshTask = nil
         aggregateRefreshID = nil
         archivedRefreshTask = nil
-        passiveDetailPollingTask = nil
         clearEnvironmentState()
         client = nil
         activeEnvironment = nil
@@ -758,6 +793,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         threadHistoryEpoch &+= 1
         pendingOlderThreadPage = nil
         latestDetails.removeAll()
+        threadResumeStates.removeAll()
         detailRenderCaches.removeAll()
         detailCacheRecency.removeAll()
         attachmentURLs.removeAll()
@@ -1608,12 +1644,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if activeThreadID == route.uiID {
             resetDetailRefresh()
             resetDetailStream()
-            passiveDetailPollingTask?.cancel()
-            passiveDetailPollingTask = nil
             activeThreadID = nil
             activeThreadEnvironmentID = nil
         }
         latestDetails[route.uiID] = nil
+        threadResumeStates[route.uiID] = nil
         detailRenderCaches[route.uiID] = nil
         detailCacheRecency.removeAll { $0 == route.uiID }
         await emitCachedSnapshot(for: route.environmentID)
@@ -1625,23 +1660,54 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let client = route.client
         let environment = client.environment
         let generation = environmentGeneration
+        retainActiveThread()
         resetDetailRefresh()
         resetDetailStream()
-        passiveDetailPollingTask?.cancel()
-        passiveDetailPollingTask = nil
         activeThreadID = route.uiID
         activeThreadEnvironmentID = environment.id
         threadHistoryEpoch &+= 1
         let historyEpoch = threadHistoryEpoch
         pendingOlderThreadPage = nil
         activeThreadPage = nil
+        activeRawThread = nil
+        activeThreadSequence = nil
+        continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
         let supportsPagination = serverConfigsByEnvironmentID[
             environment.id
         ]?.threadSnapshotPagination == true
-        let snapshot = try await client.threadSnapshot(
-            id: route.wireID,
-            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
-        )
+        let supportsResume = serverConfigsByEnvironmentID[
+            environment.id
+        ]?.threadResumeCompletionMarker == true
+        if supportsResume,
+           let cached = threadResumeStates[route.uiID], cached.client === client,
+           cached.page == nil || supportsPagination,
+           var detail = latestDetails[route.uiID],
+           detailRenderCaches[route.uiID]?.isInitialized == true {
+            activeRawThread = cached.thread
+            activeThreadSequence = cached.sequence
+            activeThreadPage = cached.page
+            detail.page = cached.page
+            markThreadCacheRecentlyUsed(route.uiID)
+            startDetailStream(route)
+            return detail
+        }
+        let snapshot: OrchestrationThreadDetailSnapshot
+        do {
+            snapshot = try await client.threadSnapshot(
+                id: route.wireID,
+                turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil,
+                timeoutInterval: threadSnapshotTimeoutInterval
+            )
+        } catch {
+            if !Task.isCancelled, threadHistoryEpoch == historyEpoch,
+               activeThreadID == route.uiID {
+                continuation.yield(.threadSync(id: route.uiID, state: .failed(error.localizedDescription)))
+                // A failed HTTP request must not prevent the socket snapshot
+                // from recovering this thread when the connection returns.
+                startDetailStream(route)
+            }
+            throw error
+        }
         guard isKnownClient(client, environmentID: environment.id, generation: generation),
               threadHistoryEpoch == historyEpoch,
               activeThreadID == route.uiID,
@@ -1664,11 +1730,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             client: client,
             environmentID: environment.id
         )
-        startDetailStream(
-            route,
-            after: snapshot.snapshotSequence,
-            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
-        )
+        startDetailStream(route)
+        if !supportsResume { markDetailSynchronized(route) }
         return detail
     }
 
@@ -1733,10 +1796,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func releaseThread(id: String) {
         guard activeThreadID == id else { return }
+        retainActiveThread()
         resetDetailRefresh()
         resetDetailStream()
-        passiveDetailPollingTask?.cancel()
-        passiveDetailPollingTask = nil
         activeThreadID = nil
         activeThreadEnvironmentID = nil
         activeRawThread = nil
@@ -1744,6 +1806,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         activeThreadPage = nil
         threadHistoryEpoch &+= 1
         pendingOlderThreadPage = nil
+        continuation.yield(.threadSync(id: id, state: nil))
         markThreadCacheRecentlyUsed(id)
         evictOldThreadCachesIfNeeded()
     }
@@ -1995,6 +2058,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             providers: previous?.providers ?? [],
             settings: settings,
             threadSnapshotPagination: previous?.threadSnapshotPagination,
+            threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
             environment: previous?.environment
         )
         setServerConfig(config, environmentID: environmentID)
@@ -2878,67 +2942,76 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         configurationTask?.cancel()
         let generation = environmentGeneration
         pollingTask = Task { [weak self] in
-            do {
-                await activeClient.connect()
-                guard self?.isCurrentSession(
-                    client: activeClient,
-                    generation: generation
-                ) == true else {
-                    return
-                }
-                let sequence = self?.latestShell?.snapshotSequence
-                let events = await activeClient.shellEvents(after: sequence)
-                // Re-bind self per event instead of holding it strongly across
-                // the indefinite stream, so the client can deinit mid-stream.
-                for try await item in events {
-                    guard !Task.isCancelled,
-                          let self,
-                          self.isCurrentSession(
-                              client: activeClient,
-                              generation: generation
-                          ) else {
-                        break
-                    }
-                    self.lastShellEventAt = .now
-                    self.emitConnection(.connected)
-                    switch item {
-                    case let .snapshot(shell):
-                        await self.consume(
-                            shell: shell,
+            while !Task.isCancelled,
+                self?.isCurrentSession(client: activeClient, generation: generation) == true
+            {
+                do {
+                    await activeClient.connect()
+                    guard
+                        self?.isCurrentSession(
                             client: activeClient,
-                            refreshActiveThread: true
-                        )
-                    case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved:
-                        await self.consume(delta: item, client: activeClient)
-                    case .refreshRequired:
-                        if let shell = try? await activeClient.shellSnapshot() {
+                            generation: generation
+                        ) == true
+                    else {
+                        return
+                    }
+                    let sequence = self?.latestShell?.snapshotSequence
+                    let events = await activeClient.shellEvents(after: sequence, reconnect: false)
+                    // Re-bind self per event instead of holding it strongly across
+                    // the indefinite stream, so the client can deinit mid-stream.
+                    for try await item in events {
+                        guard !Task.isCancelled,
+                            let self,
+                            self.isCurrentSession(
+                                client: activeClient,
+                                generation: generation
+                            )
+                        else {
+                            break
+                        }
+                        self.lastShellEventAt = .now
+                        self.emitConnection(.connected)
+                        switch item {
+                        case let .snapshot(shell):
                             await self.consume(
                                 shell: shell,
                                 client: activeClient,
                                 refreshActiveThread: true
                             )
+                        case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved:
+                            await self.consume(delta: item, client: activeClient)
+                        case .refreshRequired:
+                            if let shell = try? await activeClient.shellSnapshot() {
+                                await self.consume(
+                                    shell: shell,
+                                    client: activeClient,
+                                    refreshActiveThread: true
+                                )
+                            }
+                        case .synchronized:
+                            break
                         }
-                    case .synchronized:
-                        break
                     }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    // The independent HTTP fallback below keeps the workspace
+                    // fresh while the socket reconnects.
                 }
-            } catch is CancellationError {
-                return
-            } catch {
-                // The independent HTTP fallback below keeps the workspace
-                // fresh while the socket reconnects.
-            }
 
-            guard !Task.isCancelled,
-                  let self,
-                  self.isCurrentSession(client: activeClient, generation: generation) else {
-                return
+                guard !Task.isCancelled,
+                    let self,
+                    self.isCurrentSession(client: activeClient, generation: generation)
+                else {
+                    return
+                }
+                self.lastShellEventAt = nil
+                self.emitConnection(
+                    .reconnecting,
+                    detail: "Live updates paused. Refreshing over HTTP."
+                )
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             }
-            self.lastShellEventAt = nil
-            self.emitConnection(
-                .reconnecting,
-                detail: "Live updates paused. Refreshing over HTTP."
-            )
         }
         let fallbackPollingInitialDelay = fallbackPollingInitialDelay
         let fallbackPollingInterval = fallbackPollingInterval
@@ -3024,6 +3097,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             providers: providers,
                             settings: previous?.settings,
                             threadSnapshotPagination: previous?.threadSnapshotPagination,
+                            threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
                             environment: previous?.environment
                                 ?? self.latestServerConfig?.environment
                         )
@@ -3040,6 +3114,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             settings: settings,
                             threadSnapshotPagination: previous?.threadSnapshotPagination
                                 ?? self.latestServerConfig?.threadSnapshotPagination,
+                            threadResumeCompletionMarker: previous?.threadResumeCompletionMarker
+                                ?? self.latestServerConfig?.threadResumeCompletionMarker,
                             environment: previous?.environment
                                 ?? self.latestServerConfig?.environment
                         )
@@ -3340,46 +3416,105 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
-    private func startDetailStream(
-        _ route: NativeThreadRoute,
-        after sequence: Int,
-        turnLimit: Int?
-    ) {
+    private func startDetailStream(_ route: NativeThreadRoute) {
         detailStreamGeneration &+= 1
+        detailCompletionReceived = false
         let streamGeneration = detailStreamGeneration
         let sessionGeneration = environmentGeneration
+        continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
+        ensureDetailCatchUpFallback(route, generation: streamGeneration)
         detailStreamTask = Task { [weak self] in
-            do {
-                for try await item in await route.client.threadEvents(
-                    threadID: route.wireID,
-                    after: sequence,
-                    turnLimit: turnLimit
-                ) {
-                    guard !Task.isCancelled,
-                          let self,
-                          self.detailStreamGeneration == streamGeneration,
-                          self.activeThreadID == route.uiID,
-                          self.isKnownClient(
-                              route.client,
-                              environmentID: route.environmentID,
-                              generation: sessionGeneration
-                          ) else {
-                        break
+            while !Task.isCancelled,
+                  self?.isCurrentDetail(route, generation: streamGeneration) == true,
+                  self?.environmentGeneration == sessionGeneration {
+                // The next connection resumes from applied state, not from
+                // the cursor captured when the user first opened the thread.
+                let sequence = self?.activeRawThread == nil ? nil : self?.activeThreadSequence
+                let supportsPagination = self?.serverConfigsByEnvironmentID[
+                    route.environmentID
+                ]?.threadSnapshotPagination == true
+                do {
+                    for try await item in await route.client.threadEvents(
+                        threadID: route.wireID,
+                        after: sequence,
+                        turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil,
+                        reconnect: false
+                    ) {
+                        guard !Task.isCancelled, let self,
+                              self.isCurrentDetail(route, generation: streamGeneration),
+                              self.environmentGeneration == sessionGeneration else { return }
+                        self.consumeDetailStreamItem(item, route: route)
                     }
-                    self.consumeDetailStreamItem(item, route: route)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    // A bounded HTTP read runs alongside socket recovery.
+                }
+                guard !Task.isCancelled,
+                      self?.isCurrentDetail(route, generation: streamGeneration) == true else { return }
+                self?.detailCompletionReceived = false
+                self?.continuation.yield(.threadSync(id: route.uiID, state: .reconnecting))
+                self?.ensureDetailCatchUpFallback(route, generation: streamGeneration)
+                do { try await Task.sleep(for: .milliseconds(250)) }
+                catch { return }
+            }
+        }
+    }
+
+    private func isCurrentDetail(_ route: NativeThreadRoute, generation: Int) -> Bool {
+        detailStreamGeneration == generation
+            && activeThreadID == route.uiID
+            && environmentClients[route.environmentID] === route.client
+    }
+
+    private func ensureDetailCatchUpFallback(_ route: NativeThreadRoute, generation: Int) {
+        guard detailCatchUpTask == nil else { return }
+        let id = UUID()
+        detailCatchUpID = id
+        let delay = catchUpDelay
+        detailCatchUpTask = Task { [weak self] in
+            defer {
+                if self?.detailCatchUpID == id {
+                    self?.detailCatchUpTask = nil
+                    self?.detailCatchUpID = nil
+                }
+            }
+            do {
+                try await delay()
+                guard !Task.isCancelled,
+                      self?.isCurrentDetail(route, generation: generation) == true else { return }
+                try await self?.refreshThread(
+                    id: route.uiID,
+                    client: route.client,
+                    expectedStreamGeneration: generation
+                )
+                guard !Task.isCancelled, let self,
+                      self.isCurrentDetail(route, generation: generation) else { return }
+                if self.serverConfigsByEnvironmentID[route.environmentID]?
+                    .threadResumeCompletionMarker == true {
+                    self.continuation.yield(.threadSync(id: route.uiID, state: .reconnecting))
+                } else {
+                    self.continuation.yield(.threadSync(id: route.uiID, state: .live))
                 }
             } catch is CancellationError {
                 return
             } catch {
-                // Shell-driven HTTP refresh remains the compatibility fallback.
+                guard !Task.isCancelled,
+                      self?.isCurrentDetail(route, generation: generation) == true else { return }
+                self?.continuation.yield(.threadSync(id: route.uiID, state: .failed(error.localizedDescription)))
             }
-            guard let self else { return }
-            self.finishDetailStream(
-                generation: streamGeneration,
-                route: route,
-                sessionGeneration: sessionGeneration
-            )
         }
+    }
+
+    private func markDetailSynchronized(_ route: NativeThreadRoute) {
+        guard activeRawThread != nil else { return }
+        // Flush the final message before publishing the completion state.
+        // Otherwise the loading label can vanish one render before the text.
+        flushDetailPublish(route)
+        detailCatchUpTask?.cancel()
+        detailCatchUpTask = nil
+        detailCatchUpID = nil
+        continuation.yield(.threadSync(id: route.uiID, state: .live))
     }
 
     private func consumeDetailStreamItem(
@@ -3388,9 +3523,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ) {
         switch item {
         case .synchronized:
+            detailCompletionReceived = true
+            guard activeRawThread != nil else { return }
+            markDetailSynchronized(route)
             return
         case let .snapshot(snapshot):
-            guard snapshot.snapshotSequence > (activeThreadSequence ?? 0) else { return }
+            guard activeRawThread == nil || snapshot.snapshotSequence > (activeThreadSequence ?? 0) else { return }
             threadHistoryEpoch &+= 1
             pendingOlderThreadPage = nil
             activeThreadSequence = snapshot.snapshotSequence
@@ -3430,6 +3568,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 scheduleDetailRefresh(threadID: route.uiID, client: route.client, force: true)
             }
         }
+        if serverConfigsByEnvironmentID[route.environmentID]?.threadResumeCompletionMarker != true {
+            markDetailSynchronized(route)
+        }
     }
 
     private func scheduleRawDetailPublish(
@@ -3446,84 +3587,46 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             guard !Task.isCancelled,
                   self.detailStreamGeneration == streamGeneration,
                   self.activeThreadID == route.uiID,
-                  let rawThread = self.activeRawThread else {
+                  self.activeRawThread != nil else {
                 return
             }
-            let mutations = self.pendingDetailRenderMutations
-            self.pendingDetailRenderMutations = NativeDetailRenderMutations()
-            let previousDetail = self.latestDetails[route.uiID]
-            let detail = self.mapDetail(
-                rawThread,
-                environment: route.client.environment,
-                sourceSequence: self.activeThreadSequence ?? 0,
-                mutations: mutations,
-                page: self.activeThreadPage
-            )
-            let delta = self.makeDetailDelta(
-                previous: previousDetail,
-                next: detail,
-                mutations: mutations
-            )
-            self.publish(
-                detail,
-                threadID: route.uiID,
-                renderCacheIsSource: true,
-                delta: delta
-            )
-            self.scheduleAttachmentHydration(
-                in: detail,
-                threadID: route.uiID,
-                client: route.client,
-                environmentID: route.environmentID
-            )
+            self.flushDetailPublish(route)
         }
     }
 
-    private func finishDetailStream(
-        generation: Int,
-        route: NativeThreadRoute,
-        sessionGeneration: Int
-    ) {
-        guard detailStreamGeneration == generation,
-              activeThreadID == route.uiID,
-              isKnownClient(
-                  route.client,
-                  environmentID: route.environmentID,
-                  generation: sessionGeneration
-              ) else {
+    private func flushDetailPublish(_ route: NativeThreadRoute) {
+        guard pendingDetailRenderMutations.hasUpdates,
+              activeThreadID == route.uiID, let rawThread = activeRawThread else { return }
+        detailPublishTask?.cancel()
+        detailPublishTask = nil
+        let mutations = pendingDetailRenderMutations
+        pendingDetailRenderMutations = NativeDetailRenderMutations()
+        let previousDetail = latestDetails[route.uiID]
+        let detail = mapDetail(
+            rawThread, environment: route.client.environment,
+            sourceSequence: activeThreadSequence ?? 0, mutations: mutations,
+            page: activeThreadPage
+        )
+        let delta = makeDetailDelta(previous: previousDetail, next: detail, mutations: mutations)
+        publish(detail, threadID: route.uiID, renderCacheIsSource: true, delta: delta)
+        scheduleAttachmentHydration(
+            in: detail, threadID: route.uiID, client: route.client,
+            environmentID: route.environmentID
+        )
+    }
+
+    private func retainActiveThread() {
+        guard let id = activeThreadID, let route = try? threadRoute(for: id) else { return }
+        guard let raw = activeRawThread, let sequence = activeThreadSequence else {
+            threadResumeStates[id] = nil
             return
         }
-        detailStreamTask = nil
-        scheduleDetailRefresh(threadID: route.uiID, client: route.client)
-        startPassiveDetailPolling(route)
-    }
-
-    /// Passive environments intentionally avoid full shell WebSocket streams.
-    /// A selected passive thread is still live enough to drive remotely.
-    private func startPassiveDetailPolling(_ route: NativeThreadRoute) {
-        passiveDetailPollingTask?.cancel()
-        passiveDetailPollingTask = nil
-        guard route.environmentID != activeEnvironment?.id else { return }
-        let generation = environmentGeneration
-        passiveDetailPollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(for: .seconds(2))
-                } catch {
-                    return
-                }
-                guard let self,
-                      self.activeThreadID == route.uiID,
-                      self.isKnownClient(
-                          route.client,
-                          environmentID: route.environmentID,
-                          generation: generation
-                      ) else {
-                    return
-                }
-                try? await self.refreshThread(id: route.uiID, client: route.client)
-            }
-        }
+        flushDetailPublish(route)
+        var page = activeThreadPage
+        page?.isLoading = false
+        threadResumeStates[id] = NativeThreadResumeState(
+            client: route.client, thread: raw, sequence: sequence, page: page
+        )
     }
 
     private func finishDetailRefresh(generation: Int, client: T3Client) {
@@ -3547,6 +3650,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         detailStreamGeneration &+= 1
         detailStreamTask?.cancel()
         detailStreamTask = nil
+        detailCatchUpTask?.cancel()
+        detailCatchUpTask = nil
+        detailCatchUpID = nil
         discardPendingDetailPublish()
     }
 
@@ -3836,7 +3942,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
-    private func refreshThread(id: String, client: T3Client) async throws {
+    private func refreshThread(
+        id: String, client: T3Client, expectedStreamGeneration: Int? = nil
+    ) async throws {
         let route = try threadRoute(for: id)
         guard route.client === client else {
             throw NativeFeatureClientError.threadNotFound
@@ -3848,18 +3956,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         ]?.threadSnapshotPagination == true
         let snapshot = try await client.threadSnapshot(
             id: route.wireID,
-            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
+            turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil,
+            timeoutInterval: threadSnapshotTimeoutInterval
         )
-        guard isKnownClient(client, environmentID: environment.id, generation: generation) else {
+        guard !Task.isCancelled,
+              isKnownClient(client, environmentID: environment.id, generation: generation),
+              expectedStreamGeneration.map({ isCurrentDetail(route, generation: $0) }) ?? true else {
             throw CancellationError()
         }
         if activeThreadID == route.uiID {
             guard snapshot.snapshotSequence >= (activeThreadSequence ?? 0) else { return }
+            discardPendingDetailPublish()
             threadHistoryEpoch &+= 1
             pendingOlderThreadPage = nil
             activeRawThread = snapshot.thread
             activeThreadSequence = snapshot.snapshotSequence
             activeThreadPage = featurePage(snapshot.page)
+        } else if let cached = threadResumeStates[route.uiID],
+                  snapshot.snapshotSequence < cached.sequence {
+            return
         }
         let detail = mapDetail(
             snapshot.thread,
@@ -3868,6 +3983,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             page: activeThreadID == route.uiID ? activeThreadPage : featurePage(snapshot.page)
         )
         publish(detail, threadID: route.uiID)
+        threadResumeStates[route.uiID] = NativeThreadResumeState(
+            client: client, thread: snapshot.thread, sequence: snapshot.snapshotSequence,
+            page: featurePage(snapshot.page)
+        )
+        if activeThreadID == route.uiID, detailCompletionReceived {
+            markDetailSynchronized(route)
+        }
         let hydrationBase = latestDetails[route.uiID] ?? detail
         let hydrated = await hydratedAttachmentURLs(
             in: hydrationBase,
@@ -4622,6 +4744,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 break
             }
             latestDetails[threadID] = nil
+            threadResumeStates[threadID] = nil
             detailRenderCaches[threadID] = nil
             terminalSnapshots = terminalSnapshots.filter { $0.key.threadID != threadID }
             if let hydration = attachmentHydrationTasks.removeValue(forKey: threadID) {
@@ -6014,11 +6137,13 @@ enum NativeDetailRenderMutation: Equatable {
 }
 
 struct NativeDetailRenderMutations {
+    private(set) var hasUpdates = false
     private(set) var requiresFullRebuild = false
     private(set) var messages: [OrchestrationMessage] = []
     private(set) var activities: [OrchestrationActivity] = []
 
     mutating func formUnion(_ mutation: NativeDetailRenderMutation) {
+        if mutation != .none { hasUpdates = true }
         guard !requiresFullRebuild else { return }
         switch mutation {
         case .full:
@@ -6660,6 +6785,13 @@ private struct NativeThreadRoute {
     let wireID: String
     let environmentID: String
     let client: T3Client
+}
+
+private struct NativeThreadResumeState {
+    let client: T3Client
+    let thread: OrchestrationThread
+    let sequence: Int
+    let page: FeatureThreadPage?
 }
 
 private struct NativeSourceControlMonitorKey: Hashable {

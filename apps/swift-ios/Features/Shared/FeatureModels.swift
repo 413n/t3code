@@ -1160,6 +1160,13 @@ public enum FeatureApprovalDecision: String, Sendable, Codable {
     }
 }
 
+public enum FeatureThreadSyncState: Sendable, Equatable {
+    case catchingUp
+    case reconnecting
+    case live
+    case failed(String)
+}
+
 public enum FeatureEvent: Sendable {
     case snapshot(FeatureSnapshot)
     case connection(FeatureConnection)
@@ -1167,5 +1174,6 @@ public enum FeatureEvent: Sendable {
     case threadRemoved(id: String)
     case detail(FeatureThreadDetail)
     case detailDelta(FeatureThreadDetail, FeatureDetailDelta)
+    case threadSync(id: String, state: FeatureThreadSyncState?)
     case failure(String)
 }

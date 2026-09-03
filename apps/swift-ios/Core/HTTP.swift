@@ -222,7 +222,8 @@ public actor EnvironmentAPI {
         id: String,
         environment: Environment,
         turnLimit: Int? = nil,
-        beforeCursor: String? = nil
+        beforeCursor: String? = nil,
+        timeoutInterval: TimeInterval? = nil
     ) async throws -> OrchestrationThreadDetailSnapshot {
         let encodedID = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         var queryItems: [URLQueryItem] = []
@@ -237,6 +238,7 @@ public actor EnvironmentAPI {
             path: "/api/orchestration/threads/\(encodedID)",
             queryItems: queryItems,
             method: "GET",
+            timeoutInterval: timeoutInterval,
             as: OrchestrationThreadDetailSnapshot.self
         )
     }

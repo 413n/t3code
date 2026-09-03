@@ -1143,7 +1143,7 @@ private func multiEnvironmentDescriptor(
     return try value.decode(EnvironmentDescriptor.self)
 }
 
-private func multiEnvironmentShell(
+func multiEnvironmentShell(
     projectID: String,
     threadID: String,
     title: String,
@@ -1203,12 +1203,13 @@ private func multiEnvironmentShell(
     )
 }
 
-private func multiEnvironmentDetail(
+func multiEnvironmentDetail(
     projectID: String,
     threadID: String,
     snapshotSequence: Int = 2,
     settledOverride: String? = nil,
-    settledAt: String? = nil
+    settledAt: String? = nil,
+    messages: [OrchestrationMessage] = []
 ) -> OrchestrationThreadDetailSnapshot {
     let timestamp = "2026-07-31T12:00:00.000Z"
     return OrchestrationThreadDetailSnapshot(
@@ -1232,7 +1233,7 @@ private func multiEnvironmentDetail(
             snoozedAt: nil,
             pinnedAt: nil,
             deletedAt: nil,
-            messages: [],
+            messages: messages,
             activities: [],
             checkpoints: [],
             session: nil

@@ -222,22 +222,25 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
     public let providers: [ServerProviderSnapshot]
     public let settings: ServerSettingsSnapshot?
     public let threadSnapshotPagination: Bool?
+    public let threadResumeCompletionMarker: Bool?
     public let environment: EnvironmentDescriptor?
 
     public init(
         providers: [ServerProviderSnapshot],
         settings: ServerSettingsSnapshot? = nil,
         threadSnapshotPagination: Bool? = nil,
+        threadResumeCompletionMarker: Bool? = nil,
         environment: EnvironmentDescriptor? = nil
     ) {
         self.providers = providers
         self.settings = settings
         self.threadSnapshotPagination = threadSnapshotPagination
+        self.threadResumeCompletionMarker = threadResumeCompletionMarker
         self.environment = environment
     }
 
     private enum CodingKeys: String, CodingKey {
-        case providers, settings, threadSnapshotPagination, environment
+        case providers, settings, threadSnapshotPagination, threadResumeCompletionMarker, environment
     }
 
     public init(from decoder: any Decoder) throws {
@@ -252,6 +255,9 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
             forKey: .threadSnapshotPagination
         )
         environment = try container.decodeIfPresent(EnvironmentDescriptor.self, forKey: .environment)
+        threadResumeCompletionMarker = try container.decodeIfPresent(
+            Bool.self, forKey: .threadResumeCompletionMarker
+        )
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -263,6 +269,7 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
             forKey: .threadSnapshotPagination
         )
         try container.encodeIfPresent(environment, forKey: .environment)
+        try container.encodeIfPresent(threadResumeCompletionMarker, forKey: .threadResumeCompletionMarker)
     }
 }
 

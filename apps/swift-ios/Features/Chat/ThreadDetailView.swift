@@ -556,7 +556,8 @@ public struct ThreadDetailView: View {
         ThreadRefreshPresentation.resolve(
             loadState: model.detailLoadStates[thread.id],
             connectionState: threadConnectionState,
-            isOpening: isLoading
+            isOpening: isLoading,
+            syncState: model.threadSyncStates[thread.id]
         )
     }
 
@@ -1051,6 +1052,7 @@ public struct ThreadDetailView: View {
 
 enum ThreadRefreshPresentation: Equatable {
     case loading
+    case catchingUp
     case reconnecting
     case offline
     case failed
@@ -1058,6 +1060,7 @@ enum ThreadRefreshPresentation: Equatable {
     var title: String {
         switch self {
         case .loading: "Updating thread..."
+        case .catchingUp: "Catching up..."
         case .reconnecting: "Reconnecting..."
         case .offline: "Computer offline"
         case .failed: "Could not update thread"
@@ -1066,7 +1069,7 @@ enum ThreadRefreshPresentation: Equatable {
 
     var systemImage: String {
         switch self {
-        case .loading: "hourglass"
+        case .loading, .catchingUp: "hourglass"
         case .reconnecting: "wifi"
         case .offline, .failed: "wifi.exclamationmark"
         }
@@ -1077,8 +1080,15 @@ enum ThreadRefreshPresentation: Equatable {
     static func resolve(
         loadState: FeatureThreadLoadState?,
         connectionState: FeatureConnection.State?,
-        isOpening: Bool
+        isOpening: Bool,
+        syncState: FeatureThreadSyncState? = nil
     ) -> Self? {
+        switch syncState {
+        case .catchingUp: return .catchingUp
+        case .reconnecting: return .reconnecting
+        case .failed: return .failed
+        case .live, nil: break
+        }
         if isOpening || loadState == .loading { return .loading }
         if case .failed = loadState { return .failed }
         switch connectionState {

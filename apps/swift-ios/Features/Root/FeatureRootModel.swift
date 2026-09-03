@@ -51,6 +51,8 @@ public final class FeatureRootModel {
     private var pullRequestObservationIdentities: [String: String] = [:]
     public private(set) var details: [String: FeatureThreadDetail] = [:]
     private(set) var detailLoadStates: [String: FeatureThreadLoadState] = [:]
+    private(set) var threadSyncStates: [String: FeatureThreadSyncState] = [:]
+    private var backgroundedAt: Date?
     /// Advances whenever a Home presentation input changes.
     public private(set) var homePresentationRevision: UInt64 = 0
     /// Advances when a Home-visible thread is inserted, removed, or changed.
@@ -125,6 +127,18 @@ public final class FeatureRootModel {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    func applicationDidEnterBackground(at date: Date = .now) {
+        backgroundedAt = date
+    }
+
+    func applicationDidBecomeActive(at date: Date = .now) async {
+        guard let backgroundedAt else { return }
+        self.backgroundedAt = nil
+        await client.resumeAfterBackground(
+            reconnect: date.timeIntervalSince(backgroundedAt) >= 10
+        )
     }
 
     /// Background refresh is deliberately separate from `reload()`: native
@@ -938,6 +952,11 @@ public final class FeatureRootModel {
             pendingThreadsByID.removeValue(forKey: value.thread.id)
             store(value, delta: delta)
             upsert(value.thread)
+        case let .threadSync(id, state):
+            threadSyncStates[id] = state
+            if state == .live, case .failed = detailLoadStates[id] {
+                detailLoadStates[id] = nil
+            }
         case let .failure(message):
             errorMessage = message
         }
@@ -1171,6 +1190,7 @@ public final class FeatureRootModel {
         storedDetailLoadRequestRevisions.removeValue(forKey: id)
         activeDetailLoadRequests.removeValue(forKey: id)
         detailLoadStates.removeValue(forKey: id)
+        threadSyncStates.removeValue(forKey: id)
         bumpDetailLoadRevision(id: id)
         bumpDetailRevision(id: id, change: .full)
     }
@@ -1181,6 +1201,7 @@ public final class FeatureRootModel {
         storedDetailLoadRequestRevisions.removeAll()
         activeDetailLoadRequests.removeAll()
         detailLoadStates.removeAll()
+        threadSyncStates.removeAll()
         detailMetadataRevisions.removeAll()
         let hadDetails = !details.isEmpty
         details.removeAll()

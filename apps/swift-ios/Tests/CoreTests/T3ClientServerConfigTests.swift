@@ -27,6 +27,7 @@ final class T3ClientServerConfigTests: XCTestCase {
         XCTAssertEqual(folded.providers.first?.instanceId, "codex-new")
         XCTAssertEqual(folded.settings?.newWorktreesStartFromOrigin, false)
         XCTAssertEqual(folded.threadSnapshotPagination, true)
+        XCTAssertEqual(folded.threadResumeCompletionMarker, true)
         XCTAssertEqual(folded.environment?.environmentId, "environment-1")
 
         let replay = await client.serverConfigEvents()
@@ -229,6 +230,7 @@ private actor ServerConfigTestConnection: WebSocketConnection {
                 "newWorktreesStartFromOrigin": .bool(false),
             ]),
             "threadSnapshotPagination": .bool(true),
+            "threadResumeCompletionMarker": .bool(true),
             "environment": .object([
                 "environmentId": .string("environment-1"),
                 "label": .string("Studio"),

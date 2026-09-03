@@ -100,6 +100,10 @@ public actor T3Client {
         await rpc.stop()
     }
 
+    public func reconnect() async {
+        await rpc.reconnect()
+    }
+
     public func liveConnectionActive() async -> Bool {
         await rpc.isConnected()
     }
@@ -127,13 +131,15 @@ public actor T3Client {
     public func threadSnapshot(
         id: String,
         turnLimit: Int? = nil,
-        beforeCursor: String? = nil
+        beforeCursor: String? = nil,
+        timeoutInterval: TimeInterval? = nil
     ) async throws -> OrchestrationThreadDetailSnapshot {
         try await api.threadSnapshot(
             id: id,
             environment: environment,
             turnLimit: turnLimit,
-            beforeCursor: beforeCursor
+            beforeCursor: beforeCursor,
+            timeoutInterval: timeoutInterval
         )
     }
 
@@ -173,6 +179,7 @@ public actor T3Client {
             providers: result.providers,
             settings: current.settings,
             threadSnapshotPagination: current.threadSnapshotPagination,
+            threadResumeCompletionMarker: current.threadResumeCompletionMarker,
             environment: current.environment
         )
         cacheServerConfig(config)
@@ -411,6 +418,7 @@ public actor T3Client {
                     providers: providers,
                     settings: current.settings,
                     threadSnapshotPagination: current.threadSnapshotPagination,
+                    threadResumeCompletionMarker: current.threadResumeCompletionMarker,
                     environment: current.environment
                 ))
             }
@@ -420,6 +428,7 @@ public actor T3Client {
                     providers: current.providers,
                     settings: settings,
                     threadSnapshotPagination: current.threadSnapshotPagination,
+                    threadResumeCompletionMarker: current.threadResumeCompletionMarker,
                     environment: current.environment
                 ))
             }
@@ -563,13 +572,15 @@ public actor T3Client {
     }
 
     public func shellEvents(
-        after sequence: Int? = nil
+        after sequence: Int? = nil,
+        reconnect: Bool = true
     ) async -> AsyncThrowingStream<ShellStreamItem, Error> {
         var payload: [String: JSONValue] = ["requestCompletionMarker": .bool(true)]
         if let sequence { payload["afterSequence"] = .number(Double(sequence)) }
         return await rpc.subscribe(
             RPCMethod.subscribeShell.rawValue,
             payload: .object(payload),
+            reconnect: reconnect,
             as: ShellStreamItem.self
         )
     }
@@ -577,7 +588,8 @@ public actor T3Client {
     public func threadEvents(
         threadID: String,
         after sequence: Int? = nil,
-        turnLimit: Int? = nil
+        turnLimit: Int? = nil,
+        reconnect: Bool = true
     ) async -> AsyncThrowingStream<ThreadStreamItem, Error> {
         var payload: [String: JSONValue] = [
             "threadId": .string(threadID),
@@ -588,6 +600,7 @@ public actor T3Client {
         return await rpc.subscribe(
             RPCMethod.subscribeThread.rawValue,
             payload: .object(payload),
+            reconnect: reconnect,
             as: ThreadStreamItem.self
         )
     }

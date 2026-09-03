@@ -9,6 +9,34 @@ import UIKit
 @Suite("Feature root model")
 struct FeatureRootModelTests {
     @Test
+    func foregroundRecoveryIgnoresInitialActivationAndReplacesLongSuspendedSockets() async {
+        let client = FeatureClientStub()
+        let model = testRootModel(client: client)
+        let start = Date(timeIntervalSince1970: 100)
+        await model.applicationDidBecomeActive(at: start)
+        #expect(client.foregroundReconnects.isEmpty)
+        model.applicationDidEnterBackground(at: start)
+        await model.applicationDidBecomeActive(at: start.addingTimeInterval(9))
+        model.applicationDidEnterBackground(at: start)
+        await model.applicationDidBecomeActive(at: start.addingTimeInterval(10))
+        await model.applicationDidBecomeActive(at: start.addingTimeInterval(11))
+        #expect(client.foregroundReconnects == [false, true])
+    }
+
+    @Test
+    func connectedComputerDoesNotHideThreadCatchUpOrItsFailure() {
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .connected, isOpening: false, syncState: .catchingUp
+        ) == .catchingUp)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .connected, isOpening: false, syncState: .failed("Timeout")
+        ) == .failed)
+        #expect(ThreadRefreshPresentation.resolve(
+            loadState: nil, connectionState: .connected, isOpening: false, syncState: .live
+        ) == nil)
+    }
+
+    @Test
     func appearanceAppliesImmediatelyAndPersistsWithoutSavingTheDraft() async {
         let client = FeatureClientStub()
         let model = testRootModel(client: client)
@@ -2792,6 +2820,8 @@ private func orchestrationThread(
 
 @MainActor
 private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
+    var foregroundReconnects: [Bool] = []
+    func resumeAfterBackground(reconnect: Bool) async { foregroundReconnects.append(reconnect) }
     private let eventStream: AsyncStream<FeatureEvent>
     private let eventContinuation: AsyncStream<FeatureEvent>.Continuation
     var snapshot = FeatureSnapshot()

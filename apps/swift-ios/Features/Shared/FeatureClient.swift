@@ -9,6 +9,7 @@ public protocol FeatureClient: AnyObject {
     /// Background tasks use this instead of the foreground bootstrap path.
     func backgroundSnapshot() async throws -> FeatureSnapshot
     func events() -> AsyncStream<FeatureEvent>
+    func resumeAfterBackground(reconnect: Bool) async
 
     func preuploadAttachment(
         _ attachment: FeatureUploadAttachment,
@@ -211,6 +212,8 @@ public protocol FeatureClient: AnyObject {
 }
 
 public extension FeatureClient {
+    func resumeAfterBackground(reconnect: Bool) async {}
+
     func preuploadAttachment(
         _ attachment: FeatureUploadAttachment,
         environmentID: String
