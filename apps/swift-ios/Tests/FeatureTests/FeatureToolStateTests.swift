@@ -90,8 +90,8 @@ struct FeatureToolStateTests {
         )
         #expect(
             FeatureTypedMediaPreviewRoute.parse(
-                URL(string: "t3code://media-preview/open?path=/tmp/a.png&kind=pdf")!
-            ) == nil
+                URL(string: "t3code://media-preview/open?path=/tmp/a.pdf&kind=pdf")!
+            ) == FeatureTypedMediaPreviewRoute(path: "/tmp/a.pdf", kind: .pdf)
         )
     }
 

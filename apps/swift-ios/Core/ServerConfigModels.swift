@@ -158,6 +158,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public let sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]?
     public let sidebarAutoSettleOnMerge: Bool
     public let sidebarAutoSettleAfterDays: Double?
+    public var environmentIcon: String? = nil
 
     public init(
         defaultThreadEnvMode: ServerThreadEnvironmentMode = .local,
@@ -182,10 +183,12 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         case sidebarProjectGroupingOverrides
         case sidebarAutoSettleOnMerge
         case sidebarAutoSettleAfterDays
+        case environmentIcon
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        environmentIcon = try container.decodeIfPresent(String.self, forKey: .environmentIcon)
         defaultThreadEnvMode = try container.decodeIfPresent(
             ServerThreadEnvironmentMode.self,
             forKey: .defaultThreadEnvMode

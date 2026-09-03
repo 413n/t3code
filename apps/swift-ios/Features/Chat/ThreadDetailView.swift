@@ -185,6 +185,16 @@ public struct ThreadDetailView: View {
         .environment(\.openURL, OpenURLAction { url in
             if handleArtifactTemplateURL(url) { return .handled }
             if handleTypedMediaPreviewURL(url) { return .handled }
+            if case let .workspaceFile(hostPath) = MarkdownImageSource.classify(
+                url.absoluteString, workspaceRoot: markdownImageContext?.workspaceRoot
+            ) {
+                let kind = FeatureFilePreviewKind.infer(path: hostPath)
+                let suffix = URL(fileURLWithPath: hostPath).pathExtension.lowercased()
+                if kind == .image || kind == .video || kind == .pdf || ["html", "htm"].contains(suffix) {
+                    resolveHostMedia(path: hostPath, kind: kind)
+                    return .handled
+                }
+            }
             guard let workspaceRoot = markdownImageContext?.workspaceRoot,
                   let path = MarkdownWorkspaceFileLink.relativePath(
                       for: url,
@@ -496,6 +506,7 @@ public struct ThreadDetailView: View {
 
     @MainActor
     private func observeThreadPullRequest() async {
+        branchPullRequest = nil
         guard let observationIdentity = pullRequestObservationID else {
             branchPullRequest = nil
             return
@@ -550,7 +561,7 @@ public struct ThreadDetailView: View {
     private func reloadThread() {
         isLoading = true
         Task {
-            _ = await model.detail(for: thread.id, force: true)
+            _ = await model.detail(for: thread.id, force: true, fresh: true)
             isLoading = false
         }
     }
@@ -860,12 +871,15 @@ public struct ThreadDetailView: View {
             sendFeedback(command, message: message, submitter: submitter)
             return
         }
-        draftSaveTask?.cancel()
+        let pendingDraftSave = draftSaveTask
+        pendingDraftSave?.cancel()
+        draftSaveTask = nil
         isSending = true
         draft = ""
         attachments = []
         composerFocused = false
         Task {
+            await pendingDraftSave?.value
             let sent = await submitMessage(
                 FeatureMessageSubmission(
                 threadID: thread.id,
@@ -875,6 +889,10 @@ public struct ThreadDetailView: View {
                 )
             )
             if sent {
+                let trailingSave = draftSaveTask
+                trailingSave?.cancel()
+                draftSaveTask = nil
+                await trailingSave?.value
                 let followUpDraft = composerDraft
                 if followUpDraft.text.isEmpty && followUpDraft.attachments.isEmpty {
                     try? await draftStore.removeDraft(for: draftKey)

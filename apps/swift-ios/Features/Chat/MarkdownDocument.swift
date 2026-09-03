@@ -122,9 +122,8 @@ enum MarkdownImageSource: Equatable, Sendable {
 enum MarkdownWorkspaceFileLink {
     static func relativePath(for url: URL, workspaceRoot: String) -> String? {
         let raw = url.absoluteString
-        let lowercase = raw.lowercased()
-        if lowercase.hasPrefix("http://") || lowercase.hasPrefix("https://")
-            || lowercase.hasPrefix("data:") || lowercase.hasPrefix("javascript:") {
+        let isWindowsPath = raw.range(of: #"^[A-Za-z]:[/\\]"#, options: .regularExpression) != nil
+        if url.scheme != nil, !url.isFileURL, !isWindowsPath {
             return nil
         }
 

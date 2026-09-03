@@ -610,7 +610,7 @@ public final class FeatureRootModel {
         }
     }
 
-    public func detail(for id: String, force: Bool = false) async -> FeatureThreadDetail? {
+    public func detail(for id: String, force: Bool = false, fresh: Bool = false) async -> FeatureThreadDetail? {
         if !force, let cached = details[id] {
             return cached
         }
@@ -632,7 +632,7 @@ public final class FeatureRootModel {
             }
         }
         do {
-            var detail = try await client.loadThread(id: id)
+            var detail = try await client.loadThread(id: id, fresh: fresh)
             guard currentEnvironmentIdentity == environment else {
                 return details[id]
             }

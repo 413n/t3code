@@ -901,7 +901,7 @@ public struct AddProjectView: View {
         destinationPath: String
     ) -> Bool {
         let currentRemoteURL = resolvedRepository?.sshUrl
-            ?? repositoryInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? ProjectCreationPath.normalizedCloneURL(repositoryInput)
         return cloneRequestID == requestID
             && selectedEnvironmentID == environmentID
             && currentRemoteURL == remoteURL

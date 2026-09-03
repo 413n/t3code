@@ -157,7 +157,7 @@ struct ConnectionsView: View {
                 detailEnvironmentID = environment.id
             } label: {
                 HStack(spacing: 12) {
-                    Image(systemName: "desktopcomputer")
+                    Image(systemName: environment.systemImage)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(T3Colors.textSecondary)
                         .frame(width: 25)

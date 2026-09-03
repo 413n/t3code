@@ -94,6 +94,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
     public struct Platform: Codable, Equatable, Sendable {
         public let os: String
         public let arch: String
+        public var machine: String? = nil
     }
 
     public struct Capabilities: Codable, Equatable, Sendable {
@@ -376,6 +377,14 @@ public struct OrchestrationProject: Codable, Identifiable, Equatable, Sendable {
     public let createdAt: String
     public let updatedAt: String
     public let deletedAt: String?
+    public var projectIcon: ProjectIconOverride? = nil
+}
+
+public struct ProjectIconOverride: Codable, Equatable, Hashable, Sendable {
+    public let kind: String
+    public var name: String? = nil
+    public var color: String? = nil
+    public var emoji: String? = nil
 }
 
 public enum RuntimeMode: String, Codable, CaseIterable, Sendable {

@@ -290,7 +290,8 @@ private struct FeatureFilePreviewView: View {
                 guard let resolver = client as? any FeatureWorkspaceAssetResolving else {
                     throw FeatureCapabilityUnavailable("Native file previews")
                 }
-                let resolvedURL = if previewKind == .image || previewKind == .video {
+                let resolvedURL = if previewKind == .image || previewKind == .video || previewKind == .pdf
+                    || ["html", "htm"].contains(URL(fileURLWithPath: entry.path).pathExtension.lowercased()) {
                     try await resolver.mediaAssetURL(threadID: threadID, path: entry.path)
                 } else {
                     try await resolver.workspaceAssetURL(threadID: threadID, path: entry.path)

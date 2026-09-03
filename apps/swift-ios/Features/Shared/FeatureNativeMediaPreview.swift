@@ -27,6 +27,8 @@ struct FeatureTypedMediaPreviewRoute: Equatable {
         switch rawKind {
         case "image": kind = .image
         case "video": kind = .video
+        case "pdf": kind = .pdf
+        case "document": kind = .document
         default: return nil
         }
         return Self(path: path, kind: kind)
@@ -107,6 +109,7 @@ final class FeatureMediaPreviewLoader: ObservableObject {
     func load(source: FeatureMediaPreviewSource, fileName: String) async {
         guard fileURL == nil, !isLoading else { return }
         let activeGeneration = generation.begin()
+        errorMessage = nil
         isLoading = true
         defer {
             if generation.isCurrent(activeGeneration) { isLoading = false }
@@ -127,7 +130,8 @@ final class FeatureMediaPreviewLoader: ObservableObject {
                 try data.write(to: destination, options: .atomic)
                 fileURL = destination
             case let .remote(url):
-                let (temporaryURL, response) = try await URLSession.shared.download(from: url)
+                let request = URLRequest(url: url, timeoutInterval: 30)
+                let (temporaryURL, response) = try await URLSession.shared.download(for: request)
                 defer { try? FileManager.default.removeItem(at: temporaryURL) }
                 guard generation.isCurrent(activeGeneration), !Task.isCancelled else { return }
                 guard let response = response as? HTTPURLResponse else {
@@ -169,10 +173,10 @@ final class FeatureMediaPreviewLoader: ObservableObject {
 
     func cleanUp() {
         generation.invalidate()
-        guard let ownedDirectory else { return }
-        try? FileManager.default.removeItem(at: ownedDirectory)
+        if let ownedDirectory { try? FileManager.default.removeItem(at: ownedDirectory) }
         self.ownedDirectory = nil
         fileURL = nil
+        isLoading = false
     }
 }
 
@@ -194,11 +198,11 @@ struct FeatureNativeMediaPreviewView: View {
             } else if let fileURL = loader.fileURL {
                 preview(fileURL)
             } else if let errorMessage = loader.errorMessage {
-                ContentUnavailableView(
-                    "Preview unavailable",
-                    systemImage: "doc.badge.ellipsis",
-                    description: Text(errorMessage)
-                )
+                ContentUnavailableView {
+                    Label("Preview unavailable", systemImage: "doc.badge.ellipsis")
+                } description: { Text(errorMessage) } actions: {
+                    Button("Try again") { Task { await loader.load(source: source, fileName: fileName) } }
+                }
             } else {
                 Text("Loading preview…")
                     .foregroundStyle(T3Colors.textSecondary)
@@ -267,19 +271,55 @@ struct FeatureNativeMediaPreviewView: View {
 
 private struct FeatureVideoPlayerView: View {
     let url: URL
-    @State private var player: AVPlayer
-
-    init(url: URL) {
-        self.url = url
-        _player = State(initialValue: AVPlayer(url: url))
-    }
+    @StateObject private var playback = FeatureVideoPlayback()
 
     var body: some View {
-        VideoPlayer(player: player)
-            .onDisappear {
-                player.pause()
-                player.replaceCurrentItem(with: nil)
+        Group {
+            if playback.failed {
+                ContentUnavailableView {
+                    Label("Video unavailable", systemImage: "video.slash")
+                } description: { Text("The video could not load.") } actions: {
+                    Button("Try again") { playback.load(url) }
+                }
+            } else {
+                VideoPlayer(player: playback.player)
+                    .overlay {
+                        if !playback.ready { Text("Loading video…").foregroundStyle(.white) }
+                    }
             }
+        }
+        .onAppear { playback.load(url) }
+        .onDisappear { playback.stop() }
+    }
+}
+
+@MainActor
+private final class FeatureVideoPlayback: ObservableObject {
+    let player = AVPlayer()
+    @Published private(set) var failed = false
+    @Published private(set) var ready = false
+    private var observation: NSKeyValueObservation?
+
+    func load(_ url: URL) {
+        stop()
+        failed = false
+        ready = false
+        let item = AVPlayerItem(url: url)
+        player.replaceCurrentItem(with: item)
+        observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.player.currentItem === item else { return }
+                self.failed = item.status == .failed
+                self.ready = item.status == .readyToPlay
+            }
+        }
+    }
+
+    func stop() {
+        observation?.invalidate()
+        observation = nil
+        player.pause()
+        player.replaceCurrentItem(with: nil)
     }
 }
 

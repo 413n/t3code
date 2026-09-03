@@ -71,6 +71,7 @@ public protocol FeatureClient: AnyObject {
     func deleteThread(id: String) async throws
 
     func loadThread(id: String) async throws -> FeatureThreadDetail
+    func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail
     func loadEarlierThreadTurns(id: String) async throws -> FeatureThreadDetail?
     func releaseThread(id: String)
     func sendMessage(threadID: String, text: String, selection: FeatureSelection?) async throws
@@ -111,6 +112,7 @@ public protocol FeatureClient: AnyObject {
     ) async throws -> FeatureAutomaticSettlementSettings
 
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage]
+    func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage]
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
     func pullRequestLists(
@@ -216,6 +218,14 @@ public protocol FeatureClient: AnyObject {
 }
 
 public extension FeatureClient {
+    func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail {
+        try await loadThread(id: id)
+    }
+
+    func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage] {
+        try await usageSummaries(input)
+    }
+
     func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws {
         throw FeatureCapabilityUnavailable("Provider settings")
     }

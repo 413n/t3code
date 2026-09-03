@@ -44,6 +44,18 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
     /// has not probed this saved environment yet.
     public var connectionState: FeatureConnection.State?
     public var connectionDetail: String?
+    public var machineIcon: String? = nil
+
+    public var systemImage: String {
+        switch machineIcon {
+        case "cloud": "cloud"
+        case "desktop": "desktopcomputer"
+        case "laptop": "laptopcomputer"
+        case "mac-mini": "macmini"
+        case "mac-studio": "macstudio"
+        default: "server.rack"
+        }
+    }
 
     public init(
         id: String,
@@ -74,6 +86,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         case source
         case connectionState
         case connectionDetail
+        case machineIcon
     }
 
     public init(from decoder: any Decoder) throws {
@@ -89,6 +102,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
             forKey: .connectionState
         )
         connectionDetail = try container.decodeIfPresent(String.self, forKey: .connectionDetail)
+        machineIcon = try container.decodeIfPresent(String.self, forKey: .machineIcon)
     }
 }
 
@@ -124,6 +138,7 @@ public struct FeatureProject: Identifiable, Sendable, Equatable, Hashable, Codab
     public var repositoryIdentity: FeatureRepositoryIdentity?
     public var createdAt: String?
     public var updatedAt: String?
+    public var projectIcon: ProjectIconOverride? = nil
 
     public init(
         id: String,

@@ -458,6 +458,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage] {
+        try await usageSummaries(input, refreshPricing: false)
+    }
+
+    func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage] {
         let environments = try await runtime.environments().filter(\.isEnabled)
         let runtime = runtime
         let order = Dictionary(uniqueKeysWithValues: environments.enumerated().map {
@@ -472,13 +476,19 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 group.addTask {
                     let probe = await runtime.ephemeralClient(for: environment)
                     do {
+                        var pricingError: String?
+                        if refreshPricing {
+                            do { _ = try await probe.refreshUsageRates() }
+                            catch is CancellationError { throw CancellationError() }
+                            catch { pricingError = "Could not refresh prices. Showing the available rates." }
+                        }
                         let summary = try await probe.usageSummary(input)
                         await probe.disconnect()
                         return FeatureEnvironmentUsage(
                             environmentID: environment.id,
                             label: environment.label,
                             summary: summary,
-                            errorMessage: nil
+                            errorMessage: pricingError
                         )
                     } catch is CancellationError {
                         await probe.disconnect()
@@ -1656,6 +1666,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func loadThread(id: String) async throws -> FeatureThreadDetail {
+        try await loadThread(id: id, fresh: false)
+    }
+
+    func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail {
         let route = try threadRoute(for: id)
         let client = route.client
         let environment = client.environment
@@ -1678,7 +1692,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let supportsResume = serverConfigsByEnvironmentID[
             environment.id
         ]?.threadResumeCompletionMarker == true
-        if supportsResume,
+        if !fresh, supportsResume,
            let cached = threadResumeStates[route.uiID], cached.client === client,
            cached.page == nil || supportsPagination,
            var detail = latestDetails[route.uiID],
@@ -4222,6 +4236,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 && left.path == right.path
                 && left.defaultSelection == right.defaultSelection
                 && left.repositoryIdentity == right.repositoryIdentity
+                && left.projectIcon == right.projectIcon
                 && left.createdAt == right.createdAt
                 && left.updatedAt == right.updatedAt
         }
@@ -4403,7 +4418,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     environmentID: environment.id,
                     wireID: project.id
                 )
-                return FeatureProject(
+                var mapped = FeatureProject(
                     id: uiID,
                     wireID: project.id,
                     environmentID: environment.id,
@@ -4422,6 +4437,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     createdAt: project.createdAt,
                     updatedAt: project.updatedAt
                 )
+                mapped.projectIcon = project.projectIcon
+                return mapped
             }
         }
         let providersByEnvironment = enabledEnvironments.reduce(
@@ -4504,7 +4521,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     private func mapEnvironment(_ environment: Environment, activeID: String?) -> FeatureEnvironment {
-        FeatureEnvironment(
+        var mapped = FeatureEnvironment(
             id: environment.id,
             name: environment.label,
             endpoint: environment.httpBaseURL.absoluteString,
@@ -4518,6 +4535,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 ? environmentConnectionDetails[environment.id]
                 : nil
         )
+        mapped.machineIcon = serverConfigsByEnvironmentID[environment.id]?.settings?.environmentIcon
+            ?? environment.descriptor?.platform.machine
+        return mapped
     }
 
     private func mapThread(
@@ -5819,6 +5839,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         case "cursor": "Cursor"
         case "grok": "Grok"
         case "opencode": "OpenCode"
+        case "antigravity": "Antigravity"
         default: id
         }
     }
