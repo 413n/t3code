@@ -2019,8 +2019,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider] {
+        try await refreshProviderCatalog(environmentID: environmentID, cwd: nil, refreshModels: true)
+    }
+
+    func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider] {
+        try await refreshProviderCatalog(environmentID: environmentID, cwd: cwd, refreshModels: false)
+    }
+
+    private func refreshProviderCatalog(environmentID: String, cwd: String?, refreshModels: Bool) async throws -> [FeatureProvider] {
         let client = try await projectCreationClient(environmentID: environmentID)
-        let config = try await client.refreshProviders()
+        let config = try await client.refreshProviders(cwd: cwd, refreshModels: refreshModels)
         setServerConfig(config, environmentID: environmentID)
         if environmentID == activeEnvironment?.id { latestServerConfig = config }
         let providers = mapConfigProviders(config.providers)
@@ -5464,7 +5472,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         _ providers: [ServerProviderSnapshot]
     ) -> [FeatureProvider] {
         Self.normalizedProviders(providers.map { provider in
-                FeatureProvider(
+                var mapped = FeatureProvider(
                     id: provider.instanceId,
                     name: provider.displayName ?? providerDisplayName(provider.driver),
                     isAvailable: provider.enabled
@@ -5501,19 +5509,30 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             inputHint: command.input?.hint
                         )
                     },
-                    skills: (provider.skills ?? []).map { skill in
-                        FeatureProviderSkill(
-                            name: skill.name,
-                            displayName: skill.displayName,
-                            description: skill.description,
-                            shortDescription: skill.shortDescription,
-                            path: skill.path,
-                            scope: skill.scope,
-                            isEnabled: skill.enabled
-                        )
-                    }
+                    skills: (provider.skills ?? []).map(Self.mapSkill)
                 )
+                mapped.workspaceSnapshots = provider.workspaceSnapshots?.map { workspace in
+                    FeatureProviderWorkspace(
+                        cwd: workspace.cwd,
+                        slashCommands: workspace.slashCommands.map {
+                            FeatureProviderSlashCommand(name: $0.name, description: $0.description, inputHint: $0.input?.hint)
+                        },
+                        skills: workspace.skills.map(Self.mapSkill)
+                    )
+                }
+                return mapped
             })
+    }
+
+    private static func mapSkill(_ skill: ServerProviderSkillSnapshot) -> FeatureProviderSkill {
+        var mapped = FeatureProviderSkill(
+            name: skill.name, displayName: skill.displayName,
+            description: skill.description, shortDescription: skill.shortDescription,
+            path: skill.path, scope: skill.scope, isEnabled: skill.enabled
+        )
+        mapped.userInvocationOnly = skill.userInvocationOnly
+        mapped.userInvocable = skill.userInvocable
+        return mapped
     }
 
     /// Without a server config the catalog is inferred from selections in the

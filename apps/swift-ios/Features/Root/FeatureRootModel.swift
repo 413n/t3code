@@ -170,6 +170,18 @@ public final class FeatureRootModel {
         await reload()
     }
 
+    func refreshWorkspaceProviders(environmentID: String, cwd: String) async {
+        do {
+            let providers = try await client.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd)
+            try Task.checkCancellation()
+            var byEnvironment = snapshot.providersByEnvironment ?? [:]
+            byEnvironment[environmentID] = providers
+            snapshot.providersByEnvironment = byEnvironment
+        } catch {
+            // Older or offline servers retain their last catalog. Do not block composing.
+        }
+    }
+
     public func pair(endpoint: String, token: String?) async -> Bool {
         await perform {
             try await client.pair(endpoint: endpoint, token: token)

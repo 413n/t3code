@@ -178,6 +178,11 @@ public struct NewThreadView: View {
             }
         }
         .task(id: projectID) { await restoreDraftAndLoadBranches() }
+        .task(id: selectedProject?.id) {
+            if let project = selectedProject {
+                await model.refreshWorkspaceProviders(environmentID: project.environmentID, cwd: project.path)
+            }
+        }
         .onDisappear {
             guard !submittedSuccessfully else { return }
             persistCurrentDraftImmediately()
@@ -630,8 +635,8 @@ public struct NewThreadView: View {
             )
         }
         return FeatureComposerPowerFeatures(
-            slashCommands: provider?.slashCommands ?? [],
-            skills: provider?.skills ?? [],
+            slashCommands: provider?.workspaceCatalog(cwd: project.path).slashCommands ?? [],
+            skills: provider?.workspaceCatalog(cwd: project.path).skills ?? [],
             pathSearchScopeID: project.id,
             searchPaths: { query in
                 try await model.client.searchProjectFiles(

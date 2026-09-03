@@ -751,7 +751,7 @@ struct FeatureComposerView: View {
         case let .providerCommand(command):
             replacement = "/\(command.name) "
         case let .skill(skill):
-            replacement = "$\(skill.name) "
+            replacement = skill.invocation
         case let .path(entry):
             replacement = FeatureComposerFileLinkSerializer.markdownLink(for: entry.path) + " "
         }

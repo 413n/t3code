@@ -879,6 +879,12 @@ public struct FeatureModelOptionSelection: Identifiable, Sendable, Equatable, Ha
     }
 }
 
+public struct FeatureProviderWorkspace: Sendable, Equatable, Hashable, Codable {
+    public let cwd: String
+    public let slashCommands: [FeatureProviderSlashCommand]
+    public let skills: [FeatureProviderSkill]
+}
+
 public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Codable {
     public let id: String
     public var name: String
@@ -888,6 +894,19 @@ public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Coda
     public var models: [FeatureModel]
     public var slashCommands: [FeatureProviderSlashCommand]?
     public var skills: [FeatureProviderSkill]?
+    public var workspaceSnapshots: [FeatureProviderWorkspace]? = nil
+
+    func workspaceCatalog(cwd: String?) -> FeatureProviderWorkspace {
+        if let cwd, let workspace = workspaceSnapshots?.first(where: { $0.cwd == cwd }) {
+            return workspace
+        }
+        // A catalog from another workspace must not leak into this composer.
+        return FeatureProviderWorkspace(
+            cwd: cwd ?? "",
+            slashCommands: workspaceSnapshots == nil ? slashCommands ?? [] : [],
+            skills: workspaceSnapshots == nil ? skills ?? [] : []
+        )
+    }
 
     public init(
         id: String,

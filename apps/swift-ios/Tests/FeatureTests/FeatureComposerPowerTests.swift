@@ -6,6 +6,35 @@ import UniformTypeIdentifiers
 
 @Suite("Composer power features")
 struct FeatureComposerPowerTests {
+    @Test func workspaceSkillsStayInTheirWorkspace() {
+        var provider = FeatureProvider(id: "claude", name: "Claude", skills: [.init(name: "global")])
+        provider.workspaceSnapshots = [
+            FeatureProviderWorkspace(cwd: "/a", slashCommands: [], skills: [.init(name: "a-only")]),
+            FeatureProviderWorkspace(cwd: "/b", slashCommands: [], skills: [.init(name: "b-only")]),
+        ]
+        #expect(provider.workspaceCatalog(cwd: "/a").skills.map(\.name) == ["a-only"])
+        #expect(provider.workspaceCatalog(cwd: "/b").skills.map(\.name) == ["b-only"])
+        #expect(provider.workspaceCatalog(cwd: "/c").skills.isEmpty)
+        provider.workspaceSnapshots = nil
+        #expect(provider.workspaceCatalog(cwd: "/c").skills.map(\.name) == ["global"])
+    }
+
+    @Test func skillInvocationHonorsProviderRules() {
+        var userOnly = FeatureProviderSkill(name: "deploy")
+        userOnly.userInvocationOnly = true
+        var agentOnly = FeatureProviderSkill(name: "internal")
+        agentOnly.userInvocable = false
+        #expect(userOnly.invocation == "/deploy ")
+        #expect(agentOnly.invocation == "$internal ")
+        let items = FeatureComposerMenuBuilder.items(
+            trigger: .init(kind: .slashCommand, query: "", range: 0..<1),
+            providers: [], currentSelection: nil, threadSelection: nil,
+            powerFeatures: .init(skills: [userOnly, agentOnly]), pathEntries: []
+        )
+        #expect(items.contains { $0.id == "skill:deploy" })
+        #expect(!items.contains { $0.id == "skill:internal" })
+    }
+
     @Test(
         "Composer input grows past the former seven-line cap",
         .bug("https://github.com/saphid/t3code-personal/issues/105")

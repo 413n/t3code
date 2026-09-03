@@ -101,6 +101,15 @@ public struct ServerProviderSkillSnapshot: Codable, Equatable, Sendable {
     public let enabled: Bool
     public let displayName: String?
     public let shortDescription: String?
+    public var userInvocationOnly: Bool? = nil
+    public var userInvocable: Bool? = nil
+}
+
+public struct ServerProviderWorkspaceSnapshot: Codable, Equatable, Sendable {
+    public let cwd: String
+    public let checkedAt: String
+    public let slashCommands: [ServerProviderSlashCommandSnapshot]
+    public let skills: [ServerProviderSkillSnapshot]
 }
 
 public struct ServerProviderSnapshot: Codable, Identifiable, Equatable, Sendable {
@@ -125,6 +134,7 @@ public struct ServerProviderSnapshot: Codable, Identifiable, Equatable, Sendable
     public let models: [ServerProviderModelSnapshot]
     public let slashCommands: [ServerProviderSlashCommandSnapshot]?
     public let skills: [ServerProviderSkillSnapshot]?
+    public var workspaceSnapshots: [ServerProviderWorkspaceSnapshot]? = nil
 }
 
 public enum ServerThreadEnvironmentMode: String, Codable, Equatable, Sendable {

@@ -101,6 +101,7 @@ public protocol FeatureClient: AnyObject {
 
     func saveSettings(_ settings: FeatureSettings) async throws
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
+    func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider]
     func updateAutomaticSettlement(
         environmentID: String,
         change: FeatureAutomaticSettlementChange
@@ -244,6 +245,10 @@ public extension FeatureClient {
     func setEnvironmentEnabled(id: String, enabled: Bool) async throws {}
     func removeEnvironment(id: String) async throws {}
     func disconnect() async {}
+    func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider] {
+        throw FeatureCapabilityUnavailable("Workspace provider catalog")
+    }
+
     func refreshProviders(environmentID _: String) async throws -> [FeatureProvider] {
         throw FeatureCapabilityUnavailable("Provider refresh")
     }

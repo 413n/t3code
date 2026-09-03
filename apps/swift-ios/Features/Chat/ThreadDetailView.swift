@@ -88,6 +88,11 @@ public struct ThreadDetailView: View {
         .task(id: pullRequestObservationID) {
             await observeThreadPullRequest()
         }
+        .task(id: workspaceCatalogID) {
+            if let environmentID = currentThread.environmentID, let cwd = workspaceCatalogPath {
+                await model.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd)
+            }
+        }
         .onChange(of: draft) { scheduleDraftSave() }
         .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
@@ -689,8 +694,8 @@ public struct ThreadDetailView: View {
         let selectedProviderID = selection?.providerID ?? currentSelection?.providerID
         let provider = threadProviders.first { $0.id == selectedProviderID }
         return FeatureComposerPowerFeatures(
-            slashCommands: provider?.slashCommands ?? [],
-            skills: provider?.skills ?? [],
+            slashCommands: provider?.workspaceCatalog(cwd: workspaceCatalogPath).slashCommands ?? [],
+            skills: provider?.workspaceCatalog(cwd: workspaceCatalogPath).skills ?? [],
             pathSearchScopeID: currentThread.id,
             searchPaths: { query in
                 try await model.client.searchThreadFiles(
@@ -712,6 +717,14 @@ public struct ThreadDetailView: View {
             for: currentThread,
             in: model.snapshot
         )
+    }
+
+    private var workspaceCatalogPath: String? {
+        currentThread.worktreePath ?? model.snapshot.projects.first { $0.id == currentThread.projectID }?.path
+    }
+
+    private var workspaceCatalogID: String {
+        "\(currentThread.environmentID ?? ""):\(workspaceCatalogPath ?? "")"
     }
 
     private func refreshThreadEnvironmentModels() async throws {

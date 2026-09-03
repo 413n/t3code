@@ -52,6 +52,10 @@ public struct FeatureProviderSkill: Identifiable, Sendable, Equatable, Hashable,
     public let path: String
     public let scope: String?
     public let isEnabled: Bool
+    public var userInvocationOnly: Bool? = nil
+    public var userInvocable: Bool? = nil
+
+    var invocation: String { "\(userInvocationOnly == true ? "/" : "$")\(name) " }
 
     public init(
         name: String,
@@ -346,6 +350,7 @@ enum FeatureComposerMenuBuilder {
             }
             let enabledSkills = enabledSkills(in: powerFeatures.skills)
             let skills = enabledSkills
+                .filter { $0.userInvocable != false }
                 .filter { skill in
                     guard !normalizedSkillQuery.isEmpty else { return true }
                     return [skill.name, skill.displayName, skill.shortDescription, skill.description]
