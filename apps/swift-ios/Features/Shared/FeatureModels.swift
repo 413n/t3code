@@ -776,6 +776,7 @@ public struct FeatureModel: Identifiable, Sendable, Equatable, Hashable, Codable
     public var name: String
     public var detail: String?
     public var supportsImages: Bool
+    public var imageSupportIsUnknown: Bool? = nil
     public var supportsReasoning: Bool
     public var isDefault: Bool
     public var isLegacy: Bool?

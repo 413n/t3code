@@ -3,6 +3,17 @@ import Testing
 @testable import T3Code
 
 struct MainParityTests {
+    @Test func unknownImageSupportDoesNotChangeTheRestOfTheCatalog() {
+        var saved = FeatureModel(id: "custom", name: "Custom")
+        saved.imageSupportIsUnknown = true
+        var provider = FeatureProvider(id: "codex", name: "Codex", models: [
+            .init(id: "old-server-model", name: "Old server model"), saved,
+        ])
+        #expect(DailyUXModelOptions.supportsImages(selection: .init(providerID: "codex", modelID: "old-server-model"), providers: [provider]))
+        provider.models.append(.init(id: "vision", name: "Vision", supportsImages: true))
+        #expect(DailyUXModelOptions.supportsImages(selection: .init(providerID: "codex", modelID: "custom"), providers: [provider]))
+    }
+
     @Test func sharedPreferencesExcludeMachineSettings() throws {
         let settings = try JSONDecoder().decode(ServerSettingsSnapshot.self, from: Data(#"{"defaultThreadEnvMode":"worktree","newWorktreesStartFromOrigin":false,"sidebarAutoSettleAfterDays":null,"sidebarAutoSettleOnMerge":false,"environmentIcon":"mac-mini","sourceControlWritingStyle":{"mode":"conventional_commits","customInstructions":"","followChangeRequestTemplates":true}}"#.utf8))
         #expect(settings.sharedPatch["environmentIcon"] == nil)

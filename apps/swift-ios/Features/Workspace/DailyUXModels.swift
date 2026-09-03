@@ -1256,6 +1256,6 @@ enum DailyUXModelOptions {
               let model = provider.models.first(where: { $0.id == selection.modelID }) else {
             return true
         }
-        return model.supportsImages
+        return model.imageSupportIsUnknown == true || model.supportsImages
     }
 }
