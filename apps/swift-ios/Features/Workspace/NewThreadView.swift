@@ -178,6 +178,9 @@ public struct NewThreadView: View {
             }
         }
         .task(id: projectID) { await restoreDraftAndLoadBranches() }
+        .environment(\.providerSetupContext, selectedProject.map {
+            ProviderSetupContext(model: model, environmentID: $0.environmentID)
+        })
         .task(id: selectedProject?.id) {
             if let project = selectedProject {
                 await model.refreshWorkspaceProviders(environmentID: project.environmentID, cwd: project.path)

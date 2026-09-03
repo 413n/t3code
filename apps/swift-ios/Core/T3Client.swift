@@ -198,6 +198,33 @@ public actor T3Client {
         )
     }
 
+    public func refreshUsageRates() async throws -> UsagePricing {
+        try await rpc.request("server.refreshUsageRates", as: UsagePricing.self)
+    }
+
+    public func setProviderEnabled(instanceID: String, driver: String, enabled: Bool) async throws {
+        let settings = try await rpc.request("server.getSettings", as: JSONValue.self)
+        let patch = ProviderSettingsPatch.enabled(settings: settings, instanceID: instanceID, driver: driver, enabled: enabled)
+        let _: JSONValue = try await rpc.request("server.updateSettings", payload: .object(["patch": patch]), as: JSONValue.self)
+    }
+
+    public func providerSetup(instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent {
+        switch action {
+        case .signIn, .completeSignIn, .cancelSignIn, .signOut:
+            return .auth(try await rpc.request(action.method, payload: action.payload(instanceID: instanceID), as: ProviderAuthState.self))
+        case .install, .cancelInstall, .remove:
+            return .install(try await rpc.request(action.method, payload: action.payload(instanceID: instanceID), as: ProviderInstallState.self))
+        }
+    }
+
+    public func providerAuthEvents(instanceID: String) async -> AsyncThrowingStream<ProviderAuthState, Error> {
+        await rpc.subscribe("provider.auth.subscribe", payload: .object(["instanceId": .string(instanceID)]), as: ProviderAuthState.self)
+    }
+
+    public func providerInstallEvents(instanceID: String) async -> AsyncThrowingStream<ProviderInstallState, Error> {
+        await rpc.subscribe("provider.install.subscribe", payload: .object(["instanceId": .string(instanceID)]), as: ProviderInstallState.self)
+    }
+
     public func pullRequests(_ input: PullRequestListInput) async throws -> PullRequestListResult {
         try await rpc.request(
             RPCMethod.pullRequestsList.rawValue,

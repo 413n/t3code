@@ -895,6 +895,11 @@ public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Coda
     public var slashCommands: [FeatureProviderSlashCommand]?
     public var skills: [FeatureProviderSkill]?
     public var workspaceSnapshots: [FeatureProviderWorkspace]? = nil
+    public var setup: ProviderSetupCapabilities? = nil
+    public var isEnabled: Bool? = nil
+    public var isInstalled: Bool? = nil
+    public var authStatus: String? = nil
+    public var statusMessage: String? = nil
 
     func workspaceCatalog(cwd: String?) -> FeatureProviderWorkspace {
         if let cwd, let workspace = workspaceSnapshots?.first(where: { $0.cwd == cwd }) {

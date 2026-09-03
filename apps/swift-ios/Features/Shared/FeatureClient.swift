@@ -102,6 +102,9 @@ public protocol FeatureClient: AnyObject {
     func saveSettings(_ settings: FeatureSettings) async throws
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
     func refreshWorkspaceProviders(environmentID: String, cwd: String) async throws -> [FeatureProvider]
+    func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent
+    func providerSetupEvents(environmentID: String, instanceID: String) -> AsyncThrowingStream<ProviderSetupEvent, Error>
+    func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws
     func updateAutomaticSettlement(
         environmentID: String,
         change: FeatureAutomaticSettlementChange
@@ -213,6 +216,18 @@ public protocol FeatureClient: AnyObject {
 }
 
 public extension FeatureClient {
+    func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws {
+        throw FeatureCapabilityUnavailable("Provider settings")
+    }
+
+    func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent {
+        throw FeatureCapabilityUnavailable("Provider setup")
+    }
+
+    func providerSetupEvents(environmentID: String, instanceID: String) -> AsyncThrowingStream<ProviderSetupEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
     func resumeAfterBackground(reconnect: Bool) async {}
 
     func preuploadAttachment(

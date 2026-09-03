@@ -112,6 +112,13 @@ public struct SettingsView: View {
         SettingsSection(title: "Workspace") {
             VStack(spacing: 0) {
                 NavigationLink {
+                    ProvidersSettingsView(model: model)
+                } label: {
+                    SettingsNavigationRow(title: "Providers", systemImage: "cpu")
+                }
+                .buttonStyle(.plain)
+                settingsDivider
+                NavigationLink {
                     PullRequestsView(model: model)
                 } label: {
                     SettingsNavigationRow(

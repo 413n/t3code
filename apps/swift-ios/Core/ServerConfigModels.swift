@@ -135,6 +135,7 @@ public struct ServerProviderSnapshot: Codable, Identifiable, Equatable, Sendable
     public let slashCommands: [ServerProviderSlashCommandSnapshot]?
     public let skills: [ServerProviderSkillSnapshot]?
     public var workspaceSnapshots: [ServerProviderWorkspaceSnapshot]? = nil
+    public var setup: ProviderSetupCapabilities? = nil
 }
 
 public enum ServerThreadEnvironmentMode: String, Codable, Equatable, Sendable {

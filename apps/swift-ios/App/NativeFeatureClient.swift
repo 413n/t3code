@@ -2018,6 +2018,54 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         settingsStore.set(data, forKey: Self.settingsKey)
     }
 
+    func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        try await requireScope("orchestration:operate", client: client)
+        let config = try await client.serverConfig()
+        guard let provider = config.providers.first(where: { $0.instanceId == instanceID }), provider.driver == "antigravity" else {
+            throw FeatureCapabilityUnavailable("Provider settings")
+        }
+        try await client.setProviderEnabled(instanceID: instanceID, driver: provider.driver, enabled: enabled)
+    }
+
+    func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        try await requireScope("orchestration:operate", client: client)
+        return try await client.providerSetup(instanceID: instanceID, action: action)
+    }
+
+    func providerSetupEvents(environmentID: String, instanceID: String) -> AsyncThrowingStream<ProviderSetupEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let client = try await projectCreationClient(environmentID: environmentID)
+                    try await requireScope("orchestration:operate", client: client)
+                    let config = try await client.serverConfig()
+                    let setup = config.providers.first { $0.instanceId == instanceID }?.setup
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        if setup?.canAuthenticate == true {
+                            group.addTask {
+                                for try await state in await client.providerAuthEvents(instanceID: instanceID) {
+                                    continuation.yield(.auth(state))
+                                }
+                            }
+                        }
+                        if setup?.canInstall == true {
+                            group.addTask {
+                                for try await state in await client.providerInstallEvents(instanceID: instanceID) {
+                                    continuation.yield(.install(state))
+                                }
+                            }
+                        }
+                        try await group.waitForAll()
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider] {
         try await refreshProviderCatalog(environmentID: environmentID, cwd: nil, refreshModels: true)
     }
@@ -5511,6 +5559,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     },
                     skills: (provider.skills ?? []).map(Self.mapSkill)
                 )
+                mapped.setup = provider.setup
+                mapped.isEnabled = provider.enabled
+                mapped.isInstalled = provider.installed
+                mapped.authStatus = provider.auth.status
+                mapped.statusMessage = provider.message
                 mapped.workspaceSnapshots = provider.workspaceSnapshots?.map { workspace in
                     FeatureProviderWorkspace(
                         cwd: workspace.cwd,

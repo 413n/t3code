@@ -209,6 +209,7 @@ public struct ProviderModelPicker: View {
 
 private struct ModelPickerSheet: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
+    @SwiftUI.Environment(\.providerSetupContext) private var setupContext
     let providers: [FeatureProvider]
     @Binding var selection: FeatureSelection?
     let isLoading: Bool
@@ -285,6 +286,13 @@ private struct ModelPickerSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search models")
             .toolbar {
+                if let setupContext {
+                    ToolbarItem(placement: .topBarLeading) {
+                        NavigationLink("Providers") {
+                            ProvidersSettingsView(model: setupContext.model, environmentID: setupContext.environmentID)
+                        }
+                    }
+                }
                 if onRefresh != nil {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
@@ -1265,6 +1273,7 @@ enum ProviderModelCatalogNormalizer {
     }
 
     private static func isImplicitModel(_ model: FeatureModel) -> Bool {
+        if model.id == "antigravity-default" { return true }
         let tokens = [model.id, model.name].flatMap {
             $0.lowercased()
                 .split { !$0.isLetter && !$0.isNumber }

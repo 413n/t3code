@@ -93,6 +93,9 @@ public struct ThreadDetailView: View {
                 await model.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd)
             }
         }
+        .environment(\.providerSetupContext, currentThread.environmentID.map {
+            ProviderSetupContext(model: model, environmentID: $0)
+        })
         .onChange(of: draft) { scheduleDraftSave() }
         .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
