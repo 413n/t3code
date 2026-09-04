@@ -266,9 +266,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             return disconnectedSnapshot(environments: environments)
         }
         let environment = activeClient.environment
+        let generation = environmentGeneration
         let loads = await loadEnvironmentShells(environments.filter(\.isEnabled))
         guard let currentClient = try await runtime.activeClient(),
-              currentClient.environment.id == environment.id else {
+              currentClient === activeClient,
+              generation == environmentGeneration else {
             throw CancellationError()
         }
 
@@ -1090,8 +1092,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
               }) else {
             return false
         }
-        rebuildEntityIndexes((try? await runtime.environments()) ?? [environment])
-        await emitSnapshot(shell, environment: environment)
+        await emitSnapshot(shell, client: client, expectedGeneration: generation)
         return true
     }
 
@@ -1199,7 +1200,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 throw CancellationError()
             }
             let shell = newestShell(refreshedShell, for: environment)
-            await emitSnapshot(shell, environment: environment)
+            await emitSnapshot(shell, client: client, expectedGeneration: generation)
             if let created = shell.threads.first(where: { $0.id == pending.threadID }) {
                 provisionalThreadRoutes[FeatureScopedID.thread(
                     environmentID: environment.id,
@@ -1436,7 +1437,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 throw CancellationError()
             }
             let shell = newestShell(refreshedShell, for: environment)
-            await emitSnapshot(shell, environment: environment)
+            await emitSnapshot(shell, client: client, expectedGeneration: generation)
             if let created = shell.threads.first(where: { $0.id == pending.threadID }) {
                 provisionalThreadRoutes[FeatureScopedID.thread(
                     environmentID: environment.id,
@@ -2100,13 +2101,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func refreshProviderCatalog(environmentID: String, cwd: String?, instanceID: String? = nil, refreshModels: Bool) async throws -> [FeatureProvider] {
         let client = try await projectCreationClient(environmentID: environmentID)
+        let generation = environmentGeneration
         let config = try await client.refreshProviders(cwd: cwd, instanceID: instanceID, refreshModels: refreshModels)
+        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
+            throw CancellationError()
+        }
         setServerConfig(config, environmentID: environmentID)
         if environmentID == activeEnvironment?.id { latestServerConfig = config }
         let providers = mapConfigProviders(config.providers)
         providerCatalogCache[environmentID] = providers
         if let shell = shellsByEnvironmentID[environmentID] {
-            await emitSnapshot(shell)
+            await emitSnapshot(shell, client: client, expectedGeneration: generation)
         }
         return providers
     }
@@ -2194,8 +2199,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     private func saveServerPreferences(client: T3Client, environmentID: String, change: ServerSettingsChange) async throws -> ServerSettingsSnapshot {
-        let previous = serverConfigsByEnvironmentID[environmentID]
+        let generation = environmentGeneration
+        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
+            throw CancellationError()
+        }
         let settings = try await client.updateSettings(change)
+        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
+            throw CancellationError()
+        }
+        let previous = serverConfigsByEnvironmentID[environmentID]
         let config = ServerConfigSnapshot(
             providers: previous?.providers ?? [],
             settings: settings,
@@ -2207,7 +2219,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if environmentID == activeEnvironment?.id {
             latestServerConfig = config
         }
-        if let shell = shellsByEnvironmentID[environmentID] { await emitSnapshot(shell) }
+        if let shell = shellsByEnvironmentID[environmentID] {
+            await emitSnapshot(shell, client: client, expectedGeneration: generation)
+        }
         return settings
     }
 
@@ -2952,11 +2966,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     private func emitCachedSnapshot(for environmentID: String) async {
-        guard let environment = environmentClients[environmentID]?.environment,
+        guard let client = environmentClients[environmentID],
               let shell = shellsByEnvironmentID[environmentID] else {
             return
         }
-        await emitSnapshot(shell, environment: environment)
+        await emitSnapshot(shell, client: client, expectedGeneration: environmentGeneration)
     }
 
     private func removeCachedApproval(id: String, threadID: String) {
@@ -3116,15 +3130,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             await self.consume(
                                 shell: shell,
                                 client: activeClient,
+                                generation: generation,
                                 refreshActiveThread: true
                             )
                         case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved:
-                            await self.consume(delta: item, client: activeClient)
+                            await self.consume(delta: item, client: activeClient, generation: generation)
                         case .refreshRequired:
                             if let shell = try? await activeClient.shellSnapshot() {
                                 await self.consume(
                                     shell: shell,
                                     client: activeClient,
+                                    generation: generation,
                                     refreshActiveThread: true
                                 )
                             }
@@ -3265,7 +3281,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         continue
                     }
                     if let shell = self.latestShell {
-                        await self.emitSnapshot(shell)
+                        await self.emitSnapshot(
+                            shell, client: activeClient, expectedGeneration: generation
+                        )
                     }
                 }
             } catch is CancellationError {
@@ -3356,17 +3374,20 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private func consume(
         shell: OrchestrationShellSnapshot,
         client: T3Client,
+        generation: Int,
         refreshActiveThread: Bool
     ) async {
-        guard let currentClient = self.client,
-              currentClient === client,
+        guard !Task.isCancelled,
+              isCurrentSession(client: client, generation: generation),
               shell.snapshotSequence >= (latestShell?.snapshotSequence ?? .min) else {
             return
         }
         shellPublishTask?.cancel()
         shellPublishTask = nil
         latestShell = shell
-        await emitSnapshot(shell)
+        shellsByEnvironmentID[client.environment.id] = shell
+        await emitSnapshot(shell, client: client, expectedGeneration: generation)
+        guard isCurrentSession(client: client, generation: generation) else { return }
         if refreshActiveThread, let threadID = activeThreadID {
             scheduleDetailRefresh(threadID: threadID, client: client)
         }
@@ -3387,10 +3408,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         shellPublishTask?.cancel()
         shellPublishTask = nil
         latestShell = shell
+        shellsByEnvironmentID[client.environment.id] = shell
         await emitSnapshot(
             shell,
-            markSourceConnected: false,
-            expectedGeneration: generation
+            client: client,
+            expectedGeneration: generation,
+            markSourceConnected: false
         )
         guard isCurrentSession(client: client, generation: generation),
               let threadID = activeThreadID else {
@@ -3399,11 +3422,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         scheduleDetailRefresh(threadID: threadID, client: client)
     }
 
-    private func consume(delta: ShellStreamItem, client: T3Client) async {
-        guard let currentClient = self.client, currentClient === client else { return }
+    private func consume(delta: ShellStreamItem, client: T3Client, generation: Int) async {
+        guard !Task.isCancelled,
+              isCurrentSession(client: client, generation: generation) else { return }
         guard let current = latestShell else {
             if let shell = try? await client.shellSnapshot() {
-                await consume(shell: shell, client: client, refreshActiveThread: true)
+                await consume(
+                    shell: shell, client: client, generation: generation, refreshActiveThread: true
+                )
             }
             return
         }
@@ -3442,13 +3468,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         case let .projectRemoved(_, projectID):
             projects.removeAll { $0.id == projectID }
         case let .threadUpserted(_, thread):
-            changedThreadID = activeEnvironment.map {
-                FeatureScopedID.thread(environmentID: $0.id, wireID: thread.id)
-            }
-            if let environmentID = activeEnvironment?.id {
-                archivedThreadsByEnvironmentID[environmentID]?.removeAll {
-                    ($0.wireID ?? $0.id) == thread.id
-                }
+            changedThreadID = FeatureScopedID.thread(
+                environmentID: client.environment.id, wireID: thread.id
+            )
+            archivedThreadsByEnvironmentID[client.environment.id]?.removeAll {
+                ($0.wireID ?? $0.id) == thread.id
             }
             if let index = threads.firstIndex(where: { $0.id == thread.id }) {
                 threads[index] = thread
@@ -3456,17 +3480,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 threads.append(thread)
             }
         case let .threadRemoved(_, threadID):
-            let uiThreadID = activeEnvironment.map {
-                FeatureScopedID.thread(environmentID: $0.id, wireID: threadID)
-            }
+            let uiThreadID = FeatureScopedID.thread(
+                environmentID: client.environment.id, wireID: threadID
+            )
             changedThreadID = uiThreadID
             shouldRefreshArchived = true
             threads.removeAll { $0.id == threadID }
-            if let uiThreadID {
-                latestDetails[uiThreadID] = nil
-                detailRenderCaches[uiThreadID] = nil
-                detailCacheRecency.removeAll { $0 == uiThreadID }
-            }
+            latestDetails[uiThreadID] = nil
+            detailRenderCaches[uiThreadID] = nil
+            detailCacheRecency.removeAll { $0 == uiThreadID }
             if activeThreadID == uiThreadID {
                 resetDetailRefresh()
                 resetDetailStream()
@@ -3489,9 +3511,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             updatedAt: current.updatedAt
         )
         latestShell = shell
+        // Keep the source cache current during the coalesced UI publish. A
+        // concurrent config or HTTP refresh must not restore an older shell.
+        shellsByEnvironmentID[client.environment.id] = shell
         scheduleShellPublish(client)
-        if shouldRefreshArchived, let environment = activeEnvironment {
-            scheduleArchivedRefresh(client: client, environment: environment)
+        if shouldRefreshArchived {
+            scheduleArchivedRefresh(client: client, environment: client.environment)
         }
         if let changedThreadID, activeThreadID == changedThreadID {
             scheduleDetailRefresh(threadID: changedThreadID, client: client)
@@ -3507,13 +3532,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         shellPublishTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard let self else { return }
-            self.shellPublishTask = nil
             guard !Task.isCancelled,
                   self.isCurrentSession(client: client, generation: generation),
                   let shell = self.latestShell else {
                 return
             }
-            await self.emitSnapshot(shell)
+            self.shellPublishTask = nil
+            await self.emitSnapshot(shell, client: client, expectedGeneration: generation)
         }
     }
 
@@ -4092,9 +4117,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if activeEnvironment?.id == environment.id {
             latestShell = shell
         }
-        rebuildEntityIndexes(
-            (try? await runtime.environments()) ?? [environment]
-        )
         if includeArchived,
            let archivedShell = try? await client.archivedShellSnapshot(),
            isKnownClient(client, environmentID: environment.id, generation: generation) {
@@ -4104,9 +4126,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             archivedShellThreadsByEnvironmentID[environment.id] = Dictionary(
                 uniqueKeysWithValues: archivedShell.threads.map { ($0.id, $0) }
             )
-            rebuildEntityIndexes((try? await runtime.environments()) ?? [environment])
         }
-        await emitSnapshot(shell, environment: environment)
+        await emitSnapshot(shell, client: client, expectedGeneration: generation)
     }
 
     private func scheduleArchivedRefresh(client: T3Client, environment: Environment) {
@@ -4125,11 +4146,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             self.archivedShellThreadsByEnvironmentID[environment.id] = Dictionary(
                 uniqueKeysWithValues: archivedShell.threads.map { ($0.id, $0) }
             )
-            self.rebuildEntityIndexes(
-                (try? await self.runtime.environments()) ?? [environment]
-            )
             if let shell = self.latestShell {
-                await self.emitSnapshot(shell)
+                await self.emitSnapshot(shell, client: client, expectedGeneration: generation)
             }
         }
     }
@@ -4210,20 +4228,27 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
     }
 
+    /// Snapshots belong to the client that read them, not the selected inbox
+    /// connection. Keep that source and its session through the awaited read.
     private func emitSnapshot(
         _ shell: OrchestrationShellSnapshot,
-        environment sourceEnvironment: Environment? = nil,
-        markSourceConnected: Bool = true,
-        expectedGeneration: Int? = nil
+        client sourceClient: T3Client,
+        expectedGeneration: Int,
+        markSourceConnected: Bool = true
     ) async {
-        guard let environment = activeEnvironment else { return }
-        let sourceEnvironment = sourceEnvironment ?? environment
-        let generation = environmentGeneration
-        guard expectedGeneration == nil || expectedGeneration == generation else { return }
+        let sourceEnvironment = sourceClient.environment
+        guard !Task.isCancelled,
+              let environment = activeEnvironment,
+              isKnownClient(
+                  sourceClient, environmentID: sourceEnvironment.id, generation: expectedGeneration
+              ) else { return }
         let environments = (try? await runtime.environments()) ?? [environment]
-        guard generation == environmentGeneration,
-              expectedGeneration == nil || expectedGeneration == environmentGeneration,
+        guard !Task.isCancelled,
+              isKnownClient(
+                  sourceClient, environmentID: sourceEnvironment.id, generation: expectedGeneration
+              ),
               activeEnvironment?.id == environment.id,
+              environments.contains(where: { $0.id == sourceEnvironment.id && $0.isEnabled }),
               shell.snapshotSequence
                   >= (shellsByEnvironmentID[sourceEnvironment.id]?.snapshotSequence ?? .min) else {
             return
