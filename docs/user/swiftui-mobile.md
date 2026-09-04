@@ -33,7 +33,7 @@ A failed environment does not remove the usage data from other environments.
 Cached messages stay readable while a thread catches up. A status above the composer shows when
 the content is incomplete or the computer cannot be reached. Use **Retry** if an update fails.
 Working indicators return after the thread is current. File previews can finish loading after
-the text is ready.
+the text is ready. Saved drafts load without waiting for the thread to catch up.
 
 ## Attachments and sharing
 
@@ -41,9 +41,10 @@ One message can contain up to eight photos, videos, or files. Images can be up t
 files can be up to 50 MB, or the lower limit reported by the connected server. Older servers accept
 images only.
 
-Attachments start uploading while you compose. If an upload fails, the draft keeps its local copy
-so you can retry or remove it. Tap an image, PDF, video, or other file to preview it with native
-controls when iOS supports that format.
+Attachments start uploading while you compose. **Preparing** means the attachment is waiting to
+start. Failed or timed-out uploads show **Retry** and keep the local copy. If the app cannot save
+the draft, it shows that error instead of reporting an upload in progress. Tap an image, PDF,
+video, or other file to preview it with native controls when iOS supports that format.
 
 Links to images, videos, PDFs and HTML files can also open files outside the workspace when the
 server supports them. Failed previews show an error and a retry action.

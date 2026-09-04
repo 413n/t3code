@@ -26,6 +26,7 @@ public struct ThreadDetailView: View {
     @State private var feedbackIdentifier: String?
     @State private var didRestoreDraft = false
     @State private var draftSaveTask: Task<Void, Never>?
+    @State private var draftSaveError: String?
     @State private var toolSurface: FeatureThreadToolSurface?
     @State private var branchPullRequest: FeaturePullRequest?
     @State private var linkedMediaPreview: FeatureLinkedMediaPreview?
@@ -78,12 +79,15 @@ public struct ThreadDetailView: View {
             }
         }
         .task(id: thread.id) {
-            let restoreBaseline = composerDraft
-            let restoreKey = draftKey
             isLoading = true
             _ = await model.detail(for: thread.id, force: true)
             isLoading = false
-            await restoreDraft(from: restoreBaseline, key: restoreKey)
+        }
+        .task(id: thread.id) {
+            // A cached thread can already show its composer while the server
+            // is catching up. Local drafts must not wait for that request.
+            guard !didRestoreDraft else { return }
+            await restoreDraft(from: composerDraft, key: draftKey)
         }
         .task(id: pullRequestObservationID) {
             await observeThreadPullRequest()
@@ -98,7 +102,6 @@ public struct ThreadDetailView: View {
             ProviderSetupContext(model: model, environmentID: $0)
         })
         .onChange(of: draft) { scheduleDraftSave() }
-        .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
         .onChange(of: threadConnectionState) { _, state in
             if state == .connected,
@@ -675,7 +678,7 @@ public struct ThreadDetailView: View {
                 FeatureComposerView(
                     text: $draft,
                     selection: $selection,
-                    attachments: $attachments,
+                    attachments: attachmentBinding,
                     draftOwnerID: "thread:\(currentThread.id)",
                     environmentID: currentThread.environmentID,
                     draftStorageKey: draftKey,
@@ -705,7 +708,9 @@ public struct ThreadDetailView: View {
                     onUserInputSubmit: { id, answers in
                         Task { await model.resolveUserInput(id, answers: answers) }
                     },
-                    onRefreshModels: refreshThreadEnvironmentModels
+                    onRefreshModels: refreshThreadEnvironmentModels,
+                    draftSaveError: draftSaveError,
+                    onRetryDraftSave: persistDraftImmediately
                 )
             }
             .background(T3Colors.background)
@@ -922,7 +927,7 @@ public struct ThreadDetailView: View {
                 sendFailed = true
             }
             isSending = false
-            if !sent {
+            if !sent || !draft.isEmpty || !attachments.isEmpty {
                 persistDraftImmediately()
             }
         }
@@ -960,7 +965,12 @@ public struct ThreadDetailView: View {
         isSending = true
 
         Task {
-            defer { isSending = false }
+            defer {
+                isSending = false
+                if !draft.isEmpty || !attachments.isEmpty {
+                    persistDraftImmediately()
+                }
+            }
             do {
                 let identifier = try await submitter.submitCodexFeedback(
                     threadID: thread.id,
@@ -993,6 +1003,18 @@ public struct ThreadDetailView: View {
 
     private var draftKey: String {
         FeatureComposerDraftStore.threadKey(currentThread)
+    }
+
+    private var attachmentBinding: Binding<[FeatureDraftAttachment]> {
+        Binding(
+            get: { attachments },
+            set: { value in
+                attachments = value
+                // Photo results arrive while a full-screen cover is closing.
+                // Save at the handoff, not through a parent view observer.
+                persistDraftImmediately()
+            }
+        )
     }
 
     @MainActor
@@ -1031,15 +1053,19 @@ public struct ThreadDetailView: View {
 
     private func scheduleDraftSave() {
         guard didRestoreDraft, !isSending else { return }
-        draftSaveTask?.cancel()
+        let previousSave = draftSaveTask
+        previousSave?.cancel()
         let snapshot = composerDraft
         let key = draftKey
         let environmentID = currentThread.environmentID
         draftSaveTask = Task {
+            await previousSave?.value
             do {
                 try await Task.sleep(for: .milliseconds(220))
                 try Task.checkCancellation()
                 try await draftStore.setDraft(snapshot, for: key)
+                guard !Task.isCancelled else { return }
+                draftSaveError = nil
                 if let environmentID {
                     model.attachmentUploads.syncOwner(
                         draftKey: key,
@@ -1050,20 +1076,26 @@ public struct ThreadDetailView: View {
             } catch is CancellationError {
                 return
             } catch {
-                return
+                guard !Task.isCancelled else { return }
+                draftSaveError = "Could not save draft. \(error.localizedDescription)"
             }
         }
     }
 
     private func persistDraftImmediately() {
-        guard didRestoreDraft else { return }
-        draftSaveTask?.cancel()
+        guard didRestoreDraft, !isSending else { return }
+        let previousSave = draftSaveTask
+        previousSave?.cancel()
         let snapshot = composerDraft
         let key = draftKey
         let environmentID = currentThread.environmentID
         draftSaveTask = Task {
             do {
+                await previousSave?.value
+                try Task.checkCancellation()
                 try await draftStore.setDraft(snapshot, for: key)
+                guard !Task.isCancelled else { return }
+                draftSaveError = nil
                 if let environmentID {
                     model.attachmentUploads.syncOwner(
                         draftKey: key,
@@ -1072,7 +1104,8 @@ public struct ThreadDetailView: View {
                     )
                 }
             } catch {
-                return
+                guard !Task.isCancelled else { return }
+                draftSaveError = "Could not save draft. \(error.localizedDescription)"
             }
         }
     }

@@ -1033,6 +1033,7 @@ public actor T3Client {
     public func prepareAttachment(
         _ attachment: UploadChatAttachment
     ) async throws -> UploadedAttachmentReference? {
+        try Task.checkCancellation()
         let capabilities = latestServerEnvironment?.capabilities
             ?? environment.descriptor?.capabilities
         let supportsUploads = capabilities?.attachmentUploads == true
@@ -1059,6 +1060,7 @@ public actor T3Client {
            !reference.attachmentID.isEmpty {
             do {
                 _ = try await createAssetURL(resource: .attachment(id: reference.attachmentID))
+                try Task.checkCancellation()
                 return reference
             } catch where Self.isAttachmentNotFound(error) {
                 // The server expired the attachment. Upload the retained bytes again.
@@ -1072,6 +1074,7 @@ public actor T3Client {
             sizeBytes: attachment.sizeBytes
         )
         do {
+            try Task.checkCancellation()
             guard let url = URL(
                 string: upload.relativeUrl,
                 relativeTo: environment.httpBaseURL
@@ -1096,12 +1099,15 @@ public actor T3Client {
                     to: url
                 )
             }
+            try Task.checkCancellation()
             return UploadedAttachmentReference(
                 environmentID: environment.id,
                 attachmentID: upload.attachmentId
             )
         } catch {
-            try? await deleteAttachment(id: upload.attachmentId)
+            // Cleanup must not keep the composer in Uploading after the
+            // transfer has failed, especially if the WebSocket is offline.
+            Task { try? await self.deleteAttachment(id: upload.attachmentId) }
             throw error
         }
     }

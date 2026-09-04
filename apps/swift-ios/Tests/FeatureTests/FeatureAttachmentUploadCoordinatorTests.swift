@@ -118,6 +118,83 @@ struct FeatureAttachmentUploadCoordinatorTests {
         }
     }
 
+    @Test func timeoutShowsRetryWithoutReleasingAnActiveTransferSlot() async throws {
+        let uploads = CoordinatorUploadHarness()
+        let persistence = CoordinatorPersistenceHarness()
+        let deadlines = CoordinatorDeadlineHarness()
+        let coordinator = FeatureAttachmentUploadCoordinator(
+            maximumConcurrentUploads: 1,
+            upload: uploads.upload,
+            persist: persistence.persist,
+            waitForTimeout: deadlines.wait
+        )
+        let value = attachment(byte: 1)
+        coordinator.syncOwner(draftKey: "draft", environmentID: "one", attachments: [value])
+        _ = await uploads.nextStart()
+        deadlines.expire(await deadlines.nextStart())
+        await waitUntilObserved {
+            coordinator.state(environmentID: "one", attachmentID: value.id)
+                == .failed("Upload timed out. Check the connection and retry.")
+        }
+
+        coordinator.retry(environmentID: "one", attachmentID: value.id)
+        #expect(coordinator.state(environmentID: "one", attachmentID: value.id) == .queued)
+        #expect(uploads.startCount == 1)
+
+        // This transport ignores cancellation until its callback arrives.
+        uploads.complete(value.id, environmentID: "one", attachmentID: "late")
+        _ = await uploads.nextStart()
+        #expect(uploads.maximumActive == 1)
+        #expect(persistence.callCount == 0)
+        uploads.complete(value.id, environmentID: "one", attachmentID: "retry")
+        await waitUntilObserved {
+            coordinator.state(environmentID: "one", attachmentID: value.id)
+                == .ready(.init(environmentID: "one", attachmentID: "retry"))
+        }
+        #expect(persistence.callCount == 1)
+    }
+
+    @Test(arguments: [true, false])
+    func timeoutDuringPersistenceStartsNextUploadAndRejectsLateCompletion(succeeds: Bool) async throws {
+        let uploads = CoordinatorUploadHarness()
+        let persistence = CoordinatorPersistenceHarness(suspended: true)
+        let deadlines = CoordinatorDeadlineHarness()
+        let coordinator = FeatureAttachmentUploadCoordinator(
+            maximumConcurrentUploads: 1,
+            upload: uploads.upload,
+            persist: persistence.persist,
+            waitForTimeout: deadlines.wait
+        )
+        let values = [attachment(byte: 1), attachment(byte: 2)]
+        coordinator.syncOwner(draftKey: "draft", environmentID: "one", attachments: values)
+        let first = await uploads.nextStart()
+        let deadline = await deadlines.nextStart()
+        uploads.complete(first, environmentID: "one")
+        await persistence.nextCall()
+
+        deadlines.expire(deadline)
+        let expected = FeatureAttachmentUploadState.failed(
+            "Upload timed out. Check the connection and retry."
+        )
+        await waitUntilObserved {
+            coordinator.state(environmentID: "one", attachmentID: first) == expected
+        }
+        // A stalled disk save must not block the next network transfer.
+        let second = await uploads.nextStart()
+        if succeeds {
+            persistence.resume(result: true)
+        } else {
+            persistence.fail(error: CancellationError())
+        }
+
+        uploads.complete(second, environmentID: "one")
+        await waitUntilObserved {
+            coordinator.state(environmentID: "one", attachmentID: second)
+                == .ready(.init(environmentID: "one", attachmentID: "uploaded"))
+        }
+        #expect(coordinator.state(environmentID: "one", attachmentID: first) == expected)
+    }
+
     private func makeCoordinator(
         limit: Int,
         uploads: CoordinatorUploadHarness
@@ -244,7 +321,7 @@ private final class CoordinatorUploadHarness {
 private final class CoordinatorPersistenceHarness {
     var error: (any Error)?
     private var suspended: Bool
-    private var continuation: CheckedContinuation<Bool, Never>?
+    private var continuation: CheckedContinuation<Bool, any Error>?
     private(set) var callCount = 0
     private var callReceipts = 0
     private var callWaiters: [CheckedContinuation<Void, Never>] = []
@@ -264,7 +341,7 @@ private final class CoordinatorPersistenceHarness {
         }
         if let error = self.error { throw error }
         if self.suspended {
-            return await withCheckedContinuation { self.continuation = $0 }
+            return try await withCheckedThrowingContinuation { self.continuation = $0 }
         }
         return true
     }
@@ -275,12 +352,57 @@ private final class CoordinatorPersistenceHarness {
         continuation = nil
     }
 
+    func fail(error: any Error) {
+        suspended = false
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+
     func nextCall() async {
         if callReceipts > 0 {
             callReceipts -= 1
             return
         }
         await withCheckedContinuation { callWaiters.append($0) }
+    }
+}
+
+@MainActor
+private final class CoordinatorDeadlineHarness {
+    private var pending: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    private var startedIDs: [UUID] = []
+    private var startWaiters: [CheckedContinuation<UUID, Never>] = []
+
+    lazy var wait: FeatureAttachmentUploadCoordinator.WaitForTimeout = { [weak self] _ in
+        guard let self else { throw CancellationError() }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.pending[id] = continuation
+                if self.startWaiters.isEmpty {
+                    self.startedIDs.append(id)
+                } else {
+                    self.startWaiters.removeFirst().resume(returning: id)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    func nextStart() async -> UUID {
+        if !startedIDs.isEmpty { return startedIDs.removeFirst() }
+        return await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func expire(_ id: UUID) {
+        pending.removeValue(forKey: id)?.resume()
     }
 }
 

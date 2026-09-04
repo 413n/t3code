@@ -6,6 +6,27 @@ struct FeatureModelRefreshError: LocalizedError {
     var errorDescription: String? { "Couldn’t refresh models." }
 }
 
+struct FeatureComposerUploadStatus {
+    var preparingCount = 0
+    var uploadingCount = 0
+    var failures: [(UUID, String)] = []
+
+    init(states: [(UUID, FeatureAttachmentUploadState?)]) {
+        for (id, state) in states {
+            switch state {
+            case .some(.ready): break
+            case let .some(.failed(message)): failures.append((id, message))
+            case .some(.uploading): uploadingCount += 1
+            case .some(.queued), .none: preparingCount += 1
+            }
+        }
+    }
+
+    var blocksSend: Bool {
+        preparingCount > 0 || uploadingCount > 0 || !failures.isEmpty
+    }
+}
+
 struct FeatureComposerView: View {
     @SwiftUI.Environment(\.scenePhase) private var scenePhase
     @State private var isManuallyExpanded = false
@@ -33,6 +54,8 @@ struct FeatureComposerView: View {
     private let attachmentUploads: FeatureAttachmentUploadCoordinator
     private let attachmentPreferences: FeatureEnvironmentPreferences
     private let onRefreshModels: (() async throws -> Void)?
+    private let draftSaveError: String?
+    private let onRetryDraftSave: (() -> Void)?
     private let threadSelection: FeatureSelection?
     private let materializesDefaultSelection: Bool
     private let isSending: Bool
@@ -77,7 +100,9 @@ struct FeatureComposerView: View {
         onDismissKeyboard: (() -> Void)? = nil,
         onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)? = nil,
         onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)? = nil,
-        onRefreshModels: (() async throws -> Void)? = nil
+        onRefreshModels: (() async throws -> Void)? = nil,
+        draftSaveError: String? = nil,
+        onRetryDraftSave: (() -> Void)? = nil
     ) {
         _text = text
         _selection = selection
@@ -89,6 +114,8 @@ struct FeatureComposerView: View {
         self.attachmentUploads = attachmentUploads
         self.attachmentPreferences = attachmentPreferences
         self.onRefreshModels = onRefreshModels
+        self.draftSaveError = draftSaveError
+        self.onRetryDraftSave = onRetryDraftSave
         self.providers = providers
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
@@ -342,7 +369,20 @@ struct FeatureComposerView: View {
                     .accessibilityIdentifier("attachment-preparing")
             }
 
-            if let uploadStatus {
+            if let draftSaveError {
+                HStack(spacing: 8) {
+                    Text(draftSaveError).lineLimit(3)
+                    Spacer(minLength: 0)
+                    if let onRetryDraftSave {
+                        Button("Retry", action: onRetryDraftSave)
+                    }
+                }
+                .font(T3Typography.supporting)
+                .foregroundStyle(T3Colors.danger)
+                .padding(.horizontal, 15)
+                .padding(.bottom, 4)
+                .accessibilityIdentifier("composer-draft-save-error")
+            } else if uploadStatus.blocksSend {
                 uploadStatusView(uploadStatus)
             }
 
@@ -570,7 +610,7 @@ struct FeatureComposerView: View {
             containsFiles: attachments.contains { !$0.mimeType.hasPrefix("image/") },
             isSending: isSending,
             preparationState: attachmentPreparation
-        ) && !uploadsBlockSend
+        ) && !uploadStatus.blocksSend && draftSaveError == nil
     }
 
     private var imagesAllowed: Bool {
@@ -591,11 +631,6 @@ struct FeatureComposerView: View {
         return nil
     }
 
-    private struct UploadStatus {
-        var pendingCount = 0
-        var failures: [(UUID, String)] = []
-    }
-
     private var applicableUploadStates: [(UUID, FeatureAttachmentUploadState?)] {
         guard environmentIsConnected, let environmentID, draftStorageKey != nil else { return [] }
         return attachments.compactMap { attachment in
@@ -614,29 +649,17 @@ struct FeatureComposerView: View {
         }
     }
 
-    private var uploadsBlockSend: Bool {
-        applicableUploadStates.contains { _, state in
-            if case .some(.ready) = state { return false }
-            return true
-        }
+    private var uploadStatus: FeatureComposerUploadStatus {
+        FeatureComposerUploadStatus(states: applicableUploadStates)
     }
 
-    private var uploadStatus: UploadStatus? {
-        var result = UploadStatus()
-        for (id, state) in applicableUploadStates {
-            switch state {
-            case .some(.ready): break
-            case let .some(.failed(message)): result.failures.append((id, message))
-            case .some(.queued), .some(.uploading), .none: result.pendingCount += 1
-            }
-        }
-        return result.pendingCount == 0 && result.failures.isEmpty ? nil : result
-    }
-
-    private func uploadStatusView(_ status: UploadStatus) -> some View {
+    private func uploadStatusView(_ status: FeatureComposerUploadStatus) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            if status.pendingCount > 0 {
-                Text("Uploading \(status.pendingCount) attachment\(status.pendingCount == 1 ? "" : "s")")
+            if status.preparingCount > 0 {
+                Text("Preparing \(status.preparingCount) attachment\(status.preparingCount == 1 ? "" : "s")")
+            }
+            if status.uploadingCount > 0 {
+                Text("Uploading \(status.uploadingCount) attachment\(status.uploadingCount == 1 ? "" : "s")")
             }
             ForEach(status.failures, id: \.0) { failure in
                 HStack(spacing: 8) {

@@ -277,7 +277,7 @@ public actor EnvironmentAPI {
         mimeType: String,
         to url: URL
     ) async throws {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 60)
         request.httpMethod = "POST"
         request.httpBody = data
         request.setValue(mimeType, forHTTPHeaderField: "Content-Type")
@@ -305,7 +305,7 @@ public actor EnvironmentAPI {
         mimeType: String,
         to url: URL
     ) async throws {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 60)
         request.httpMethod = "POST"
         request.setValue(mimeType, forHTTPHeaderField: "Content-Type")
         request.setValue(String(byteCount), forHTTPHeaderField: "Content-Length")

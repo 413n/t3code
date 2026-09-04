@@ -28,6 +28,7 @@ public final class FeatureAttachmentUploadCoordinator {
         FeatureDraftAttachment,
         String
     ) async throws -> Bool
+    typealias WaitForTimeout = @MainActor @Sendable (Duration) async throws -> Void
 
     private struct Owner {
         var environmentID: String
@@ -39,11 +40,13 @@ public final class FeatureAttachmentUploadCoordinator {
         let token: UUID
         var state: FeatureAttachmentUploadState
         var task: Task<Void, Never>?
+        var deadlineTask: Task<Void, Never>?
     }
 
     public private(set) var states: [FeatureAttachmentUploadKey: FeatureAttachmentUploadState] = [:]
     private let upload: Upload
     private let persist: Persist
+    private let waitForTimeout: WaitForTimeout
     private let maximumConcurrentUploads: Int
     private var owners: [String: Owner] = [:]
     private var outboxOwners: [String: Set<FeatureAttachmentUploadKey>] = [:]
@@ -74,11 +77,13 @@ public final class FeatureAttachmentUploadCoordinator {
     init(
         maximumConcurrentUploads: Int = 3,
         upload: @escaping Upload,
-        persist: @escaping Persist
+        persist: @escaping Persist,
+        waitForTimeout: @escaping WaitForTimeout = { try await Task.sleep(for: $0) }
     ) {
         self.maximumConcurrentUploads = max(1, maximumConcurrentUploads)
         self.upload = upload
         self.persist = persist
+        self.waitForTimeout = waitForTimeout
     }
 
     public func syncOwner(
@@ -188,6 +193,7 @@ public final class FeatureAttachmentUploadCoordinator {
         if let job = jobs[key] {
             guard !Self.samePayload(job.attachment, attachment) else { return }
             job.task?.cancel()
+            job.deadlineTask?.cancel()
             jobs[key] = nil
             states[key] = nil
         }
@@ -199,7 +205,8 @@ public final class FeatureAttachmentUploadCoordinator {
             attachment: attachment,
             token: UUID(),
             state: .queued,
-            task: nil
+            task: nil,
+            deadlineTask: nil
         )
         states[key] = .queued
     }
@@ -213,6 +220,19 @@ public final class FeatureAttachmentUploadCoordinator {
             job.state = .uploading
             runningTokens.insert(token)
             states[key] = .uploading
+            job.deadlineTask = Task { [weak self, waitForTimeout] in
+                do {
+                    // Include connection setup and draft persistence, not just
+                    // the HTTP transfer. Files can be as large as 50 MiB.
+                    let timeout: Duration = attachment.mimeType.hasPrefix("image/")
+                        ? .seconds(120) : .seconds(600)
+                    try await waitForTimeout(timeout)
+                    try Task.checkCancellation()
+                } catch {
+                    return
+                }
+                self?.uploadTimedOut(key: key, token: token)
+            }
             job.task = Task { [weak self, upload] in
                 let result: Result<FeatureUploadedAttachmentReference?, any Error>
                 do {
@@ -241,7 +261,7 @@ public final class FeatureAttachmentUploadCoordinator {
         result: Result<FeatureUploadedAttachmentReference?, any Error>
     ) async {
         runningTokens.remove(token)
-        guard jobs[key]?.token == token else {
+        guard jobs[key]?.token == token, jobs[key]?.state == .uploading else {
             startQueuedJobs()
             return
         }
@@ -292,6 +312,8 @@ public final class FeatureAttachmentUploadCoordinator {
               currentAndOwned(key: key, token: token, attachment: attachment) else { return }
         job.state = .ready(reference)
         job.task = nil
+        job.deadlineTask?.cancel()
+        job.deadlineTask = nil
         jobs[key] = job
         states[key] = job.state
     }
@@ -309,18 +331,30 @@ public final class FeatureAttachmentUploadCoordinator {
     }
 
     private func fail(key: FeatureAttachmentUploadKey, token: UUID, error: any Error) {
-        guard var job = jobs[key], job.token == token else { return }
+        guard var job = jobs[key], job.token == token, job.state == .uploading else { return }
         job.state = .failed(
             (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         )
         job.task = nil
+        job.deadlineTask?.cancel()
+        job.deadlineTask = nil
         jobs[key] = job
         states[key] = job.state
+    }
+
+    private func uploadTimedOut(key: FeatureAttachmentUploadKey, token: UUID) {
+        guard let job = jobs[key], job.token == token, job.state == .uploading else { return }
+        job.task?.cancel()
+        // Publish the failure even if a canceled transfer has not returned.
+        // Its concurrency slot still belongs to it until transferReturned.
+        fail(key: key, token: token, error: CoordinatorError.timedOut)
+        startQueuedJobs()
     }
 
     private func cancelUnowned(_ keys: Set<FeatureAttachmentUploadKey>) {
         for key in keys where !isOwned(key) {
             jobs[key]?.task?.cancel()
+            jobs[key]?.deadlineTask?.cancel()
             jobs[key] = nil
             states[key] = nil
         }
@@ -332,7 +366,7 @@ public final class FeatureAttachmentUploadCoordinator {
         token: UUID,
         attachment: FeatureDraftAttachment
     ) -> Bool {
-        guard let job = jobs[key], job.token == token,
+        guard let job = jobs[key], job.token == token, job.state == .uploading,
               Self.samePayload(job.attachment, attachment) else { return false }
         return outboxOwners.values.contains(where: { $0.contains(key) }) || !matchingDraftKeys(
             key: key,
@@ -364,6 +398,7 @@ public final class FeatureAttachmentUploadCoordinator {
 private enum CoordinatorError: LocalizedError {
     case wrongEnvironment
     case persistenceRejected
+    case timedOut
 
     var errorDescription: String? {
         switch self {
@@ -371,6 +406,8 @@ private enum CoordinatorError: LocalizedError {
             "The uploaded attachment belongs to a different environment."
         case .persistenceRejected:
             "The draft changed before the upload could be saved. Retry the upload."
+        case .timedOut:
+            "Upload timed out. Check the connection and retry."
         }
     }
 }

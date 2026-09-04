@@ -32,6 +32,7 @@ public struct NewThreadView: View {
     @State private var restoredDraftProjectID: String?
     @State private var draftRestoreContext: NewTaskDraftRestoreContext?
     @State private var draftSaveTask: Task<Void, Never>?
+    @State private var draftSaveError: String?
     @State private var immediateDraftSaveTasks: [String: Task<Void, Never>] = [:]
     @State private var submittedSuccessfully = false
     @State private var restoresPromptAfterPickerDismissal = false
@@ -93,7 +94,7 @@ public struct NewThreadView: View {
                     FeatureComposerView(
                         text: $prompt,
                         selection: selectionBinding,
-                        attachments: $attachments,
+                        attachments: attachmentBinding,
                         draftOwnerID: selectedProject.map {
                             "new-task:\($0.environmentID):\($0.id)"
                         } ?? "new-task:unselected",
@@ -116,7 +117,9 @@ public struct NewThreadView: View {
                         forceExpanded: true,
                         powerFeatures: composerPowerFeatures,
                         onDismissKeyboard: { promptFocused = false },
-                        onRefreshModels: refreshSelectedEnvironmentModels
+                        onRefreshModels: refreshSelectedEnvironmentModels,
+                        draftSaveError: draftSaveError,
+                        onRetryDraftSave: persistCurrentDraftImmediately
                     )
                 }
                 .background(T3Colors.background)
@@ -165,7 +168,6 @@ public struct NewThreadView: View {
         }
         .onChange(of: prompt) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
-        .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: workspaceMode) { scheduleDraftSave() }
         .onChange(of: selectedBranch) { scheduleDraftSave() }
         .onChange(of: startFromOrigin) { scheduleDraftSave() }
@@ -780,6 +782,7 @@ public struct NewThreadView: View {
                 onCreated(thread)
             } else {
                 isSubmitting = false
+                persistCurrentDraftImmediately()
                 submissionFailed = true
             }
         }
@@ -860,6 +863,7 @@ public struct NewThreadView: View {
         }
 
         restoredDraftProjectID = nil
+        draftSaveError = nil
         draftSaveTask?.cancel()
         draftSaveTask = nil
         prompt = ""
@@ -1025,6 +1029,18 @@ public struct NewThreadView: View {
         return draftKey(for: project)
     }
 
+    private var attachmentBinding: Binding<[FeatureDraftAttachment]> {
+        Binding(
+            get: { attachments },
+            set: { value in
+                attachments = value
+                if restoredDraftProjectID == projectID {
+                    persistCurrentDraftImmediately()
+                }
+            }
+        )
+    }
+
     private func draftKey(for project: FeatureProject) -> String {
         FeatureComposerDraftStore.newTaskKey(project: project, in: model.snapshot)
     }
@@ -1062,12 +1078,16 @@ public struct NewThreadView: View {
         draftSaveTask = nil
         let snapshot = composerDraft
         let environmentID = selectedProject?.environmentID
+        let immediateSave = immediateDraftSaveTasks[key]
         draftSaveTask = Task {
             await NewTaskDraftWriteFence.wait(pendingDraftSaveTask)
+            await NewTaskDraftWriteFence.wait(immediateSave)
             do {
                 try await Task.sleep(for: .milliseconds(220))
                 try Task.checkCancellation()
                 try await draftStore.setDraft(snapshot, for: key)
+                guard !Task.isCancelled else { return }
+                if currentDraftKey == key { draftSaveError = nil }
                 if let environmentID {
                     model.attachmentUploads.syncOwner(
                         draftKey: key,
@@ -1078,13 +1098,14 @@ public struct NewThreadView: View {
             } catch is CancellationError {
                 return
             } catch {
-                return
+                guard !Task.isCancelled, currentDraftKey == key else { return }
+                draftSaveError = "Could not save draft. \(error.localizedDescription)"
             }
         }
     }
 
     private func persistCurrentDraftImmediately() {
-        guard !submittedSuccessfully,
+        guard !submittedSuccessfully, !isSubmitting,
               let key = currentDraftKey else {
             return
         }
@@ -1110,6 +1131,8 @@ public struct NewThreadView: View {
                 let merged = restoreContext.merging(saved: saved, current: snapshot)
                 do {
                     try await draftStore.setDraft(merged, for: key)
+                    guard !Task.isCancelled else { return }
+                    if currentDraftKey == key { draftSaveError = nil }
                     if let environmentID {
                         model.attachmentUploads.syncOwner(
                             draftKey: key,
@@ -1118,11 +1141,14 @@ public struct NewThreadView: View {
                         )
                     }
                 } catch {
-                    return
+                    guard !Task.isCancelled, currentDraftKey == key else { return }
+                    draftSaveError = "Could not save draft. \(error.localizedDescription)"
                 }
             } else {
                 do {
                     try await draftStore.setDraft(snapshot, for: key)
+                    guard !Task.isCancelled else { return }
+                    if currentDraftKey == key { draftSaveError = nil }
                     if let environmentID {
                         model.attachmentUploads.syncOwner(
                             draftKey: key,
@@ -1131,7 +1157,8 @@ public struct NewThreadView: View {
                         )
                     }
                 } catch {
-                    return
+                    guard !Task.isCancelled, currentDraftKey == key else { return }
+                    draftSaveError = "Could not save draft. \(error.localizedDescription)"
                 }
             }
         }

@@ -3,6 +3,7 @@ import Observation
 import SwiftUI
 import Testing
 import UIKit
+import XCTest
 @testable import T3Code
 
 @MainActor
@@ -1607,6 +1608,177 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func cachedThreadRestoresAttachmentsBeforeItsNetworkRefreshFinishes() async throws {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(
+            id: "cached-draft", projectID: "project", environmentID: "one",
+            title: "Cached draft"
+        )
+        let cached = FeatureThreadDetail(thread: thread)
+        client.threadDetail = cached
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-thread-draft-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let draftStore = FeatureComposerDraftStore(
+            fileURL: directory.appendingPathComponent("drafts.json")
+        )
+        let attachment = FeatureDraftAttachment(
+            data: Data([1]), filename: "example.png", mimeType: "image/png"
+        )
+        try await draftStore.setDraft(
+            FeatureComposerDraft(text: "Keep this draft", attachments: [attachment]),
+            for: FeatureComposerDraftStore.threadKey(thread)
+        )
+        let model = FeatureRootModel(
+            client: client,
+            outboxStore: FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json")),
+            draftStore: draftStore
+        )
+        _ = await model.detail(for: thread.id)
+
+        let loads = AsyncStream<Void>.makeStream()
+        let uploads = AsyncStream<UUID>.makeStream()
+        var pendingLoad: CheckedContinuation<FeatureThreadDetail, any Error>?
+        client.loadThreadHandler = { _ in
+            try await withCheckedThrowingContinuation { continuation in
+                pendingLoad = continuation
+                loads.continuation.yield()
+            }
+        }
+        client.preuploadHandler = { value, environmentID in
+            #expect(environmentID == "one")
+            uploads.continuation.yield(value.id)
+            return nil
+        }
+        defer {
+            pendingLoad?.resume(returning: cached)
+            loads.continuation.finish()
+            uploads.continuation.finish()
+        }
+
+        let controller = UIHostingController(rootView: ThreadDetailView(
+            model: model, thread: thread, submitMessage: { _ in false }, draftStore: draftStore
+        ))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 402, height: 800))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true }
+        controller.view.layoutIfNeeded()
+
+        var loadEvents = loads.stream.makeAsyncIterator()
+        await loadEvents.next()
+        var uploadEvents = uploads.stream.makeAsyncIterator()
+        #expect(await uploadEvents.next() == attachment.id)
+        #expect(pendingLoad != nil)
+        #expect(model.detailLoadStates[thread.id] == .loading)
+        #expect(model.details[thread.id] == cached)
+    }
+
+    @Test(.serialized, arguments: [false, true])
+    func freshThreadImageSavesAndUploadsAfterDraftRestore(afterFullScreenCover: Bool) async throws {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(
+            id: "fresh-image", projectID: "project", environmentID: "one", title: "Fresh image"
+        )
+        client.threadDetail = FeatureThreadDetail(thread: thread)
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .connected),
+            environments: [.init(
+                id: "one", name: "Studio", endpoint: "https://studio.example",
+                connectionState: .connected
+            )],
+            threads: [thread],
+            preferencesByEnvironment: ["one": .init(supportsImageUploads: true)]
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-fresh-image-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let draftStore = FeatureComposerDraftStore(fileURL: directory.appendingPathComponent("drafts.json"))
+        let draftKey = FeatureComposerDraftStore.threadKey(thread)
+        let initialText = "Attach this screenshot"
+        try await draftStore.setDraft(FeatureComposerDraft(text: initialText), for: draftKey)
+        let model = FeatureRootModel(
+            client: client,
+            outboxStore: FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json")),
+            draftStore: draftStore
+        )
+        await model.reload()
+        _ = await model.detail(for: thread.id)
+
+        let uploaded = XCTestExpectation(description: "Fresh attachment saved and upload started")
+        var uploadedAttachment: FeatureUploadAttachment?
+        client.preuploadHandler = { attachment, environmentID in
+            let saved = try await draftStore.draft(for: draftKey)
+            #expect(environmentID == "one")
+            #expect(saved?.text == initialText)
+            #expect(saved?.attachments.map(\.id) == [attachment.id])
+            uploadedAttachment = attachment
+            uploaded.fulfill()
+            return nil
+        }
+        let presentation = ThreadImageCoverPresentation()
+        let controller = UIHostingController(rootView: ThreadImageTestHost(
+            detail: ThreadDetailView(
+                model: model, thread: thread, submitMessage: { _ in false }, draftStore: draftStore
+            ),
+            presentation: presentation
+        ))
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = try #require(scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first)
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 402, height: 800)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            controller.dismiss(animated: false)
+            window.isHidden = true
+            previousKeyWindow?.makeKey()
+        }
+        // A representable can update its text without laying out the hosting
+        // controller. Drive UI frames until the restored editor is visible.
+        var renderedInput: UIView?
+        let layoutDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        repeat {
+            controller.view.setNeedsLayout()
+            controller.view.layoutIfNeeded()
+            renderedInput = firstMultilineTextInput(in: controller.view)
+            if textInputText(renderedInput) == initialText { break }
+            try await Task.sleep(for: .milliseconds(16))
+        } while ContinuousClock.now < layoutDeadline
+        try #require(
+            textInputText(renderedInput) == initialText,
+            "Editor after layout: \(String(describing: textInputText(renderedInput)))"
+        )
+        let input = try #require(renderedInput as? FeatureComposerUITextView)
+        let pasteImages = try #require(input.onPasteImages)
+        let imageFormat = UIGraphicsImageRendererFormat()
+        imageFormat.opaque = true
+        let image = UIGraphicsImageRenderer(
+            size: CGSize(width: 180, height: 320), format: imageFormat
+        ).image { context in
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 180, height: 320))
+        }
+        let attachImage = { pasteImages([NSItemProvider(object: image)]) }
+
+        if afterFullScreenCover {
+            presentation.onDismiss = attachImage
+            presentation.isPresented = true
+            try #require(await XCTWaiter.fulfillment(of: [presentation.appeared], timeout: 2) == .completed)
+            presentation.isPresented = false
+            try #require(await XCTWaiter.fulfillment(of: [presentation.dismissed], timeout: 2) == .completed)
+        } else {
+            attachImage()
+        }
+        try #require(await XCTWaiter.fulfillment(of: [uploaded], timeout: 2) == .completed)
+        let attachment = try #require(uploadedAttachment)
+        #expect(attachment.byteCount > 0)
+        #expect(attachment.mimeType.hasPrefix("image/"))
+        #expect(try await draftStore.draft(for: draftKey)?.attachments.map(\.id) == [attachment.id])
+    }
+
+    @Test
     func threadRefreshPresentationShowsConnectionLossEvenWithCachedContent() {
         #expect(ThreadRefreshPresentation.resolve(
             loadState: nil, connectionState: .connected, isOpening: true
@@ -2783,6 +2955,51 @@ struct FeatureRootModelTests {
 }
 
 @MainActor
+@Observable
+private final class ThreadImageCoverPresentation {
+    var isPresented = false
+    var onDismiss: (() -> Void)?
+    let appeared = XCTestExpectation(description: "Full-screen attachment flow appeared")
+    let dismissed = XCTestExpectation(description: "Full-screen attachment flow dismissed")
+}
+
+private struct ThreadImageTestHost: View {
+    let detail: ThreadDetailView
+    @Bindable var presentation: ThreadImageCoverPresentation
+
+    var body: some View {
+        detail.fullScreenCover(isPresented: $presentation.isPresented, onDismiss: {
+            presentation.onDismiss?()
+            presentation.dismissed.fulfill()
+        }) {
+            ThreadImageAppearanceProbe(onAppear: { presentation.appeared.fulfill() })
+        }
+    }
+}
+
+private struct ThreadImageAppearanceProbe: UIViewControllerRepresentable {
+    let onAppear: () -> Void
+
+    func makeUIViewController(context: Context) -> Controller {
+        let controller = Controller()
+        controller.onAppear = onAppear
+        return controller
+    }
+
+    func updateUIViewController(_ controller: Controller, context: Context) {}
+
+    final class Controller: UIViewController {
+        var onAppear: (() -> Void)?
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            onAppear?()
+            onAppear = nil
+        }
+    }
+}
+
+@MainActor
 private func firstMultilineTextInput(in view: UIView) -> UIView? {
     if view is UITextView || view is UITextField {
         return view
@@ -2904,6 +3121,7 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var beforeSendMessage: (() throws -> Void)?
     var loadThreadError: (any Error)?
     var loadThreadHandler: ((String) async throws -> FeatureThreadDetail)?
+    var preuploadHandler: ((FeatureUploadAttachment, String) async throws -> FeatureUploadedAttachmentReference?)?
     var beforeLoadThreadReturn: (() async -> Void)?
     var loadEarlierCallCount = 0
     var resolvedInputID: String?
@@ -3040,6 +3258,13 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         if let runtimeModeError { throw runtimeModeError }
     }
     func deleteThread(id: String) async throws {}
+
+    func preuploadAttachment(
+        _ attachment: FeatureUploadAttachment,
+        environmentID: String
+    ) async throws -> FeatureUploadedAttachmentReference? {
+        try await preuploadHandler?(attachment, environmentID)
+    }
 
     func loadThread(id: String) async throws -> FeatureThreadDetail {
         if let loadThreadError {

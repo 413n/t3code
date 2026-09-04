@@ -450,6 +450,57 @@ final class TransportReliabilityTests: XCTestCase {
         ])
     }
 
+    func testUploadFailureReturnsBeforeBestEffortCleanupCompletes() async throws {
+        let environment = Environment(
+            id: "environment-1",
+            label: "Studio",
+            httpBaseURL: URL(string: "https://studio.example")!,
+            webSocketBaseURL: URL(string: "wss://studio.example")!,
+            descriptor: try attachmentDescriptor(#"{"attachmentUploads":true}"#)
+        )
+        let transport = RecordingHTTPTransport { request in
+            if request.url?.path == "/api/auth/websocket-ticket" {
+                return (
+                    Data(#"{"ticket":"ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
+                    transportResponse(request)
+                )
+            }
+            return (
+                Data("Upload rejected".utf8),
+                transportResponse(request, status: 503)
+            )
+        }
+        let socket = RecordingWebSocketConnection(holdAttachmentDeletion: true)
+        let client = T3Client(
+            environment: environment,
+            credentialStore: InMemoryCredentialStore(credentials: [
+                environment.id: EnvironmentCredential(accessToken: "access-token"),
+            ]),
+            httpTransport: transport,
+            webSocketConnector: StaticWebSocketConnector(connection: socket)
+        )
+        let image = try UploadChatAttachment(
+            data: Data([1]), name: "image.png", mimeType: "image/png"
+        )
+        let failed = XCTestExpectation(description: "Upload failure returned")
+        let preparation = Task {
+            do {
+                _ = try await client.prepareAttachment(image)
+                XCTFail("Expected the upload error")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("Upload rejected"))
+            }
+            failed.fulfill()
+        }
+
+        await socket.waitForAttachmentDeletion()
+        let result = await XCTWaiter.fulfillment(of: [failed], timeout: 1)
+        // Disconnect releases the held cleanup request, including on failure.
+        await client.disconnect()
+        await preparation.value
+        XCTAssertEqual(result, .completed)
+    }
+
     func testGenericFileUsesTypedUploadAndRawPostBody() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -917,19 +968,29 @@ private struct FailingWebSocketConnector: WebSocketConnecting {
 
 private actor RecordingWebSocketConnection: WebSocketConnection {
     private let assetErrorMessage: String?
+    private let holdAttachmentDeletion: Bool
+    private var attachmentDeletionStarted = false
+    private var attachmentDeletionWaiter: CheckedContinuation<Void, Never>?
     private var recordedRequests: [JSONValue] = []
     private var recordedConnectionURLs: [URL] = []
     private var queuedResponses: [Data] = []
     private var receiver: CheckedContinuation<Data, Error>?
 
-    init(assetErrorMessage: String? = nil) {
+    init(assetErrorMessage: String? = nil, holdAttachmentDeletion: Bool = false) {
         self.assetErrorMessage = assetErrorMessage
+        self.holdAttachmentDeletion = holdAttachmentDeletion
     }
 
     func send(_ data: Data) throws {
         let request = try JSONDecoder.t3.decode(JSONValue.self, from: data)
         recordedRequests.append(request)
         guard case let .number(rawID) = request["id"] else { return }
+        if request["tag"]?.stringValue == "attachments.delete", holdAttachmentDeletion {
+            attachmentDeletionStarted = true
+            attachmentDeletionWaiter?.resume()
+            attachmentDeletionWaiter = nil
+            return
+        }
         if request["tag"]?.stringValue == "assets.createUrl", let assetErrorMessage {
             let response = JSONValue.object([
                 "_tag": .string("Exit"),
@@ -990,6 +1051,11 @@ private actor RecordingWebSocketConnection: WebSocketConnection {
 
     func requests() -> [JSONValue] {
         recordedRequests
+    }
+
+    func waitForAttachmentDeletion() async {
+        guard !attachmentDeletionStarted else { return }
+        await withCheckedContinuation { attachmentDeletionWaiter = $0 }
     }
 
     func recordConnectionURL(_ url: URL) {
