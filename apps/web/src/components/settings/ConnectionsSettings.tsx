@@ -1236,6 +1236,7 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
                           AuthOrchestrationReadScope,
                           AuthFilesystemReadScope,
                           AuthDiagnosticsReadScope,
+                          AuthTerminalReadScope,
                         ].filter((scope) => delegatableScopes.includes(scope)),
                       )
                     }
