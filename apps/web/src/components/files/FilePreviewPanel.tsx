@@ -7,7 +7,8 @@ import type {
   ScopedThreadRef,
 } from "@t3tools/contracts";
 import { filePreviewDelimiter } from "@t3tools/shared/delimitedPreview";
-import { AuthFilesystemReadScope, AuthFilesystemWriteScope } from "@t3tools/contracts";
+import { AuthFilesystemWriteScope } from "@t3tools/contracts";
+import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import {
   isWorkspaceAudioPreviewPath,
   isWorkspaceImagePreviewPath,
@@ -50,6 +51,7 @@ import { buildFileReviewComment } from "~/reviewCommentContext";
 import { assetEnvironment } from "~/state/assets";
 import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
+import { useEnvironmentPresentation } from "~/state/presentation";
 import { useEnvironmentQuery } from "~/state/query";
 import { environmentSession, useEnvironmentScope } from "~/state/session";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -950,10 +952,13 @@ export default function FilePreviewPanel({
   const isHostFile =
     attachment !== undefined || (relativePath !== null && isAbsolutePath(relativePath));
   const fileAccessSession = useEnvironmentQuery(environmentSession.sessionStateAtom(environmentId));
-  const canReadFiles =
-    fileAccessSession.error === null &&
-    fileAccessSession.data?.authenticated === true &&
-    fileAccessSession.data.scopes?.includes(AuthFilesystemReadScope) === true;
+  const fileEnvironment = useEnvironmentPresentation(environmentId);
+  const fileAccess = resolveFilesystemReadAccess({
+    connection: fileEnvironment.presentation?.connection ?? null,
+    session: fileAccessSession.data,
+    sessionError: fileAccessSession.error,
+  });
+  const { canReadFiles } = fileAccess;
   const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
   // Media and PDFs render from their absolute path, so their contents are never
   // shown. The read still runs: a folder named `assets.png` is only knowable as a
@@ -1113,7 +1118,7 @@ export default function FilePreviewPanel({
   ]);
 
   if (attachment === undefined && !canReadFiles) {
-    if (fileAccessSession.data === null && fileAccessSession.error === null) {
+    if (fileAccess.isPending) {
       return (
         <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
           <LoaderCircle className="size-4 animate-spin" aria-hidden />
@@ -1123,7 +1128,7 @@ export default function FilePreviewPanel({
     }
     return (
       <div className="p-4 text-sm text-muted-foreground">
-        {fileAccessSession.error ?? "This connection cannot read host files."}
+        {fileAccess.error ?? "This connection cannot read host files."}
       </div>
     );
   }
