@@ -1,24 +1,33 @@
 // @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off - This tests the standalone Node release tool with a fake HTTP server.
 import * as NodeCrypto from "node:crypto";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   createTestFlightClient,
   makeAppStoreToken,
   parseTestFlightArgs,
-  parseTestFlightConfig,
+  parseTestFlightEnv,
+  readTestFlightEnv,
   validateUploadMetadata,
+  withTemporaryPrivateKey,
 } from "./swift-testflight.ts";
 
-const config = parseTestFlightConfig({
-  keyId: "TESTKEY123",
-  issuerId: "00000000-0000-0000-0000-000000000001",
-  privateKeyPath: "/unused/test-key.p8",
-  appId: "12345",
-  publicGroupId: "public",
-  internalGroupId: "internal",
-});
 const keys = NodeCrypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const encodedKey = Buffer.from(keys.privateKey.export({ type: "pkcs8", format: "pem" })).toString(
+  "base64",
+);
+const envSource = `# Synthetic test credentials, never used with Apple.
+T3_SWIFT_ASC_KEY_ID="TESTKEY123"
+T3_SWIFT_ASC_ISSUER_ID=00000000-0000-0000-0000-000000000001
+T3_SWIFT_ASC_PRIVATE_KEY_BASE64="${encodedKey}"
+T3_SWIFT_ASC_APP_ID=12345
+T3_SWIFT_ASC_PUBLIC_GROUP_ID=public
+T3_SWIFT_ASC_INTERNAL_GROUP_ID=internal
+`;
+const { config } = parseTestFlightEnv(envSource);
 const selection = { build: "46", version: "0.1.0" };
 const notes = "Fix attachment imports and keep the keyboard open during dictation.";
 const linkage = (type: string, id: string) => ({ data: { type, id } });
@@ -149,7 +158,7 @@ function mockServer(
         return Response.json({ data: path === "/v1/buildBetaDetails" ? [detail] : reviews });
       }
       if (path === "/v1/betaGroups") {
-        expect(url.searchParams.get("filter[app]")).toBe(config.appId);
+        expect(url.searchParams.has("filter[app]")).toBe(false);
         expect(url.searchParams.get("filter[builds]")).toBe("build-46");
         return Response.json({ data: [...state.assigned].map(groupResource) });
       }
@@ -215,6 +224,72 @@ function mockServer(
 }
 
 describe("App Store Connect authentication", () => {
+  it("does not print a token echoed in an API error", async () => {
+    let capturedToken = "";
+    const client = createTestFlightClient(config, keys.privateKey, async (_input, init) => {
+      capturedToken = new Headers(init?.headers).get("Authorization")?.slice(7) ?? "";
+      return Response.json({ errors: [{ detail: `Rejected ${capturedToken}` }] }, { status: 401 });
+    });
+    await expect(client.status(selection)).rejects.toThrow("Rejected [redacted token]");
+    expect(capturedToken).not.toBe("");
+  });
+
+  it("parses a quoted env file and restores the downloaded PEM key", () => {
+    const parsed = parseTestFlightEnv(envSource);
+    expect(parsed.config).toEqual({
+      keyId: "TESTKEY123",
+      issuerId: "00000000-0000-0000-0000-000000000001",
+      appId: "12345",
+      publicGroupId: "public",
+      internalGroupId: "internal",
+    });
+    expect(
+      NodeCrypto.createPublicKey(parsed.privateKey).export({ type: "spki", format: "pem" }),
+    ).toBe(keys.publicKey.export({ type: "spki", format: "pem" }));
+  });
+
+  it("does not export parsed env variables to the process", () => {
+    const before = process.env.T3_SWIFT_ENV_PARSE_TEST_SENTINEL;
+    parseTestFlightEnv(`${envSource}T3_SWIFT_ENV_PARSE_TEST_SENTINEL="local only"\n`);
+    expect(process.env.T3_SWIFT_ENV_PARSE_TEST_SENTINEL).toBe(before);
+  });
+
+  it("requires private permissions on the env file", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-swift-env-test-"));
+    const path = NodePath.join(directory, ".env.testflight.local");
+    try {
+      await NodeFSP.writeFile(path, envSource, { mode: 0o600 });
+      expect((await readTestFlightEnv(path)).config).toEqual(config);
+      await NodeFSP.chmod(path, 0o644);
+      await expect(readTestFlightEnv(path)).rejects.toThrow("mode 600");
+    } finally {
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])(
+    "removes the temporary Xcode key after success or failure: %s",
+    async (fail) => {
+      let temporaryPath: string | undefined;
+      const operation = withTemporaryPrivateKey(keys.privateKey, async (path) => {
+        temporaryPath = path;
+        expect((await NodeFSP.stat(path)).mode & 0o777).toBe(0o600);
+        expect((await NodeFSP.stat(NodePath.dirname(path))).mode & 0o777).toBe(0o700);
+        const savedKey = NodeCrypto.createPrivateKey(await NodeFSP.readFile(path));
+        expect(NodeCrypto.createPublicKey(savedKey).export({ type: "spki", format: "pem" })).toBe(
+          keys.publicKey.export({ type: "spki", format: "pem" }),
+        );
+        if (fail) throw new Error("Upload failed");
+      });
+      if (fail) await expect(operation).rejects.toThrow("Upload failed");
+      else await operation;
+      if (!temporaryPath) throw new Error("The upload callback did not run");
+      await expect(NodeFSP.stat(NodePath.dirname(temporaryPath))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
   it("signs a ten-minute ES256 token with the API audience and P1363 signature", () => {
     const token = makeAppStoreToken(config, keys.privateKey, 1_000);
     const [header, payload, signature] = token.split(".");
@@ -406,10 +481,10 @@ describe("release command input", () => {
         "46",
         "--version",
         "0.1.0",
-        "--config",
-        "/tmp/config.json",
+        "--env-file",
+        "/tmp/.env.testflight.local",
       ]),
-    ).toMatchObject({ command: "status", ...selection, configPath: "/tmp/config.json" });
+    ).toMatchObject({ command: "status", ...selection, envFile: "/tmp/.env.testflight.local" });
   });
 
   it("requires supplied export options and reads upload versions only from the archive", () => {

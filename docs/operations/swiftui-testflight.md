@@ -15,28 +15,34 @@ access. Get the account owner's approval for that scope before creating it.
 The release helper verifies the SwiftUI bundle identifier and the app that owns
 each tester group before it changes anything.
 
-Download the private key once. Store it outside the checkout, for example at
-`~/.appstoreconnect/private_keys/AuthKey_KEY_ID.p8`. Give the directory mode `700`
-and the key mode `600`. Do not put the private key or generated tokens in Git,
-build output, or pull request comments.
+Download the private key once. Keep its contents in a private, uncommitted
+`~/.config/t3code/.env.testflight` file. This location survives worktree cleanup.
+Give the directory mode `700` and the env file mode `600`. Do not put the private
+key or generated tokens in Git, build output, or pull request comments.
 
-Create `~/.config/t3code/swift-testflight.json`, also with mode `600`:
-
-```json
-{
-  "keyId": "KEY_ID",
-  "issuerId": "ISSUER_UUID",
-  "privateKeyPath": "/absolute/path/AuthKey_KEY_ID.p8",
-  "appId": "SWIFTUI_APP_ID",
-  "publicGroupId": "PUBLIC_BETA_GROUP_UUID",
-  "internalGroupId": "INTERNAL_GROUP_UUID"
-}
+```dotenv
+T3_SWIFT_ASC_KEY_ID=KEY_ID
+T3_SWIFT_ASC_ISSUER_ID=ISSUER_UUID
+T3_SWIFT_ASC_PRIVATE_KEY_BASE64=BASE64_OF_THE_ENTIRE_DOWNLOADED_P8_FILE
+T3_SWIFT_ASC_APP_ID=SWIFTUI_APP_ID
+T3_SWIFT_ASC_PUBLIC_GROUP_ID=PUBLIC_BETA_GROUP_UUID
+T3_SWIFT_ASC_INTERNAL_GROUP_ID=INTERNAL_GROUP_UUID
 ```
 
+Base64 is only an encoding, not encryption. Import the downloaded key without
+printing its contents or the encoded value. Verify the saved value before
+removing the separate download.
+
 Use the app and groups belonging to the SwiftUI app. Do not copy the React Native
-app ID from EAS. `T3_SWIFT_TESTFLIGHT_CONFIG` or `--config` can select another
-config file. The helper signs short-lived API tokens locally for each request.
-It does not read Safari cookies or use an Apple ID password.
+app ID from EAS. `T3_SWIFT_TESTFLIGHT_ENV_FILE` or `--env-file` can select another
+env file. If you keep it in a checkout, use an ignored `.env` file and verify
+that it is not tracked. The helper reads the file without exporting its values
+to other processes or loading the app's general `.env`.
+
+REST requests use the key in memory to sign short-lived tokens. Xcode uploads
+need a key file, so the helper creates a private temporary `.p8` and removes it
+after the upload finishes or fails. No permanent `.p8` or JSON config is needed.
+The helper does not read Safari cookies or use an Apple ID password.
 
 ## Release
 

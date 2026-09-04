@@ -55,24 +55,53 @@ function relationship(value: Resource, name: string, type: string) {
   return relation.data === null ? undefined : resource(relation.data, type).id;
 }
 
-export function parseTestFlightConfig(value: unknown) {
-  const config = record(value, "TestFlight config");
-  const result = {
-    keyId: text(config.keyId, "keyId"),
-    issuerId: text(config.issuerId, "issuerId"),
-    privateKeyPath: text(config.privateKeyPath, "privateKeyPath"),
-    appId: text(config.appId, "appId"),
-    publicGroupId: text(config.publicGroupId, "publicGroupId"),
-    internalGroupId: text(config.internalGroupId, "internalGroupId"),
+export function parseTestFlightEnv(source: string) {
+  const env = NodeUtil.parseEnv(source);
+  const config = {
+    keyId: text(env.T3_SWIFT_ASC_KEY_ID, "T3_SWIFT_ASC_KEY_ID"),
+    issuerId: text(env.T3_SWIFT_ASC_ISSUER_ID, "T3_SWIFT_ASC_ISSUER_ID"),
+    appId: text(env.T3_SWIFT_ASC_APP_ID, "T3_SWIFT_ASC_APP_ID"),
+    publicGroupId: text(env.T3_SWIFT_ASC_PUBLIC_GROUP_ID, "T3_SWIFT_ASC_PUBLIC_GROUP_ID"),
+    internalGroupId: text(env.T3_SWIFT_ASC_INTERNAL_GROUP_ID, "T3_SWIFT_ASC_INTERNAL_GROUP_ID"),
   };
-  if (result.publicGroupId === result.internalGroupId) {
+  if (config.publicGroupId === config.internalGroupId) {
     throw new Error("Public and internal groups must be different.");
   }
-  return result;
+  const encodedKey = text(env.T3_SWIFT_ASC_PRIVATE_KEY_BASE64, "T3_SWIFT_ASC_PRIVATE_KEY_BASE64");
+  let privateKey: NodeCrypto.KeyObject;
+  try {
+    const decoded = Buffer.from(encodedKey, "base64");
+    if (decoded.toString("base64") !== encodedKey) throw new Error("invalid base64");
+    privateKey = NodeCrypto.createPrivateKey(decoded);
+  } catch {
+    throw new Error("T3_SWIFT_ASC_PRIVATE_KEY_BASE64 must contain the base64-encoded .p8 file.");
+  }
+  requireAppStorePrivateKey(privateKey);
+  return { config, privateKey };
 }
 
-type TestFlightConfig = ReturnType<typeof parseTestFlightConfig>;
+type TestFlightConfig = ReturnType<typeof parseTestFlightEnv>["config"];
 type BuildSelection = { build: string; version: string };
+
+export async function readTestFlightEnv(path: string) {
+  let file: NodeFSP.FileHandle | undefined;
+  let source: string;
+  try {
+    file = await NodeFSP.open(expandHome(path), "r");
+    const metadata = await file.stat();
+    if (!metadata.isFile() || (metadata.mode & 0o077) !== 0) {
+      throw new Error("unsafe permissions");
+    }
+    source = await file.readFile("utf8");
+  } catch {
+    throw new Error(
+      `Cannot read TestFlight env file at ${path}. Use a private file with mode 600.`,
+    );
+  } finally {
+    await file?.close();
+  }
+  return parseTestFlightEnv(source);
+}
 
 function validateBuildSelection(selection: BuildSelection) {
   if (
@@ -84,11 +113,7 @@ function validateBuildSelection(selection: BuildSelection) {
   return selection;
 }
 
-export function makeAppStoreToken(
-  config: Pick<TestFlightConfig, "keyId" | "issuerId">,
-  privateKey: NodeCrypto.KeyObject,
-  nowSeconds = Math.floor(Date.now() / 1_000),
-) {
+function requireAppStorePrivateKey(privateKey: NodeCrypto.KeyObject) {
   if (
     privateKey.type !== "private" ||
     privateKey.asymmetricKeyType !== "ec" ||
@@ -96,6 +121,14 @@ export function makeAppStoreToken(
   ) {
     throw new Error("App Store Connect requires a P-256 private key.");
   }
+}
+
+export function makeAppStoreToken(
+  config: Pick<TestFlightConfig, "keyId" | "issuerId">,
+  privateKey: NodeCrypto.KeyObject,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+) {
+  requireAppStorePrivateKey(privateKey);
   const header = Buffer.from(
     JSON.stringify({ alg: "ES256", kid: config.keyId, typ: "JWT" }),
   ).toString("base64url");
@@ -158,6 +191,7 @@ export function createTestFlightClient(
                   .join(": "),
               )
               .join("; ")
+              .replaceAll(token, "[redacted token]")
           : "";
       throw new Error(
         `App Store Connect ${operation}: HTTP ${response.status}${details ? ` (${details.slice(0, 1_000)})` : ""}.${uncertainWrite}`,
@@ -295,8 +329,8 @@ export function createTestFlightClient(
       optionalBuildResource("buildBetaDetail", "buildBetaDetails"),
       optionalBuildResource("betaAppReviewSubmission", "betaAppReviewSubmissions"),
     ]);
+    // Apple accepts one relationship filter. The build's app was checked above.
     const membershipQuery = new URLSearchParams({
-      "filter[app]": app.id,
       "filter[builds]": build.id,
       limit: "200",
     });
@@ -471,6 +505,7 @@ async function uploadArchive(
   archive: string,
   exportOptions: string,
   config: TestFlightConfig,
+  privateKey: NodeCrypto.KeyObject,
   verifyUpload: (selection: BuildSelection) => Promise<void>,
 ) {
   const archivePath = NodePath.resolve(expandHome(archive));
@@ -481,34 +516,57 @@ async function uploadArchive(
   ]);
   const selection = validateUploadMetadata(info, options);
   await verifyUpload(selection);
-  await new Promise<void>((resolve, reject) => {
-    const child = NodeChildProcess.spawn(
-      "xcodebuild",
-      [
-        "-exportArchive",
-        "-archivePath",
-        archivePath,
-        "-exportOptionsPlist",
-        optionsPath,
-        "-authenticationKeyPath",
-        expandHome(config.privateKeyPath),
-        "-authenticationKeyID",
-        config.keyId,
-        "-authenticationKeyIssuerID",
-        config.issuerId,
-      ],
-      { stdio: "inherit" },
-    );
-    child.once("error", () => reject(new Error("Could not start xcodebuild.")));
-    child.once("exit", (code) =>
-      code === 0
-        ? resolve()
-        : reject(new Error("Xcode upload failed. Check status before trying another upload.")),
-    );
-  });
+  await withTemporaryPrivateKey(
+    privateKey,
+    (keyPath) =>
+      new Promise<void>((resolve, reject) => {
+        const child = NodeChildProcess.spawn(
+          "xcodebuild",
+          [
+            "-exportArchive",
+            "-archivePath",
+            archivePath,
+            "-exportOptionsPlist",
+            optionsPath,
+            "-authenticationKeyPath",
+            keyPath,
+            "-authenticationKeyID",
+            config.keyId,
+            "-authenticationKeyIssuerID",
+            config.issuerId,
+          ],
+          { stdio: "inherit" },
+        );
+        child.once("error", () => reject(new Error("Could not start xcodebuild.")));
+        child.once("exit", (code) =>
+          code === 0
+            ? resolve()
+            : reject(new Error("Xcode upload failed. Check status before trying another upload.")),
+        );
+      }),
+  );
   process.stdout.write(
     `Xcode uploaded SwiftUI ${selection.version} (${selection.build}). Check status after Apple processes it.\n`,
   );
+}
+
+// Xcode needs a file. REST requests use only the in-memory key.
+export async function withTemporaryPrivateKey(
+  privateKey: NodeCrypto.KeyObject,
+  operation: (keyPath: string) => Promise<void>,
+) {
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-swift-testflight-"));
+  try {
+    await NodeFSP.chmod(directory, 0o700);
+    const keyPath = NodePath.join(directory, "AuthKey.p8");
+    await NodeFSP.writeFile(keyPath, privateKey.export({ format: "pem", type: "pkcs8" }), {
+      mode: 0o600,
+      flag: "wx",
+    });
+    await operation(keyPath);
+  } finally {
+    await NodeFSP.rm(directory, { recursive: true, force: true });
+  }
 }
 
 export function parseTestFlightArgs(args: string[]) {
@@ -516,7 +574,7 @@ export function parseTestFlightArgs(args: string[]) {
     args,
     allowPositionals: true,
     options: {
-      config: { type: "string" },
+      "env-file": { type: "string" },
       build: { type: "string" },
       version: { type: "string" },
       "notes-file": { type: "string" },
@@ -533,10 +591,10 @@ export function parseTestFlightArgs(args: string[]) {
   ) {
     throw new Error("Choose status, publish, or upload. Use --help for usage.");
   }
-  const configPath =
-    values.config ??
-    process.env.T3_SWIFT_TESTFLIGHT_CONFIG ??
-    NodePath.join(NodeOS.homedir(), ".config/t3code/swift-testflight.json");
+  const envFile =
+    values["env-file"] ??
+    process.env.T3_SWIFT_TESTFLIGHT_ENV_FILE ??
+    NodePath.join(NodeOS.homedir(), ".config/t3code/.env.testflight");
   if (command === "upload") {
     if (values.build || values.version || values["notes-file"]) {
       throw new Error(
@@ -545,7 +603,7 @@ export function parseTestFlightArgs(args: string[]) {
     }
     return {
       command: "upload" as const,
-      configPath,
+      envFile,
       archive: text(values.archive, "--archive"),
       exportOptions: text(values["export-options"], "--export-options"),
     };
@@ -562,11 +620,11 @@ export function parseTestFlightArgs(args: string[]) {
   return command === "publish"
     ? {
         command: "publish" as const,
-        configPath,
+        envFile,
         ...selection,
         notesFile: text(values["notes-file"], "--notes-file"),
       }
-    : { command: "status" as const, configPath, ...selection };
+    : { command: "status" as const, envFile, ...selection };
 }
 
 function expandHome(path: string) {
@@ -581,38 +639,20 @@ async function main() {
   node scripts/swift-testflight.ts publish --build 46 --version 0.1.0 --notes-file /path/to/notes.txt
   node scripts/swift-testflight.ts upload --archive /path/to/T3Code.xcarchive --export-options /path/to/ExportOptions.plist
 
-Optional: --config /path/to/config.json or T3_SWIFT_TESTFLIGHT_CONFIG.
-Default config: ~/.config/t3code/swift-testflight.json
-Fields: keyId, issuerId, privateKeyPath, appId, publicGroupId, internalGroupId.
+Optional: --env-file /path/to/.env or T3_SWIFT_TESTFLIGHT_ENV_FILE.
+Default env file: ~/.config/t3code/.env.testflight (mode 600, never committed).
+Required variables: T3_SWIFT_ASC_KEY_ID, T3_SWIFT_ASC_ISSUER_ID,
+T3_SWIFT_ASC_PRIVATE_KEY_BASE64, T3_SWIFT_ASC_APP_ID,
+T3_SWIFT_ASC_PUBLIC_GROUP_ID, T3_SWIFT_ASC_INTERNAL_GROUP_ID.
 Only the Release SwiftUI app and the two configured existing groups are supported.
 Publish does not upload, create testers, change signing, or expire other builds.
 `);
     return;
   }
-  let rawConfig: unknown;
-  try {
-    rawConfig = JSON.parse(await NodeFSP.readFile(expandHome(args.configPath), "utf8"));
-  } catch {
-    throw new Error(
-      `Cannot read valid TestFlight config at ${args.configPath}. Use --help for required fields.`,
-    );
-  }
-  const config = parseTestFlightConfig(rawConfig);
-  const keyPath = expandHome(config.privateKeyPath);
-  if (!NodePath.isAbsolute(keyPath)) throw new Error("privateKeyPath must be an absolute path.");
-  let privateKey: NodeCrypto.KeyObject;
-  try {
-    const metadata = await NodeFSP.stat(keyPath);
-    if (!metadata.isFile() || (metadata.mode & 0o077) !== 0) {
-      throw new Error("unsafe permissions");
-    }
-    privateKey = NodeCrypto.createPrivateKey(await NodeFSP.readFile(keyPath));
-  } catch {
-    throw new Error("Cannot read the configured private key. Use a valid .p8 file with mode 600.");
-  }
+  const { config, privateKey } = await readTestFlightEnv(args.envFile);
   const client = createTestFlightClient(config, privateKey);
   if (args.command === "upload") {
-    await uploadArchive(args.archive, args.exportOptions, config, client.verifyUpload);
+    await uploadArchive(args.archive, args.exportOptions, config, privateKey, client.verifyUpload);
     return;
   }
   const selection = { build: args.build, version: args.version };
