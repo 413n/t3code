@@ -778,7 +778,10 @@ export const make = Effect.gen(function* () {
   };
   const resolveBootstrapGrant = (
     credential: string,
-    input?: { readonly proofKeyThumbprint?: string; readonly requestedScopes?: ReadonlyArray<AuthEnvironmentScope> },
+    input?: {
+      readonly proofKeyThumbprint?: string;
+      readonly requestedScopes?: ReadonlyArray<AuthEnvironmentScope>;
+    },
   ): Effect.Effect<
     ResolvedBootstrapGrant,
     ServerAuthInvalidCredentialError | ServerAuthInternalError | ServerAuthScopeNotGrantedError
@@ -786,7 +789,13 @@ export const make = Effect.gen(function* () {
     if (!devAuth?.matches(credential)) {
       return bootstrapCredentials
         .consume(credential, input)
-        .pipe(Effect.mapError((cause) => cause._tag === "BootstrapCredentialScopeNotGrantedError" ? new ServerAuthScopeNotGrantedError({}) : toBootstrapExchangeError(cause)));
+        .pipe(
+          Effect.mapError((cause) =>
+            cause._tag === "BootstrapCredentialScopeNotGrantedError"
+              ? new ServerAuthScopeNotGrantedError({})
+              : toBootstrapExchangeError(cause),
+          ),
+        );
     }
     return sessions.verify(credential).pipe(
       mapSessionVerificationErrors,
