@@ -812,7 +812,6 @@ struct FeatureComposerView: View {
 
     private func startVoiceInput() {
         synchronizeVoiceDraft(ownerChanged: false)
-        focused = false
         voiceInputController.start()
     }
 

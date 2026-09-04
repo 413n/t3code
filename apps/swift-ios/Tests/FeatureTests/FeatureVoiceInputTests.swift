@@ -1,10 +1,73 @@
 import Foundation
+import SwiftUI
 import Testing
+import UIKit
 @testable import T3Code
 
 @Suite("Local voice input", .serialized)
 @MainActor
 struct FeatureVoiceInputTests {
+    @Test(arguments: [false, true])
+    func lockingTheDraftPreservesTheExistingKeyboard(keyboardIsOpen: Bool) async throws {
+        var text = "Draft"
+        var focused = keyboardIsOpen
+        func input(readOnly: Bool) -> FeatureComposerTextInput {
+            FeatureComposerTextInput(
+                text: Binding(get: { text }, set: { text = $0 }),
+                focused: Binding(get: { focused }, set: { focused = $0 }),
+                placeholder: "Message", acceptsImages: true, isReadOnly: readOnly,
+                selectionRequest: nil, onSelectionChange: { _ in },
+                onPasteImages: { _ in Issue.record("Pasted while dictating") },
+                onDismissKeyboard: nil
+            )
+        }
+        let scene = try #require(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let previousKeyWindow = scene.keyWindow
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: input(readOnly: false))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            previousKeyWindow?.makeKey()
+        }
+
+        let editor = try #require(await renderedEditor(in: host.view, readOnly: false))
+        #expect(editor.isFirstResponder == keyboardIsOpen)
+        host.rootView = input(readOnly: true)
+        #expect(await renderedEditor(in: host.view, readOnly: true) === editor)
+        #expect(editor.isFirstResponder == keyboardIsOpen)
+        #expect(focused == keyboardIsOpen)
+        #expect(editor.isEditable)
+        #expect(!editor.canPerformAction(#selector(UIResponderStandardEditActions.paste(_:)), withSender: nil))
+        editor.insertText("ignored")
+        editor.deleteBackward()
+        #expect(text == "Draft")
+        #expect(editor.text == "Draft")
+
+        host.rootView = input(readOnly: false)
+        #expect(await renderedEditor(in: host.view, readOnly: false) === editor)
+        #expect(editor.isFirstResponder == keyboardIsOpen)
+        editor.insertText(" works")
+        #expect(text == "Draft works")
+    }
+
+    private func renderedEditor(in view: UIView, readOnly: Bool) async -> FeatureComposerUITextView? {
+        func find(in view: UIView) -> FeatureComposerUITextView? {
+            if let editor = view as? FeatureComposerUITextView { return editor }
+            return view.subviews.lazy.compactMap { find(in: $0) }.first
+        }
+        for _ in 0..<30 {
+            view.setNeedsLayout()
+            view.layoutIfNeeded()
+            if let editor = find(in: view), editor.isReadOnly == readOnly {
+                return editor
+            }
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+        return nil
+    }
+
     @Test
     func insertsAtUTF16SelectionsWithEnglishSpacing() {
         let text = "Fix 🧪 then $review please"

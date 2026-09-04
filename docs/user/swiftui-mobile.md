@@ -58,8 +58,11 @@ On supported devices with iOS 26 or later, the composer can transcribe up to fiv
 on the device. Voice input needs microphone permission. The first use can also require Apple's
 speech model download.
 
-Tap the checkmark to confirm the recording. T3 Code inserts editable text into the draft and never
+Tap Stop to finish recording. T3 Code inserts editable text into the draft and never
 sends it automatically.
+
+Starting voice input keeps an open keyboard in place. Editing pauses until voice input finishes
+or is canceled.
 
 ## Codex content
 

@@ -30,7 +30,7 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         let textView = FeatureComposerUITextView()
         textView.delegate = context.coordinator
         textView.acceptsImages = acceptsImages
-        textView.isEditable = !isReadOnly
+        textView.isReadOnly = isReadOnly
         textView.onPasteImages = onPasteImages
         textView.onDismissKeyboard = onDismissKeyboard
         if onDismissKeyboard != nil {
@@ -63,7 +63,7 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         textView.acceptsImages = acceptsImages
         textView.onPasteImages = onPasteImages
         textView.onDismissKeyboard = onDismissKeyboard
-        textView.isEditable = !isReadOnly
+        textView.isReadOnly = isReadOnly
 
         let shouldApplySelection = selectionRequest.map {
             context.coordinator.lastAppliedSelectionRequestID != $0.id
@@ -148,6 +148,14 @@ struct FeatureComposerTextInput: UIViewRepresentable {
             self.parent = parent
         }
 
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn range: NSRange,
+            replacementText text: String
+        ) -> Bool {
+            !parent.isReadOnly
+        }
+
         func textViewDidChange(_ textView: UITextView) {
             guard !isApplyingProgrammaticUpdate else { return }
             guard parent.text != textView.text else { return }
@@ -181,6 +189,29 @@ struct FeatureComposerTextInput: UIViewRepresentable {
 final class FeatureComposerUITextView: UITextView {
     private static let bottomEditingInset: CGFloat = 10
     private var lastLaidOutBoundsSize = CGSize.zero
+
+    // Changing isEditable can dismiss an open keyboard. During voice input,
+    // keep the responder and reject user edits without changing isEditable.
+    var isReadOnly = false
+
+    override var canBecomeFirstResponder: Bool {
+        (!isReadOnly || isFirstResponder) && super.canBecomeFirstResponder
+    }
+
+    override func insertText(_ text: String) {
+        guard !isReadOnly else { return }
+        super.insertText(text)
+    }
+
+    override func deleteBackward() {
+        guard !isReadOnly else { return }
+        super.deleteBackward()
+    }
+
+    override func cut(_ sender: Any?) {
+        guard !isReadOnly else { return }
+        super.cut(sender)
+    }
 
     func configureComposerViewport() {
         clipsToBounds = true
@@ -321,6 +352,9 @@ final class FeatureComposerUITextView: UITextView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if isReadOnly, action == #selector(paste(_:)) || action == #selector(cut(_:)) {
+            return false
+        }
         if action == #selector(paste(_:)),
            acceptsImages,
            FeatureComposerPasteboardPolicy.containsImage(in: UIPasteboard.general) {
@@ -336,6 +370,7 @@ final class FeatureComposerUITextView: UITextView {
     // image vanishes into UITextView's text-only default and the surface's
     // highlight never hears that the session ended.
     override func canPaste(_ itemProviders: [NSItemProvider]) -> Bool {
+        guard !isReadOnly else { return false }
         let holdsImage = itemProviders.contains {
             $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
         }
@@ -347,6 +382,7 @@ final class FeatureComposerUITextView: UITextView {
     // purpose: Slack and X do the same, and inserting a stray URL next to an
     // attached screenshot reads as a bug.
     override func paste(_ sender: Any?) {
+        guard !isReadOnly else { return }
         guard acceptsImages else {
             super.paste(sender)
             return
