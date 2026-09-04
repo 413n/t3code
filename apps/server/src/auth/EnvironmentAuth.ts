@@ -778,15 +778,15 @@ export const make = Effect.gen(function* () {
   };
   const resolveBootstrapGrant = (
     credential: string,
-    input?: { readonly proofKeyThumbprint?: string },
+    input?: { readonly proofKeyThumbprint?: string; readonly requestedScopes?: ReadonlyArray<AuthEnvironmentScope> },
   ): Effect.Effect<
     ResolvedBootstrapGrant,
-    ServerAuthInvalidCredentialError | ServerAuthInternalError
+    ServerAuthInvalidCredentialError | ServerAuthInternalError | ServerAuthScopeNotGrantedError
   > => {
     if (!devAuth?.matches(credential)) {
       return bootstrapCredentials
         .consume(credential, input)
-        .pipe(Effect.mapError(toBootstrapExchangeError));
+        .pipe(Effect.mapError((cause) => cause._tag === "BootstrapCredentialScopeNotGrantedError" ? new ServerAuthScopeNotGrantedError({}) : toBootstrapExchangeError(cause)));
     }
     return sessions.verify(credential).pipe(
       mapSessionVerificationErrors,
@@ -803,13 +803,13 @@ export const make = Effect.gen(function* () {
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuth["Service"]["exchangeBootstrapCredentialForAccessToken"] =
     (credential, requestedScopes, requestMetadata, input) =>
-      resolveBootstrapGrant(credential, input).pipe(
+      resolveBootstrapGrant(credential, {
+        ...input,
+        ...(requestedScopes !== undefined ? { requestedScopes } : {}),
+      }).pipe(
         Effect.flatMap((grant) =>
           Effect.gen(function* () {
             const grantedScopes = requestedScopes ?? grant.scopes;
-            if (!grantedScopes.every((scope) => grant.scopes.includes(scope))) {
-              return yield* new ServerAuthScopeNotGrantedError({});
-            }
             return yield* sessions
               .issue({
                 method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
