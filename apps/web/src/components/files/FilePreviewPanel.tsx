@@ -1,10 +1,11 @@
 import { Spinner } from "~/components/ui/spinner";
-import type {
-  ChatFileAttachment,
-  EditorId,
-  EnvironmentId,
-  ResolvedKeybindingsConfig,
-  ScopedThreadRef,
+import {
+  AuthPreviewOperateScope,
+  type ChatFileAttachment,
+  type EditorId,
+  type EnvironmentId,
+  type ResolvedKeybindingsConfig,
+  type ScopedThreadRef,
 } from "@t3tools/contracts";
 import { filePreviewDelimiter } from "@t3tools/shared/delimitedPreview";
 import { AuthFilesystemWriteScope } from "@t3tools/contracts";
@@ -28,6 +29,7 @@ import { Code2, Eye, Table2 } from "lucide";
 import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { useEnvironmentScope } from "~/state/session";
 import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
 import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
 import { OpenInPicker } from "~/components/chat/OpenInPicker";
@@ -930,6 +932,7 @@ export default function FilePreviewPanel({
     attachment === undefined ? resolveFilePreviewPath(requestedPath, cwd) : requestedPath;
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);
+  const canOperatePreview = useEnvironmentScope(environmentId, AuthPreviewOperateScope);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const remoteOpenState = useRemoteOpenState(environmentId);
   const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(environmentId);
@@ -1035,6 +1038,7 @@ export default function FilePreviewPanel({
       ? setRenderTablePreferred
       : setRenderBrowserFilePreferred;
   const canOpenInBrowser =
+    canOperatePreview &&
     previewPath !== null &&
     attachment === undefined &&
     !isVideo &&
@@ -1077,7 +1081,7 @@ export default function FilePreviewPanel({
   };
 
   const handleOpenInBrowser = useCallback(() => {
-    if (!canReadFiles || !absolutePath || !environmentHttpBaseUrl) return;
+    if (!canReadFiles || !canOperatePreview || !absolutePath || !environmentHttpBaseUrl) return;
     void (async () => {
       const result = await openFileInPreview({
         threadRef,
@@ -1102,6 +1106,7 @@ export default function FilePreviewPanel({
   }, [
     absolutePath,
     canReadFiles,
+    canOperatePreview,
     createAssetUrl,
     cwd,
     environmentHttpBaseUrl,
