@@ -91,6 +91,10 @@ Each identity also has matching widget and share-extension bundle identifiers
 and a separate App Group. Debug data and credentials therefore do not alter the
 TestFlight installation.
 
+The registered Debug App Group is `group.com.t3tools.t3code.swiftui.debug`.
+Its suffix differs from the `.dev` bundle identifier. Keep the host, widget,
+share extension, and shared-container code on that same group.
+
 ## Verify
 
 Run the `T3Code` scheme's tests in Xcode, or use the same entry point as CI. It
