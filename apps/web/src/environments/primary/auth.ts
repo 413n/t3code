@@ -428,6 +428,12 @@ export async function revokeOtherServerClientSessions(): Promise<number> {
 }
 
 export async function resolveInitialServerAuthGateState(): Promise<ServerAuthGateState> {
+  // Pairing can replace an existing browser grant without consuming the link before confirmation.
+  if (window.location.pathname === "/pair" && peekPairingTokenFromUrl()) {
+    const currentSession = await fetchSessionState();
+    return { status: "requires-auth", auth: currentSession.auth };
+  }
+
   const urlCredential = takePairingTokenFromUrl();
   const previousPromise = bootstrapPromise;
   if (urlCredential) {
