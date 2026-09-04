@@ -52,6 +52,8 @@ import {
   AuthSettingsWriteScope,
   AuthSourceControlWriteScope,
   AuthPreviewOperateScope,
+  AuthTerminalReadScope,
+  AuthTerminalOperateScope,
   type AssistantCitation,
   type ChatFileAttachment,
   CommandId,
@@ -970,6 +972,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   keybindings,
   onAddTerminalContext,
 }: PersistentThreadTerminalDrawerProps) {
+  const canOperateTerminal = useEnvironmentScope(threadRef.environmentId, AuthTerminalOperateScope);
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
@@ -1131,7 +1134,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   );
 
   const splitTerminal = useCallback(() => {
-    if (!cwd) {
+    if (!canOperateTerminal || !cwd) {
       return;
     }
     const terminalId = nextTerminalId(allocatableTerminalIds);
@@ -1157,9 +1160,10 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     threadId,
     threadRef,
     openTerminal,
+    canOperateTerminal,
   ]);
   const splitTerminalVertical = useCallback(() => {
-    if (!cwd) {
+    if (!canOperateTerminal || !cwd) {
       return;
     }
     const terminalId = nextTerminalId(allocatableTerminalIds);
@@ -1181,6 +1185,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     cwd,
     effectiveWorktreePath,
     openTerminal,
+    canOperateTerminal,
     runtimeEnv,
     storeSplitTerminalVertical,
     threadId,
@@ -1188,7 +1193,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   ]);
 
   const createNewTerminal = useCallback(() => {
-    if (!cwd) {
+    if (!canOperateTerminal || !cwd) {
       return;
     }
     const terminalId = nextTerminalId(allocatableTerminalIds);
@@ -1214,6 +1219,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     threadId,
     threadRef,
     openTerminal,
+    canOperateTerminal,
   ]);
 
   const activateTerminal = useCallback(
@@ -1226,6 +1232,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
 
   const closeTerminal = useCallback(
     (terminalId: string) => {
+      if (!canOperateTerminal) return;
       const fallbackExitWrite = () =>
         writeTerminal({
           environmentId: threadRef.environmentId,
@@ -1255,6 +1262,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
       threadId,
       threadRef,
       closeTerminalMutation,
+      canOperateTerminal,
       writeTerminal,
     ],
   );
@@ -1293,7 +1301,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
           visible={visible}
           height={terminalUiState.terminalHeight}
           // Known-session order is MRU and changes on focus; persisted store order keeps sidebar labels stable.
-          terminalIds={terminalUiState.terminalIds}
+          terminalIds={canOperateTerminal ? terminalUiState.terminalIds : serverOrderedTerminalIds}
           activeTerminalId={terminalUiState.activeTerminalId}
           terminalGroups={terminalUiState.terminalGroups}
           activeTerminalGroupId={terminalUiState.activeTerminalGroupId}
@@ -1534,6 +1542,8 @@ export default function ChatView(props: ChatViewProps) {
     forceExpandedMobileComposer = false,
   } = props;
   const canOperateThread = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+  const canOperateTerminal = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
+  const canReadTerminal = useEnvironmentScope(environmentId, AuthTerminalReadScope);
   const draftId = routeKind === "draft" ? props.draftId : null;
   const handleNewThread = useNewThreadHandler();
   const { settleThread, pinThread, confirmAndUnpinThread } = useThreadActions();
@@ -4669,9 +4679,9 @@ export default function ChatView(props: ChatViewProps) {
     [activeThreadRef, storeSetTerminalOpen],
   );
   const toggleTerminalVisibility = useCallback(() => {
-    if (!activeThreadRef) return;
+    if (!activeThreadRef || (!canReadTerminal && !canOperateTerminal)) return;
     const nextOpen = !terminalUiState.terminalOpen;
-    if (nextOpen && terminalUiState.terminalIds.length === 0) {
+    if (nextOpen && canOperateTerminal && terminalUiState.terminalIds.length === 0) {
       if (!activeThreadId || !activeProject) {
         return;
       }
@@ -4706,14 +4716,22 @@ export default function ChatView(props: ChatViewProps) {
     environmentId,
     gitCwd,
     openTerminal,
+    canOperateTerminal,
     setTerminalOpen,
+    canReadTerminal,
     storeEnsureTerminal,
     terminalUiState.terminalIds.length,
     terminalUiState.terminalOpen,
   ]);
   const splitTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
-      if (!activeThreadRef || hasReachedSplitLimit || !activeThreadId || !activeProject) {
+      if (
+        !canOperateTerminal ||
+        !activeThreadRef ||
+        hasReachedSplitLimit ||
+        !activeThreadId ||
+        !activeProject
+      ) {
         return;
       }
       const cwdForOpen = gitCwd ?? activeProject.workspaceRoot;
@@ -4747,6 +4765,7 @@ export default function ChatView(props: ChatViewProps) {
       allocatableActiveTerminalIds,
       activeThreadRef,
       openTerminal,
+      canOperateTerminal,
       activeThreadWorktreePath,
       environmentId,
       gitCwd,
@@ -4756,7 +4775,7 @@ export default function ChatView(props: ChatViewProps) {
     ],
   );
   const createNewTerminal = useCallback(() => {
-    if (!activeThreadRef || !activeThreadId || !activeProject) {
+    if (!canOperateTerminal || !activeThreadRef || !activeThreadId || !activeProject) {
       return;
     }
     const cwdForOpen = gitCwd ?? activeProject.workspaceRoot;
@@ -4785,6 +4804,7 @@ export default function ChatView(props: ChatViewProps) {
     allocatableActiveTerminalIds,
     activeThreadRef,
     openTerminal,
+    canOperateTerminal,
     activeThreadWorktreePath,
     environmentId,
     gitCwd,
@@ -4792,7 +4812,7 @@ export default function ChatView(props: ChatViewProps) {
   ]);
   const closeTerminal = useCallback(
     (terminalId: string) => {
-      if (!activeThreadId || !activeThreadRef) return;
+      if (!canOperateTerminal || !activeThreadId || !activeThreadRef) return;
       const fallbackExitWrite = () =>
         writeTerminal({
           environmentId,
@@ -4818,6 +4838,7 @@ export default function ChatView(props: ChatViewProps) {
       activeThreadId,
       activeThreadRef,
       closeTerminalMutation,
+      canOperateTerminal,
       environmentId,
       storeCloseTerminal,
       writeTerminal,
@@ -4834,7 +4855,7 @@ export default function ChatView(props: ChatViewProps) {
         rememberAsLastInvoked?: boolean;
       },
     ) => {
-      if (!activeThreadId || !activeProject || !activeThread) return;
+      if (!canOperateTerminal || !activeThreadId || !activeProject || !activeThread) return;
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
           if (current[activeProject.id] === script.id) return current;
@@ -4956,6 +4977,7 @@ export default function ChatView(props: ChatViewProps) {
       environmentId,
       openTerminal,
       openPreview,
+      canOperateTerminal,
       activeKnownTerminalIds,
       allocatableActiveTerminalIds,
       runningTerminalIds,
@@ -5725,7 +5747,7 @@ export default function ChatView(props: ChatViewProps) {
     previewPanelOpen,
   ]);
   const addTerminalSurface = useCallback(() => {
-    if (!activeThreadRef || !activeThreadId || !activeProject) return;
+    if (!canOperateTerminal || !activeThreadRef || !activeThreadId || !activeProject) return;
     const cwd = gitCwd ?? activeProject.workspaceRoot;
     const terminalId = nextTerminalId(allocatableActiveTerminalIds);
     useRightPanelStore.getState().openTerminal(activeThreadRef, terminalId);
@@ -5751,10 +5773,12 @@ export default function ChatView(props: ChatViewProps) {
     allocatableActiveTerminalIds,
     gitCwd,
     openTerminal,
+    canOperateTerminal,
   ]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
       if (
+        !canOperateTerminal ||
         !activeThreadRef ||
         !activeThreadId ||
         !activeProject ||
@@ -5792,6 +5816,7 @@ export default function ChatView(props: ChatViewProps) {
       allocatableActiveTerminalIds,
       gitCwd,
       openTerminal,
+      canOperateTerminal,
     ],
   );
   const splitPanelTerminalVertical = useCallback(() => {
@@ -5809,7 +5834,8 @@ export default function ChatView(props: ChatViewProps) {
   );
   const closePanelTerminal = useCallback(
     (terminalId: string) => {
-      if (!activeThreadRef || activeRightPanelSurface?.kind !== "terminal") return;
+      if (!canOperateTerminal || !activeThreadRef || activeRightPanelSurface?.kind !== "terminal")
+        return;
       void closeTerminalMutation({
         environmentId: activeThreadRef.environmentId,
         input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
@@ -5820,25 +5846,33 @@ export default function ChatView(props: ChatViewProps) {
         .closeTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId);
       setTerminalFocusRequestId((value) => value + 1);
     },
-    [activeRightPanelSurface, activeThreadRef, closeTerminalMutation, storeCloseTerminal],
+    [
+      canOperateTerminal,
+      activeRightPanelSurface,
+      activeThreadRef,
+      closeTerminalMutation,
+      storeCloseTerminal,
+    ],
   );
   const requestCloseTerminal = useCallback(
     (terminalId: string) => {
+      if (!canOperateTerminal) return;
       const label = activeTerminalLabelsById.get(terminalId) ?? getTerminalLabel(terminalId);
       void confirmTerminalClose([label]).then((confirmed) => {
         if (confirmed) closeTerminal(terminalId);
       });
     },
-    [activeTerminalLabelsById, closeTerminal],
+    [canOperateTerminal, activeTerminalLabelsById, closeTerminal],
   );
   const requestClosePanelTerminal = useCallback(
     (terminalId: string) => {
+      if (!canOperateTerminal) return;
       const label = activeTerminalLabelsById.get(terminalId) ?? getTerminalLabel(terminalId);
       void confirmTerminalClose([label]).then((confirmed) => {
         if (confirmed) closePanelTerminal(terminalId);
       });
     },
-    [activeTerminalLabelsById, closePanelTerminal],
+    [canOperateTerminal, activeTerminalLabelsById, closePanelTerminal],
   );
   const activateRightPanelSurface = useCallback(
     (surface: RightPanelSurface) => {
@@ -5889,7 +5923,7 @@ export default function ChatView(props: ChatViewProps) {
             threadRef: activeThreadRef,
           });
         }
-        if (surface.kind === "terminal") {
+        if (surface.kind === "terminal" && canOperateTerminal) {
           for (const terminalId of surface.terminalIds) {
             storeCloseTerminal(activeThreadRef, terminalId);
             void closeTerminalMutation({
@@ -5906,6 +5940,7 @@ export default function ChatView(props: ChatViewProps) {
       canOperatePreview,
       closePreview,
       closeTerminalMutation,
+      canOperateTerminal,
       storeCloseTerminal,
     ],
   );
