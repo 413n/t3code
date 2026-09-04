@@ -1,5 +1,6 @@
 import { useMemo } from "react";
-import { AuthAccessWriteScope } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
+import { AuthEnvironmentMaintainScope } from "@t3tools/contracts";
 
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
 import { isElectron } from "~/env";
@@ -7,7 +8,8 @@ import { isLocalEnvironmentDisabled } from "~/localEnvironment";
 import { desktopWslStateAtom } from "~/state/desktopWslState";
 import { useEnvironments } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
-import { usePrimarySessionState } from "~/environments/primary";
+import { useEnvironmentScope } from "~/state/session";
+import { primaryServerConfigAtom } from "~/state/server";
 import { isWslSettingsRowVisible } from "./ConnectionsSettings.logic";
 import { isProviderSettingsEnvironmentAvailable } from "./ProviderSettingsPanel.logic";
 import type { SettingsScopeSearch } from "./settingsScope";
@@ -18,17 +20,12 @@ import {
 
 export function useAvailableSettingsSearchItems(scopeSearch: SettingsScopeSearch = {}) {
   const { environments } = useEnvironments();
-  const primarySessionState = usePrimarySessionState();
   const localEnvironmentDisabled = isLocalEnvironmentDisabled();
+  const canMaintain = useEnvironmentScope(primaryEnvironmentId, AuthEnvironmentMaintainScope);
+  const canManageLocalBackend = !localEnvironmentDisabled && canMaintain;
   const desktopWsl = useEnvironmentQuery(
-    isElectron && !localEnvironmentDisabled ? desktopWslStateAtom : null,
+    isElectron && canManageLocalBackend ? desktopWslStateAtom : null,
   );
-  const canManageLocalBackend =
-    !localEnvironmentDisabled &&
-    (isElectron ||
-      ((primarySessionState.data?.authenticated &&
-        primarySessionState.data.scopes?.includes(AuthAccessWriteScope)) ??
-        false));
 
   return useMemo(
     () =>

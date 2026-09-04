@@ -86,6 +86,7 @@ import {
   ChatAttachmentId,
   PersistChatAttachmentsError,
   RpcClientId,
+  requiredScopesForServerSettingsPatch,
   EnvironmentAuthorizationError,
   type ProjectId,
   type ProviderDriverKind,
@@ -2577,6 +2578,7 @@ const makeWsRpcLayer = (
             {
               "rpc.aggregate": "server",
             },
+            requiredScopesForServerSettingsPatch(patch),
           ),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>
           observeRpcEffect(
