@@ -34,6 +34,15 @@ export function optimisticFileAtom(
   return projectEnvironment.optimisticFile({ environmentId, cwd, relativePath });
 }
 
+// Dirty contents must survive a closed preview, including failed or unauthorized saves.
+const unsavedFileMounts = new Map<ReturnType<typeof optimisticFileAtom>, () => void>();
+
+function releaseUnsavedFile(atom: ReturnType<typeof optimisticFileAtom>): void {
+  const unmount = unsavedFileMounts.get(atom);
+  unsavedFileMounts.delete(atom);
+  unmount?.();
+}
+
 interface ProjectQueryState<A> {
   readonly data: A | null;
   readonly error: string | null;
@@ -74,7 +83,11 @@ export function setProjectFileQueryData(
   relativePath: string,
   contents: string,
 ): void {
-  appAtomRegistry.set(optimisticFileAtom(environmentId, cwd, relativePath), {
+  const atom = optimisticFileAtom(environmentId, cwd, relativePath);
+  if (!unsavedFileMounts.has(atom)) {
+    unsavedFileMounts.set(atom, appAtomRegistry.mount(atom));
+  }
+  appAtomRegistry.set(atom, {
     confirmedAgainst: undefined,
     data: {
       relativePath,
@@ -118,6 +131,7 @@ export function confirmProjectFileQueryData(
     confirmedAgainst: appAtomRegistry.get(queryAtom),
   };
   appAtomRegistry.set(atom, confirmed);
+  releaseUnsavedFile(atom);
   appAtomRegistry.refresh(queryAtom);
   void executeAtomQuery(appAtomRegistry, queryAtom, {
     reportDefect: false,
@@ -145,7 +159,9 @@ export function clearProjectFileQueryData(
   cwd: string,
   relativePath: string,
 ): void {
-  appAtomRegistry.set(optimisticFileAtom(environmentId, cwd, relativePath), null);
+  const atom = optimisticFileAtom(environmentId, cwd, relativePath);
+  appAtomRegistry.set(atom, null);
+  releaseUnsavedFile(atom);
 }
 
 function failureCause<A>(result: AsyncResult.AsyncResult<A, unknown>): unknown {
