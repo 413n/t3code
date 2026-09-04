@@ -37,6 +37,49 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func liveThreadSyncOutranksStaleEnvironmentReachability() {
+        for connectionState in [FeatureConnection.State.disconnected, .reconnecting] {
+            #expect(ThreadRefreshPresentation.resolve(
+                loadState: nil, connectionState: connectionState, isOpening: false, syncState: .live
+            ) == nil)
+            #expect(ThreadRefreshPresentation.resolve(
+                loadState: .loading, connectionState: connectionState, isOpening: false, syncState: .live
+            ) == .loading)
+            #expect(ThreadRefreshPresentation.resolve(
+                loadState: .failed("Timeout"), connectionState: connectionState, isOpening: false, syncState: .live
+            ) == .failed)
+        }
+    }
+
+    @Test
+    func repeatedCatchUpEventsDoNotInvalidateViewState() async {
+        let client = FeatureClientStub()
+        let model = testRootModel(client: client)
+        let run = Task { await model.start() }
+        await withCheckedContinuation { continuation in
+            withObservationTracking {
+                _ = model.threadSyncStates["thread"]
+            } onChange: {
+                continuation.resume()
+            }
+            client.emit(.threadSync(id: "thread", state: .catchingUp))
+        }
+        let changes = AsyncStream<Void>.makeStream()
+        withObservationTracking {
+            _ = model.threadSyncStates["thread"]
+        } onChange: {
+            changes.continuation.yield()
+        }
+        client.emit(.threadSync(id: "thread", state: .catchingUp))
+        client.finishEvents()
+        await run.value
+        changes.continuation.finish()
+        let didChange = await changes.stream.contains { _ in true }
+        #expect(!didChange)
+        #expect(model.threadSyncStates["thread"] == .catchingUp)
+    }
+
+    @Test
     func appearanceAppliesImmediatelyAndPersistsWithoutSavingTheDraft() async {
         let client = FeatureClientStub()
         let model = testRootModel(client: client)
