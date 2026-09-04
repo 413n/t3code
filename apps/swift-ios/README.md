@@ -142,6 +142,9 @@ and extension bundle identifiers without a device build.
 
 ## Release checklist
 
+Use the [API-key TestFlight workflow](../../docs/operations/swiftui-testflight.md)
+for uploads and beta distribution. It does not depend on a Safari login.
+
 1. Set a unique `MARKETING_VERSION` and a higher `CURRENT_PROJECT_VERSION`.
 2. Confirm the production bundle identifier, display name, app icon, signing team,
    and T3 Connect HTTPS relay configuration.
