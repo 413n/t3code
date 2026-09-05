@@ -1,4 +1,5 @@
 import {
+  AuthPreviewOperateScope,
   DEFAULT_CLIENT_SETTINGS,
   EnvironmentId,
   ThreadId,
@@ -25,6 +26,7 @@ import {
   applyPreviewDesktopState,
 } from "~/previewStateStore";
 import { appAtomRegistry, AppAtomRegistryProvider } from "~/rpc/atomRegistry";
+import * as Session from "~/state/session";
 
 import { PreviewAutomationHosts } from "./PreviewAutomationHosts";
 
@@ -117,6 +119,10 @@ let renderer: ReactTestRenderer | null = null;
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  vi.spyOn(Session, "useEnvironmentScope").mockImplementation(
+    (targetEnvironmentId, scope) =>
+      targetEnvironmentId === environmentId && scope === AuthPreviewOperateScope,
+  );
   mocks.getClientSettings.mockReset().mockResolvedValue(savedSettings);
   mocks.respond.mockReset();
   mocks.focus.mockReset().mockResolvedValue(AsyncResult.success(undefined));
