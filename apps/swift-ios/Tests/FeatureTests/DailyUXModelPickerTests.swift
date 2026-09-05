@@ -117,6 +117,12 @@ struct DailyUXModelPickerTests {
                     kind: .boolean,
                     defaultValue: .boolean(true)
                 ),
+                FeatureModelOptionDescriptor(
+                    id: "thinking",
+                    label: "Thinking",
+                    kind: .boolean,
+                    defaultValue: .boolean(false)
+                ),
             ]
         )
 
@@ -125,7 +131,107 @@ struct DailyUXModelPickerTests {
         #expect(defaults == [
             FeatureModelOptionSelection(id: "effort", value: .string("high")),
             FeatureModelOptionSelection(id: "fast", value: .boolean(true)),
+            FeatureModelOptionSelection(id: "thinking", value: .boolean(false)),
         ])
+    }
+
+    @Test
+    func additionalReasoningOptionsRemainAvailable() {
+        let effort = FeatureModelOptionDescriptor(
+            id: "effort",
+            label: "Reasoning",
+            kind: .select,
+            choices: [.init(id: "high", label: "High", isDefault: true)]
+        )
+        let thinking = FeatureModelOptionDescriptor(id: "thinking", label: "Thinking", kind: .boolean)
+        let fast = FeatureModelOptionDescriptor(id: "fastMode", label: "Fast mode", kind: .boolean)
+        let model = FeatureModel(id: "work-model", name: "Work model", options: [effort, thinking, fast])
+
+        #expect(DailyUXModelOptions.reasoningDescriptor(for: model) == effort)
+        #expect(DailyUXModelOptions.advancedDescriptors(for: model) == [thinking, fast])
+    }
+
+    @Test
+    func selectingAModelDoesNotInventOptionDefaults() {
+        let model = FeatureModel(
+            id: "work-model",
+            name: "Work model",
+            options: [
+                .init(
+                    id: "effort",
+                    label: "Reasoning",
+                    kind: .select,
+                    choices: [.init(id: "low", label: "Low"), .init(id: "high", label: "High")]
+                ),
+                .init(id: "thinking", label: "Thinking", kind: .boolean),
+            ]
+        )
+        let provider = FeatureProvider(id: "work", name: "Work", models: [model])
+        let selected = ProviderModelConfiguration.selection(
+            for: DailyUXModelOption(provider: provider, model: model),
+            preserving: nil
+        )
+
+        #expect(selected == FeatureSelection(providerID: "work", modelID: "work-model"))
+        #expect(DailyUXModelOptions.summary(for: model, selections: selected.options) == nil)
+        for descriptor in model.options {
+            #expect(DailyUXModelOptions.value(for: descriptor, in: selected.options) == nil)
+        }
+    }
+
+    @Test
+    func returningToProviderDefaultsPreservesOtherSavedOptions() {
+        let model = FeatureModel(
+            id: "work-model",
+            name: "Work model",
+            options: [
+                .init(
+                    id: "effort",
+                    label: "Reasoning",
+                    kind: .select,
+                    choices: [.init(id: "high", label: "High")]
+                ),
+                .init(id: "thinking", label: "Thinking", kind: .boolean),
+            ]
+        )
+        let provider = FeatureProvider(id: "work", name: "Work", models: [model])
+        let saved = FeatureSelection(
+            providerID: provider.id,
+            modelID: model.id,
+            options: [
+                .init(id: "effort", value: .string("unlisted")),
+                .init(id: "thinking", value: .boolean(false)),
+                .init(id: "providerFlag", value: .boolean(true)),
+            ]
+        )
+
+        #expect(
+            ProviderModelConfiguration.selection(
+                for: DailyUXModelOption(provider: provider, model: model),
+                preserving: saved
+            ) == saved
+        )
+
+        let withoutThinking = DailyUXModelOptions.updating(saved.options, id: "thinking", value: nil)
+        #expect(
+            ProviderModelConfiguration.materializedOptions(
+                for: model,
+                preserving: withoutThinking
+            ) == [
+                .init(id: "effort", value: .string("unlisted")),
+                .init(id: "providerFlag", value: .boolean(true)),
+            ]
+        )
+
+        let withoutEffort = DailyUXModelOptions.updating(withoutThinking, id: "effort", value: nil)
+        #expect(
+            ProviderModelConfiguration.materializedOptions(
+                for: model,
+                preserving: withoutEffort
+            ) == [
+                .init(id: "providerFlag", value: .boolean(true)),
+            ]
+        )
     }
 
     @Test

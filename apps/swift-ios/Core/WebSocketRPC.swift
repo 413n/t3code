@@ -311,6 +311,10 @@ public actor WebSocketRPCClient {
         connection != nil
     }
 
+    public func currentConnectionID() -> UUID? {
+        connectionID
+    }
+
     /// Replaces a socket after suspension without replaying sent commands.
     /// Resumable subscriptions survive; one-shot owners choose their next cursor.
     public func reconnect() async {

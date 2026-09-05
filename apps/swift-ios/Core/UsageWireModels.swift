@@ -3,10 +3,13 @@ import Foundation
 public let usageContractVersion = 5
 public let minimumCompatibleUsageContractVersion = 3
 
-/// Versions 3 through 5 contain every field this client needs. Keep them working
-/// while servers update independently across a user's environments.
-public func isCompatibleUsageContractVersion(_ version: Int) -> Bool {
-    (minimumCompatibleUsageContractVersion ... usageContractVersion).contains(version)
+/// Version 3 supports daily totals. Hourly windows require version 4 or later.
+public func isCompatibleUsageContractVersion(
+    _ version: Int,
+    resolution: UsageResolution? = nil
+) -> Bool {
+    let minimum = resolution == .hour ? 4 : minimumCompatibleUsageContractVersion
+    return (minimum ... usageContractVersion).contains(version)
 }
 
 public enum UsageProviderKind: String, Codable, CaseIterable, Sendable {

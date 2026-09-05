@@ -25,8 +25,15 @@ menu.
 Project icons set on the computer appear in the inbox. Environment icons follow each computer's
 settings. Supported environments offer an icon picker in their connection preferences.
 
-Use **Refresh prices** in Usage to fetch new model rates without waiting for the daily refresh.
-A failed environment does not remove the usage data from other environments.
+Usage loads each computer separately. A slow or offline computer does not prevent the others
+from reporting. Use **Refresh prices** to fetch new model rates without waiting for the daily refresh.
+
+Open **Usage > Limits** for subscription limits and reset times reported by your computers.
+Supported Codex accounts also let you use a reset credit after confirmation. This uses a credit
+on that account and cannot be undone. Computers that do not support limits can still report usage.
+
+Older computers that report daily totals cannot supply the 24-hour view. Select 7d or 30d to
+include their data.
 
 ## Thread connection state
 

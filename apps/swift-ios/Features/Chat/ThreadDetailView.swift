@@ -18,6 +18,7 @@ public struct ThreadDetailView: View {
     @State private var selection: FeatureSelection?
     @State private var attachments: [FeatureDraftAttachment] = []
     @State private var isSending = false
+    @State private var submittingCompaction = false
     @State private var isLoading = true
     @State private var sendFailed = false
     @State private var feedbackMessages: [FeatureMessage] = []
@@ -271,6 +272,10 @@ public struct ThreadDetailView: View {
         detail?.thread ?? thread
     }
 
+    private var isCompacting: Bool {
+        submittingCompaction || detail?.isCompacting == true
+    }
+
     private var currentSelection: FeatureSelection? {
         guard let providerID = detail?.thread.providerID ?? thread.providerID,
               let modelID = detail?.thread.modelID ?? thread.modelID else { return nil }
@@ -316,7 +321,7 @@ public struct ThreadDetailView: View {
                 Group {
                     if refreshPresentation != nil {
                         EmptyView()
-                    } else if currentThread.homeStatus == .working {
+                    } else if currentThread.homeStatus == .working, !isCompacting {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
                             headerStatus(at: context.date)
                         }
@@ -335,7 +340,8 @@ public struct ThreadDetailView: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isHeader)
         .accessibilityAddTraits(
-            refreshPresentation == nil && currentThread.hasLiveWorkingDuration ? .updatesFrequently : []
+            refreshPresentation == nil && !isCompacting && currentThread.hasLiveWorkingDuration
+                ? .updatesFrequently : []
         )
         .transaction { transaction in
             transaction.animation = nil
@@ -346,7 +352,12 @@ public struct ThreadDetailView: View {
     @ViewBuilder
     private func headerStatus(at now: Date) -> some View {
         let duration = currentThread.homeWorkingDuration(at: now)
-        if let label = duration ?? currentThread.detailHeaderStatusLabel {
+        if isCompacting {
+            Label("Compacting", systemImage: "arrow.down.right.and.arrow.up.left")
+                .font(T3Typography.status)
+                .foregroundStyle(T3Colors.statusRunning)
+                .lineLimit(1)
+        } else if let label = duration ?? currentThread.detailHeaderStatusLabel {
             HStack(spacing: 5) {
                 if let icon = currentThread.detailHeaderStatusIcon {
                     Image(systemName: icon)
@@ -638,6 +649,7 @@ public struct ThreadDetailView: View {
         let hasActiveWork = detail.thread.state == .working
             || detail.thread.state == .queued
             || detail.thread.state == .monitoring
+            || isCompacting
         let isWorking = hasActiveWork && refreshPresentation == nil
         return Group {
             if detail.messages.isEmpty, !hasActiveWork {
@@ -660,6 +672,7 @@ public struct ThreadDetailView: View {
                     renderUpdate: timelineRenderUpdate,
                     dynamicTypeSize: dynamicTypeSize,
                     isWorking: isWorking,
+                    isCompacting: isCompacting,
                     activeSubagentCount: detail.activeSubagentCount,
                     backgroundWorkIsActive: detail.backgroundWorkIsActive,
                     isMonitoring: detail.thread.state == .monitoring,
@@ -691,7 +704,8 @@ public struct ThreadDetailView: View {
                     threadSelection: currentSelection,
                     materializesDefaultSelection: false,
                     isSending: isSending,
-                    isWorking: detail.thread.state == .working || detail.thread.state == .queued,
+                    isWorking: detail.thread.state == .working || detail.thread.state == .queued
+                        || isCompacting,
                     focused: $composerFocused,
                     onSend: send,
                     onStop: {
@@ -723,6 +737,10 @@ public struct ThreadDetailView: View {
         return FeatureComposerPowerFeatures(
             slashCommands: provider?.workspaceCatalog(cwd: workspaceCatalogPath).slashCommands ?? [],
             skills: provider?.workspaceCatalog(cwd: workspaceCatalogPath).skills ?? [],
+            canCompactContext: FeatureContextCompaction.canStart(
+                in: detail,
+                isBusy: isSending || refreshPresentation != nil
+            ),
             pathSearchScopeID: currentThread.id,
             searchPaths: { query in
                 try await model.client.searchThreadFiles(
@@ -888,6 +906,10 @@ public struct ThreadDetailView: View {
         pendingDraftSave?.cancel()
         draftSaveTask = nil
         isSending = true
+        submittingCompaction = FeatureContextCompaction.isCommand(
+            message,
+            hasAttachments: !pendingAttachments.isEmpty
+        )
         draft = ""
         attachments = []
         composerFocused = false
@@ -926,6 +948,7 @@ public struct ThreadDetailView: View {
                 }
                 sendFailed = true
             }
+            submittingCompaction = false
             isSending = false
             if !sent || !draft.isEmpty || !attachments.isEmpty {
                 persistDraftImmediately()
@@ -1164,11 +1187,11 @@ enum ThreadRefreshPresentation: Equatable {
         case .failed: return .failed
         case .live, nil: break
         }
-        if isOpening || loadState == .loading { return .loading }
-        if case .failed = loadState { return .failed }
-        // A synchronized thread subscription is newer evidence than an
+        // A synchronized subscription outranks local loading flags and an
         // environment's periodic shell probe. Socket loss has its own state.
         if syncState == .live { return nil }
+        if isOpening || loadState == .loading { return .loading }
+        if case .failed = loadState { return .failed }
         switch connectionState {
         case .connecting, .reconnecting: return .reconnecting
         case .disconnected: return .offline
@@ -1299,6 +1322,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     let renderUpdate: FeatureDetailRenderUpdate?
     let dynamicTypeSize: DynamicTypeSize
     let isWorking: Bool
+    let isCompacting: Bool
     let activeSubagentCount: Int
     let backgroundWorkIsActive: Bool
     let isMonitoring: Bool
@@ -1335,6 +1359,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             renderUpdate: renderUpdate,
             dynamicTypeSize: dynamicTypeSize,
             isWorking: isWorking,
+            isCompacting: isCompacting,
             activeSubagentCount: activeSubagentCount,
             backgroundWorkIsActive: backgroundWorkIsActive,
             isMonitoring: isMonitoring,
@@ -1386,6 +1411,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var currentDetailRevision: UInt64?
         private var currentDynamicTypeSize: DynamicTypeSize?
         private var currentIsWorking = false
+        private var currentIsCompacting = false
         private var currentActiveSubagentCount = 0
         private var currentBackgroundWorkIsActive = false
         private var currentIsMonitoring = false
@@ -1417,6 +1443,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 if messageID == FeatureTranscriptCollectionView.workingIndicatorID {
                     cell.contentConfiguration = UIHostingConfiguration {
                         FeatureThreadWorkingIndicator(
+                            isCompacting: self?.currentIsCompacting == true,
                             activeSubagentCount: self?.currentActiveSubagentCount ?? 0,
                             backgroundWorkIsActive: self?.currentBackgroundWorkIsActive == true,
                             isMonitoring: self?.currentIsMonitoring == true
@@ -1461,6 +1488,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             renderUpdate: FeatureDetailRenderUpdate?,
             dynamicTypeSize: DynamicTypeSize,
             isWorking: Bool,
+            isCompacting: Bool,
             activeSubagentCount: Int,
             backgroundWorkIsActive: Bool,
             isMonitoring: Bool,
@@ -1479,7 +1507,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let typeSizeChanged = currentDynamicTypeSize != dynamicTypeSize
             let revisionChanged = currentDetailRevision != renderUpdate?.revision
             let workingChanged = currentIsWorking != isWorking
-            let workingDetailChanged = currentActiveSubagentCount != activeSubagentCount
+            let workingDetailChanged = currentIsCompacting != isCompacting
+                || currentActiveSubagentCount != activeSubagentCount
                 || currentBackgroundWorkIsActive != backgroundWorkIsActive
                 || currentIsMonitoring != isMonitoring
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
@@ -1501,6 +1530,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             currentDetailRevision = renderUpdate?.revision
             currentDynamicTypeSize = dynamicTypeSize
             currentIsWorking = isWorking
+            currentIsCompacting = isCompacting
             currentActiveSubagentCount = activeSubagentCount
             currentBackgroundWorkIsActive = backgroundWorkIsActive
             currentIsMonitoring = isMonitoring
@@ -1867,11 +1897,15 @@ private struct FeatureLoadEarlierTurnsButton: View {
 }
 
 private struct FeatureThreadWorkingIndicator: View {
+    let isCompacting: Bool
     let activeSubagentCount: Int
     let backgroundWorkIsActive: Bool
     let isMonitoring: Bool
 
     private var title: String {
+        if isCompacting {
+            return "Compacting context"
+        }
         if isMonitoring {
             return "Monitoring in the background"
         }
@@ -1885,12 +1919,12 @@ private struct FeatureThreadWorkingIndicator: View {
     }
 
     private var detail: String? {
-        backgroundWorkIsActive || isMonitoring ? nil : "New output will appear here"
+        isCompacting || backgroundWorkIsActive || isMonitoring ? nil : "New output will appear here"
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "circle.dotted")
+            Image(systemName: isCompacting ? "arrow.down.right.and.arrow.up.left" : "circle.dotted")
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(T3Colors.statusRunning)
                 .frame(width: 22, height: 22)
@@ -2459,11 +2493,39 @@ struct FeatureMessageView: View {
             FeatureWorkLogView(message: message, imageContext: imageContext)
                 .id(message.id)
         case .system:
+            systemMessage
+                .accessibilityIdentifier("message-\(message.id)")
+        }
+    }
+
+    @ViewBuilder
+    private var systemMessage: some View {
+        if message.toolName == "runtime.warning" {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(T3Colors.warning)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(message.text)
+                        .foregroundStyle(T3Colors.textPrimary)
+                        .textSelection(.enabled)
+                    Text(message.createdAt, format: .dateTime.month(.abbreviated).day().hour().minute())
+                        .foregroundStyle(T3Colors.textSecondary)
+                }
+            }
+            .font(T3Typography.supporting)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+        } else if message.toolName == "context-compaction" {
+            Label(message.text, systemImage: "arrow.down.right.and.arrow.up.left")
+                .font(T3Typography.supporting)
+                .foregroundStyle(T3Colors.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 4)
+        } else {
             Text(message.text)
                 .font(T3Typography.supporting)
                 .foregroundStyle(T3Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .center)
-                .accessibilityIdentifier("message-\(message.id)")
         }
     }
 

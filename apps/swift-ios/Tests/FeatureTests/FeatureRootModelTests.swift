@@ -38,17 +38,20 @@ struct FeatureRootModelTests {
     }
 
     @Test
-    func liveThreadSyncOutranksStaleEnvironmentReachability() {
-        for connectionState in [FeatureConnection.State.disconnected, .reconnecting] {
+    func liveThreadSyncOutranksStaleLoadingAndEnvironmentReachability() {
+        for connectionState in [FeatureConnection.State.connected, .disconnected, .reconnecting] {
             #expect(ThreadRefreshPresentation.resolve(
                 loadState: nil, connectionState: connectionState, isOpening: false, syncState: .live
             ) == nil)
             #expect(ThreadRefreshPresentation.resolve(
                 loadState: .loading, connectionState: connectionState, isOpening: false, syncState: .live
-            ) == .loading)
+            ) == nil)
             #expect(ThreadRefreshPresentation.resolve(
                 loadState: .failed("Timeout"), connectionState: connectionState, isOpening: false, syncState: .live
-            ) == .failed)
+            ) == nil)
+            #expect(ThreadRefreshPresentation.resolve(
+                loadState: .loading, connectionState: connectionState, isOpening: true, syncState: .live
+            ) == nil)
         }
     }
 

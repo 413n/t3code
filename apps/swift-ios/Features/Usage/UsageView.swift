@@ -16,12 +16,19 @@ private enum UsageBreakdown: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+private enum UsageTab: String {
+    case usage
+    case limits
+}
+
 public struct UsageView: View {
     private let client: any FeatureClient
 
     @State private var loadState = UsageLoadState()
     @State private var metric = UsageMetric.cost
     @State private var breakdown = UsageBreakdown.model
+    @State private var tab = UsageTab.usage
+    @State private var resetCreditStates: [UsageResetCreditTarget: UsageResetCreditState] = [:]
 
     public init(client: any FeatureClient) {
         self.client = client
@@ -40,6 +47,41 @@ public struct UsageView: View {
     }
 
     public var body: some View {
+        VStack(spacing: 0) {
+            Picker("Usage view", selection: $tab) {
+                Text("Usage").tag(UsageTab.usage)
+                Text("Limits").tag(UsageTab.limits)
+            }
+            .pickerStyle(.segmented)
+            .tint(T3Colors.textPrimary)
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+
+            if tab == .limits {
+                UsageLimitsView(client: client, resetCreditStates: $resetCreditStates)
+            } else {
+                usageContent
+            }
+        }
+        .background(T3Colors.background)
+        .navigationTitle("Usage")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            if tab == .usage {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Refresh prices", systemImage: "arrow.clockwise") {
+                        Task { await load(refreshPricing: true) }
+                    }
+                    .disabled(isLoading)
+                }
+            }
+        }
+        .t3NavigationChrome()
+    }
+
+    private var usageContent: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
                 Picker("Usage window", selection: windowDays) {
@@ -53,7 +95,8 @@ public struct UsageView: View {
 
                 coverageNotice
 
-                if isLoading, environments.isEmpty {
+                if isLoading, !hasCompatibleSummary,
+                   environments.isEmpty || environments.contains(where: \.isPending) {
                     Text("Scanning provider transcripts…")
                         .font(T3Typography.supporting)
                         .foregroundStyle(T3Colors.textSecondary)
@@ -77,7 +120,9 @@ public struct UsageView: View {
                     ContentUnavailableView {
                         Label("Couldn’t load usage", systemImage: "exclamationmark.circle")
                     } description: {
-                        Text("No compatible usage data is available.")
+                        Text(hasDailyOnlySummary
+                            ? "This server reports daily usage. Select 7d or 30d to see it."
+                            : "No compatible usage data is available.")
                     } actions: {
                         Button("Try again") { Task { await load() } }
                     }
@@ -94,19 +139,6 @@ public struct UsageView: View {
         }
         .scrollIndicators(.hidden)
         .refreshable { await load() }
-        .background(T3Colors.background)
-        .navigationTitle("Usage")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Refresh prices", systemImage: "arrow.clockwise") {
-                    Task { await load(refreshPricing: true) }
-                }
-                .disabled(isLoading)
-            }
-        }
-        .t3NavigationChrome()
         .task(id: loadState.windowDays) {
             await load()
         }
@@ -118,10 +150,19 @@ public struct UsageView: View {
         let stale = environments.filter { merged.staleEnvironments.contains($0.environmentID) }
         let hasRefreshError = errorMessage != nil && hasCompatibleSummary
         if hasRefreshError
+            || loadState.isPartial
+            || loadState.hasPendingCachedTotals
             || !failed.isEmpty
             || !stale.isEmpty
             || !merged.duplicateSources.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
+                if loadState.hasPendingCachedTotals {
+                    Text(loadState.isPartial
+                        ? "Updating usage. Totals are partial and include the last scan."
+                        : "Updating usage. Some totals are from the last scan.")
+                } else if loadState.isPartial {
+                    Text("Some environments are still reporting. Totals are partial.")
+                }
                 if hasRefreshError {
                     Text("Couldn’t refresh usage. The totals below are from the last successful scan.")
                 }
@@ -129,7 +170,11 @@ public struct UsageView: View {
                     Text("\(environment.label): \(environment.errorMessage ?? "Could not report usage.")")
                 }
                 ForEach(stale) { environment in
-                    Text("\(environment.label) uses an unsupported usage format and is excluded from totals.")
+                    if windowInput.resolution == .hour, environment.summary?.contractVersion == 3 {
+                        Text("\(environment.label) reports daily usage only. Select 7d or 30d to include it.")
+                    } else {
+                        Text("\(environment.label) uses an unsupported usage format and is excluded from totals.")
+                    }
                 }
                 if !merged.duplicateSources.isEmpty {
                     Text(
@@ -452,17 +497,25 @@ public struct UsageView: View {
 
     private var hasCompatibleSummary: Bool {
         environments.contains {
-            $0.summary.map { isCompatibleUsageContractVersion($0.contractVersion) } == true
+            $0.summary.map {
+                isCompatibleUsageContractVersion($0.contractVersion, resolution: windowInput.resolution)
+            } == true
         }
+    }
+
+    private var hasDailyOnlySummary: Bool {
+        windowInput.resolution == .hour
+            && environments.contains { $0.summary?.contractVersion == 3 }
     }
 
     private func load(refreshPricing: Bool = false) async {
         let request = loadState.begin(days: loadState.windowDays)
         defer { loadState.finish(request) }
         do {
-            let result = try await client.usageSummaries(request.input, refreshPricing: refreshPricing)
-            try Task.checkCancellation()
-            loadState.receive(result, for: request)
+            for try await result in client.usageSummaryUpdates(request.input, refreshPricing: refreshPricing) {
+                try Task.checkCancellation()
+                loadState.receive(result, for: request)
+            }
         } catch is CancellationError {
             return
         } catch {

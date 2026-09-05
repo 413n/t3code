@@ -244,7 +244,13 @@ public actor T3ConnectManagedEnvironmentAuthorizer {
         _ request: URLRequest,
         as type: Response.Type
     ) async throws -> Response {
-        let (data, response) = try await transport.data(for: HTTPRequestPolicy.prepare(request))
+        let data: Data
+        let response: HTTPURLResponse
+        do {
+            (data, response) = try await transport.data(for: HTTPRequestPolicy.prepare(request))
+        } catch {
+            throw T3ConnectNetworkError.wrapping(error)
+        }
         guard (200..<300).contains(response.statusCode) else {
             let body = try? JSONDecoder.t3.decode(ErrorBody.self, from: data)
             throw T3ConnectRelayError.response(

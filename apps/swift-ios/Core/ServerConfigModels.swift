@@ -136,6 +136,7 @@ public struct ServerProviderSnapshot: Codable, Identifiable, Equatable, Sendable
     public let skills: [ServerProviderSkillSnapshot]?
     public var workspaceSnapshots: [ServerProviderWorkspaceSnapshot]? = nil
     public var setup: ProviderSetupCapabilities? = nil
+    public var usageLimits: ServerProviderUsageLimits? = nil
 }
 
 public enum ServerThreadEnvironmentMode: String, Codable, Equatable, Sendable {
@@ -158,10 +159,16 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public let sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]?
     public let sidebarAutoSettleOnMerge: Bool
     public let sidebarAutoSettleAfterDays: Double?
+    public let continueThreadsAfterServerUpdate: Bool
     public var environmentIcon: String? = nil
     public var sourceControlWritingStyle: JSONValue? = nil
 
     public var sharedPatch: JSONValue {
+        sharedPatch(supportsRestartContinuation: false)
+    }
+
+    /// Include restart continuation only when both environments support it.
+    public func sharedPatch(supportsRestartContinuation: Bool) -> JSONValue {
         var fields: [String: JSONValue] = [
             "sidebarAutoSettleAfterDays": sidebarAutoSettleAfterDays.map(JSONValue.number) ?? .null,
             "sidebarAutoSettleOnMerge": .bool(sidebarAutoSettleOnMerge),
@@ -169,6 +176,9 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
             "newWorktreesStartFromOrigin": .bool(newWorktreesStartFromOrigin),
         ]
         if let sourceControlWritingStyle { fields["sourceControlWritingStyle"] = sourceControlWritingStyle }
+        if supportsRestartContinuation {
+            fields["continueThreadsAfterServerUpdate"] = .bool(continueThreadsAfterServerUpdate)
+        }
         return .object(fields)
     }
 
@@ -178,7 +188,8 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         sidebarProjectGroupingMode: ServerProjectGroupingMode? = nil,
         sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]? = nil,
         sidebarAutoSettleOnMerge: Bool = true,
-        sidebarAutoSettleAfterDays: Double? = 3
+        sidebarAutoSettleAfterDays: Double? = 3,
+        continueThreadsAfterServerUpdate: Bool = false
     ) {
         self.defaultThreadEnvMode = defaultThreadEnvMode
         self.newWorktreesStartFromOrigin = newWorktreesStartFromOrigin
@@ -186,6 +197,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         self.sidebarProjectGroupingOverrides = sidebarProjectGroupingOverrides
         self.sidebarAutoSettleOnMerge = sidebarAutoSettleOnMerge
         self.sidebarAutoSettleAfterDays = sidebarAutoSettleAfterDays
+        self.continueThreadsAfterServerUpdate = continueThreadsAfterServerUpdate
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -195,6 +207,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         case sidebarProjectGroupingOverrides
         case sidebarAutoSettleOnMerge
         case sidebarAutoSettleAfterDays
+        case continueThreadsAfterServerUpdate
         case environmentIcon
         case sourceControlWritingStyle
     }
@@ -203,6 +216,10 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         environmentIcon = try container.decodeIfPresent(String.self, forKey: .environmentIcon)
         sourceControlWritingStyle = try container.decodeIfPresent(JSONValue.self, forKey: .sourceControlWritingStyle)
+        continueThreadsAfterServerUpdate = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .continueThreadsAfterServerUpdate
+        ) ?? false
         defaultThreadEnvMode = try container.decodeIfPresent(
             ServerThreadEnvironmentMode.self,
             forKey: .defaultThreadEnvMode
@@ -236,6 +253,7 @@ public enum ServerSettingsChange: Equatable, Sendable {
     case sidebarAutoSettleAfterDays(Double?)
     case defaultThreadEnvMode(ServerThreadEnvironmentMode)
     case newWorktreesStartFromOrigin(Bool)
+    case continueThreadsAfterServerUpdate(Bool)
     case environmentIcon(String?)
     case sharedPreferences(JSONValue)
 
@@ -243,6 +261,8 @@ public enum ServerSettingsChange: Equatable, Sendable {
         switch self {
         case let .defaultThreadEnvMode(value): .object(["defaultThreadEnvMode": .string(value.rawValue)])
         case let .newWorktreesStartFromOrigin(value): .object(["newWorktreesStartFromOrigin": .bool(value)])
+        case let .continueThreadsAfterServerUpdate(value):
+            .object(["continueThreadsAfterServerUpdate": .bool(value)])
         case let .environmentIcon(value): .object(["environmentIcon": value.map(JSONValue.string) ?? .null])
         case let .sharedPreferences(value): value
         case let .sidebarAutoSettleOnMerge(value):
@@ -260,23 +280,27 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
     public let threadSnapshotPagination: Bool?
     public let threadResumeCompletionMarker: Bool?
     public let environment: EnvironmentDescriptor?
+    public var usageLimitSources: [UsageLimitSourceSnapshot]
 
     public init(
         providers: [ServerProviderSnapshot],
         settings: ServerSettingsSnapshot? = nil,
         threadSnapshotPagination: Bool? = nil,
         threadResumeCompletionMarker: Bool? = nil,
-        environment: EnvironmentDescriptor? = nil
+        environment: EnvironmentDescriptor? = nil,
+        usageLimitSources: [UsageLimitSourceSnapshot] = []
     ) {
         self.providers = providers
         self.settings = settings
         self.threadSnapshotPagination = threadSnapshotPagination
         self.threadResumeCompletionMarker = threadResumeCompletionMarker
         self.environment = environment
+        self.usageLimitSources = usageLimitSources
     }
 
     private enum CodingKeys: String, CodingKey {
         case providers, settings, threadSnapshotPagination, threadResumeCompletionMarker, environment
+        case usageLimitSources
     }
 
     public init(from decoder: any Decoder) throws {
@@ -294,6 +318,10 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
         threadResumeCompletionMarker = try container.decodeIfPresent(
             Bool.self, forKey: .threadResumeCompletionMarker
         )
+        usageLimitSources = try container.decodeIfPresent(
+            ForwardCompatibleArray<UsageLimitSourceSnapshot>.self,
+            forKey: .usageLimitSources
+        )?.wrappedValue ?? []
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -306,6 +334,7 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
         )
         try container.encodeIfPresent(environment, forKey: .environment)
         try container.encodeIfPresent(threadResumeCompletionMarker, forKey: .threadResumeCompletionMarker)
+        try container.encode(usageLimitSources, forKey: .usageLimitSources)
     }
 }
 
@@ -321,6 +350,7 @@ public enum ServerConfigStreamEvent: Decodable, Sendable {
     case snapshot(ServerConfigSnapshot)
     case providerStatuses([ServerProviderSnapshot])
     case settingsUpdated(ServerSettingsSnapshot)
+    case usageLimitSourcesUpdated([UsageLimitSourceSnapshot])
     case unrelated(type: String)
 
     private enum CodingKeys: String, CodingKey { case type, config, payload }
@@ -338,6 +368,9 @@ public enum ServerConfigStreamEvent: Decodable, Sendable {
         }
     }
     private struct SettingsPayload: Decodable { let settings: ServerSettingsSnapshot }
+    private struct UsageLimitSourcesPayload: Decodable {
+        @ForwardCompatibleArray var sources: [UsageLimitSourceSnapshot]
+    }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -355,6 +388,10 @@ public enum ServerConfigStreamEvent: Decodable, Sendable {
             self = .settingsUpdated(
                 try container.decode(SettingsPayload.self, forKey: .payload).settings
             )
+        case "usageLimitSourcesUpdated":
+            self = .usageLimitSourcesUpdated(
+                try container.decode(UsageLimitSourcesPayload.self, forKey: .payload).sources
+            )
         default:
             self = .unrelated(type: type)
         }
@@ -362,7 +399,7 @@ public enum ServerConfigStreamEvent: Decodable, Sendable {
 }
 
 public struct ServerRefreshProvidersResult: Codable, Equatable, Sendable {
-    public let providers: [ServerProviderSnapshot]
+    @ForwardCompatibleArray public var providers: [ServerProviderSnapshot]
 
     public init(providers: [ServerProviderSnapshot]) {
         self.providers = providers

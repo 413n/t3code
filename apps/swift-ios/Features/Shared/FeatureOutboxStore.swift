@@ -261,18 +261,11 @@ public actor FeatureOutboxStore {
             cached = []
             return []
         }
-        let document: Document
-        do {
-            document = try JSONDecoder.t3.decode(
-                Document.self,
-                from: Data(contentsOf: fileURL)
-            )
-        } catch {
-            // Surface the recovery once, but do not permanently brick sending.
-            // The next enqueue atomically replaces the unreadable document.
-            cached = []
-            throw error
-        }
+        // Keep failed reads uncached so later writes cannot replace unreadable messages.
+        let document = try JSONDecoder.t3.decode(
+            Document.self,
+            from: Data(contentsOf: fileURL)
+        )
         cached = document.submissions.map { submission in
             var submission = submission
             submission.interactionMode = submission.interactionMode.mobileNormalized

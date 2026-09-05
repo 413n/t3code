@@ -6,11 +6,14 @@ import UIKit
 struct GhosttyTerminalSurface: UIViewRepresentable {
     @SwiftUI.Environment(\.colorScheme) private var colorScheme
     let terminalKey: String
+    let lifecycleVersion: Int
     let buffer: String
     let fontSize: CGFloat
     let isRunning: Bool
+    let hostPlatform: TerminalHostPlatform
     let focusRequest: Int
     let onInput: (String) -> Void
+    let onPaste: (String) -> Void
     let onResize: (Int, Int) -> Void
     let onClear: () -> Void
     let onFontSizeStep: (Int) -> Void
@@ -32,14 +35,115 @@ struct GhosttyTerminalSurface: UIViewRepresentable {
     private func configure(_ view: GhosttyTerminalView) {
         view.isDarkMode = colorScheme == .dark
         view.onInput = onInput
+        view.onPaste = onPaste
         view.onResize = onResize
         view.onClear = onClear
         view.onFontSizeStep = onFontSizeStep
         view.terminalKey = terminalKey
+        view.lifecycleVersion = lifecycleVersion
         view.fontSize = fontSize
         view.isRunning = isRunning
+        view.hostPlatform = hostPlatform
         view.buffer = buffer
         view.focusRequest = focusRequest
+    }
+}
+
+enum TerminalHostPlatform: Equatable {
+    case mac
+    case linux
+    case windows
+    case unknown
+
+    init(os: String?) {
+        self = switch os {
+        case "darwin": .mac
+        case "linux": .linux
+        case "windows": .windows
+        default: .unknown
+        }
+    }
+}
+
+enum TerminalInputModifier: Equatable {
+    case command
+    case control
+}
+
+enum TerminalInputAction: Equatable {
+    case write(String)
+    case paste
+}
+
+enum TerminalInputEncoder {
+    // TerminalWriteInput.data is limited to UTF-16 code units, not Swift characters.
+    static let maximumWriteLength = 65_536
+
+    static func modified(
+        _ input: String,
+        modifier: TerminalInputModifier,
+        hostPlatform: TerminalHostPlatform
+    ) -> TerminalInputAction {
+        let pasteModifier: TerminalInputModifier = hostPlatform == .mac ? .command : .control
+        if modifier == pasteModifier, input.lowercased() == "v" {
+            return .paste
+        }
+        return .write(modifier == .control ? applyingControl(to: input) : "\u{1B}\(input)")
+    }
+
+    static func applyingControl(to input: String) -> String {
+        guard let scalar = input.lowercased().unicodeScalars.first else { return input }
+        return controlSequence(for: scalar) ?? input
+    }
+
+    static func controlSequence(for scalar: Unicode.Scalar) -> String? {
+        switch scalar {
+        case "a"..."z": return UnicodeScalar(scalar.value - 96).map(String.init)
+        case " ", "@": return "\u{00}"
+        case "[": return "\u{1B}"
+        case "\\": return "\u{1C}"
+        case "]": return "\u{1D}"
+        case "^": return "\u{1E}"
+        case "_", "-": return "\u{1F}"
+        case "?": return "\u{7F}"
+        default: return nil
+        }
+    }
+
+    /// The native surface does not expose bracketed paste. Remove raw controls
+    /// and use carriage returns so pasted line breaks work in raw-mode programs.
+    static func paste(_ text: String) -> String {
+        var result = ""
+        result.reserveCapacity(text.utf8.count)
+        var previousWasCarriageReturn = false
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x0A:
+                if !previousWasCarriageReturn { result.append("\r") }
+            case 0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F:
+                result.append(" ")
+            default:
+                result.unicodeScalars.append(scalar)
+            }
+            previousWasCarriageReturn = scalar.value == 0x0D
+        }
+        return result
+    }
+
+    static func chunks(_ data: String) -> [String] {
+        let units = data.utf16
+        var chunks = [String]()
+        var start = units.startIndex
+        while start < units.endIndex {
+            var end = units.index(start, offsetBy: maximumWriteLength, limitedBy: units.endIndex)
+                ?? units.endIndex
+            if end < units.endIndex, (0xD800...0xDBFF).contains(units[units.index(before: end)]) {
+                end = units.index(before: end)
+            }
+            chunks.append(String(decoding: units[start..<end], as: UTF16.self))
+            start = end
+        }
+        return chunks
     }
 }
 
@@ -95,7 +199,7 @@ private enum GhosttyRuntime {
 }
 
 @MainActor
-private enum TerminalHardwareKeyEncoder {
+enum TerminalHardwareKeyEncoder {
     private static let controlInputs = "abcdefghijklmnopqrstuvwxyz@[\\]^_-? "
 
     static func makeKeyCommands(action: Selector) -> [UIKeyCommand] {
@@ -146,9 +250,16 @@ private enum TerminalHardwareKeyEncoder {
         return command
     }
 
-    static func sequence(input: String, modifiers: UIKeyModifierFlags) -> String? {
+    static func sequence(
+        input: String,
+        modifiers: UIKeyModifierFlags,
+        hostPlatform: TerminalHostPlatform
+    ) -> String? {
         if modifiers == .command {
             return input.lowercased() == "c" ? "copy" : input.lowercased() == "v" ? "paste" : nil
+        }
+        if modifiers.contains(.control), hostPlatform != .mac, input.lowercased() == "v" {
+            return "paste"
         }
 
         switch input {
@@ -165,30 +276,12 @@ private enum TerminalHardwareKeyEncoder {
               let scalar = input.lowercased().unicodeScalars.first else {
             return nil
         }
-        return controlSequence(for: scalar)
-    }
-
-    static func applyingControl(to input: String) -> String {
-        guard let scalar = input.lowercased().unicodeScalars.first else { return input }
-        return controlSequence(for: scalar) ?? input
-    }
-
-    private static func controlSequence(for scalar: Unicode.Scalar) -> String? {
-        switch scalar {
-        case "a"..."z": return UnicodeScalar(scalar.value - 96).map(String.init)
-        case " ", "@": return "\u{00}"
-        case "[": return "\u{1B}"
-        case "\\": return "\u{1C}"
-        case "]": return "\u{1D}"
-        case "^": return "\u{1E}"
-        case "_", "-": return "\u{1F}"
-        case "?": return "\u{7F}"
-        default: return nil
-        }
+        return TerminalInputEncoder.controlSequence(for: scalar)
     }
 }
 
 private final class TerminalInputField: UITextField {
+    var hostPlatform = TerminalHostPlatform.unknown
     var onDeleteBackward: (() -> Void)?
     var onInsert: ((String) -> Void)?
     var onCopyOutput: (() -> Void)?
@@ -205,11 +298,16 @@ private final class TerminalInputField: UITextField {
         super.deleteBackward()
     }
 
+    override func paste(_ sender: Any?) {
+        onPasteText?()
+    }
+
     @objc private func handleHardwareKeyCommand(_ command: UIKeyCommand) {
         guard let input = command.input,
               let sequence = TerminalHardwareKeyEncoder.sequence(
                 input: input,
-                modifiers: command.modifierFlags
+                modifiers: command.modifierFlags,
+                hostPlatform: hostPlatform
               ) else {
             return
         }
@@ -229,6 +327,7 @@ private enum TerminalAccessoryAction: String {
     case command
     case control
     case tab
+    case paste
     case clear
     case up
     case down
@@ -246,6 +345,7 @@ private enum TerminalAccessoryAction: String {
         case .command: "cmd"
         case .control: "ctrl"
         case .tab: "tab"
+        case .paste: "paste"
         case .clear: "clear"
         case .up: "↑"
         case .down: "↓"
@@ -271,7 +371,7 @@ private enum TerminalAccessoryAction: String {
         case .pipe: "|"
         case .slash: "/"
         case .dash: "-"
-        case .command, .control, .clear, .dismiss: nil
+        case .command, .control, .paste, .clear, .dismiss: nil
         }
     }
 
@@ -279,7 +379,7 @@ private enum TerminalAccessoryAction: String {
         switch self {
         case .escape, .tab: 44
         case .command: 48
-        case .control, .clear: 50
+        case .control, .paste, .clear: 50
         case .up, .down, .left, .right, .tilde, .pipe, .slash, .dash: 38
         case .dismiss: 36
         }
@@ -304,6 +404,7 @@ private final class TerminalAccessoryView: UIInputView {
     private let dismissButton = TerminalAccessoryButton(action: .dismiss)
     private var actionButtons = [TerminalAccessoryAction: TerminalAccessoryButton]()
     private var activeModifier: TerminalAccessoryAction?
+    private var hostPlatform = TerminalHostPlatform.unknown
     var onAction: ((TerminalAccessoryAction) -> Void)?
 
     init() {
@@ -324,7 +425,7 @@ private final class TerminalAccessoryView: UIInputView {
         scrollView.addSubview(stackView)
 
         let actions: [TerminalAccessoryAction] = [
-            .escape, .command, .control, .tab, .clear,
+            .escape, .control, .command, .tab, .paste, .clear,
             .up, .down, .left, .right, .tilde, .pipe, .slash, .dash,
         ]
         for action in actions {
@@ -370,6 +471,16 @@ private final class TerminalAccessoryView: UIInputView {
         }
     }
 
+    func setHostPlatform(_ platform: TerminalHostPlatform) {
+        guard hostPlatform != platform else { return }
+        hostPlatform = platform
+        if let command = actionButtons[.command] {
+            stackView.removeArrangedSubview(command)
+            stackView.insertArrangedSubview(command, at: platform == .mac ? 1 : 2)
+        }
+        refreshAppearance()
+    }
+
     func setActiveModifier(_ action: TerminalAccessoryAction?) {
         activeModifier = action
         for modifier in [TerminalAccessoryAction.command, .control] {
@@ -406,7 +517,11 @@ private final class TerminalAccessoryView: UIInputView {
         var configuration = UIButton.Configuration.plain()
         if let terminalButton = button as? TerminalAccessoryButton,
            terminalButton.terminalAction != .dismiss {
-            configuration.title = terminalButton.terminalAction.label.uppercased()
+            let action = terminalButton.terminalAction
+            let label = action == .command && hostPlatform != .mac ? "alt" : action.label
+            configuration.title = label.uppercased()
+            button.accessibilityLabel = action == .paste ? "Paste" : label
+            button.accessibilityIdentifier = "terminal-key-\(label)"
         }
         let isDark = traitCollection.userInterfaceStyle == .dark
         configuration.baseForegroundColor = if active {
@@ -494,6 +609,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     """
 
     var onInput: ((String) -> Void)?
+    var onPaste: ((String) -> Void)?
     var onResize: ((Int, Int) -> Void)?
     var onClear: (() -> Void)?
     var onFontSizeStep: ((Int) -> Void)?
@@ -513,6 +629,12 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
             guard oldValue != terminalKey else { return }
             pendingModifier = nil
             resetSurface()
+        }
+    }
+
+    var lifecycleVersion = 0 {
+        didSet {
+            if oldValue != lifecycleVersion { pendingModifier = nil }
         }
     }
 
@@ -551,6 +673,15 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         }
     }
 
+    var hostPlatform = TerminalHostPlatform.unknown {
+        didSet {
+            guard oldValue != hostPlatform else { return }
+            inputField.hostPlatform = hostPlatform
+            accessoryView.setHostPlatform(hostPlatform)
+            pendingModifier = nil
+        }
+    }
+
     var focusRequest = 0 {
         didSet {
             guard oldValue != focusRequest else { return }
@@ -565,8 +696,10 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     private let focusTapGesture = UITapGestureRecognizer()
     private let scrollPanGesture = UIPanGestureRecognizer()
     private let fontPinchGesture = UIPinchGestureRecognizer()
-    private var pendingModifier: TerminalAccessoryAction? {
-        didSet { accessoryView.setActiveModifier(pendingModifier) }
+    private var pendingModifier: TerminalInputModifier? {
+        didSet {
+            accessoryView.setActiveModifier(pendingModifier.map { $0 == .command ? .command : .control })
+        }
     }
     private var lastViewportSize: CGSize = .zero
     private var lastContentScale: CGFloat = 0
@@ -829,6 +962,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
 
     func tearDown() {
         onInput = nil
+        onPaste = nil
         onResize = nil
         onClear = nil
         onFontSizeStep = nil
@@ -961,16 +1095,16 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
 
     private func sendInput(_ data: String) {
         guard isRunning, !data.isEmpty else { return }
-        let resolved: String
-        if pendingModifier == .control {
-            resolved = TerminalHardwareKeyEncoder.applyingControl(to: data)
-        } else if pendingModifier == .command {
-            resolved = "\u{1B}\(data)"
-        } else {
-            resolved = data
-        }
+        let modifier = pendingModifier
         pendingModifier = nil
-        onInput?(resolved)
+        guard let modifier else {
+            onInput?(data)
+            return
+        }
+        switch TerminalInputEncoder.modified(data, modifier: modifier, hostPlatform: hostPlatform) {
+        case .write(let data): onInput?(data)
+        case .paste: pasteText()
+        }
     }
 
     private func copyOutput() {
@@ -978,14 +1112,22 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func pasteText() {
-        guard let value = UIPasteboard.general.string, !value.isEmpty else { return }
-        sendInput(value)
+        pendingModifier = nil
+        let key = terminalKey
+        let version = lifecycleVersion
+        guard isRunning, let value = UIPasteboard.general.string, !value.isEmpty else { return }
+        guard terminalKey == key, lifecycleVersion == version, isRunning else { return }
+        onPaste?(value)
     }
 
     private func handleAccessoryAction(_ action: TerminalAccessoryAction) {
         switch action {
-        case .command, .control:
-            pendingModifier = pendingModifier == action ? nil : action
+        case .command:
+            pendingModifier = pendingModifier == .command ? nil : .command
+        case .control:
+            pendingModifier = pendingModifier == .control ? nil : .control
+        case .paste:
+            pasteText()
         case .clear:
             pendingModifier = nil
             onClear?()

@@ -224,6 +224,47 @@ final class NativeMultiEnvironmentTests: XCTestCase {
         await fixture.client.disconnect()
     }
 
+    func testRestartPreferenceOnlyReachesComputersThatSupportIt() async throws {
+        let server = MultiEnvironmentConfigurationServer(restartSupportHosts: ["one.example"])
+        let fixture = try await makeFixture(
+            webSocketConnector: MultiEnvironmentConfigurationConnector(server: server),
+            rpcConnectionWaitTimeout: .seconds(1),
+            fallbackPollingInitialDelay: .seconds(60),
+            aggregateRefreshInterval: .seconds(60)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let snapshot = try await fixture.client.initialSnapshot()
+        XCTAssertEqual(snapshot.preferencesByEnvironment?["one"]?.continueThreadsAfterServerUpdate, false)
+        XCTAssertNil(snapshot.preferencesByEnvironment?["two"]?.continueThreadsAfterServerUpdate)
+
+        try await fixture.client.updateServerPreferences(
+            environmentID: "one", change: .continueThreadsAfterServerUpdate(true)
+        )
+        let updatedHosts = await server.updatedHosts()
+        XCTAssertEqual(updatedHosts, ["one.example"])
+        XCTAssertTrue(fixture.client.sharedPreferenceMismatches(environmentID: "one").isEmpty)
+
+        let all = ServerSettingsSnapshot(continueThreadsAfterServerUpdate: true)
+        try await fixture.client.updateServerPreferences(
+            environmentID: "one",
+            change: .sharedPreferences(all.sharedPatch(supportsRestartContinuation: true))
+        )
+        let supportedSettings = await server.settings(host: "one.example")
+        let legacySettings = await server.settings(host: "two.example")
+        XCTAssertEqual(supportedSettings["continueThreadsAfterServerUpdate"], .bool(true))
+        XCTAssertNil(legacySettings["continueThreadsAfterServerUpdate"])
+        XCTAssertEqual(legacySettings["defaultThreadEnvMode"], .string("local"))
+        do {
+            try await fixture.client.updateServerPreferences(
+                environmentID: "two", change: .continueThreadsAfterServerUpdate(true)
+            )
+            XCTFail("An older computer must not receive the restart preference.")
+        } catch is FeatureCapabilityUnavailable {
+            // The unsupported action must fail before sending a settings command.
+        }
+        await fixture.client.disconnect()
+    }
+
     func testBackgroundLivenessKeepsASettledThreadWorking() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -1154,8 +1195,14 @@ private struct UnavailableMultiEnvironmentWebSocketConnector: WebSocketConnectin
 private actor MultiEnvironmentConfigurationServer {
     private var settingsByHost: [String: [String: JSONValue]] = [:]
     private var settingsUpdateHosts: [String] = []
+    private let restartSupportHosts: Set<String>
+
+    init(restartSupportHosts: Set<String> = []) {
+        self.restartSupportHosts = restartSupportHosts
+    }
 
     func updatedHosts() -> [String] { settingsUpdateHosts }
+    func settings(host: String) -> [String: JSONValue] { settingsByHost[host] ?? [:] }
 
     func response(to request: JSONValue, host: String) throws -> JSONValue? {
         guard let tag = request["tag"]?.stringValue,
@@ -1206,6 +1253,7 @@ private actor MultiEnvironmentConfigurationServer {
                 "serverVersion": .string("1.0.0"),
                 "capabilities": .object([
                     "threadAutoSettlement": .bool(true), "environmentIcon": .bool(true),
+                    "threadRestartContinuation": .bool(restartSupportHosts.contains(host)),
                 ]),
             ]),
         ])

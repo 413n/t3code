@@ -5,6 +5,7 @@ public struct FeatureEnvironmentUsage: Identifiable, Equatable, Sendable {
     public let label: String
     public let summary: UsageSummary?
     public let errorMessage: String?
+    public let isPending: Bool
 
     public var id: String { environmentID }
 
@@ -12,12 +13,14 @@ public struct FeatureEnvironmentUsage: Identifiable, Equatable, Sendable {
         environmentID: String,
         label: String,
         summary: UsageSummary?,
-        errorMessage: String?
+        errorMessage: String? = nil,
+        isPending: Bool = false
     ) {
         self.environmentID = environmentID
         self.label = label
         self.summary = summary
         self.errorMessage = errorMessage
+        self.isPending = isPending
     }
 }
 
@@ -113,6 +116,19 @@ struct UsageLoadState: Equatable {
     private(set) var errorMessage: String?
     private var activeLoadID: UUID?
 
+    var isPartial: Bool {
+        environments.contains {
+            $0.summary.map {
+                isCompatibleUsageContractVersion($0.contractVersion, resolution: windowInput.resolution)
+            } == true
+        }
+            && environments.contains { $0.isPending && $0.summary == nil }
+    }
+
+    var hasPendingCachedTotals: Bool {
+        environments.contains { $0.isPending && $0.summary != nil }
+    }
+
     init(
         days: Int = 30,
         now: Date = Date(),
@@ -159,9 +175,27 @@ struct UsageLoadState: Equatable {
         for request: UsageLoadRequest
     ) -> Bool {
         guard activeLoadID == request.id, request.days == windowDays else { return false }
+        // A pending row may retain the last scan only for the same window.
+        // Results from a previous day or rolling hour must not enter new totals.
+        let previous = windowInput == request.input
+            ? Dictionary(uniqueKeysWithValues: environments.map { ($0.environmentID, $0) })
+            : [:]
         windowInput = request.input
-        environments = result
-        merged = UsageMerger.merge(result)
+        environments = result.map { environment in
+            guard environment.isPending,
+                  environment.summary == nil,
+                  let summary = previous[environment.environmentID]?.summary else {
+                return environment
+            }
+            return FeatureEnvironmentUsage(
+                environmentID: environment.environmentID,
+                label: environment.label,
+                summary: summary,
+                errorMessage: environment.errorMessage,
+                isPending: true
+            )
+        }
+        merged = UsageMerger.merge(environments, resolution: request.input.resolution)
         errorMessage = nil
         return true
     }
@@ -208,16 +242,19 @@ enum UsageMerger {
         var byProvider: [UsageProviderKind: UsageProviderValue] = [:]
     }
 
-    static func merge(_ environments: [FeatureEnvironmentUsage]) -> MergedUsage {
+    static func merge(
+        _ environments: [FeatureEnvironmentUsage],
+        resolution: UsageResolution? = nil
+    ) -> MergedUsage {
         let available = environments.compactMap { environment -> (FeatureEnvironmentUsage, UsageSummary)? in
             guard let summary = environment.summary else { return nil }
             return (environment, summary)
         }
         let current = available.filter {
-            isCompatibleUsageContractVersion($0.1.contractVersion)
+            isCompatibleUsageContractVersion($0.1.contractVersion, resolution: resolution)
         }
         let staleEnvironmentIDs = available.compactMap { environment, summary in
-            isCompatibleUsageContractVersion(summary.contractVersion)
+            isCompatibleUsageContractVersion(summary.contractVersion, resolution: resolution)
                 ? nil
                 : environment.environmentID
         }

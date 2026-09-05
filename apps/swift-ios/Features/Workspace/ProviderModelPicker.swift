@@ -655,6 +655,17 @@ private struct ModelPickerSheet: View {
                         .accessibilityIdentifier("reasoning-effort-control")
                 } else {
                     Menu {
+                        if DailyUXModelOptions.defaultValue(for: descriptor) == nil {
+                            Button {
+                                updateDraftOption(id: descriptor.id, value: nil)
+                            } label: {
+                                if currentValue(for: descriptor) == nil {
+                                    Label("Provider default", systemImage: "checkmark")
+                                } else {
+                                    Text("Provider default")
+                                }
+                            }
+                        }
                         ForEach(descriptor.choices) { choice in
                             Button {
                                 updateDraftOption(
@@ -684,9 +695,13 @@ private struct ModelPickerSheet: View {
             }
             .frame(minHeight: T3Metrics.minimumTapTarget)
         case .boolean:
-            Toggle("Reasoning effort", isOn: booleanBinding(for: descriptor))
-                .frame(minHeight: T3Metrics.minimumTapTarget)
-                .accessibilityIdentifier("reasoning-effort-control")
+            BooleanModelOptionControl(
+                title: "Reasoning effort",
+                descriptor: descriptor,
+                value: optionBinding(for: descriptor)
+            )
+            .frame(minHeight: T3Metrics.minimumTapTarget)
+            .accessibilityIdentifier("reasoning-effort-control")
         }
     }
 
@@ -710,10 +725,14 @@ private struct ModelPickerSheet: View {
     private func optionValueLabel(
         for descriptor: FeatureModelOptionDescriptor
     ) -> String {
-        guard case let .string(value) = currentValue(for: descriptor) else {
-            return "Choose"
+        switch currentValue(for: descriptor) {
+        case let .string(value):
+            return descriptor.choices.first(where: { $0.id == value })?.label ?? value
+        case let .boolean(value):
+            return value ? "On" : "Off"
+        case nil:
+            return "Provider default"
         }
-        return descriptor.choices.first(where: { $0.id == value })?.label ?? value
     }
 
     private func currentValue(
@@ -725,7 +744,7 @@ private struct ModelPickerSheet: View {
         )
     }
 
-    private func updateDraftOption(id: String, value: FeatureModelOptionValue) {
+    private func updateDraftOption(id: String, value: FeatureModelOptionValue?) {
         guard var next = pickerSelection else { return }
         next.options = DailyUXModelOptions.updating(next.options, id: id, value: value)
         draftSelection = next
@@ -740,17 +759,12 @@ private struct ModelPickerSheet: View {
         currentValue(for: descriptor) == .string(choice.id)
     }
 
-    private func booleanBinding(
+    private func optionBinding(
         for descriptor: FeatureModelOptionDescriptor
-    ) -> Binding<Bool> {
+    ) -> Binding<FeatureModelOptionValue?> {
         Binding(
-            get: {
-                guard case let .boolean(value) = currentValue(for: descriptor) else {
-                    return false
-                }
-                return value
-            },
-            set: { updateDraftOption(id: descriptor.id, value: .boolean($0)) }
+            get: { currentValue(for: descriptor) },
+            set: { updateDraftOption(id: descriptor.id, value: $0) }
         )
     }
 
@@ -1343,6 +1357,32 @@ enum ProviderModelFamilyClassifier {
     }
 }
 
+private struct BooleanModelOptionControl: View {
+    let title: String
+    let descriptor: FeatureModelOptionDescriptor
+    @Binding var value: FeatureModelOptionValue?
+
+    var body: some View {
+        if DailyUXModelOptions.defaultValue(for: descriptor) != nil {
+            Toggle(title, isOn: Binding(
+                get: { value == .boolean(true) },
+                set: { value = .boolean($0) }
+            ))
+        } else {
+            Picker(title, selection: $value) {
+                Text("Provider default").tag(Optional<FeatureModelOptionValue>.none)
+                Text("On").tag(Optional(FeatureModelOptionValue.boolean(true)))
+                Text("Off").tag(Optional(FeatureModelOptionValue.boolean(false)))
+                if case let .string(savedValue) = value {
+                    Text(savedValue).tag(Optional(FeatureModelOptionValue.string(savedValue)))
+                }
+            }
+            .pickerStyle(.menu)
+            .tint(T3Colors.textPrimary)
+        }
+    }
+}
+
 private struct ModelConfigurationView: View {
     let option: DailyUXModelOption
     let onConfirm: (FeatureSelection) -> Void
@@ -1379,6 +1419,24 @@ private struct ModelConfigurationView: View {
                                     .foregroundStyle(T3Colors.textSecondary)
                             } else {
                                 Menu {
+                                    if DailyUXModelOptions.defaultValue(for: descriptor) == nil {
+                                        Button {
+                                            optionSelections = DailyUXModelOptions.updating(
+                                                optionSelections,
+                                                id: descriptor.id,
+                                                value: nil
+                                            )
+                                        } label: {
+                                            if DailyUXModelOptions.value(
+                                                for: descriptor,
+                                                in: optionSelections
+                                            ) == nil {
+                                                Label("Provider default", systemImage: "checkmark")
+                                            } else {
+                                                Text("Provider default")
+                                            }
+                                        }
+                                    }
                                     ForEach(descriptor.choices) { choice in
                                         Button {
                                             optionSelections = DailyUXModelOptions.updating(
@@ -1408,9 +1466,10 @@ private struct ModelConfigurationView: View {
                         .accessibilityIdentifier("advanced-option-\(descriptor.id)")
                         .accessibilityValue(optionValueLabel(for: descriptor))
                     case .boolean:
-                        Toggle(
-                            descriptor.label,
-                            isOn: booleanBinding(for: descriptor)
+                        BooleanModelOptionControl(
+                            title: descriptor.label,
+                            descriptor: descriptor,
+                            value: optionBinding(for: descriptor)
                         )
                         .frame(minHeight: T3Metrics.minimumTapTarget)
                         .accessibilityIdentifier("advanced-option-\(descriptor.id)")
@@ -1463,13 +1522,17 @@ private struct ModelConfigurationView: View {
     private func optionValueLabel(
         for descriptor: FeatureModelOptionDescriptor
     ) -> String {
-        guard case let .string(value) = DailyUXModelOptions.value(
+        switch DailyUXModelOptions.value(
             for: descriptor,
             in: optionSelections
-        ) else {
-            return "Choose"
+        ) {
+        case let .string(value):
+            return descriptor.choices.first(where: { $0.id == value })?.label ?? value
+        case let .boolean(value):
+            return value ? "On" : "Off"
+        case nil:
+            return "Provider default"
         }
-        return descriptor.choices.first(where: { $0.id == value })?.label ?? value
     }
 
     private func isSelected(
@@ -1501,24 +1564,21 @@ private struct ModelConfigurationView: View {
         }
     }
 
-    private func booleanBinding(
+    private func optionBinding(
         for descriptor: FeatureModelOptionDescriptor
-    ) -> Binding<Bool> {
+    ) -> Binding<FeatureModelOptionValue?> {
         Binding(
             get: {
-                guard case let .boolean(value) = DailyUXModelOptions.value(
+                DailyUXModelOptions.value(
                     for: descriptor,
                     in: optionSelections
-                ) else {
-                    return false
-                }
-                return value
+                )
             },
             set: { value in
                 optionSelections = DailyUXModelOptions.updating(
                     optionSelections,
                     id: descriptor.id,
-                    value: .boolean(value)
+                    value: value
                 )
             }
         )

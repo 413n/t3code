@@ -100,6 +100,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     private var terminalSnapshots: [TerminalKey: FeatureTerminalSnapshot] = [:]
+    // Keep versions unique when a terminal cache is evicted or an environment reconnects.
+    private var terminalLifecycleVersion = 0
     private var pollingTask: Task<Void, Never>?
     private var fallbackPollingTask: Task<Void, Never>?
     private var configurationTask: Task<Void, Never>?
@@ -112,6 +114,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var detailCatchUpTask: Task<Void, Never>?
     private var detailCatchUpID: UUID?
     private var detailCompletionReceived = false
+    private var detailWasSynchronized = false
+    private var activeDetailConnectionID: UUID?
     private var detailPublishTask: Task<Void, Never>?
     private var detailRefreshPending = false
     private var detailRefreshGeneration = 0
@@ -235,6 +239,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func resumeAfterBackground(reconnect: Bool) async {
         let sessionGeneration = environmentGeneration
         let selectedRoute = activeThreadID.flatMap { try? threadRoute(for: $0) }
+        detailWasSynchronized = false
+        activeDetailConnectionID = nil
+        for id in threadResumeStates.keys {
+            threadResumeStates[id]?.wasSynchronized = false
+        }
         if let selectedRoute {
             retainActiveThread()
             continuation.yield(.threadSync(id: selectedRoute.uiID, state: .catchingUp))
@@ -253,7 +262,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         guard sessionGeneration == environmentGeneration else { return }
         if let client { startPolling(client) }
-        if let selectedRoute, activeThreadID == selectedRoute.uiID {
+        if let selectedRoute, activeThreadID == selectedRoute.uiID,
+           isKnownClient(selectedRoute.client, environmentID: selectedRoute.environmentID, generation: sessionGeneration) {
             resetDetailRefresh()
             resetDetailStream()
             startDetailStream(selectedRoute)
@@ -465,59 +475,163 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage] {
+        var result: [FeatureEnvironmentUsage] = []
+        for try await update in usageSummaryUpdates(input, refreshPricing: refreshPricing) {
+            result = update
+        }
+        return result
+    }
+
+    func usageSummaryUpdates(
+        _ input: UsageSummaryInput,
+        refreshPricing: Bool
+    ) -> AsyncThrowingStream<[FeatureEnvironmentUsage], Error> {
+        let runtime = runtime
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task {
+                do {
+                    let environments = try await runtime.environments().filter(\.isEnabled)
+                    var results = environments.map {
+                        FeatureEnvironmentUsage(
+                            environmentID: $0.id, label: $0.label,
+                            summary: nil, isPending: true
+                        )
+                    }
+                    continuation.yield(results)
+                    try await withThrowingTaskGroup(of: (Int, FeatureEnvironmentUsage).self) { group in
+                        for (index, environment) in environments.enumerated() {
+                            group.addTask {
+                                let probe = await runtime.ephemeralClient(for: environment)
+                                let result: FeatureEnvironmentUsage
+                                do {
+                                    var pricingError: String?
+                                    if refreshPricing {
+                                        do { _ = try await probe.refreshUsageRates() }
+                                        catch is CancellationError { throw CancellationError() }
+                                        catch { pricingError = "Could not refresh prices. Showing the available rates." }
+                                    }
+                                    let summary = try await probe.usageSummary(input)
+                                    try Task.checkCancellation()
+                                    result = FeatureEnvironmentUsage(
+                                        environmentID: environment.id, label: environment.label,
+                                        summary: summary, errorMessage: pricingError
+                                    )
+                                } catch is CancellationError {
+                                    await probe.disconnect()
+                                    throw CancellationError()
+                                } catch {
+                                    result = FeatureEnvironmentUsage(
+                                        environmentID: environment.id, label: environment.label,
+                                        summary: nil, errorMessage: "This environment could not report usage."
+                                    )
+                                }
+                                await probe.disconnect()
+                                return (index, result)
+                            }
+                        }
+                        for try await (index, result) in group {
+                            try Task.checkCancellation()
+                            results[index] = result
+                            continuation.yield(results)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func usageLimitsUpdates() -> AsyncThrowingStream<[FeatureEnvironmentUsageLimits], Error> {
+        let runtime = runtime
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task {
+                do {
+                    let environments = try await runtime.environments().filter(\.isEnabled)
+                    let rows = environments.map {
+                        FeatureEnvironmentUsageLimits(environmentID: $0.id, label: $0.label, isPending: true)
+                    }
+                    let collector = NativeUsageLimitsCollector(rows: rows, continuation: continuation)
+                    continuation.yield(rows)
+                    await withTaskGroup(of: Void.self) { group in
+                        for (index, environment) in environments.enumerated() {
+                            group.addTask {
+                                // This view owns these subscriptions. Closing it releases all
+                                // quota streams without disturbing the inbox or thread socket.
+                                let probe = await runtime.ephemeralClient(for: environment)
+                                do {
+                                    let config = try await probe.serverConfig()
+                                    try Task.checkCancellation()
+                                    await collector.update(index: index, config: config)
+                                    for try await event in await probe.serverConfigEvents() {
+                                        try Task.checkCancellation()
+                                        if case .unrelated = event { continue }
+                                        let config = try await probe.serverConfig()
+                                        await collector.update(index: index, config: config)
+                                    }
+                                } catch is CancellationError {
+                                    // View or tab changes own cancellation, not a connection failure.
+                                } catch {
+                                    await collector.fail(index: index, message: error.localizedDescription)
+                                }
+                                await probe.disconnect()
+                            }
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func refreshUsageLimits() async throws -> [FeatureEnvironmentUsageLimits] {
         let environments = try await runtime.environments().filter(\.isEnabled)
         let runtime = runtime
-        let order = Dictionary(uniqueKeysWithValues: environments.enumerated().map {
-            ($0.element.id, $0.offset)
-        })
-
-        let results = try await withThrowingTaskGroup(
-            of: FeatureEnvironmentUsage.self,
-            returning: [FeatureEnvironmentUsage].self
-        ) { group in
-            for environment in environments {
+        return try await withThrowingTaskGroup(of: (Int, FeatureEnvironmentUsageLimits).self) { group in
+            for (index, environment) in environments.enumerated() {
                 group.addTask {
                     let probe = await runtime.ephemeralClient(for: environment)
+                    let row: FeatureEnvironmentUsageLimits
                     do {
-                        var pricingError: String?
-                        if refreshPricing {
-                            do { _ = try await probe.refreshUsageRates() }
-                            catch is CancellationError { throw CancellationError() }
-                            catch { pricingError = "Could not refresh prices. Showing the available rates." }
-                        }
-                        let summary = try await probe.usageSummary(input)
-                        await probe.disconnect()
-                        return FeatureEnvironmentUsage(
-                            environmentID: environment.id,
-                            label: environment.label,
-                            summary: summary,
-                            errorMessage: pricingError
+                        let config = try await probe.refreshProviders(refreshModels: false)
+                        try Task.checkCancellation()
+                        row = FeatureEnvironmentUsageLimits(
+                            environmentID: environment.id, label: environment.label,
+                            providers: config.providers, sources: config.usageLimitSources
                         )
                     } catch is CancellationError {
                         await probe.disconnect()
                         throw CancellationError()
                     } catch {
-                        await probe.disconnect()
-                        return FeatureEnvironmentUsage(
-                            environmentID: environment.id,
-                            label: environment.label,
-                            summary: nil,
-                            errorMessage: "This environment could not report usage."
+                        row = FeatureEnvironmentUsageLimits(
+                            environmentID: environment.id, label: environment.label,
+                            isConnected: false, errorMessage: error.localizedDescription
                         )
                     }
+                    await probe.disconnect()
+                    return (index, row)
                 }
             }
+            var results: [(Int, FeatureEnvironmentUsageLimits)] = []
+            for try await row in group { results.append(row) }
+            return results.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+    }
 
-            var results: [FeatureEnvironmentUsage] = []
-            results.reserveCapacity(environments.count)
-            for try await result in group {
-                results.append(result)
-            }
-            return results
+    func consumeResetCredit(
+        environmentID: String,
+        instanceID: String
+    ) async throws -> ProviderConsumeResetCreditResult {
+        guard try await runtime.environments().contains(where: { $0.id == environmentID && $0.isEnabled }) else {
+            throw NativeFeatureClientError.environmentNotFound
         }
-        return results.sorted {
-            order[$0.environmentID, default: .max] < order[$1.environmentID, default: .max]
-        }
+        let client = try await projectCreationClient(environmentID: environmentID)
+        return try await client.consumeResetCredit(instanceID: instanceID)
     }
 
     func pullRequestLists(_ input: PullRequestListInput) async throws
@@ -1570,7 +1684,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             case .invalidResponse:
                 return true
             case .status, .missingCredential, .incompatibleCredential,
-                 .managedAuthorizationUnavailable:
+                 .managedAuthorizationUnavailable, .unauthenticatedSession:
                 return false
             }
         }
@@ -1692,7 +1806,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         activeThreadPage = nil
         activeRawThread = nil
         activeThreadSequence = nil
-        continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
         let supportsPagination = serverConfigsByEnvironmentID[
             environment.id
         ]?.threadSnapshotPagination == true
@@ -1704,14 +1817,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
            cached.page == nil || supportsPagination,
            var detail = latestDetails[route.uiID],
            detailRenderCaches[route.uiID]?.isInitialized == true {
+            let currentConnectionID = await client.currentConnectionID()
+            guard !Task.isCancelled,
+                  isKnownClient(client, environmentID: environment.id, generation: generation),
+                  threadHistoryEpoch == historyEpoch,
+                  activeThreadID == route.uiID,
+                  activeThreadEnvironmentID == environment.id else { throw CancellationError() }
+            let warmConnectionID = cached.wasSynchronized
+                && cached.connectionID != nil && cached.connectionID == currentConnectionID
+                ? currentConnectionID
+                : nil
             activeRawThread = cached.thread
             activeThreadSequence = cached.sequence
             activeThreadPage = cached.page
             detail.page = cached.page
             markThreadCacheRecentlyUsed(route.uiID)
-            startDetailStream(route)
+            startDetailStream(route, warmConnectionID: warmConnectionID)
             return detail
         }
+        continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
         let snapshot: OrchestrationThreadDetailSnapshot
         do {
             snapshot = try await client.threadSnapshot(
@@ -2156,10 +2280,19 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func sharedPreferenceMismatches(environmentID: String) -> [String] {
-        guard let expected = serverConfigsByEnvironmentID[environmentID]?.settings?.sharedPatch else { return [] }
+        guard let source = serverConfigsByEnvironmentID[environmentID]?.settings else { return [] }
         return sharedPreferenceTargetIDs.filter { id in
-            id != environmentID && serverConfigsByEnvironmentID[id]?.settings?.sharedPatch != expected
+            guard id != environmentID,
+                  let target = serverConfigsByEnvironmentID[id]?.settings else { return false }
+            let supportsRestart = supportsRestartContinuation(environmentID: environmentID)
+                && supportsRestartContinuation(environmentID: id)
+            return source.sharedPatch(supportsRestartContinuation: supportsRestart)
+                != target.sharedPatch(supportsRestartContinuation: supportsRestart)
         }.map { id in latestSnapshot?.environments.first { $0.id == id }?.name ?? id }
+    }
+
+    private func supportsRestartContinuation(environmentID: String) -> Bool {
+        serverConfigsByEnvironmentID[environmentID]?.environment?.capabilities.threadRestartContinuation == true
     }
 
     private var sharedPreferenceTargetIDs: [String] {
@@ -2172,26 +2305,46 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws {
         let client = try await projectCreationClient(environmentID: environmentID)
+        let generation = environmentGeneration
         let config = try await client.serverConfig()
-        if case .environmentIcon = change {
+        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
+            throw CancellationError()
+        }
+        setServerConfig(config, environmentID: environmentID)
+        switch change {
+        case .environmentIcon:
             guard config.environment?.capabilities.environmentIcon == true else {
                 throw FeatureCapabilityUnavailable("Environment icons")
             }
-        } else {
+        case .continueThreadsAfterServerUpdate:
+            guard config.environment?.capabilities.threadRestartContinuation == true else {
+                throw FeatureCapabilityUnavailable("Restart continuation")
+            }
+        default:
             guard config.environment?.capabilities.threadAutoSettlement == true else {
                 throw FeatureCapabilityUnavailable("Shared preferences")
             }
         }
-        _ = try await saveServerPreferences(client: client, environmentID: environmentID, change: change)
-        if case .environmentIcon = change { return }
-        await fanOutSharedPreferences(from: environmentID, change: change)
+        guard let supportedChange = NativeSharedPreferenceChange.filter(
+            change,
+            supportsRestartContinuation: supportsRestartContinuation(environmentID: environmentID)
+        ) else { throw FeatureCapabilityUnavailable("Restart continuation") }
+        _ = try await saveServerPreferences(client: client, environmentID: environmentID, change: supportedChange)
+        if case .environmentIcon = supportedChange { return }
+        await fanOutSharedPreferences(from: environmentID, change: supportedChange)
     }
 
     private func fanOutSharedPreferences(from sourceID: String, change: ServerSettingsChange) async {
+        let sourceSupportsRestart = supportsRestartContinuation(environmentID: sourceID)
         for id in sharedPreferenceTargetIDs where id != sourceID {
+            guard let targetChange = NativeSharedPreferenceChange.filter(
+                change,
+                supportsRestartContinuation: sourceSupportsRestart
+                    && supportsRestartContinuation(environmentID: id)
+            ) else { continue }
             do {
                 let client = try await projectCreationClient(environmentID: id)
-                _ = try await saveServerPreferences(client: client, environmentID: id, change: change)
+                _ = try await saveServerPreferences(client: client, environmentID: id, change: targetChange)
             } catch {
                 // Keep the last real settings so the mismatch remains visible and can be retried.
             }
@@ -2213,7 +2366,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settings: settings,
             threadSnapshotPagination: previous?.threadSnapshotPagination,
             threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
-            environment: previous?.environment
+            environment: previous?.environment,
+            usageLimitSources: previous?.usageLimitSources ?? []
         )
         setServerConfig(config, environmentID: environmentID)
         if environmentID == activeEnvironment?.id {
@@ -2551,11 +2705,20 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             return snapshot
         }
         let context = try workspaceContext(route: route)
-        return FeatureTerminalSnapshot(
+        let snapshot = FeatureTerminalSnapshot(
             threadID: route.uiID,
             terminalID: terminalID,
-            workingDirectory: context.cwd
+            workingDirectory: context.cwd,
+            lifecycleVersion: nextTerminalLifecycleVersion()
         )
+        terminalSnapshots[key] = snapshot
+        return snapshot
+    }
+
+    func terminalHostOS(threadID: String) -> String? {
+        guard let route = try? threadRoute(for: threadID) else { return nil }
+        return serverConfigsByEnvironmentID[route.environmentID]?.environment?.platform.os
+            ?? route.client.environment.descriptor?.platform.os
     }
 
     func terminalEvents(
@@ -2627,6 +2790,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         )
                     snapshot.state = .failed
                     snapshot.error = error.localizedDescription
+                    snapshot.lifecycleVersion = self.nextTerminalLifecycleVersion()
                     self.terminalSnapshots[key] = snapshot
                     continuation.yield(snapshot)
                     continuation.finish()
@@ -2677,6 +2841,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             if event.threadId == wireThreadID,
                                let terminalID = event.terminalId {
                                 summaries.removeAll { $0.terminalId == terminalID }
+                                let key = TerminalKey(threadID: uiThreadID, terminalID: terminalID)
+                                if var cached = self.terminalSnapshots[key] {
+                                    cached.state = .stopped
+                                    cached.lifecycleVersion = self.nextTerminalLifecycleVersion()
+                                    self.terminalSnapshots[key] = cached
+                                }
                             }
                         default:
                             break
@@ -2727,6 +2897,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         var scoped = mapped
         scoped.threadID = route.uiID
         scoped.buffer = Self.cappedTerminalBuffer(scoped.buffer)
+        scoped.lifecycleVersion = nextTerminalLifecycleVersion()
         terminalSnapshots[TerminalKey(threadID: route.uiID, terminalID: terminalID)] = scoped
     }
 
@@ -2776,7 +2947,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             FeatureTerminalSnapshot(
                 threadID: route.uiID,
                 terminalID: terminalID,
-                workingDirectory: context.cwd
+                workingDirectory: context.cwd,
+                lifecycleVersion: nextTerminalLifecycleVersion()
             )
     }
 
@@ -3016,6 +3188,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             var snapshot = NativeWorkspaceMapper.terminal(coreSnapshot)
             snapshot.threadID = threadID
             snapshot.buffer = Self.cappedTerminalBuffer(snapshot.buffer)
+            snapshot.lifecycleVersion = nextTerminalLifecycleVersion()
             terminalSnapshots[key] = snapshot
             return snapshot
         }
@@ -3023,17 +3196,23 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         var snapshot = terminalSnapshots[key]
             ?? FeatureTerminalSnapshot(threadID: threadID, terminalID: terminalID)
         switch event.type {
+        case "started", "restarted":
+            snapshot.state = .running
+            snapshot.lifecycleVersion = nextTerminalLifecycleVersion()
         case "output":
             snapshot.buffer.append(event.data ?? "")
             snapshot.buffer = Self.cappedTerminalBuffer(snapshot.buffer)
         case "exited":
             snapshot.state = .exited
             snapshot.exitCode = event.exitCode
+            snapshot.lifecycleVersion = nextTerminalLifecycleVersion()
         case "closed":
             snapshot.state = .stopped
+            snapshot.lifecycleVersion = nextTerminalLifecycleVersion()
         case "error":
             snapshot.state = .failed
             snapshot.error = event.message
+            snapshot.lifecycleVersion = nextTerminalLifecycleVersion()
         case "cleared":
             snapshot.buffer = ""
         case "activity":
@@ -3057,9 +3236,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if let cached = terminalSnapshots[key] {
             snapshot.buffer = cached.buffer
             snapshot.error = cached.error
+            snapshot.lifecycleVersion = cached.lifecycleVersion
+        } else {
+            snapshot.lifecycleVersion = nextTerminalLifecycleVersion()
         }
         terminalSnapshots[key] = snapshot
         return snapshot
+    }
+
+    private func nextTerminalLifecycleVersion() -> Int {
+        terminalLifecycleVersion += 1
+        return terminalLifecycleVersion
     }
 
     /// A verbose command can stream megabytes; the viewer only ever shows the
@@ -3255,7 +3442,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             threadSnapshotPagination: previous?.threadSnapshotPagination,
                             threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
                             environment: previous?.environment
-                                ?? self.latestServerConfig?.environment
+                                ?? self.latestServerConfig?.environment,
+                            usageLimitSources: previous?.usageLimitSources
+                                ?? self.latestServerConfig?.usageLimitSources ?? []
                         )
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
@@ -3273,10 +3462,28 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             threadResumeCompletionMarker: previous?.threadResumeCompletionMarker
                                 ?? self.latestServerConfig?.threadResumeCompletionMarker,
                             environment: previous?.environment
-                                ?? self.latestServerConfig?.environment
+                                ?? self.latestServerConfig?.environment,
+                            usageLimitSources: previous?.usageLimitSources
+                                ?? self.latestServerConfig?.usageLimitSources ?? []
                         )
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
+                    case let .usageLimitSourcesUpdated(sources):
+                        guard let previous = self.serverConfigsByEnvironmentID[activeClient.environment.id]
+                            ?? self.latestServerConfig else { continue }
+                        let config = ServerConfigSnapshot(
+                            providers: previous.providers,
+                            settings: previous.settings,
+                            threadSnapshotPagination: previous.threadSnapshotPagination,
+                            threadResumeCompletionMarker: previous.threadResumeCompletionMarker,
+                            environment: previous.environment,
+                            usageLimitSources: sources
+                        )
+                        self.latestServerConfig = config
+                        self.setServerConfig(config, environmentID: activeClient.environment.id)
+                        // Limits have their own subscription. A quota update
+                        // does not change home rows or the model catalog.
+                        continue
                     case .unrelated:
                         continue
                     }
@@ -3551,6 +3758,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
               activeThreadEnvironmentID == client.environment.id else { return }
         guard force || detailStreamTask == nil else { return }
         if force {
+            detailWasSynchronized = false
             // This required read owns recovery now. An older fallback must not
             // replace its loading state with an error from a stale snapshot.
             detailCatchUpTask?.cancel()
@@ -3604,12 +3812,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
-    private func startDetailStream(_ route: NativeThreadRoute) {
+    private func startDetailStream(_ route: NativeThreadRoute, warmConnectionID: UUID? = nil) {
         detailStreamGeneration &+= 1
         detailCompletionReceived = false
+        detailWasSynchronized = warmConnectionID != nil
+        activeDetailConnectionID = warmConnectionID
         let streamGeneration = detailStreamGeneration
         let sessionGeneration = environmentGeneration
-        continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
+        continuation.yield(.threadSync(
+            id: route.uiID, state: warmConnectionID != nil ? .live : .catchingUp
+        ))
         ensureDetailCatchUpFallback(route, generation: streamGeneration)
         detailStreamTask = Task { [weak self] in
             while !Task.isCancelled,
@@ -3623,12 +3835,41 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 ]?.threadSnapshotPagination == true
                 let subscriptionEpoch = self?.threadHistoryEpoch ?? 0
                 do {
-                    for try await item in await route.client.threadEvents(
+                    let connectionBeforeSubscribe = await route.client.currentConnectionID()
+                    guard !Task.isCancelled,
+                          self?.isCurrentDetail(route, generation: streamGeneration) == true,
+                          self?.environmentGeneration == sessionGeneration else { return }
+                    let events = await route.client.threadEvents(
                         threadID: route.wireID,
                         after: sequence,
                         turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil,
                         reconnect: false
-                    ) {
+                    )
+                    let connectionAfterSubscribe = await route.client.currentConnectionID()
+                    guard !Task.isCancelled,
+                          self?.isCurrentDetail(route, generation: streamGeneration) == true,
+                          self?.environmentGeneration == sessionGeneration else { return }
+                    // A socket that changed during subscription cannot prove
+                    // which connection produced already-buffered events.
+                    let subscriptionConnectionID = connectionBeforeSubscribe == connectionAfterSubscribe
+                        ? connectionBeforeSubscribe
+                        : nil
+                    if self?.detailWasSynchronized == true,
+                       subscriptionConnectionID == nil || subscriptionConnectionID != self?.activeDetailConnectionID {
+                        self?.detailWasSynchronized = false
+                        self?.continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
+                    }
+                    self?.activeDetailConnectionID = subscriptionConnectionID
+                    for try await item in events {
+                        if case .synchronized = item {
+                            let connectionID = await route.client.currentConnectionID()
+                            guard !Task.isCancelled, let self,
+                                  self.isCurrentDetail(route, generation: streamGeneration),
+                                  self.environmentGeneration == sessionGeneration else { return }
+                            if connectionID != subscriptionConnectionID {
+                                self.activeDetailConnectionID = nil
+                            }
+                        }
                         guard !Task.isCancelled, let self,
                               self.isCurrentDetail(route, generation: streamGeneration),
                               self.environmentGeneration == sessionGeneration else { return }
@@ -3644,6 +3885,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 guard !Task.isCancelled,
                       self?.isCurrentDetail(route, generation: streamGeneration) == true else { return }
                 self?.detailCompletionReceived = false
+                self?.detailWasSynchronized = false
+                self?.activeDetailConnectionID = nil
                 self?.continuation.yield(.threadSync(id: route.uiID, state: .reconnecting))
                 self?.ensureDetailCatchUpFallback(route, generation: streamGeneration)
                 do { try await Task.sleep(for: .milliseconds(250)) }
@@ -3707,7 +3950,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         detailCatchUpTask?.cancel()
         detailCatchUpTask = nil
         detailCatchUpID = nil
+        detailWasSynchronized = true
         continuation.yield(.threadSync(id: route.uiID, state: .live))
+    }
+
+    private func beginWarmReplayIfNeeded(_ route: NativeThreadRoute) {
+        guard detailWasSynchronized, !detailCompletionReceived,
+              serverConfigsByEnvironmentID[route.environmentID]?.threadResumeCompletionMarker == true else { return }
+        detailWasSynchronized = false
+        continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
+        ensureDetailCatchUpFallback(route, generation: detailStreamGeneration)
     }
 
     private func consumeDetailStreamItem(
@@ -3728,6 +3980,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                subscriptionEpoch < requiredEpoch { return }
             guard snapshot.snapshotSequence >= (activeThreadSequence ?? 0),
                   activeRawThread == nil || snapshot.snapshotSequence > (activeThreadSequence ?? 0) else { return }
+            beginWarmReplayIfNeeded(route)
             resetDetailRefresh()
             detailSnapshotRequiredAfterEpoch = nil
             threadHistoryEpoch &+= 1
@@ -3764,6 +4017,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 return
             }
             guard reduction.sequence > (activeThreadSequence ?? 0) else { return }
+            beginWarmReplayIfNeeded(route)
             switch reduction.result {
             case let .updated(thread):
                 activeThreadSequence = reduction.sequence
@@ -3839,7 +4093,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         var page = activeThreadPage
         page?.isLoading = false
         threadResumeStates[id] = NativeThreadResumeState(
-            client: route.client, thread: raw, sequence: sequence, page: page
+            client: route.client, thread: raw, sequence: sequence, page: page,
+            wasSynchronized: detailWasSynchronized,
+            connectionID: activeDetailConnectionID
         )
     }
 
@@ -3864,6 +4120,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func resetDetailStream() {
         detailStreamGeneration &+= 1
+        detailCompletionReceived = false
+        detailWasSynchronized = false
+        activeDetailConnectionID = nil
         detailSnapshotRequiredAfterEpoch = nil
         detailStreamTask?.cancel()
         detailStreamTask = nil
@@ -4213,7 +4472,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         publish(detail, threadID: route.uiID)
         threadResumeStates[route.uiID] = NativeThreadResumeState(
             client: client, thread: snapshot.thread, sequence: snapshot.snapshotSequence,
-            page: featurePage(snapshot.page)
+            page: featurePage(snapshot.page),
+            wasSynchronized: false,
+            connectionID: nil
         )
         if activeThreadID == route.uiID,
            detailCompletionReceived
@@ -4319,6 +4580,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         if shell.snapshotSequence >= (activeThreadSequence ?? .min) {
             applySettlementAuthority(from: shellThread, to: &detail.thread)
+            if let compaction = detailRenderCaches[threadID]?.compaction {
+                detail.isCompacting = compaction.isActive(
+                    sessionStatus: shellThread.session?.status,
+                    latestTurnState: shellThread.latestTurn?.state,
+                    latestTurnRequestedAt: (shellThread.latestTurn?.requestedAt).flatMap(parseValidDate)
+                )
+            }
         }
         detail.backgroundWorkIsActive = backgroundWorkIsActive
         detail.activeSubagentCount = backgroundWorkIsActive || sessionIsLive
@@ -4458,7 +4726,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
         var changedIDs = Set(mutations.messages.map(\.id))
         for activity in mutations.activities {
-            if activity.tone == "error" {
+            if NativeActivityNotice.accepts(activity) {
                 changedIDs.insert("activity-\(activity.id)")
             } else if NativeWorkLogAccumulator.accepts(activity) {
                 changedIDs.insert("work-log-\(activity.turnId ?? "unscoped")")
@@ -4495,7 +4763,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             userInputs: replacingChangedSuffix(current.userInputs, with: incoming.userInputs),
             page: incoming.page,
             activeSubagentCount: incoming.activeSubagentCount,
-            backgroundWorkIsActive: incoming.backgroundWorkIsActive
+            backgroundWorkIsActive: incoming.backgroundWorkIsActive,
+            isCompacting: incoming.isCompacting == true
         )
     }
 
@@ -4658,7 +4927,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     )
                     : nil,
                 supportsImageUploads: supportsImageUploads,
-                maxFileAttachmentBytes: maxFileAttachmentBytes
+                maxFileAttachmentBytes: maxFileAttachmentBytes,
+                continueThreadsAfterServerUpdate: capabilities?.threadRestartContinuation == true
+                    ? serverSettings.continueThreadsAfterServerUpdate
+                    : nil
             )
         }
         return FeatureSnapshot(
@@ -4876,15 +5148,20 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         markThreadCacheRecentlyUsed(threadID)
 
         if !cache.isInitialized || mutations == nil || mutations?.requiresFullRebuild == true {
+            cache.compaction = NativeContextCompactionState()
             cache.messagesByID = thread.messages.reduce(into: [:]) { result, raw in
                 result[raw.id] = mapMessage(raw, environmentID: environment.id)
+                cache.compaction.apply(raw, createdAt: parseDate(raw.createdAt))
             }
             cache.approvals = pendingApprovals(thread, environment: environment)
             cache.userInputs = pendingUserInputs(thread, environment: environment)
-            let errors = thread.activities.compactMap(mapErrorActivity)
+            let notices = thread.activities.compactMap { activity in
+                cache.compaction.apply(activity)
+                return NativeActivityNotice.message(activity, createdAt: parseDate(activity.createdAt))
+            }
             let sessionIsLive = thread.session?.status == "starting"
                 || thread.session?.status == "running"
-            let activityMessages = (errors + collapsedWorkLogs(
+            let activityMessages = (notices + collapsedWorkLogs(
                 thread.activities,
                 sessionIsLive: sessionIsLive
             ))
@@ -4900,6 +5177,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             for message in mutations.messages {
                 let mapped = mapMessage(message, environmentID: environment.id)
                 cache.messagesByID[message.id] = mapped
+                cache.compaction.apply(message, createdAt: mapped.createdAt)
                 upsertMergedMessage(mapped, cache: cache)
             }
             for activity in mutations.activities {
@@ -4953,7 +5231,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             activeSubagentCount: backgroundWorkIsActive || sessionIsLive
                 ? cache.subagents.activeCount
                 : 0,
-            backgroundWorkIsActive: backgroundWorkIsActive
+            backgroundWorkIsActive: backgroundWorkIsActive,
+            isCompacting: cache.compaction.isActive(
+                sessionStatus: thread.session?.status,
+                latestTurnState: thread.latestTurn?.state,
+                latestTurnRequestedAt: (thread.latestTurn?.requestedAt).flatMap(parseValidDate)
+            )
         )
     }
 
@@ -5076,7 +5359,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             userInputs: currentDetail.userInputs,
             page: activeThreadPage,
             activeSubagentCount: currentDetail.activeSubagentCount,
-            backgroundWorkIsActive: currentDetail.backgroundWorkIsActive
+            backgroundWorkIsActive: currentDetail.backgroundWorkIsActive,
+            isCompacting: currentDetail.isCompacting == true
         )
         publish(detail, threadID: route.uiID, renderCacheIsSource: true)
         scheduleAttachmentHydration(
@@ -5098,7 +5382,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let workIsLive = thread.session?.status == "starting"
             || thread.session?.status == "running"
             || backgroundLiveness(threadID: thread.id, environmentID: environmentID) == .working
-        let activities = thread.activities.compactMap(mapErrorActivity)
+        let activities = thread.activities.compactMap {
+            NativeActivityNotice.message($0, createdAt: parseDate($0.createdAt))
+        }
             + collapsedWorkLogs(thread.activities, sessionIsLive: workIsLive)
         return (messages + activities).sorted { $0.createdAt < $1.createdAt }
     }
@@ -5180,6 +5466,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         environment: Environment,
         cache: NativeDetailRenderCache
     ) {
+        cache.compaction.apply(activity)
         cache.subagents.apply(activity)
         applyApprovalActivity(
             activity,
@@ -5193,8 +5480,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             environment: environment,
             cache: cache
         )
-        if let error = mapErrorActivity(activity) {
-            upsertMergedMessage(error, cache: cache)
+        if let notice = NativeActivityNotice.message(activity, createdAt: parseDate(activity.createdAt)) {
+            upsertMergedMessage(notice, cache: cache)
         }
         guard NativeWorkLogAccumulator.accepts(activity),
               cache.workLogActivityIDs.insert(activity.id).inserted else {
@@ -5364,20 +5651,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     url: cachedAttachmentURL(for: $0.id, environmentID: environmentID)
                 )
             }
-        )
-    }
-
-    private func mapErrorActivity(_ activity: OrchestrationActivity) -> FeatureMessage? {
-        guard activity.tone == "error" else { return nil }
-        let detail = activity.payload["detail"]?.stringValue
-        let text = detail.map { "\(activity.summary)\n\($0)" } ?? activity.summary
-        return FeatureMessage(
-            id: "activity-\(activity.id)",
-            role: .system,
-            text: text,
-            createdAt: parseDate(activity.createdAt),
-            state: .complete,
-            toolName: activity.kind
         )
     }
 
@@ -5670,18 +5943,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         .default
     }
 
-    /// The mapped catalog for the config-driven branch of mapProviders. Every
-    /// publish rebuilds the snapshot, but the catalog only changes when a new
-    /// server config arrives, so mapping hundreds of models per publish is
-    /// wasted work. Entries are invalidated wherever
-    /// serverConfigsByEnvironmentID is written.
+    /// Reuse mapped models across shell and settings updates. The config
+    /// setter invalidates an entry only when its provider snapshots change.
     private var providerCatalogCache: [String: [FeatureProvider]] = [:]
 
     /// Single write path for server configs so the provider catalog cache can
     /// never go stale against the config that feeds it.
     private func setServerConfig(_ config: ServerConfigSnapshot, environmentID: String) {
+        if serverConfigsByEnvironmentID[environmentID]?.providers != config.providers {
+            providerCatalogCache[environmentID] = nil
+        }
         serverConfigsByEnvironmentID[environmentID] = config
-        providerCatalogCache[environmentID] = nil
     }
 
     private func mapProviders(
@@ -6427,6 +6699,96 @@ private final class NativeDetailRenderCache {
     var approvals: [FeatureApproval] = []
     var userInputs: [FeatureUserInput] = []
     var subagents = FeatureActiveSubagentTracker()
+    var compaction = NativeContextCompactionState()
+}
+
+enum NativeActivityNotice {
+    static func accepts(_ activity: OrchestrationActivity) -> Bool {
+        activity.tone == "error" || activity.kind == "runtime.warning"
+            || activity.kind == "context-compaction"
+    }
+
+    static func message(_ activity: OrchestrationActivity, createdAt: Date) -> FeatureMessage? {
+        guard accepts(activity) else { return nil }
+        let text: String
+        if activity.kind == "context-compaction" {
+            text = activity.summary
+        } else if let message = activity.payload["message"]?.stringValue,
+                  !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            text = message
+        } else if let detail = activity.payload["detail"]?.stringValue,
+                  !detail.isEmpty, detail != activity.summary {
+            text = "\(activity.summary)\n\(detail)"
+        } else {
+            text = activity.summary
+        }
+        return FeatureMessage(
+            id: "activity-\(activity.id)",
+            role: .system,
+            text: text,
+            createdAt: createdAt,
+            state: .complete,
+            toolName: activity.kind
+        )
+    }
+}
+
+/// The latest compaction request and its matching result survive live updates
+/// without scanning the retained activity history for each streamed token.
+struct NativeContextCompactionState {
+    private var requestID: String?
+    private var requestedAt: Date?
+    private var settled = false
+
+    mutating func apply(_ message: OrchestrationMessage, createdAt: Date) {
+        guard message.role == "user",
+              FeatureContextCompaction.isCommand(
+                message.text, hasAttachments: message.attachments?.isEmpty == false
+              ) else { return }
+        if let requestedAt, createdAt < requestedAt { return }
+        if requestID != message.id {
+            requestID = message.id
+            requestedAt = createdAt
+            settled = false
+        }
+    }
+
+    mutating func apply(_ activity: OrchestrationActivity) {
+        guard activity.kind == "context-compaction" || activity.kind == "provider.turn.start.failed",
+              let requestID, activity.payload["requestId"]?.stringValue == requestID else { return }
+        settled = true
+    }
+
+    func isActive(
+        sessionStatus: String?,
+        latestTurnState: String?,
+        latestTurnRequestedAt: Date?
+    ) -> Bool {
+        guard !settled, let requestedAt,
+              sessionStatus == "starting" || sessionStatus == "running" else { return false }
+        let turnRequestedAt = latestTurnRequestedAt ?? requestedAt
+        return requestedAt > turnRequestedAt
+            || (latestTurnState == "running" && requestedAt == turnRequestedAt)
+    }
+}
+
+enum NativeSharedPreferenceChange {
+    static func filter(
+        _ change: ServerSettingsChange,
+        supportsRestartContinuation: Bool
+    ) -> ServerSettingsChange? {
+        guard !supportsRestartContinuation else { return change }
+        switch change {
+        case .continueThreadsAfterServerUpdate:
+            return nil
+        case let .sharedPreferences(.object(fields)):
+            var fields = fields
+            fields.removeValue(forKey: "continueThreadsAfterServerUpdate")
+            return fields.isEmpty ? nil : .sharedPreferences(.object(fields))
+        default:
+            return change
+        }
+    }
 }
 
 struct NativeWorkLogAccumulator {
@@ -7049,6 +7411,8 @@ private struct NativeThreadResumeState {
     let thread: OrchestrationThread
     let sequence: Int
     let page: FeatureThreadPage?
+    var wasSynchronized: Bool
+    let connectionID: UUID?
 }
 
 private struct NativeSourceControlMonitorKey: Hashable {

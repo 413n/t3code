@@ -43,8 +43,96 @@ final class NativeThreadCatchUpTests: XCTestCase {
         XCTAssertEqual(resumed.payload["afterSequence"], .number(3))
         XCTAssertEqual(resumed.payload["turnLimit"], .number(10))
         XCTAssertEqual(resumed.payload["requestCompletionMarker"], .bool(true))
+        let resumedState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(resumedState, .live, "A completed warm thread must not flash catch-up status.")
+        try await resumed.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.firstID)
         let reads = await fixture.http.threadRequests
         XCTAssertEqual(reads.count, 2, "Only the two cold opens should fetch HTTP snapshots.")
+        await fixture.client.disconnect()
+    }
+
+    func testWarmReplayShowsCatchUpOnlyAfterReceivingNewerData() async throws {
+        let fixture = try await CatchUpFixture.make()
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let first = try await nextThreadRequest(&requests)
+        try await first.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.firstID)
+
+        fixture.client.releaseThread(id: fixture.firstID)
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let resumed = try await nextThreadRequest(&requests)
+        let initialState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(initialState, .live)
+
+        try await resumed.sendMessage(text: "Finished while away", sequence: 3)
+        try await resumed.synchronize()
+        var states: [FeatureThreadSyncState] = []
+        var messages: [String] = []
+        while let event = await events.next(isolation: #isolation) {
+            if case let .threadSync(id, state) = event,
+               id == fixture.firstID, let state {
+                states.append(state)
+                if state == .live { break }
+                if case .failed = state { break }
+            }
+            switch event {
+            case let .detail(detail), let .detailDelta(detail, _):
+                if detail.thread.id == fixture.firstID { messages = detail.messages.map(\.text) }
+            default: break
+            }
+        }
+        XCTAssertEqual(states, [.catchingUp, .live])
+        XCTAssertTrue(messages.contains("Finished while away"))
+        await fixture.client.disconnect()
+    }
+
+    func testIncompleteWarmCacheStillShowsCatchUp() async throws {
+        let fixture = try await CatchUpFixture.make()
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        _ = try await nextThreadRequest(&requests)
+        fixture.client.releaseThread(id: fixture.firstID)
+        while let event = await events.next(isolation: #isolation) {
+            if case .threadSync(fixture.firstID, nil) = event { break }
+        }
+
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let resumed = try await nextThreadRequest(&requests)
+        let initialState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(initialState, .catchingUp)
+        try await resumed.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.firstID)
+        await fixture.client.disconnect()
+    }
+
+    func testWarmCacheShowsCatchUpAfterSocketReplacement() async throws {
+        let fixture = try await CatchUpFixture.make()
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let first = try await nextThreadRequest(&requests)
+        try await first.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.firstID)
+        fixture.client.releaseThread(id: fixture.firstID)
+
+        await first.socket.close()
+        while let request = await requests.next(isolation: #isolation) {
+            if request.socket !== first.socket { break }
+        }
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let resumed = try await nextThreadRequest(&requests)
+        XCTAssertFalse(resumed.socket === first.socket)
+        let resumedState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(resumedState, .catchingUp)
+        try await resumed.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.firstID)
         await fixture.client.disconnect()
     }
 
@@ -63,6 +151,8 @@ final class NativeThreadCatchUpTests: XCTestCase {
         let resumed = try await nextThreadRequest(&requests)
         XCTAssertFalse(resumed.socket === first.socket)
         XCTAssertEqual(resumed.payload["afterSequence"], .number(7))
+        let resumedState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(resumedState, .catchingUp)
         try await resumed.sendMessage(text: "Completed while away", sequence: 8)
         try await resumed.synchronize()
         let messages = await messagesBeforeLive(&events, threadID: fixture.firstID)
@@ -86,6 +176,8 @@ final class NativeThreadCatchUpTests: XCTestCase {
         let resumed = try await nextThreadRequest(&requests)
         XCTAssertEqual(resumed.payload["afterSequence"], .number(12))
         XCTAssertFalse(resumed.socket === first.socket)
+        let resumedState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(resumedState, .reconnecting)
         await fixture.client.disconnect()
     }
 
@@ -520,6 +612,18 @@ final class NativeThreadCatchUpTests: XCTestCase {
             if request.tag == RPCMethod.subscribeThread.rawValue { return request }
         }
         throw CancellationError()
+    }
+
+    private func nextSyncState(
+        _ iterator: inout AsyncStream<FeatureEvent>.Iterator, threadID: String
+    ) async -> FeatureThreadSyncState? {
+        while let event = await iterator.next(isolation: #isolation) {
+            if case let .threadSync(id, state) = event, id == threadID, let state {
+                return state
+            }
+        }
+        XCTFail("The thread did not report its sync state.")
+        return nil
     }
 
     private func messagesBeforeLive(

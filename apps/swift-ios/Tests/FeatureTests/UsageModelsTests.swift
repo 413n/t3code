@@ -437,6 +437,89 @@ struct UsageModelsTests {
         #expect(!isCompatibleUsageContractVersion(6))
     }
 
+    @Test
+    func versionThreeKeepsDailyUsageButCannotEnterHourlyTotals() throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-18T12:00:00Z"))
+        let environment = FeatureEnvironmentUsage(
+            environmentID: "legacy", label: "Legacy",
+            summary: summary(contractVersion: 3, provider: .claude, costUsd: 20)
+        )
+        var state = UsageLoadState(days: 1, now: now)
+        let hourly = state.begin(days: 1, now: now)
+        state.receive([environment], for: hourly)
+
+        #expect(state.merged.costUsd == 0)
+        #expect(state.merged.totalTokens == 0)
+        #expect(state.merged.staleEnvironments == ["legacy"])
+        #expect(!isCompatibleUsageContractVersion(3, resolution: .hour))
+        #expect(isCompatibleUsageContractVersion(4, resolution: .hour))
+        #expect(isCompatibleUsageContractVersion(5, resolution: .hour))
+
+        let daily = state.begin(days: 7, now: now)
+        state.receive([environment], for: daily)
+        #expect(state.merged.costUsd == 20)
+        #expect(state.merged.staleEnvironments.isEmpty)
+        #expect(isCompatibleUsageContractVersion(3, resolution: .day))
+    }
+
+    @Test
+    func firstEnvironmentRendersWhileAnotherIsStillPending() throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-18T12:00:00Z"))
+        var state = UsageLoadState(now: now)
+        let request = state.begin(days: 30, now: now)
+        let pending = FeatureEnvironmentUsage(
+            environmentID: "slow", label: "Slow", summary: nil, isPending: true
+        )
+        let ready = FeatureEnvironmentUsage(
+            environmentID: "ready", label: "Ready", summary: summary(provider: .codex, costUsd: 10)
+        )
+
+        state.receive([ready, pending], for: request)
+        #expect(state.merged.costUsd == 10)
+        #expect(state.isLoading)
+        #expect(state.isPartial)
+        #expect(!state.hasPendingCachedTotals)
+
+        state.receive([
+            ready,
+            .init(environmentID: "slow", label: "Slow", summary: nil, errorMessage: "Offline")
+        ], for: request)
+        state.finish(request)
+        #expect(state.merged.costUsd == 10)
+        #expect(!state.isLoading)
+        #expect(!state.isPartial)
+        #expect(state.environments.last?.errorMessage == "Offline")
+    }
+
+    @Test
+    func pendingRefreshRetainsOnlyTheSameWindowsLastScan() throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-18T12:00:00Z"))
+        let timeZone = try #require(TimeZone(identifier: "UTC"))
+        var state = UsageLoadState(now: now, timeZone: timeZone)
+        let initial = state.begin(days: 30, now: now, timeZone: timeZone)
+        let previous = FeatureEnvironmentUsage(
+            environmentID: "current", label: "Current", summary: summary(provider: .codex, costUsd: 10)
+        )
+        state.receive([previous], for: initial)
+        state.finish(initial)
+        let pending = FeatureEnvironmentUsage(
+            environmentID: "current", label: "Current", summary: nil, isPending: true
+        )
+
+        let refresh = state.begin(days: 30, now: now, timeZone: timeZone)
+        state.receive([pending], for: refresh)
+        #expect(state.merged.costUsd == 10)
+        #expect(state.environments.first?.isPending == true)
+        #expect(state.hasPendingCachedTotals)
+        #expect(!state.isPartial)
+
+        let nextDay = state.begin(days: 30, now: now.addingTimeInterval(24 * 60 * 60), timeZone: timeZone)
+        state.receive([pending], for: nextDay)
+        #expect(state.merged.costUsd == 0)
+        #expect(state.environments.first?.summary == nil)
+        #expect(!state.hasPendingCachedTotals)
+    }
+
     private func summary(
         contractVersion: Int = usageContractVersion,
         provider: UsageProviderKind,

@@ -109,6 +109,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public let pullRequests: Bool?
         public let threadSettlement: Bool?
         public let threadAutoSettlement: Bool?
+        public var threadRestartContinuation: Bool? = nil
         public let threadSnooze: Bool?
         public let threadPinning: Bool?
         public let threadTitleRegeneration: Bool?
@@ -116,6 +117,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public let serverSelfUpdate: String?
         public let serverSelfUpdateProgress: Bool?
         public var environmentIcon: Bool? = nil
+        public var usageLimitSources: Bool? = nil
 
         private enum CodingKeys: String, CodingKey {
             case repositoryIdentity
@@ -125,6 +127,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case pullRequests
             case threadSettlement
             case threadAutoSettlement
+            case threadRestartContinuation
             case threadSnooze
             case threadPinning
             case threadTitleRegeneration
@@ -132,11 +135,13 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case serverSelfUpdate
             case serverSelfUpdateProgress
             case environmentIcon
+            case usageLimitSources
         }
 
         public init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             environmentIcon = try container.decodeIfPresent(Bool.self, forKey: .environmentIcon)
+            usageLimitSources = try container.decodeIfPresent(Bool.self, forKey: .usageLimitSources)
             repositoryIdentity =
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
             connectionProbe = try container.decodeIfPresent(Bool.self, forKey: .connectionProbe)
@@ -150,6 +155,10 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             threadAutoSettlement = try container.decodeIfPresent(
                 Bool.self,
                 forKey: .threadAutoSettlement
+            )
+            threadRestartContinuation = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .threadRestartContinuation
             )
             threadSnooze = try container.decodeIfPresent(Bool.self, forKey: .threadSnooze)
             threadPinning = try container.decodeIfPresent(Bool.self, forKey: .threadPinning)

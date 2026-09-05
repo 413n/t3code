@@ -941,6 +941,7 @@ public struct FeatureTerminalSnapshot: Sendable, Equatable, Codable {
     public var error: String?
     public var hasRunningSubprocess: Bool
     public var updatedAt: String?
+    public var lifecycleVersion: Int
 
     public init(
         threadID: String,
@@ -952,7 +953,8 @@ public struct FeatureTerminalSnapshot: Sendable, Equatable, Codable {
         exitCode: Int? = nil,
         error: String? = nil,
         hasRunningSubprocess: Bool = false,
-        updatedAt: String? = nil
+        updatedAt: String? = nil,
+        lifecycleVersion: Int = 0
     ) {
         self.threadID = threadID
         self.terminalID = terminalID
@@ -964,5 +966,26 @@ public struct FeatureTerminalSnapshot: Sendable, Equatable, Codable {
         self.error = error
         self.hasRunningSubprocess = hasRunningSubprocess
         self.updatedAt = updatedAt
+        self.lifecycleVersion = lifecycleVersion
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case threadID, terminalID, state, title, workingDirectory, buffer
+        case exitCode, error, hasRunningSubprocess, updatedAt, lifecycleVersion
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        threadID = try container.decode(String.self, forKey: .threadID)
+        terminalID = try container.decodeIfPresent(String.self, forKey: .terminalID) ?? "default"
+        state = try container.decodeIfPresent(FeatureTerminalState.self, forKey: .state) ?? .stopped
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "Terminal"
+        workingDirectory = try container.decodeIfPresent(String.self, forKey: .workingDirectory)
+        buffer = try container.decodeIfPresent(String.self, forKey: .buffer) ?? ""
+        exitCode = try container.decodeIfPresent(Int.self, forKey: .exitCode)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        hasRunningSubprocess = try container.decodeIfPresent(Bool.self, forKey: .hasRunningSubprocess) ?? false
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
+        lifecycleVersion = try container.decodeIfPresent(Int.self, forKey: .lifecycleVersion) ?? 0
     }
 }

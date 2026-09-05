@@ -108,6 +108,10 @@ public actor T3Client {
         await rpc.isConnected()
     }
 
+    public func currentConnectionID() async -> UUID? {
+        await rpc.currentConnectionID()
+    }
+
     public func shellSnapshot(
         timeoutInterval: TimeInterval? = nil
     ) async throws -> OrchestrationShellSnapshot {
@@ -179,16 +183,26 @@ public actor T3Client {
             as: ServerRefreshProvidersResult.self
         )
         guard generation == serverConfigGeneration else { throw CancellationError() }
+        let latest = serverConfigCache ?? current
         let config = ServerConfigSnapshot(
             providers: result.providers,
-            settings: current.settings,
-            threadSnapshotPagination: current.threadSnapshotPagination,
-            threadResumeCompletionMarker: current.threadResumeCompletionMarker,
-            environment: current.environment
+            settings: latest.settings,
+            threadSnapshotPagination: latest.threadSnapshotPagination,
+            threadResumeCompletionMarker: latest.threadResumeCompletionMarker,
+            environment: latest.environment,
+            usageLimitSources: latest.usageLimitSources
         )
         cacheServerConfig(config)
         serverConfigListeners.values.forEach { $0.yield(.snapshot(config)) }
         return config
+    }
+
+    public func consumeResetCredit(instanceID: String) async throws -> ProviderConsumeResetCreditResult {
+        try await rpc.request(
+            RPCMethod.providerConsumeResetCredit.rawValue,
+            payload: .object(["instanceId": .string(instanceID)]),
+            as: ProviderConsumeResetCreditResult.self
+        )
     }
 
     public func usageSummary(_ input: UsageSummaryInput) async throws -> UsageSummary {
@@ -425,6 +439,7 @@ public actor T3Client {
             guard let self else { return }
             let stream = await rpc.subscribe(
                 RPCMethod.subscribeServerConfig.rawValue,
+                payload: .object(["usageLimitSources": .bool(true)]),
                 as: ServerConfigStreamEvent.self
             )
             do {
@@ -441,8 +456,16 @@ public actor T3Client {
 
     private func consumeServerConfig(_ event: ServerConfigStreamEvent, generation: UInt64) {
         guard generation == serverConfigGeneration else { return }
+        var emittedEvent = event
         switch event {
-        case let .snapshot(config): cacheServerConfig(config)
+        case var .snapshot(config):
+            // Wire snapshots omit sources. Keep them until a capable server
+            // publishes its current set. Drop them when source support is gone.
+            config.usageLimitSources = config.environment?.capabilities.usageLimitSources == true
+                ? serverConfigCache?.usageLimitSources ?? config.usageLimitSources
+                : []
+            cacheServerConfig(config)
+            emittedEvent = .snapshot(config)
         case let .providerStatuses(providers):
             if let current = serverConfigCache {
                 cacheServerConfig(.init(
@@ -450,7 +473,8 @@ public actor T3Client {
                     settings: current.settings,
                     threadSnapshotPagination: current.threadSnapshotPagination,
                     threadResumeCompletionMarker: current.threadResumeCompletionMarker,
-                    environment: current.environment
+                    environment: current.environment,
+                    usageLimitSources: current.usageLimitSources
                 ))
             }
         case let .settingsUpdated(settings):
@@ -460,12 +484,18 @@ public actor T3Client {
                     settings: settings,
                     threadSnapshotPagination: current.threadSnapshotPagination,
                     threadResumeCompletionMarker: current.threadResumeCompletionMarker,
-                    environment: current.environment
+                    environment: current.environment,
+                    usageLimitSources: current.usageLimitSources
                 ))
             }
+        case let .usageLimitSourcesUpdated(sources):
+            guard var current = serverConfigCache,
+                  current.environment?.capabilities.usageLimitSources == true else { return }
+            current.usageLimitSources = sources
+            cacheServerConfig(current)
         case .unrelated: break
         }
-        serverConfigListeners.values.forEach { $0.yield(event) }
+        serverConfigListeners.values.forEach { $0.yield(emittedEvent) }
     }
 
     private func cacheServerConfig(_ config: ServerConfigSnapshot) {
@@ -1910,6 +1940,7 @@ public enum RPCMethod: String, Sendable {
     case attachmentsCreateUploadURL = "attachments.createUploadUrl"
     case attachmentsDelete = "attachments.delete"
     case providerUploadFeedback = "provider.uploadFeedback"
+    case providerConsumeResetCredit = "provider.consumeResetCredit"
     case subscribeServerConfig
     case serverDiscoverSourceControl = "server.discoverSourceControl"
     case subscribeVCSStatus = "subscribeVcsStatus"

@@ -105,6 +105,7 @@ public enum HTTPError: LocalizedError, Sendable {
     case missingCredential
     case incompatibleCredential
     case managedAuthorizationUnavailable
+    case unauthenticatedSession
 
     public var errorDescription: String? {
         switch self {
@@ -118,6 +119,30 @@ public enum HTTPError: LocalizedError, Sendable {
             "This environment's saved authentication method is invalid. Connect it again."
         case .managedAuthorizationUnavailable:
             "This build cannot authorize a managed T3 Connect environment."
+        case .unauthenticatedSession:
+            "The environment rejected the session authorization."
+        }
+    }
+}
+
+struct T3ConnectNetworkError: LocalizedError, Sendable {
+    static let hint =
+        "Your DNS or firewall may be blocking T3 Connect. Try another network, such as a phone hotspot."
+
+    let message: String
+
+    var errorDescription: String? { "\(message) \(Self.hint)" }
+
+    // A failed transport can be an outage or filtering. Keep protocol and
+    // authentication errors unchanged because they have a server response.
+    static func wrapping(_ error: any Error) -> any Error {
+        guard let error = error as? URLError else { return error }
+        switch error.code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .networkConnectionLost, .notConnectedToInternet:
+            return Self(message: error.localizedDescription)
+        default:
+            return error
         }
     }
 }
@@ -339,6 +364,7 @@ public actor EnvironmentAPI {
             environment: environment,
             path: "/api/auth/session",
             method: "GET",
+            isUnauthorizedResponse: { !$0.authenticated },
             as: AuthSessionState.self
         )
     }
@@ -385,6 +411,7 @@ public actor EnvironmentAPI {
         method: String,
         body: Data? = nil,
         timeoutInterval: TimeInterval? = nil,
+        isUnauthorizedResponse: (@Sendable (Result) -> Bool)? = nil,
         as type: Result.Type
     ) async throws -> Result {
         guard let credential = try await credentials.credential(for: environment.id) else {
@@ -447,7 +474,12 @@ public actor EnvironmentAPI {
                 request.timeoutInterval = timeoutInterval
             }
             do {
-                return try await send(request, as: type)
+                return try await send(
+                    request,
+                    isManagedRequest: true,
+                    isUnauthorizedResponse: isUnauthorizedResponse,
+                    as: type
+                )
             } catch let error as HTTPError where error.isRejectedAuthorization {
                 if let saved = try await newestUsableManagedCredential(
                     replacing: current,
@@ -476,7 +508,12 @@ public actor EnvironmentAPI {
                 if let timeoutInterval {
                     retry.timeoutInterval = timeoutInterval
                 }
-                return try await send(retry, as: type)
+                return try await send(
+                    retry,
+                    isManagedRequest: true,
+                    isUnauthorizedResponse: isUnauthorizedResponse,
+                    as: type
+                )
             }
         }
     }
@@ -560,9 +597,17 @@ public actor EnvironmentAPI {
 
     private func send<Result: Decodable & Sendable>(
         _ request: URLRequest,
+        isManagedRequest: Bool = false,
+        isUnauthorizedResponse: (@Sendable (Result) -> Bool)? = nil,
         as type: Result.Type
     ) async throws -> Result {
-        let (data, response) = try await transport.data(for: HTTPRequestPolicy.prepare(request))
+        let data: Data
+        let response: HTTPURLResponse
+        do {
+            (data, response) = try await transport.data(for: HTTPRequestPolicy.prepare(request))
+        } catch {
+            throw isManagedRequest ? T3ConnectNetworkError.wrapping(error) : error
+        }
         guard (200..<300).contains(response.statusCode) else {
             let body = try? JSONDecoder.t3.decode(EnvironmentErrorBody.self, from: data)
             let message: String
@@ -583,14 +628,21 @@ public actor EnvironmentAPI {
                 traceID: body?.traceId
             )
         }
-        return try JSONDecoder.t3.decode(type, from: data)
+        let result = try JSONDecoder.t3.decode(type, from: data)
+        if isUnauthorizedResponse?(result) == true {
+            throw HTTPError.unauthenticatedSession
+        }
+        return result
     }
 }
 
 private extension HTTPError {
     var isRejectedAuthorization: Bool {
-        guard case let .status(status, _, _) = self else { return false }
-        return status == 401
+        switch self {
+        case .unauthenticatedSession: return true
+        case let .status(status, _, _): return status == 401
+        default: return false
+        }
     }
 }
 

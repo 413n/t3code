@@ -723,6 +723,7 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
     public var page: FeatureThreadPage?
     public var activeSubagentCount: Int
     public var backgroundWorkIsActive: Bool
+    public var isCompacting: Bool?
 
     public init(
         thread: FeatureThread,
@@ -731,7 +732,8 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
         userInputs: [FeatureUserInput] = [],
         page: FeatureThreadPage? = nil,
         activeSubagentCount: Int = 0,
-        backgroundWorkIsActive: Bool = false
+        backgroundWorkIsActive: Bool = false,
+        isCompacting: Bool = false
     ) {
         self.thread = thread
         self.messages = messages
@@ -740,6 +742,7 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
         self.page = page
         self.activeSubagentCount = activeSubagentCount
         self.backgroundWorkIsActive = backgroundWorkIsActive
+        self.isCompacting = isCompacting
     }
 }
 
@@ -1053,6 +1056,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
     public var automaticSettlement: FeatureAutomaticSettlementSettings?
     public var supportsImageUploads: Bool
     public var maxFileAttachmentBytes: Int?
+    public var continueThreadsAfterServerUpdate: Bool?
 
     public init(
         defaultWorkspaceMode: FeatureWorkspaceMode = .local,
@@ -1061,7 +1065,8 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         projectGroupingOverrides: [String: ProjectGroupingMode] = [:],
         automaticSettlement: FeatureAutomaticSettlementSettings? = nil,
         supportsImageUploads: Bool = false,
-        maxFileAttachmentBytes: Int? = nil
+        maxFileAttachmentBytes: Int? = nil,
+        continueThreadsAfterServerUpdate: Bool? = nil
     ) {
         self.defaultWorkspaceMode = defaultWorkspaceMode
         self.newWorktreesStartFromOrigin = newWorktreesStartFromOrigin
@@ -1070,6 +1075,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         self.automaticSettlement = automaticSettlement
         self.supportsImageUploads = supportsImageUploads
         self.maxFileAttachmentBytes = maxFileAttachmentBytes
+        self.continueThreadsAfterServerUpdate = continueThreadsAfterServerUpdate
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1080,6 +1086,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         case automaticSettlement
         case supportsImageUploads
         case maxFileAttachmentBytes
+        case continueThreadsAfterServerUpdate
     }
 
     public init(from decoder: any Decoder) throws {
@@ -1104,6 +1111,10 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
             Int.self,
             forKey: .maxFileAttachmentBytes
         )
+        continueThreadsAfterServerUpdate = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .continueThreadsAfterServerUpdate
+        )
         projectGroupingOverrides = try container.decodeIfPresent(
             [String: ProjectGroupingMode].self,
             forKey: .projectGroupingOverrides
@@ -1123,6 +1134,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         try container.encodeIfPresent(automaticSettlement, forKey: .automaticSettlement)
         try container.encode(supportsImageUploads, forKey: .supportsImageUploads)
         try container.encodeIfPresent(maxFileAttachmentBytes, forKey: .maxFileAttachmentBytes)
+        try container.encodeIfPresent(continueThreadsAfterServerUpdate, forKey: .continueThreadsAfterServerUpdate)
     }
 }
 

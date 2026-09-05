@@ -116,6 +116,16 @@ public protocol FeatureClient: AnyObject {
 
     func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage]
     func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage]
+    func usageSummaryUpdates(
+        _ input: UsageSummaryInput,
+        refreshPricing: Bool
+    ) -> AsyncThrowingStream<[FeatureEnvironmentUsage], Error>
+    func usageLimitsUpdates() -> AsyncThrowingStream<[FeatureEnvironmentUsageLimits], Error>
+    func refreshUsageLimits() async throws -> [FeatureEnvironmentUsageLimits]
+    func consumeResetCredit(
+        environmentID: String,
+        instanceID: String
+    ) async throws -> ProviderConsumeResetCreditResult
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
     func pullRequestLists(
@@ -206,6 +216,7 @@ public protocol FeatureClient: AnyObject {
     ) async throws -> FeatureSourceControlStatus
 
     func terminalSnapshot(threadID: String, terminalID: String) async throws -> FeatureTerminalSnapshot
+    func terminalHostOS(threadID: String) -> String?
     func terminalEvents(threadID: String, terminalID: String) -> AsyncStream<FeatureTerminalSnapshot>
     func terminalSessions(threadID: String) -> AsyncStream<[FeatureTerminalSnapshot]>
     func openTerminal(threadID: String, terminalID: String, columns: Int, rows: Int) async throws
@@ -236,6 +247,40 @@ public extension FeatureClient {
     func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage] {
         try await usageSummaries(input)
     }
+
+    func usageSummaryUpdates(
+        _ input: UsageSummaryInput,
+        refreshPricing: Bool
+    ) -> AsyncThrowingStream<[FeatureEnvironmentUsage], Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let result = try await usageSummaries(input, refreshPricing: refreshPricing)
+                    try Task.checkCancellation()
+                    continuation.yield(result)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func usageLimitsUpdates() -> AsyncThrowingStream<[FeatureEnvironmentUsageLimits], Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
+    func refreshUsageLimits() async throws -> [FeatureEnvironmentUsageLimits] { [] }
+
+    func consumeResetCredit(
+        environmentID: String,
+        instanceID: String
+    ) async throws -> ProviderConsumeResetCreditResult {
+        throw FeatureCapabilityUnavailable("Usage reset credits")
+    }
+
+    func terminalHostOS(threadID: String) -> String? { nil }
 
     func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws {
         throw FeatureCapabilityUnavailable("Provider settings")

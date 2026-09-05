@@ -172,6 +172,64 @@ struct FeatureOutboxStoreTests {
     }
 
     @Test
+    func failedLoadPreservesSavedMessagesAndRetriesBeforeWriting() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-feature-outbox-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("outbox.json")
+        let saved = FeatureQueuedSubmission(
+            environmentID: "saved-environment",
+            identity: FeatureSubmissionIdentity(createdAt: Date(timeIntervalSince1970: 1)),
+            threadID: "saved-thread",
+            text: "Keep this message",
+            selection: nil,
+            runtimeMode: .fullAccess,
+            interactionMode: .standard,
+            attachments: [
+                FeatureUploadAttachment(
+                    data: Data([1, 2, 3]),
+                    name: "reference.png",
+                    mimeType: "image/png"
+                ),
+            ]
+        )
+        let incoming = FeatureQueuedSubmission(
+            environmentID: "another-environment",
+            identity: FeatureSubmissionIdentity(createdAt: Date(timeIntervalSince1970: 2)),
+            threadID: "another-thread",
+            text: "Send after recovery",
+            selection: nil,
+            runtimeMode: .fullAccess,
+            interactionMode: .standard,
+            attachments: []
+        )
+        try await FeatureOutboxStore(fileURL: fileURL).enqueue(saved)
+        let savedData = try Data(contentsOf: fileURL)
+        let unreadableData = Data("{".utf8)
+        try unreadableData.write(to: fileURL, options: .atomic)
+        let store = FeatureOutboxStore(fileURL: fileURL)
+
+        await #expect(throws: DecodingError.self) {
+            try await store.submissions()
+        }
+        await #expect(throws: DecodingError.self) {
+            try await store.enqueue(incoming)
+        }
+        await #expect(throws: DecodingError.self) {
+            try await store.remove(id: saved.id)
+        }
+        await #expect(throws: DecodingError.self) {
+            try await store.removeAll(environmentID: incoming.environmentID)
+        }
+        #expect(try Data(contentsOf: fileURL) == unreadableData)
+
+        try savedData.write(to: fileURL, options: .atomic)
+        try await store.enqueue(incoming)
+        let restored = try await FeatureOutboxStore(fileURL: fileURL).submissions()
+        #expect(restored == [saved, incoming])
+    }
+
+    @Test
     func policySendsFollowUpsWhileWorkingAndWaitsWhenOffline() {
         let thread = FeatureThread(
             id: "thread-scoped",

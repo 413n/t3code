@@ -55,6 +55,101 @@ enum TerminalSessionList {
     }
 }
 
+/// Serializes input for one attached terminal. A session change drops unsent
+/// chunks. A new paste also replaces the unsent part of an older paste.
+/// Keys waiting for a response share one batch, so typing does not wait once per key.
+@MainActor
+final class TerminalInputSession {
+    struct Target: Equatable, Sendable {
+        let threadID: String
+        let terminalID: String
+        let lifecycleVersion: Int
+    }
+
+    private final class KeyBatch {
+        var data: String
+
+        init(_ data: String) {
+            self.data = data
+        }
+    }
+
+    private var target: Target?
+    private var isAttached = false
+    private var generation: UInt64 = 0
+    private var latestPasteRequest: UInt64 = 0
+    private var writeTail: Task<Bool, Never>?
+    private var pendingKeys: KeyBatch?
+
+    func attach(to target: Target?) {
+        isAttached = true
+        updateTarget(target)
+    }
+
+    func updateTarget(_ target: Target?) {
+        guard self.target != target else { return }
+        self.target = target
+        pendingKeys = nil
+        generation &+= 1
+    }
+
+    func detach() {
+        isAttached = false
+        pendingKeys = nil
+        generation &+= 1
+    }
+
+    @discardableResult
+    func enqueue(
+        _ data: String,
+        target: Target,
+        isPaste: Bool = false,
+        write: @escaping @MainActor (String) async -> Bool
+    ) -> Task<Bool, Never>? {
+        guard isAttached, self.target == target, !data.isEmpty else { return nil }
+        let keyBatch: KeyBatch?
+        if isPaste {
+            latestPasteRequest &+= 1
+            pendingKeys = nil
+            keyBatch = nil
+        } else if let pendingKeys, let writeTail {
+            pendingKeys.data.append(data)
+            return writeTail
+        } else {
+            keyBatch = KeyBatch(data)
+            pendingKeys = keyBatch
+        }
+        let pasteRequest = isPaste ? latestPasteRequest : nil
+        let generation = generation
+        let previousWrite = writeTail
+        let task = Task { @MainActor [weak self] in
+            _ = await previousWrite?.value
+            guard let self,
+                  self.isCurrent(target: target, generation: generation, pasteRequest: pasteRequest) else {
+                return false
+            }
+            if let keyBatch, self.pendingKeys === keyBatch {
+                self.pendingKeys = nil
+            }
+            let encoded = isPaste ? TerminalInputEncoder.paste(data) : keyBatch?.data ?? data
+            for chunk in TerminalInputEncoder.chunks(encoded) {
+                guard self.isCurrent(target: target, generation: generation, pasteRequest: pasteRequest),
+                      await write(chunk) else {
+                    return false
+                }
+            }
+            return true
+        }
+        writeTail = task
+        return task
+    }
+
+    private func isCurrent(target: Target, generation: UInt64, pasteRequest: UInt64?) -> Bool {
+        isAttached && self.target == target && self.generation == generation
+            && (pasteRequest == nil || pasteRequest == latestPasteRequest)
+    }
+}
+
 public struct FeatureTerminalView: View {
     let client: any FeatureClient
     let threadID: String
@@ -64,7 +159,7 @@ public struct FeatureTerminalView: View {
     @State private var terminal: FeatureTerminalSnapshot?
     @State private var sessions = [FeatureTerminalSnapshot]()
     @State private var activeTerminalID = "default"
-    @State private var sessionsResolved = false
+    @State private var resolvedThreadID: String?
     @State private var columns = 80
     @State private var rows = 24
     @State private var focusRequest = 0
@@ -72,6 +167,7 @@ public struct FeatureTerminalView: View {
     @State private var isLoading = true
     @State private var isOpening = false
     @State private var errorMessage: String?
+    @State private var inputSession = TerminalInputSession()
 
     public init(client: any FeatureClient, threadID: String) {
         self.client = client
@@ -79,18 +175,23 @@ public struct FeatureTerminalView: View {
     }
 
     public var body: some View {
+        let target = inputTarget
         ZStack {
             T3Colors.background
 
             GhosttyTerminalSurface(
                 terminalKey: "\(threadID):\(activeTerminalID)",
+                lifecycleVersion: terminal?.lifecycleVersion ?? 0,
                 buffer: terminal?.buffer ?? "",
                 fontSize: CGFloat(fontSize),
                 isRunning: isRunning,
+                hostPlatform: TerminalHostPlatform(os: client.terminalHostOS(threadID: threadID)),
                 focusRequest: focusRequest,
                 onInput: { data in
-                    let terminalID = activeTerminalID
-                    Task { await write(data, terminalID: terminalID) }
+                    _ = enqueueInput(data, target: target)
+                },
+                onPaste: { data in
+                    _ = enqueueInput(data, target: target, isPaste: true)
                 },
                 onResize: { nextColumns, nextRows in
                     updateGrid(columns: nextColumns, rows: nextRows)
@@ -137,15 +238,27 @@ public struct FeatureTerminalView: View {
         }
         .background(T3Colors.background.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
-        .task {
+        .onAppear { inputSession.attach(to: inputTarget) }
+        .onDisappear { inputSession.detach() }
+        .onChange(of: threadID) { _, _ in
+            updateTerminal(nil)
+            sessions = []
+            activeTerminalID = "default"
+            resolvedThreadID = nil
+            errorMessage = nil
+        }
+        .task(id: threadID) {
+            inputSession.updateTarget(inputTarget)
             for await updates in client.terminalSessions(threadID: threadID) {
+                guard !Task.isCancelled else { return }
                 sessions = updates
                 if !sessionsResolved {
                     activeTerminalID = TerminalSessionList.initialID(in: updates)
-                    sessionsResolved = true
+                    resolvedThreadID = threadID
                 }
             }
-            sessionsResolved = true
+            guard !Task.isCancelled else { return }
+            resolvedThreadID = threadID
         }
         .task(id: terminalTaskID) {
             guard sessionsResolved else { return }
@@ -158,14 +271,14 @@ public struct FeatureTerminalView: View {
                 threadID: threadID,
                 terminalID: terminalID
             ) {
-                guard terminalID == activeTerminalID else { break }
+                guard !Task.isCancelled, terminalID == activeTerminalID else { break }
                 let shouldSyncGrid = !isRunning
                     && (update.state == .running || update.state == .starting)
-                if let currentBuffer = terminal?.buffer,
-                   !update.buffer.hasPrefix(currentBuffer) {
+                let currentBuffer = terminal?.buffer
+                guard updateTerminal(update) else { continue }
+                if let currentBuffer, !update.buffer.hasPrefix(currentBuffer) {
                     surfaceGeneration += 1
                 }
-                terminal = update
                 if shouldSyncGrid {
                     try? await client.resizeTerminal(
                         threadID: threadID,
@@ -304,7 +417,40 @@ public struct FeatureTerminalView: View {
     }
 
     private var terminalTaskID: String {
-        "\(sessionsResolved):\(activeTerminalID)"
+        "\(threadID):\(sessionsResolved):\(activeTerminalID)"
+    }
+
+    private var sessionsResolved: Bool {
+        resolvedThreadID == threadID
+    }
+
+    private var inputTarget: TerminalInputSession.Target? {
+        guard let terminal, isRunning,
+              terminal.threadID == threadID, terminal.terminalID == activeTerminalID else {
+            return nil
+        }
+        return .init(
+            threadID: threadID,
+            terminalID: activeTerminalID,
+            lifecycleVersion: terminal.lifecycleVersion
+        )
+    }
+
+    @discardableResult
+    private func updateTerminal(_ snapshot: FeatureTerminalSnapshot?) -> Bool {
+        if let snapshot {
+            guard snapshot.threadID == threadID, snapshot.terminalID == activeTerminalID else {
+                return false
+            }
+            if let terminal,
+               terminal.threadID == snapshot.threadID, terminal.terminalID == snapshot.terminalID,
+               snapshot.lifecycleVersion < terminal.lifecycleVersion {
+                return false
+            }
+        }
+        terminal = snapshot
+        inputSession.updateTarget(inputTarget)
+        return true
     }
 
     private var menuSessions: [FeatureTerminalSnapshot] {
@@ -356,7 +502,7 @@ public struct FeatureTerminalView: View {
 
     private func selectTerminal(_ terminalID: String) {
         guard terminalID != activeTerminalID else { return }
-        terminal = nil
+        updateTerminal(nil)
         errorMessage = nil
         activeTerminalID = terminalID
     }
@@ -365,7 +511,7 @@ public struct FeatureTerminalView: View {
         let nextID = TerminalSessionList.nextID(
             occupiedIDs: sessions.map(\.terminalID) + [activeTerminalID]
         )
-        terminal = nil
+        updateTerminal(nil)
         errorMessage = nil
         activeTerminalID = nextID
     }
@@ -401,8 +547,8 @@ public struct FeatureTerminalView: View {
                 threadID: threadID,
                 terminalID: terminalID
             )
-            guard terminalID == activeTerminalID else { return }
-            terminal = snapshot
+            guard !Task.isCancelled, terminalID == activeTerminalID else { return }
+            guard updateTerminal(snapshot) else { return }
             if snapshot.state == .stopped || snapshot.state == .exited {
                 try await openTerminal(terminalID: terminalID)
             }
@@ -426,43 +572,53 @@ public struct FeatureTerminalView: View {
     }
 
     private func openTerminal(terminalID: String) async throws {
+        inputSession.updateTarget(nil)
         try await client.openTerminal(
             threadID: threadID,
             terminalID: terminalID,
             columns: columns,
             rows: rows
         )
-        guard terminalID == activeTerminalID else { return }
-        terminal = try await client.terminalSnapshot(
+        guard !Task.isCancelled, terminalID == activeTerminalID else { return }
+        let snapshot = try await client.terminalSnapshot(
             threadID: threadID,
             terminalID: terminalID
         )
+        guard !Task.isCancelled, terminalID == activeTerminalID else { return }
+        updateTerminal(snapshot)
     }
 
     private func stop() async {
         let terminalID = activeTerminalID
+        inputSession.updateTarget(nil)
         let fallbackID = TerminalSessionList.fallbackID(
             in: sessions,
             excluding: terminalID
         )
         do {
             try await client.closeTerminal(threadID: threadID, terminalID: terminalID)
+            guard terminalID == activeTerminalID else { return }
             if let fallbackID {
                 selectTerminal(fallbackID)
             } else {
-                terminal = try? await client.terminalSnapshot(
+                let snapshot = try? await client.terminalSnapshot(
                     threadID: threadID,
                     terminalID: terminalID
                 )
+                guard terminalID == activeTerminalID else { return }
+                updateTerminal(snapshot)
             }
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            if terminalID == activeTerminalID {
+                inputSession.updateTarget(inputTarget)
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
     private func clear(terminalID: String) async {
-        let wasRunning = isRunning
+        let target = inputTarget
         do {
             if terminalID == activeTerminalID {
                 terminal?.buffer = ""
@@ -472,12 +628,8 @@ public struct FeatureTerminalView: View {
                 threadID: threadID,
                 terminalID: terminalID
             )
-            if wasRunning {
-                try await client.writeTerminal(
-                    threadID: threadID,
-                    terminalID: terminalID,
-                    data: "\u{0C}"
-                )
+            if let target, target.terminalID == terminalID {
+                guard let task = enqueueInput("\u{0C}", target: target), await task.value else { return }
             }
             if terminalID == activeTerminalID {
                 errorMessage = nil
@@ -489,17 +641,31 @@ public struct FeatureTerminalView: View {
         }
     }
 
-    private func write(_ data: String, terminalID: String) async {
+    private func enqueueInput(
+        _ data: String,
+        target: TerminalInputSession.Target?,
+        isPaste: Bool = false
+    ) -> Task<Bool, Never>? {
+        guard let target else { return nil }
+        return inputSession.enqueue(data, target: target, isPaste: isPaste) { chunk in
+            await write(chunk, target: target)
+        }
+    }
+
+    private func write(_ data: String, target: TerminalInputSession.Target) async -> Bool {
+        guard target == inputTarget else { return false }
         do {
             try await client.writeTerminal(
-                threadID: threadID,
-                terminalID: terminalID,
+                threadID: target.threadID,
+                terminalID: target.terminalID,
                 data: data
             )
+            return true
         } catch {
-            if terminalID == activeTerminalID {
+            if target == inputTarget {
                 errorMessage = error.localizedDescription
             }
+            return false
         }
     }
 }

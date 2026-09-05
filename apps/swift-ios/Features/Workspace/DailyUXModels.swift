@@ -1082,7 +1082,8 @@ enum DailyUXModelOptions {
     static func advancedDescriptors(
         for model: FeatureModel
     ) -> [FeatureModelOptionDescriptor] {
-        model.options.filter { !isReasoningDescriptor($0) }
+        let primaryID = reasoningDescriptor(for: model)?.id
+        return model.options.filter { $0.id != primaryID }
     }
 
     static func undescribedSelections(
@@ -1149,19 +1150,24 @@ enum DailyUXModelOptions {
 
     static func defaults(for model: FeatureModel) -> [FeatureModelOptionSelection] {
         model.options.compactMap { descriptor in
-            if let defaultValue = descriptor.defaultValue {
-                return FeatureModelOptionSelection(id: descriptor.id, value: defaultValue)
+            defaultValue(for: descriptor).map { value in
+                FeatureModelOptionSelection(id: descriptor.id, value: value)
             }
-            switch descriptor.kind {
-            case .select:
-                guard let choice = descriptor.choices.first(where: \.isDefault)
-                    ?? descriptor.choices.first else {
-                    return nil
-                }
-                return FeatureModelOptionSelection(id: descriptor.id, value: .string(choice.id))
-            case .boolean:
-                return FeatureModelOptionSelection(id: descriptor.id, value: .boolean(false))
-            }
+        }
+    }
+
+    /// An option without a declared default stays unset until the user selects it.
+    static func defaultValue(
+        for descriptor: FeatureModelOptionDescriptor
+    ) -> FeatureModelOptionValue? {
+        if let defaultValue = descriptor.defaultValue {
+            return defaultValue
+        }
+        switch descriptor.kind {
+        case .select:
+            return descriptor.choices.first(where: \.isDefault).map { .string($0.id) }
+        case .boolean:
+            return nil
         }
     }
 
@@ -1172,26 +1178,18 @@ enum DailyUXModelOptions {
         if let selected = selections.first(where: { $0.id == descriptor.id })?.value {
             return selected
         }
-        if let defaultValue = descriptor.defaultValue {
-            return defaultValue
-        }
-        switch descriptor.kind {
-        case .select:
-            let choice = descriptor.choices.first(where: \.isDefault)
-                ?? descriptor.choices.first
-            return choice.map { .string($0.id) }
-        case .boolean:
-            return .boolean(false)
-        }
+        return defaultValue(for: descriptor)
     }
 
     static func updating(
         _ selections: [FeatureModelOptionSelection],
         id: String,
-        value: FeatureModelOptionValue
+        value: FeatureModelOptionValue?
     ) -> [FeatureModelOptionSelection] {
         var next = selections.filter { $0.id != id }
-        next.append(FeatureModelOptionSelection(id: id, value: value))
+        if let value {
+            next.append(FeatureModelOptionSelection(id: id, value: value))
+        }
         return next
     }
 

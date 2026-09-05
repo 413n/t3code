@@ -12,6 +12,10 @@ struct EnvironmentPreferencesView: View {
         model.snapshot.environments.first { $0.id == environmentID }
     }
 
+    private var supportsRestartContinuation: Bool {
+        model.snapshot.preferencesByEnvironment?[environmentID]?.continueThreadsAfterServerUpdate != nil
+    }
+
     var body: some View {
         Form {
             if let settings {
@@ -44,6 +48,12 @@ struct EnvironmentPreferencesView: View {
                             get: { settings.newWorktreesStartFromOrigin },
                             set: { save(.newWorktreesStartFromOrigin($0)) }
                         ))
+                        if supportsRestartContinuation {
+                            Toggle("Continue threads after restarts", isOn: Binding(
+                                get: { settings.continueThreadsAfterServerUpdate },
+                                set: { save(.continueThreadsAfterServerUpdate($0)) }
+                            ))
+                        }
                     } footer: {
                         Text("These preferences and automatic settlement apply to connected environments that support them. Projects, models and providers remain separate.")
                     }
@@ -51,7 +61,9 @@ struct EnvironmentPreferencesView: View {
                         Section("Different preferences") {
                             ForEach(mismatches, id: \.self) { Text($0) }
                             Button("Use this environment’s preferences") {
-                                save(.sharedPreferences(settings.sharedPatch))
+                                save(.sharedPreferences(settings.sharedPatch(
+                                    supportsRestartContinuation: supportsRestartContinuation
+                                )))
                             }
                         }
                     }

@@ -8,22 +8,50 @@ struct FeatureComposerPowerFeatures {
 
     var slashCommands: [FeatureProviderSlashCommand]
     var skills: [FeatureProviderSkill]
+    var canCompactContext: Bool
     var pathSearchScopeID: String
     var searchPaths: PathSearch?
 
     init(
         slashCommands: [FeatureProviderSlashCommand] = [],
         skills: [FeatureProviderSkill] = [],
+        canCompactContext: Bool = false,
         pathSearchScopeID: String = "",
         searchPaths: PathSearch? = nil
     ) {
         self.slashCommands = slashCommands
         self.skills = skills
+        self.canCompactContext = canCompactContext
         self.pathSearchScopeID = pathSearchScopeID
         self.searchPaths = searchPaths
     }
 
     static var disabled: FeatureComposerPowerFeatures { FeatureComposerPowerFeatures() }
+}
+
+enum FeatureContextCompaction {
+    static func isCommand(_ text: String, hasAttachments: Bool) -> Bool {
+        !hasAttachments
+            && text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "/compact"
+    }
+
+    static func canStart(in detail: FeatureThreadDetail?, isBusy: Bool) -> Bool {
+        guard let detail, !isBusy, detail.isCompacting != true,
+              detail.approvals.isEmpty, detail.userInputs.isEmpty else { return false }
+        switch detail.thread.state {
+        case .queued, .working, .monitoring, .waitingForApproval, .waitingForInput:
+            return false
+        case .idle, .completed, .failed:
+            break
+        }
+
+        return detail.messages.contains { message in
+            guard message.role == .user, message.state != .queued else { return false }
+            return !message.attachments.isEmpty
+                || (!message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !isCommand(message.text, hasAttachments: false))
+        } || (detail.page?.hasMore == true && detail.thread.settlementFacts?.latestUserMessageAt != nil)
+    }
 }
 
 public struct FeatureProviderSlashCommand: Identifiable, Sendable, Equatable, Hashable, Codable {
@@ -365,6 +393,7 @@ enum FeatureComposerMenuBuilder {
             let excludedCommandNames = Set(["model", "plan", "default"].map(normalizedName))
             let commands = powerFeatures.slashCommands
                 .filter { !excludedCommandNames.contains(normalizedName($0.name)) }
+                .filter { normalizedName($0.name) != "compact" || powerFeatures.canCompactContext }
                 .filter { !enabledSkillNames.contains(normalizedName($0.name)) }
                 .filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
