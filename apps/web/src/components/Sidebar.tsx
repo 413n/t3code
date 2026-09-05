@@ -4266,7 +4266,7 @@ export default function Sidebar() {
             {
               id: "settle",
               label: `Settle (${count})`,
-              disabled: !canOperateThreads(settlingThreads),
+              disabled: settlingThreads.length === 0 || !canOperateThreads(settlingThreads),
             },
             ...(canSnoozeSelection
               ? [
@@ -4313,8 +4313,14 @@ export default function Sidebar() {
           : clicked.value === "regenerate-title"
             ? regeneratableTitleThreads
             : clicked.value === "settle"
-              ? settlingThreads
+              ? settlingThreads.flatMap((thread) => {
+                  const current = threadByKeyRef.current.get(
+                    scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+                  );
+                  return current && current.settledOverride !== "settled" ? [current] : [];
+                })
               : selectedThreads;
+      if (clicked.value === "settle" && actionTargets.length === 0) return;
       if (clicked.value !== "mark-unread" && !checkThreadOperations(actionTargets)) return;
       if (clicked.value?.startsWith("snooze:")) {
         const preset =
@@ -4388,7 +4394,7 @@ export default function Sidebar() {
         return;
       }
       if (clicked.value === "settle") {
-        settleThreads(threadKeys);
+        settleThreads(actionTargets.map((thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))));
         clearSelection();
         return;
       }
