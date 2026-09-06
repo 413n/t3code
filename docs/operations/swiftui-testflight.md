@@ -44,6 +44,20 @@ need a key file, so the helper creates a private temporary `.p8` and removes it
 after the upload finishes or fails. No permanent `.p8` or JSON config is needed.
 The helper does not read Safari cookies or use an Apple ID password.
 
+## Signing preflight
+
+API authentication does not supply a distribution signing identity. The current
+API-key upload path needs a matching local Apple Distribution certificate and
+private key. Check available identities before uploading:
+
+```sh
+security find-identity -v -p codesigning
+```
+
+A cloud-managed distribution certificate will not appear as a local identity.
+Existing cloud signing may need the signed-in Xcode Apple-ID session instead.
+Do not create or revoke certificates to fix this difference.
+
 ## Release
 
 1. Update the project's build number, commit, and push. Keep the existing version
@@ -63,6 +77,19 @@ The helper does not read Safari cookies or use an Apple ID password.
    `testFlightInternalTestingOnly=false`, and
    `manageAppVersionAndBuildNumber=false`. Keep the existing signing assets.
    The helper does not enable provisioning updates or fall back to Apple ID auth.
+
+   If this machine uses existing cloud signing, an explicit one-time export can
+   use its Xcode Apple-ID session. First check API status for the exact version
+   and build, and check the previous upload log. Proceed only if no build was
+   uploaded and no upload is still running. Use the same archive and options:
+
+   ```sh
+   xcodebuild -exportArchive \
+     -archivePath /absolute/path/T3Code.xcarchive \
+     -exportOptionsPlist /absolute/path/TestFlightExportOptions.plist
+   ```
+
+   Do not add provisioning-update flags. Keep status and publishing API-based.
 
 4. Check Apple's processing state:
 
