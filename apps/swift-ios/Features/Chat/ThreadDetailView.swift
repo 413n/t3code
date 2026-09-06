@@ -669,6 +669,9 @@ public struct ThreadDetailView: View {
                     threadID: thread.id,
                     messages: timelineMessages(detail.messages),
                     imageContext: markdownImageContext,
+                    attachmentContext: (model.client as? any FeatureAttachmentAssetResolving).map {
+                        FeatureAttachmentContext(threadID: thread.id, resolver: $0)
+                    },
                     renderUpdate: timelineRenderUpdate,
                     dynamicTypeSize: dynamicTypeSize,
                     isWorking: isWorking,
@@ -1319,6 +1322,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     let threadID: String
     let messages: [FeatureMessage]
     let imageContext: MarkdownImageContext?
+    let attachmentContext: FeatureAttachmentContext?
     let renderUpdate: FeatureDetailRenderUpdate?
     let dynamicTypeSize: DynamicTypeSize
     let isWorking: Bool
@@ -1356,6 +1360,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             threadID: threadID,
             messages: messages,
             imageContext: imageContext,
+            attachmentContext: attachmentContext,
             renderUpdate: renderUpdate,
             dynamicTypeSize: dynamicTypeSize,
             isWorking: isWorking,
@@ -1408,6 +1413,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
         private var currentImageContext: MarkdownImageContext?
+        private var currentAttachmentContext: FeatureAttachmentContext?
         private var currentDetailRevision: UInt64?
         private var currentDynamicTypeSize: DynamicTypeSize?
         private var currentIsWorking = false
@@ -1460,7 +1466,10 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 }
 
                 cell.contentConfiguration = UIHostingConfiguration {
-                    FeatureMessageView(message: message, imageContext: self?.currentImageContext)
+                    FeatureMessageView(
+                        message: message, imageContext: self?.currentImageContext,
+                        attachmentContext: self?.currentAttachmentContext
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .margins(.all, 0)
@@ -1485,6 +1494,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             threadID: String,
             messages: [FeatureMessage],
             imageContext: MarkdownImageContext?,
+            attachmentContext: FeatureAttachmentContext?,
             renderUpdate: FeatureDetailRenderUpdate?,
             dynamicTypeSize: DynamicTypeSize,
             isWorking: Bool,
@@ -1504,6 +1514,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
             let threadChanged = currentThreadID != threadID
             let imageContextChanged = currentImageContext != imageContext
+                || currentAttachmentContext != attachmentContext
             let typeSizeChanged = currentDynamicTypeSize != dynamicTypeSize
             let revisionChanged = currentDetailRevision != renderUpdate?.revision
             let workingChanged = currentIsWorking != isWorking
@@ -1527,6 +1538,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 : state.changedIDs
 
             currentImageContext = imageContext
+            currentAttachmentContext = attachmentContext
             currentDetailRevision = renderUpdate?.revision
             currentDynamicTypeSize = dynamicTypeSize
             currentIsWorking = isWorking
@@ -2435,6 +2447,7 @@ private enum FeatureAttachmentThumbnailError: Error {
 struct FeatureMessageView: View {
     let message: FeatureMessage
     var imageContext: MarkdownImageContext? = nil
+    var attachmentContext: FeatureAttachmentContext? = nil
 
     var body: some View {
         switch message.role {
@@ -2442,7 +2455,7 @@ struct FeatureMessageView: View {
             HStack {
                 Spacer(minLength: 44)
                 VStack(alignment: .leading, spacing: 10) {
-                    FeatureMessageAttachmentsView(attachments: message.attachments)
+                    FeatureMessageAttachmentsView(attachments: message.attachments, context: attachmentContext)
                     if !message.text.isEmpty {
                         MarkdownMessageView(
                             message.text,
@@ -2477,7 +2490,7 @@ struct FeatureMessageView: View {
                     .font(T3Typography.supportingStrong)
                     .foregroundStyle(T3Colors.statusRunning)
                 }
-                FeatureMessageAttachmentsView(attachments: message.attachments)
+                FeatureMessageAttachmentsView(attachments: message.attachments, context: attachmentContext)
                 if !message.text.isEmpty {
                     MarkdownMessageView(
                         message.text,
@@ -2630,97 +2643,21 @@ enum FeatureWorkLogMedia {
 
 private struct FeatureMessageAttachmentsView: View {
     let attachments: [FeatureMessageAttachment]
+    let context: FeatureAttachmentContext?
     @State private var previewedAttachment: FeatureMessageAttachment?
 
     var body: some View {
         if !attachments.isEmpty {
             LazyVGrid(
-                columns: [
-                    GridItem(.adaptive(minimum: 118, maximum: 190), spacing: 7),
-                ],
+                columns: [GridItem(.adaptive(minimum: 118, maximum: 190), spacing: 7)],
                 alignment: .leading,
                 spacing: 7
             ) {
                 ForEach(attachments) { attachment in
-                    VStack(alignment: .leading, spacing: 6) {
-                        if attachment.mimeType.hasPrefix("image/") {
-                            Group {
-                                if let previewData = attachment.previewData {
-                                    FeatureLocalAttachmentThumbnail(
-                                        attachmentID: attachment.id,
-                                        previewData: previewData
-                                    )
-                                } else if let url = attachment.url {
-                                    FeatureRemoteAttachmentThumbnail(url: url)
-                                } else {
-                                    attachmentPlaceholder(systemImage: "photo")
-                                }
-                            }
-                            .frame(height: 160)
-                            .frame(maxWidth: .infinity)
-                            .background(T3Colors.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                        }
-
-                        HStack(spacing: 9) {
-                            Image(
-                                systemName: attachment.mimeType.hasPrefix("image/")
-                                    ? "photo"
-                                    : "doc"
-                            )
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(T3Colors.textSecondary)
-                            .frame(width: 30, height: 30)
-                            .background(
-                                T3Colors.surfaceRaised,
-                                in: RoundedRectangle(cornerRadius: 6)
-                            )
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(attachment.name)
-                                    .font(T3Typography.control)
-                                    .lineLimit(1)
-                                Text(
-                                    ByteCountFormatter.string(
-                                        fromByteCount: Int64(attachment.sizeBytes),
-                                        countStyle: .file
-                                    )
-                                )
-                                .font(T3Typography.supporting.monospacedDigit())
-                                .foregroundStyle(T3Colors.textSecondary)
-                            }
-                        }
+                    FeatureMessageAttachmentView(attachment: attachment, context: context) {
+                        previewedAttachment = $0
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(7)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(T3Colors.border, lineWidth: 1)
-                    }
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel(
-                        attachment.mimeType.hasPrefix("image/")
-                            ? "Image attachment"
-                            : "File attachment"
-                    )
-                    .accessibilityValue(attachmentAccessibilityValue(attachment))
-                    .accessibilityIdentifier("attachment-\(attachment.id)")
-                    .accessibilityAddTraits(canPreview(attachment) ? .isButton : [])
-                    .accessibilityHint(
-                        canPreview(attachment)
-                            ? "Opens full-screen preview"
-                            : ""
-                    )
-                    .accessibilityAction {
-                        if canPreview(attachment) {
-                            previewedAttachment = attachment
-                        }
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if canPreview(attachment) {
-                            previewedAttachment = attachment
-                        }
-                    }
+                    .id("\(context?.threadID ?? ""):attachment:\(attachment.id)")
                 }
             }
             .fullScreenCover(item: $previewedAttachment) { attachment in
@@ -2728,27 +2665,118 @@ private struct FeatureMessageAttachmentsView: View {
             }
         }
     }
+}
 
-    private func attachmentPlaceholder(systemImage: String) -> some View {
-        Image(systemName: systemImage)
-            .font(.system(size: 22, weight: .medium))
-            .foregroundStyle(T3Colors.textSecondary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+private struct FeatureMessageAttachmentView: View {
+    let attachment: FeatureMessageAttachment
+    let context: FeatureAttachmentContext?
+    let onPreview: (FeatureMessageAttachment) -> Void
+    @State private var resolvedURL: URL?
+    @State private var failed = false
+    @State private var isOpening = false
+
+    private var isImage: Bool { attachment.mimeType.hasPrefix("image/") }
+    private var currentURL: URL? { resolvedURL ?? attachment.url }
+    private var hasLocalPreview: Bool { isImage && attachment.previewData != nil }
+    private var showsStatus: Bool { failed || isOpening || (currentURL == nil && !hasLocalPreview) }
+    private var statusText: String { failed ? "Couldn’t load. Tap to retry." : "Loading attachment…" }
+    private var canPreview: Bool { hasLocalPreview || currentURL != nil || context != nil }
+    private var sizeText: String {
+        ByteCountFormatter.string(fromByteCount: Int64(attachment.sizeBytes), countStyle: .file)
     }
 
-    private func attachmentAccessibilityValue(
-        _ attachment: FeatureMessageAttachment
-    ) -> String {
-        let size = ByteCountFormatter.string(
-            fromByteCount: Int64(attachment.sizeBytes),
-            countStyle: .file
-        )
-        return "\(attachment.name), \(size)"
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if isImage { thumbnail }
+            HStack(spacing: 9) {
+                Image(systemName: isImage ? "photo" : "doc")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .frame(width: 30, height: 30)
+                    .background(T3Colors.surfaceRaised, in: RoundedRectangle(cornerRadius: 6))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(attachment.name)
+                        .font(T3Typography.control)
+                        .lineLimit(1)
+                    Text(showsStatus ? statusText : sizeText)
+                        .font(T3Typography.supporting.monospacedDigit())
+                        .foregroundStyle(T3Colors.textSecondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(7)
+        .overlay {
+            RoundedRectangle(cornerRadius: 8).stroke(T3Colors.border, lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(isImage ? "Image attachment" : "File attachment")
+        .accessibilityValue("\(attachment.name), \(showsStatus ? statusText : sizeText)")
+        .accessibilityIdentifier("attachment-\(attachment.id)")
+        .accessibilityAddTraits(canPreview ? .isButton : [])
+        .accessibilityHint(canPreview ? "Opens full-screen preview" : "")
+        .accessibilityAction { openPreview() }
+        .contentShape(Rectangle())
+        .onTapGesture { openPreview() }
+        .task { await resolveURL() }
+        .task(id: isOpening) {
+            guard isOpening else { return }
+            defer { isOpening = false }
+            // A row can stay mounted beyond a signed URL's expiry.
+            await resolveURL()
+            guard !Task.isCancelled, !failed, let currentURL else { return }
+            var preview = attachment
+            preview.url = currentURL
+            onPreview(preview)
+        }
     }
 
-    private func canPreview(_ attachment: FeatureMessageAttachment) -> Bool {
-        (attachment.previewData != nil && attachment.mimeType.hasPrefix("image/"))
-            || attachment.url != nil
+    private var thumbnail: some View {
+        Group {
+            if let previewData = attachment.previewData {
+                FeatureLocalAttachmentThumbnail(attachmentID: attachment.id, previewData: previewData)
+            } else if let currentURL {
+                FeatureRemoteAttachmentThumbnail(url: currentURL)
+            } else {
+                Image(systemName: failed ? "exclamationmark.triangle" : "photo")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(height: 160)
+        .frame(maxWidth: .infinity)
+        .background(T3Colors.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func openPreview() {
+        if hasLocalPreview {
+            onPreview(attachment)
+        } else if canPreview {
+            isOpening = true
+        }
+    }
+
+    private func resolveURL() async {
+        guard let context else {
+            failed = currentURL == nil && !hasLocalPreview
+            return
+        }
+        failed = false
+        do {
+            let url = try await context.resolver.attachmentAssetURL(
+                threadID: context.threadID, attachment: attachment
+            )
+            try Task.checkCancellation()
+            resolvedURL = url
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            failed = true
+        }
     }
 }
 

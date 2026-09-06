@@ -429,6 +429,44 @@ final class NativeMultiEnvironmentTests: XCTestCase {
         await fixture.client.disconnect()
     }
 
+    func testCachedShellRowsApplySettlementAndRemoveDeletedRoutes() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let initial = try await fixture.client.initialSnapshot()
+        let original = try XCTUnwrap(initial.threads.first { $0.environmentID == "two" })
+        let updated = multiEnvironmentShell(
+            projectID: "project-two", threadID: "thread-two", title: "Remote work",
+            providerID: "claudeAgent", modelID: "claude-opus-4-1",
+            backgroundLiveness: .monitoring, snapshotSequence: 2,
+            settledOverride: "settled", settledAt: "2026-07-31T12:01:00.000Z"
+        )
+        await fixture.transport.setShell(updated, host: "two.example")
+        let refreshed = try await fixture.client.initialSnapshot()
+        let settled = try XCTUnwrap(refreshed.threads.first { $0.id == original.id })
+        XCTAssertEqual(settled.updatedAt, original.updatedAt)
+        XCTAssertTrue(settled.isSettled)
+        XCTAssertEqual(settled.state, .monitoring)
+        XCTAssertEqual(refreshed.threads.first { $0.environmentID == "one" },
+                       initial.threads.first { $0.environmentID == "one" })
+
+        await fixture.transport.setShell(
+            OrchestrationShellSnapshot(
+                snapshotSequence: 3, projects: updated.projects, threads: [], updatedAt: updated.updatedAt
+            ),
+            host: "two.example"
+        )
+        let removed = try await fixture.client.initialSnapshot()
+        XCTAssertFalse(removed.threads.contains { $0.id == original.id })
+        XCTAssertEqual(removed.projects.first { $0.environmentID == "two" }?.threadCount, 0)
+        do {
+            _ = try await fixture.client.loadThread(id: original.id)
+            XCTFail("Removed threads must no longer have a route.")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "The selected thread is no longer available.")
+        }
+        await fixture.client.disconnect()
+    }
+
     func testOlderHTTPSnapshotCannotReplaceNewerEnvironmentState() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }

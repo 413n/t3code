@@ -228,9 +228,12 @@ public actor WebSocketRPCClient {
             return try await value.handle(data, expectedConnectionID: connectionID)
         }
 
-        func disconnected(connectionID: UUID) async -> Bool {
+        func disconnected(connectionID: UUID, subscriptionError: RPCError? = nil) async -> Bool {
             guard let value else { return false }
-            return await value.disconnected(expectedConnectionID: connectionID)
+            return await value.disconnected(
+                expectedConnectionID: connectionID,
+                subscriptionError: subscriptionError ?? .disconnected
+            )
         }
 
         func finishConnectionLoop(_ loopID: UUID) async {
@@ -267,6 +270,7 @@ public actor WebSocketRPCClient {
     private var subscriptions: [UUID: Subscription] = [:]
     private var subscriptionByRequestID: [Int: UUID] = [:]
     private var awaitingKeepaliveResponse = false
+    private var connectionWaiters: [UUID: (previous: UUID?, continuation: CheckedContinuation<UUID, any Error>)] = [:]
 
     public init(
         connector: any WebSocketConnecting = URLSessionWebSocketConnector(),
@@ -315,6 +319,29 @@ public actor WebSocketRPCClient {
         connectionID
     }
 
+    /// Waits without polling after a subscription cannot use its current socket.
+    public func waitForConnection(after previous: UUID?) async throws -> UUID {
+        try Task.checkCancellation()
+        if let connectionID, connectionID != previous { return connectionID }
+        guard desired else { throw RPCError.disconnected }
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    connectionWaiters[waiterID] = (previous, continuation)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelConnectionWaiter(waiterID) }
+        }
+    }
+
+    private func cancelConnectionWaiter(_ id: UUID) {
+        connectionWaiters.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
+    }
+
     /// Replaces a socket after suspension without replaying sent commands.
     /// Resumable subscriptions survive; one-shot owners choose their next cursor.
     public func reconnect() async {
@@ -337,6 +364,9 @@ public actor WebSocketRPCClient {
         awaitingKeepaliveResponse = false
         connection = nil
         connectionID = nil
+        let waiting = connectionWaiters.values
+        connectionWaiters.removeAll()
+        waiting.forEach { $0.continuation.resume(throwing: RPCError.disconnected) }
         failUnary(RPCError.disconnected, includingUnsent: true)
         let active = Array(subscriptions.values)
         subscriptions.removeAll()
@@ -409,6 +439,27 @@ public actor WebSocketRPCClient {
                 Task { await self.sendSubscription(subscriptionID) }
             }
             start()
+        }
+    }
+
+    /// Registers the stream and its socket identity in one actor turn. A cold
+    /// subscriber must not mistake its first failed socket for a replacement.
+    public func subscribeOnCurrentConnection<Value: Decodable & Sendable>(
+        _ tag: String,
+        payload: JSONValue = .object([:]),
+        as type: Value.Type
+    ) async throws -> (events: AsyncThrowingStream<Value, Error>, connectionID: UUID) {
+        try Task.checkCancellation()
+        start()
+        while true {
+            try Task.checkCancellation()
+            if let id = connectionID {
+                return (
+                    subscribe(tag, payload: payload, reconnect: false, as: type),
+                    id
+                )
+            }
+            _ = try await waitForConnection(after: nil)
         }
     }
 
@@ -495,7 +546,15 @@ public actor WebSocketRPCClient {
                     "WebSocket connection failed: \(String(describing: error), privacy: .private)"
                 )
                 if let openedID {
-                    if !(await owner.disconnected(connectionID: openedID)) {
+                    let protocolError: RPCError?
+                    if error is DecodingError {
+                        protocolError = .protocolViolation("The server sent an invalid live response.")
+                    } else if case let RPCError.protocolViolation(message) = error {
+                        protocolError = .protocolViolation(message)
+                    } else {
+                        protocolError = nil
+                    }
+                    if !(await owner.disconnected(connectionID: openedID, subscriptionError: protocolError)) {
                         await openedConnection?.close()
                     }
                 } else {
@@ -535,6 +594,11 @@ public actor WebSocketRPCClient {
         // Sending queued work during setup is actor-reentrant. A send failure
         // can discard this socket before setup completes.
         guard isCurrentConnectionLoop(loopID), connectionID == id else { return nil }
+        let ready = connectionWaiters.filter { $0.value.previous != id }
+        for (waiterID, waiter) in ready {
+            connectionWaiters.removeValue(forKey: waiterID)
+            waiter.continuation.resume(returning: id)
+        }
         return id
     }
 
@@ -573,7 +637,10 @@ public actor WebSocketRPCClient {
     }
 
     @discardableResult
-    private func disconnected(expectedConnectionID: UUID? = nil) async -> Bool {
+    private func disconnected(
+        expectedConnectionID: UUID? = nil,
+        subscriptionError: RPCError = .disconnected
+    ) async -> Bool {
         if let expectedConnectionID, connectionID != expectedConnectionID {
             return false
         }
@@ -589,7 +656,7 @@ public actor WebSocketRPCClient {
         let oneShotSubscriptions = subscriptions.filter { !$0.value.reconnect }
         for (id, subscription) in oneShotSubscriptions {
             subscriptions.removeValue(forKey: id)
-            subscription.finish(RPCError.disconnected)
+            subscription.finish(subscriptionError)
         }
         for id in Array(subscriptions.keys) {
             subscriptions[id]?.requestID = nil
@@ -649,11 +716,13 @@ public actor WebSocketRPCClient {
             guard let subscriptionID = subscriptionByRequestID.removeValue(forKey: requestID),
                   let subscription = subscriptions.removeValue(forKey: subscriptionID)
             else { return }
-            subscription.finish(exit._tag == "Success" ? nil : remoteError(exit))
+            if exit.cause?.contains(where: { $0._tag == "Die" }) == true {
+                subscription.finish(RPCError.protocolViolation("The server could not complete the live request."))
+            } else {
+                subscription.finish(exit._tag == "Success" ? nil : remoteError(exit))
+            }
         case "Defect", "ClientProtocolError":
-            throw RPCError.remote(
-                response.defect?.stringValue ?? "The server reported an RPC protocol error."
-            )
+            throw RPCError.protocolViolation("The server reported an RPC protocol error.")
         default:
             throw RPCError.protocolViolation("Unknown RPC response \(response._tag).")
         }

@@ -3,6 +3,85 @@ import XCTest
 
 @MainActor
 final class WebSocketRPCRaceTests: XCTestCase {
+    func testColdSubscriptionRetainsFailedSocketIdentity() async throws {
+        let connection = SubscriptionTrafficConnection(sendsInvalidSubscriptionValue: true)
+        let connector = GatedConnector(connection: connection)
+        let client = WebSocketRPCClient(
+            connector: connector,
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+        let pending = Task {
+            try await client.subscribeOnCurrentConnection("thread.events", as: Int.self)
+        }
+        await connector.waitUntilConnectStarted()
+        let beforeConnection = await client.currentConnectionID()
+        XCTAssertNil(beforeConnection)
+        await connector.release()
+        let subscription = try await pending.value
+        var events = subscription.events.makeAsyncIterator()
+        do {
+            _ = try await events.next()
+            XCTFail("The first invalid value must terminate the cold subscription.")
+        } catch is DecodingError {}
+        let failedSocketID = await client.currentConnectionID()
+        XCTAssertEqual(subscription.connectionID, failedSocketID)
+        let waiting = Task { try await client.waitForConnection(after: subscription.connectionID) }
+        _ = try await client.request("server.stillHealthy", as: JSONValue.self)
+        waiting.cancel()
+        do {
+            _ = try await waiting.value
+            XCTFail("The failed socket must not satisfy the wait for its replacement.")
+        } catch is CancellationError {}
+        await client.stop()
+    }
+
+    func testConnectionWaitResumesOnlyForAReplacementSocket() async throws {
+        let first = AutoReplyConnection()
+        let second = AutoReplyConnection()
+        let client = WebSocketRPCClient(
+            connector: SequencedConnector(connections: [first, second]),
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+        _ = try await client.request("server.first", as: JSONValue.self)
+        let firstID = await client.currentConnectionID()
+        XCTAssertNotNil(firstID)
+        let waiting = Task { try await client.waitForConnection(after: firstID) }
+        _ = try await client.request("server.stillFirst", as: JSONValue.self)
+        await client.reconnect()
+        let nextID = try await waiting.value
+        XCTAssertNotEqual(nextID, firstID)
+        let currentID = await client.currentConnectionID()
+        XCTAssertEqual(nextID, currentID)
+        await client.stop()
+    }
+
+    func testConnectionWaitEndsOnCancellationAndStop() async throws {
+        for cancel in [true, false] {
+            let client = WebSocketRPCClient(
+                connector: SequencedConnector(connections: [AutoReplyConnection()]),
+                endpointProvider: { URL(string: "wss://studio.example/ws")! }
+            )
+            _ = try await client.request("server.first", as: JSONValue.self)
+            let firstID = await client.currentConnectionID()
+            let waiting = Task { try await client.waitForConnection(after: firstID) }
+            _ = try await client.request("server.stillFirst", as: JSONValue.self)
+            if cancel { waiting.cancel() }
+            else { await client.stop() }
+            do {
+                _ = try await waiting.value
+                XCTFail("A canceled or stopped connection wait must finish.")
+            } catch is CancellationError {
+                XCTAssertTrue(cancel)
+            } catch let error as RPCError {
+                guard case .disconnected = error, !cancel else {
+                    await client.stop()
+                    return XCTFail("Unexpected connection wait failure: \(error)")
+                }
+            }
+            await client.stop()
+        }
+    }
+
     func testResponseDeadlineStartsAfterConnectionAndSend() async throws {
         let connection = AutoReplyConnection()
         let connector = GatedConnector(connection: connection)

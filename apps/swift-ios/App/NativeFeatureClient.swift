@@ -24,7 +24,7 @@ private struct T3ConnectManagedCleanupError: LocalizedError {
 /// Composes the transport-focused Core layer with the UI-focused Features layer.
 @MainActor
 final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
-    FeatureProjectCreationClient, FeatureWorkspaceAssetResolving,
+    FeatureProjectCreationClient, FeatureWorkspaceAssetResolving, FeatureAttachmentAssetResolving,
     FeatureFeedbackSubmitting, T3ConnectCapable
 {
     private static let maximumRetainedThreadDetails = 6
@@ -49,6 +49,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private let environmentShellTimeoutInterval: TimeInterval
     private let threadSnapshotTimeoutInterval: TimeInterval
     private let catchUpDelay: @Sendable () async throws -> Void
+    private let threadRetryDelay: @Sendable (Int) async throws -> Void
     private let aggregateEnvironmentLoader: @Sendable (EnvironmentRuntime) async throws -> [Environment]
     private let stream: AsyncStream<FeatureEvent>
     private let continuation: AsyncStream<FeatureEvent>.Continuation
@@ -58,6 +59,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var latestShell: OrchestrationShellSnapshot?
     private var environmentClients: [String: T3Client] = [:]
     private var shellsByEnvironmentID: [String: OrchestrationShellSnapshot] = [:]
+    private var shellProjectionCache: [String: NativeShellProjection] = [:]
+    private var indexedShellMembership: [NativeShellMembership]?
+    private var indexedProvisionalRoutes: [String: ProvisionalThreadRoute] = [:]
     private var archivedThreadsByEnvironmentID: [String: [FeatureThread]] = [:]
     private var archivedShellThreadsByEnvironmentID: [
         String: [String: OrchestrationThreadShell]
@@ -88,9 +92,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ] = [:]
     private var pendingBootstrapSubmissions: [PendingBootstrapSubmission] = []
     private var pendingTurnSubmissions: [String: PendingTurnSubmission] = [:]
-    private var attachmentHydrationTasks: [
-        String: (id: UUID, task: Task<Void, Never>)
-    ] = [:]
     private var approvalRoutes: [String: PendingRequestRoute] = [:]
     private var inputRoutes: [String: PendingRequestRoute] = [:]
     private var relayDeviceSessionIDs: Set<String> = []
@@ -144,6 +145,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         catchUpDelay: @escaping @Sendable () async throws -> Void = {
             try await Task.sleep(for: .seconds(2))
         },
+        threadRetryDelay: @escaping @Sendable (Int) async throws -> Void = { attempt in
+            try await Task.sleep(for: .seconds(min(5, 0.25 * pow(2, Double(min(5, attempt - 1))))))
+        },
         aggregateEnvironmentLoader: @escaping @Sendable (EnvironmentRuntime) async throws -> [Environment] = {
             try await $0.environments()
         }
@@ -176,6 +180,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         self.environmentShellTimeoutInterval = environmentShellTimeoutInterval
         self.threadSnapshotTimeoutInterval = threadSnapshotTimeoutInterval
         self.catchUpDelay = catchUpDelay
+        self.threadRetryDelay = threadRetryDelay
         self.aggregateEnvironmentLoader = aggregateEnvironmentLoader
         let pair = AsyncStream<FeatureEvent>.makeStream()
         stream = pair.stream
@@ -193,7 +198,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         detailStreamTask?.cancel()
         detailCatchUpTask?.cancel()
         detailPublishTask?.cancel()
-        attachmentHydrationTasks.values.forEach { $0.task.cancel() }
         projectFaviconRefreshTasks.values.forEach { $0.cancel() }
         continuation.finish()
     }
@@ -447,6 +451,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             environmentConnectionDetails[id] = nil
             environmentClients[id] = nil
             shellsByEnvironmentID[id] = nil
+            shellProjectionCache[id] = nil
             serverConfigsByEnvironmentID[id] = nil
             providerCatalogCache[id] = nil
             archivedThreadsByEnvironmentID[id] = nil
@@ -887,8 +892,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         environmentGeneration &+= 1
         resetDetailRefresh()
         resetDetailStream()
-        attachmentHydrationTasks.values.forEach { $0.task.cancel() }
-        attachmentHydrationTasks.removeAll()
         archivedRefreshTask?.cancel()
         archivedRefreshTask = nil
         shellPublishTask?.cancel()
@@ -899,6 +902,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if !preserveEnvironmentSnapshots {
             environmentClients.removeAll()
             shellsByEnvironmentID.removeAll()
+            shellProjectionCache.removeAll()
+            indexedShellMembership = nil
+            indexedProvisionalRoutes.removeAll()
             serverConfigsByEnvironmentID.removeAll()
             providerCatalogCache.removeAll()
             archivedThreadsByEnvironmentID.removeAll()
@@ -980,9 +986,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func mediaAssetURL(threadID: String, path: String) async throws -> URL {
+        try await mediaAsset(threadID: threadID, path: path).url
+    }
+
+    func mediaAsset(threadID: String, path: String) async throws -> ResolvedAssetURL {
         let route = try threadRoute(for: threadID)
         do {
-            return try await route.client.resolvedAssetURL(
+            return try await route.client.resolvedAsset(
                 resource: .mediaFile(threadID: route.wireID, path: path)
             )
         } catch let RPCError.remote(message)
@@ -991,7 +1001,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     || message.localizedCaseInsensitiveContains("unsupported")
                     || message.localizedCaseInsensitiveContains("unknown tag")
                     || message.localizedCaseInsensitiveContains("unknown discriminator")) {
-            return try await route.client.resolvedAssetURL(
+            return try await route.client.resolvedAsset(
                 resource: .workspaceFile(threadID: route.wireID, path: path)
             )
         }
@@ -1869,12 +1879,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         activeRawThread = snapshot.thread
         activeThreadSequence = snapshot.snapshotSequence
         latestDetails[route.uiID] = detail
-        scheduleAttachmentHydration(
-            in: detail,
-            threadID: route.uiID,
-            client: client,
-            environmentID: environment.id
-        )
         startDetailStream(route)
         if !supportsResume { markDetailSynchronized(route) }
         return detail
@@ -3823,7 +3827,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             id: route.uiID, state: warmConnectionID != nil ? .live : .catchingUp
         ))
         ensureDetailCatchUpFallback(route, generation: streamGeneration)
+        let retryDelay = threadRetryDelay
         detailStreamTask = Task { [weak self] in
+            var failedAttempts = 0
+            var recoveringFromFailure = false
             while !Task.isCancelled,
                   self?.isCurrentDetail(route, generation: streamGeneration) == true,
                   self?.environmentGeneration == sessionGeneration {
@@ -3834,33 +3841,28 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     route.environmentID
                 ]?.threadSnapshotPagination == true
                 let subscriptionEpoch = self?.threadHistoryEpoch ?? 0
+                var failedConnectionID: UUID?
                 do {
-                    let connectionBeforeSubscribe = await route.client.currentConnectionID()
                     guard !Task.isCancelled,
                           self?.isCurrentDetail(route, generation: streamGeneration) == true,
                           self?.environmentGeneration == sessionGeneration else { return }
-                    let events = await route.client.threadEvents(
+                    let subscription = try await route.client.threadEvents(
                         threadID: route.wireID,
                         after: sequence,
-                        turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil,
-                        reconnect: false
+                        turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
                     )
-                    let connectionAfterSubscribe = await route.client.currentConnectionID()
+                    let subscriptionConnectionID = subscription.connectionID
+                    failedConnectionID = subscriptionConnectionID
                     guard !Task.isCancelled,
                           self?.isCurrentDetail(route, generation: streamGeneration) == true,
                           self?.environmentGeneration == sessionGeneration else { return }
-                    // A socket that changed during subscription cannot prove
-                    // which connection produced already-buffered events.
-                    let subscriptionConnectionID = connectionBeforeSubscribe == connectionAfterSubscribe
-                        ? connectionBeforeSubscribe
-                        : nil
                     if self?.detailWasSynchronized == true,
-                       subscriptionConnectionID == nil || subscriptionConnectionID != self?.activeDetailConnectionID {
+                       subscriptionConnectionID != self?.activeDetailConnectionID {
                         self?.detailWasSynchronized = false
                         self?.continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
                     }
                     self?.activeDetailConnectionID = subscriptionConnectionID
-                    for try await item in events {
+                    for try await item in subscription.events {
                         if case .synchronized = item {
                             let connectionID = await route.client.currentConnectionID()
                             guard !Task.isCancelled, let self,
@@ -3873,14 +3875,46 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         guard !Task.isCancelled, let self,
                               self.isCurrentDetail(route, generation: streamGeneration),
                               self.environmentGeneration == sessionGeneration else { return }
+                        failedAttempts = 0
+                        if recoveringFromFailure {
+                            recoveringFromFailure = false
+                            self.continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
+                            self.ensureDetailCatchUpFallback(route, generation: streamGeneration)
+                        }
                         self.consumeDetailStreamItem(
                             item, route: route, subscriptionEpoch: subscriptionEpoch
                         )
                     }
+                    // A thread subscription stays open until its owner leaves.
+                    // A clean end is not proof that the thread is still live.
+                    throw RPCError.protocolViolation("The live thread stream ended.")
                 } catch is CancellationError {
                     return
                 } catch {
-                    // A bounded HTTP read runs alongside socket recovery.
+                    guard !Task.isCancelled,
+                          self?.isCurrentDetail(route, generation: streamGeneration) == true else { return }
+                    if Self.isTerminalThreadStreamFailure(error) {
+                        self?.failDetailStream(route, message: "Could not synchronize the thread. Try again.")
+                        do {
+                            _ = try await route.client.waitForConnection(after: failedConnectionID)
+                        } catch { return }
+                        guard !Task.isCancelled,
+                              self?.isCurrentDetail(route, generation: streamGeneration) == true else { return }
+                        self?.continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
+                        self?.ensureDetailCatchUpFallback(route, generation: streamGeneration)
+                        continue
+                    }
+                    switch error {
+                    case RPCError.disconnected, RPCError.connectionUnavailable:
+                        break
+                    default:
+                        self?.failDetailStream(route, message: error.localizedDescription)
+                        recoveringFromFailure = true
+                        failedAttempts = min(6, failedAttempts + 1)
+                        do { try await retryDelay(failedAttempts) }
+                        catch { return }
+                        continue
+                    }
                 }
                 guard !Task.isCancelled,
                       self?.isCurrentDetail(route, generation: streamGeneration) == true else { return }
@@ -3889,10 +3923,32 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 self?.activeDetailConnectionID = nil
                 self?.continuation.yield(.threadSync(id: route.uiID, state: .reconnecting))
                 self?.ensureDetailCatchUpFallback(route, generation: streamGeneration)
-                do { try await Task.sleep(for: .milliseconds(250)) }
+                do {
+                    _ = try await route.client.waitForConnection(after: failedConnectionID)
+                }
                 catch { return }
             }
         }
+    }
+
+    private static func isTerminalThreadStreamFailure(_ error: any Error) -> Bool {
+        if error is DecodingError { return true }
+        if case RPCError.protocolViolation = error { return true }
+        return false
+    }
+
+    private func failDetailStream(_ route: NativeThreadRoute, message: String) {
+        // Drain applied updates before retaining the diagnostic. An older HTTP
+        // read must not replace this failure with an unrelated loading state.
+        flushDetailPublish(route)
+        resetDetailRefresh()
+        detailCatchUpTask?.cancel()
+        detailCatchUpTask = nil
+        detailCatchUpID = nil
+        detailCompletionReceived = false
+        detailWasSynchronized = false
+        activeDetailConnectionID = nil
+        continuation.yield(.threadSync(id: route.uiID, state: .failed(message)))
     }
 
     private func isCurrentDetail(_ route: NativeThreadRoute, generation: Int) -> Bool {
@@ -4077,10 +4133,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         let delta = makeDetailDelta(previous: previousDetail, next: detail, mutations: mutations)
         publish(detail, threadID: route.uiID, renderCacheIsSource: true, delta: delta)
-        scheduleAttachmentHydration(
-            in: detail, threadID: route.uiID, client: route.client,
-            environmentID: route.environmentID
-        )
     }
 
     private func retainActiveThread() {
@@ -4213,6 +4265,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let savedIDs = Set(savedEnvironments.map(\.id))
         environmentClients = environmentClients.filter { savedIDs.contains($0.key) }
         shellsByEnvironmentID = shellsByEnvironmentID.filter { savedIDs.contains($0.key) }
+        shellProjectionCache = shellProjectionCache.filter { savedIDs.contains($0.key) }
         serverConfigsByEnvironmentID = serverConfigsByEnvironmentID.filter {
             savedIDs.contains($0.key)
         }
@@ -4279,6 +4332,21 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         provisionalThreadRoutes = provisionalThreadRoutes.filter {
             savedIDs.contains($0.value.environmentID)
         }
+
+        // Metadata changes do not change routing. Avoid rebuilding scoped IDs
+        // and ambiguity sets for every title, activity, or settlement update.
+        let membership = environments.map { environment in
+            NativeShellMembership(
+                environmentID: environment.id,
+                projectIDs: shellsByEnvironmentID[environment.id]?.projects.map(\.id) ?? [],
+                threadIDs: shellsByEnvironmentID[environment.id]?.threads.map(\.id) ?? [],
+                archivedIDs: archivedThreadsByEnvironmentID[environment.id]?.map {
+                    $0.wireID ?? $0.id
+                } ?? []
+            )
+        }
+        guard membership != indexedShellMembership
+            || provisionalThreadRoutes != indexedProvisionalRoutes else { return }
 
         var nextProjectEnvironments: [String: String] = [:]
         var nextProjectWireIDs: [String: String] = [:]
@@ -4359,6 +4427,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         projectWireIDs = nextProjectWireIDs
         threadEnvironmentIDs = nextThreadEnvironments
         threadWireIDs = nextThreadWireIDs
+        indexedShellMembership = membership
+        indexedProvisionalRoutes = provisionalThreadRoutes
     }
 
     private func refresh(client: T3Client, includeArchived: Bool = false) async throws {
@@ -4481,12 +4551,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             || serverConfigsByEnvironmentID[environment.id]?.threadResumeCompletionMarker != true {
             markDetailSynchronized(route)
         }
-        scheduleAttachmentHydration(
-            in: detail,
-            threadID: route.uiID,
-            client: client,
-            environmentID: environment.id
-        )
     }
 
     /// Snapshots belong to the client that read them, not the selected inbox
@@ -4677,7 +4741,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         _ detail: FeatureThreadDetail,
         threadID: String,
         renderCacheIsSource: Bool = false,
-        synchronizeRenderedMessages: Bool = false,
         delta: FeatureDetailDelta? = nil
     ) {
         if renderCacheIsSource {
@@ -4699,16 +4762,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if let cache = detailRenderCaches[threadID] {
             cache.approvals = next.approvals
             cache.userInputs = next.userInputs
-            if synchronizeRenderedMessages {
-                for message in next.messages {
-                    if let index = cache.mergedIndexByID[message.id] {
-                        cache.mergedMessages[index] = message
-                    }
-                    if cache.messagesByID[message.id] != nil {
-                        cache.messagesByID[message.id] = message
-                    }
-                }
-            }
         }
         continuation.yield(.detail(next))
     }
@@ -4828,21 +4881,40 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         connectionDetail: String? = nil
     ) -> FeatureSnapshot {
         let enabledEnvironments = environments.filter(\.isEnabled)
-        let threads = enabledEnvironments.flatMap { environment in
-            let live = shellsByEnvironmentID[environment.id]?.threads.map {
-                mapThread($0, environment: environment)
-            } ?? []
+        let enabledIDs = Set(enabledEnvironments.map(\.id))
+        shellProjectionCache = shellProjectionCache.filter { enabledIDs.contains($0.key) }
+        var threads: [FeatureThread] = []
+        var projects: [FeatureProject] = []
+        for environment in enabledEnvironments {
+            // Take ownership while updating so the cache does not copy its
+            // retained arrays when one row changes.
+            var projection = shellProjectionCache.removeValue(forKey: environment.id)
+                ?? NativeShellProjection()
+            let providerNames = (serverConfigsByEnvironmentID[environment.id]?.providers ?? [])
+                .reduce(into: [String: String]()) { names, provider in
+                    // Match threadProviderName's first matching instance.
+                    if names[provider.instanceId] == nil {
+                        names[provider.instanceId] = provider.displayName
+                            ?? providerDisplayName(provider.driver)
+                    }
+                }
+            let live = projection.mapThreads(
+                shellsByEnvironmentID[environment.id]?.threads ?? [],
+                environment: environment,
+                providerNames: providerNames
+            ) { mapThread($0, environment: environment) }
             let liveIDs = Set(live.map(\.id))
             let cached = (archivedThreadsByEnvironmentID[environment.id] ?? []).filter {
                 !liveIDs.contains($0.id)
             }
-            return live + cached
-        }
-        let threadCountByProjectID = threads.reduce(into: [String: Int]()) {
-            $0[$1.projectID, default: 0] += 1
-        }
-        let projects = enabledEnvironments.flatMap { environment in
-            (shellsByEnvironmentID[environment.id]?.projects ?? []).map { project in
+            threads.append(contentsOf: live)
+            threads.append(contentsOf: cached)
+            var threadCountByProjectID: [String: Int] = [:]
+            for thread in live { threadCountByProjectID[thread.projectID, default: 0] += 1 }
+            for thread in cached { threadCountByProjectID[thread.projectID, default: 0] += 1 }
+            let mappedProjects = projection.projects.map(
+                shellsByEnvironmentID[environment.id]?.projects ?? []
+            ) { project in
                 let uiID = FeatureScopedID.project(
                     environmentID: environment.id,
                     wireID: project.id
@@ -4853,7 +4925,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     environmentID: environment.id,
                     name: project.title,
                     path: project.workspaceRoot,
-                    threadCount: threadCountByProjectID[uiID, default: 0],
+                    threadCount: 0,
                     defaultSelection: project.defaultModelSelection.map(mapSelection),
                     repositoryIdentity: project.repositoryIdentity.map {
                         FeatureRepositoryIdentity(
@@ -4869,6 +4941,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 mapped.projectIcon = project.projectIcon
                 return mapped
             }
+            for var project in mappedProjects {
+                project.threadCount = threadCountByProjectID[project.id, default: 0]
+                projects.append(project)
+            }
+            shellProjectionCache[environment.id] = projection
         }
         let providersByEnvironment = enabledEnvironments.reduce(
             into: [String: [FeatureProvider]]()
@@ -5268,9 +5345,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             threadResumeStates[threadID] = nil
             detailRenderCaches[threadID] = nil
             terminalSnapshots = terminalSnapshots.filter { $0.key.threadID != threadID }
-            if let hydration = attachmentHydrationTasks.removeValue(forKey: threadID) {
-                hydration.task.cancel()
-            }
         }
     }
 
@@ -5363,12 +5437,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             isCompacting: currentDetail.isCompacting == true
         )
         publish(detail, threadID: route.uiID, renderCacheIsSource: true)
-        scheduleAttachmentHydration(
-            in: detail,
-            threadID: route.uiID,
-            client: route.client,
-            environmentID: route.environmentID
-        )
         return detail
     }
 
@@ -6312,151 +6380,44 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return cached.url
     }
 
-    private func scheduleAttachmentHydration(
-        in detail: FeatureThreadDetail,
+    func attachmentAssetURL(
         threadID: String,
-        client: T3Client,
-        environmentID: String
-    ) {
-        guard detail.messages.contains(where: { message in
-            message.attachments.contains { $0.url == nil }
-        }) else {
-            return
-        }
-        // Streaming activity can publish many detail revisions per second. Let the
-        // current asset resolution finish instead of continuously restarting it.
-        guard attachmentHydrationTasks[threadID] == nil else { return }
+        attachment: FeatureMessageAttachment
+    ) async throws -> URL {
+        try Task.checkCancellation()
+        let route = try threadRoute(for: threadID)
         let generation = environmentGeneration
-        let workID = UUID()
-        let task = Task { [weak self] in
-            guard let self else { return }
-            let hydrated = await self.hydratedAttachmentURLs(
-                in: detail,
-                client: client,
-                environmentID: environmentID,
-                generation: generation
+        if let cached = cachedAttachmentURL(for: attachment.id, environmentID: route.environmentID) {
+            return cached
+        }
+        let resolved = try await route.client.resolvedAsset(
+            resource: .attachment(
+                id: attachment.id,
+                fileName: attachment.name,
+                mimeType: attachment.mimeType
             )
-            guard self.isKnownClient(
-                client,
-                environmentID: environmentID,
-                generation: generation
-            ),
-                  self.latestDetails[threadID] == detail,
-                  hydrated != detail else {
-                self.finishAttachmentHydration(threadID: threadID, workID: workID)
-                if let latest = self.latestDetails[threadID], latest != detail {
-                    self.scheduleAttachmentHydration(
-                        in: latest,
-                        threadID: threadID,
-                        client: client,
-                        environmentID: environmentID
-                    )
-                }
-                return
-            }
-            self.publish(
-                hydrated,
-                threadID: threadID,
-                synchronizeRenderedMessages: true
-            )
-            self.finishAttachmentHydration(threadID: threadID, workID: workID)
-        }
-        attachmentHydrationTasks[threadID] = (workID, task)
-    }
-
-    private func finishAttachmentHydration(threadID: String, workID: UUID) {
-        guard attachmentHydrationTasks[threadID]?.id == workID else { return }
-        attachmentHydrationTasks[threadID] = nil
-    }
-
-    private func hydratedAttachmentURLs(
-        in detail: FeatureThreadDetail,
-        client: T3Client,
-        environmentID: String,
-        generation: Int
-    ) async -> FeatureThreadDetail {
-        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
-            return detail
-        }
-        let attachmentMetadata = detail.messages.flatMap(\.attachments).reduce(
-            into: [String: (name: String, mimeType: String)]()
-        ) { metadata, attachment in
-            metadata[attachment.id] = (attachment.name, attachment.mimeType)
-        }
-        // Threads without attachments refresh every couple of seconds. Skip
-        // the resolve pass and full message walk when there is nothing to hydrate.
-        guard !attachmentMetadata.isEmpty else { return detail }
-        let missingIDs = Array(attachmentMetadata.keys.filter {
-            cachedAttachmentURL(for: $0, environmentID: environmentID) == nil
-        })
-
-        await withTaskGroup(of: (String, ResolvedAssetURL?).self) { group in
-            var iterator = missingIDs.makeIterator()
-            for _ in 0..<min(4, missingIDs.count) {
-                guard let id = iterator.next() else { break }
-                group.addTask {
-                    (
-                        id,
-                        try? await client.resolvedAsset(
-                            resource: .attachment(
-                                id: id,
-                                fileName: attachmentMetadata[id]?.name,
-                                mimeType: attachmentMetadata[id]?.mimeType
-                            )
-                        )
-                    )
-                }
-            }
-            while let (id, resolved) = await group.next() {
-                if let resolved,
-                   isKnownClient(
-                       client,
-                       environmentID: environmentID,
-                       generation: generation
-                   ) {
-                    let key = AttachmentCacheKey(
-                        environmentID: environmentID,
-                        attachmentID: id
-                    )
-                    attachmentURLs[key] = CachedAttachmentURL(
-                        url: resolved.url,
-                        expiresAt: resolved.expiresAt
-                    )
-                }
-                if isKnownClient(
-                    client,
-                    environmentID: environmentID,
-                    generation: generation
-                ),
-                   let nextID = iterator.next() {
-                    group.addTask {
-                        (
-                            nextID,
-                            try? await client.resolvedAsset(
-                                resource: .attachment(
-                                    id: nextID,
-                                    fileName: attachmentMetadata[nextID]?.name,
-                                    mimeType: attachmentMetadata[nextID]?.mimeType
-                                )
-                            )
-                        )
-                    }
-                }
+        )
+        try Task.checkCancellation()
+        guard isKnownClient(
+            route.client, environmentID: route.environmentID, generation: generation
+        ) else { throw CancellationError() }
+        let key = AttachmentCacheKey(
+            environmentID: route.environmentID, attachmentID: attachment.id
+        )
+        // URLs are small, but a session can visit thousands of attachments.
+        if attachmentURLs.count >= 256 {
+            let expiry = Date().addingTimeInterval(30)
+            attachmentURLs = attachmentURLs.filter { $0.value.expiresAt > expiry }
+            if attachmentURLs.count >= 256, let oldest = attachmentURLs.min(by: {
+                $0.value.expiresAt < $1.value.expiresAt
+            })?.key {
+                attachmentURLs[oldest] = nil
             }
         }
-
-        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
-            return detail
-        }
-        var hydrated = detail
-        for messageIndex in hydrated.messages.indices {
-            for attachmentIndex in hydrated.messages[messageIndex].attachments.indices {
-                let id = hydrated.messages[messageIndex].attachments[attachmentIndex].id
-                hydrated.messages[messageIndex].attachments[attachmentIndex].url =
-                    cachedAttachmentURL(for: id, environmentID: environmentID)
-            }
-        }
-        return hydrated
+        attachmentURLs[key] = CachedAttachmentURL(
+            url: resolved.url, expiresAt: resolved.expiresAt
+        )
+        return resolved.url
     }
 
     private func lastActivityDate(
@@ -7363,6 +7324,69 @@ enum NativeThreadDetailReducer {
     }
 }
 
+/// Shell metadata often changes for only one row. Keep the mapped values for
+/// equal source records, including across a fresh HTTP snapshot or a reorder.
+struct NativeShellRowProjection<Source: Identifiable & Equatable, Row> {
+    private var sources: [Source] = []
+    private var rows: [Row] = []
+
+    mutating func map(_ next: [Source], transform: (Source) -> Row) -> [Row] {
+        guard next != sources else { return rows }
+        var previousIndexByID: [Source.ID: Int]?
+        let nextRows = next.enumerated().map { index, source in
+            if index < sources.count, sources[index].id == source.id {
+                return sources[index] == source ? rows[index] : transform(source)
+            }
+            // Most deltas keep order. Only build the lookup after an insert,
+            // removal, or reorder moves a row to a different position.
+            if previousIndexByID == nil {
+                previousIndexByID = sources.enumerated().reduce(into: [:]) {
+                    $0[$1.element.id] = $1.offset
+                }
+            }
+            if let oldIndex = previousIndexByID?[source.id], sources[oldIndex] == source {
+                return rows[oldIndex]
+            }
+            return transform(source)
+        }
+        sources = next
+        rows = nextRows
+        return nextRows
+    }
+}
+
+struct NativeShellProjection {
+    private struct ThreadContext: Equatable {
+        let environment: Environment
+        let providerNames: [String: String]
+    }
+
+    private var threadContext: ThreadContext?
+    private var threads = NativeShellRowProjection<OrchestrationThreadShell, FeatureThread>()
+    var projects = NativeShellRowProjection<OrchestrationProject, FeatureProject>()
+
+    mutating func mapThreads(
+        _ source: [OrchestrationThreadShell],
+        environment: Environment,
+        providerNames: [String: String],
+        transform: (OrchestrationThreadShell) -> FeatureThread
+    ) -> [FeatureThread] {
+        let context = ThreadContext(environment: environment, providerNames: providerNames)
+        if threadContext != context {
+            threads = NativeShellRowProjection()
+            threadContext = context
+        }
+        return threads.map(source, transform: transform)
+    }
+}
+
+private struct NativeShellMembership: Equatable {
+    let environmentID: String
+    let projectIDs: [String]
+    let threadIDs: [String]
+    let archivedIDs: [String]
+}
+
 private struct AttachmentCacheKey: Hashable {
     let environmentID: String
     let attachmentID: String
@@ -7428,7 +7452,7 @@ private final class NativeSourceControlMonitor {
     var task: Task<Void, Never>?
 }
 
-private struct ProvisionalThreadRoute {
+private struct ProvisionalThreadRoute: Equatable {
     let environmentID: String
     let wireID: String
 }

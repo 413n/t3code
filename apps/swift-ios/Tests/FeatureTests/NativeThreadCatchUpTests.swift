@@ -5,6 +5,115 @@ import XCTest
 @MainActor
 @available(iOS 18.0, *)
 final class NativeThreadCatchUpTests: XCTestCase {
+    func testDomainFailureBacksOffAndKeepsItsErrorUntilTheStreamRecovers() async throws {
+        let retry = CatchUpRetryGate()
+        let fixture = try await CatchUpFixture.make(threadRetryDelay: { try await retry.wait($0) })
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        var attempts = retry.attempts.makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        var current = try await nextThreadRequest(&requests)
+        for expectedAttempt in 1...3 {
+            try await current.socket.fail(id: current.id, message: "Thread is temporarily unavailable.")
+            while let event = await events.next(isolation: #isolation) {
+                if case let .threadSync(id, .failed(message)) = event, id == fixture.firstID {
+                    XCTAssertEqual(message, "Thread is temporarily unavailable.")
+                    break
+                }
+            }
+            let attempt = await attempts.next(isolation: #isolation)
+            XCTAssertEqual(attempt, expectedAttempt)
+            await retry.release()
+            let next = try await nextThreadRequest(&requests)
+            XCTAssertTrue(next.socket === current.socket)
+            current = next
+        }
+
+        try await current.sendMessage(text: "Recovered without reconnecting", sequence: 3)
+        try await current.synchronize()
+        let nextState = await nextSyncState(&events, threadID: fixture.firstID)
+        XCTAssertEqual(nextState, .catchingUp, "A rejected retry must retain its failure until real data arrives.")
+        let messages = await messagesBeforeLive(&events, threadID: fixture.firstID)
+        XCTAssertEqual(messages, ["Recovered without reconnecting"])
+
+        try await current.socket.fail(id: current.id, message: "Temporarily unavailable again.")
+        let resetAttempt = await attempts.next(isolation: #isolation)
+        XCTAssertEqual(resetAttempt, 1, "Valid stream data resets the retry backoff.")
+        await fixture.client.disconnect()
+    }
+
+    func testTerminatedStreamsKeepBufferedTextAndRecoverOnConnectionOrForeground() async throws {
+        for failure in CatchUpStreamFailure.allCases {
+            let fixture = try await CatchUpFixture.make()
+            defer { fixture.cleanUp() }
+            var requests = fixture.requests.makeAsyncIterator()
+            var events = fixture.client.events().makeAsyncIterator()
+            _ = try await fixture.client.loadThread(id: fixture.firstID)
+            let first = try await nextThreadRequest(&requests)
+            try await first.sendMessage(text: "Received before the failure", sequence: 3)
+            try await first.terminate(failure)
+
+            var bufferedMessages: [String] = []
+            while let event = await events.next(isolation: #isolation) {
+                switch event {
+                case let .detail(detail), let .detailDelta(detail, _):
+                    if detail.thread.id == fixture.firstID {
+                        bufferedMessages = detail.messages.map(\.text)
+                    }
+                case let .threadSync(id, .failed(message)) where id == fixture.firstID:
+                    XCTAssertEqual(message, "Could not synchronize the thread. Try again.")
+                default: continue
+                }
+                if case .threadSync(fixture.firstID, .failed) = event { break }
+            }
+            XCTAssertEqual(bufferedMessages, ["Received before the failure"])
+
+            if failure == .malformed {
+                await first.socket.close()
+            } else {
+                await fixture.client.resumeAfterBackground(reconnect: false)
+            }
+            let resumed = try await nextThreadRequest(&requests)
+            XCTAssertEqual(resumed.payload["afterSequence"], .number(3))
+            XCTAssertEqual(resumed.socket === first.socket, failure != .malformed)
+            let resumedState = await nextSyncState(&events, threadID: fixture.firstID)
+            XCTAssertEqual(resumedState, .catchingUp)
+            try await resumed.sendMessage(text: "Recovered", sequence: 4)
+            try await resumed.synchronize()
+            let messages = await messagesBeforeLive(&events, threadID: fixture.firstID)
+            XCTAssertEqual(messages, ["Received before the failure", "Recovered"])
+            let reads = await fixture.http.threadRequests
+            XCTAssertEqual(reads.count, 1, "A failed stream must retain its usable snapshot.")
+            await fixture.client.disconnect()
+        }
+    }
+
+    func testLeavingFailedThreadCancelsItsConnectionWait() async throws {
+        let fixture = try await CatchUpFixture.make()
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let first = try await nextThreadRequest(&requests)
+        try await first.terminate(.malformed)
+        while let event = await events.next(isolation: #isolation) {
+            if case .threadSync(fixture.firstID, .failed) = event { break }
+        }
+
+        fixture.client.releaseThread(id: fixture.firstID)
+        _ = try await fixture.client.loadThread(id: fixture.secondID)
+        let second = try await nextThreadRequest(&requests)
+        try await second.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.secondID)
+        await second.socket.close()
+        let resumed = try await nextThreadRequest(&requests)
+        XCTAssertEqual(resumed.payload["threadId"], .string("second"))
+        try await resumed.synchronize()
+        _ = await messagesBeforeLive(&events, threadID: fixture.secondID)
+        await fixture.client.disconnect()
+    }
+
     func testExplicitRetryReadsFreshSnapshotInsteadOfWarmResume() async throws {
         let fixture = try await CatchUpFixture.make()
         defer { fixture.cleanUp() }
@@ -479,11 +588,18 @@ final class NativeThreadCatchUpTests: XCTestCase {
         try await stream.sendMessage(text: "Text ready", sequence: 11)
         await nextCatchUp(&events, threadID: fixture.firstID)
         first.succeed()
+        let messages = await messagesBeforeLive(&events, threadID: fixture.firstID)
+        XCTAssertEqual(messages, ["Text ready"])
+        let resolving = Task {
+            try await fixture.client.attachmentAssetURL(
+                threadID: fixture.firstID,
+                attachment: .init(id: "image-0", name: "test.png", mimeType: "image/png", sizeBytes: 20)
+            )
+        }
+        defer { resolving.cancel() }
         while let request = await requests.next(isolation: #isolation) {
             if request.tag == RPCMethod.assetsCreateURL.rawValue { break }
         }
-        let messages = await messagesBeforeLive(&events, threadID: fixture.firstID)
-        XCTAssertEqual(messages, ["Text ready"])
         let firstReadCount = await fixture.http.threadRequests.count
         XCTAssertEqual(firstReadCount, 2, "The first snapshot already includes the skipped message.")
 
@@ -498,7 +614,7 @@ final class NativeThreadCatchUpTests: XCTestCase {
         await fixture.client.disconnect()
     }
 
-    func testNonImageAttachmentsResolveAfterTextCatchUpCompletes() async throws {
+    func testVisibleNonImageAttachmentsResolveWithoutRepublishingThread() async throws {
         for (name, mimeType) in [("document.pdf", "application/pdf"), ("clip.mp4", "video/mp4")] {
             let fixture = try await CatchUpFixture.make()
             defer { fixture.cleanUp() }
@@ -518,6 +634,12 @@ final class NativeThreadCatchUpTests: XCTestCase {
             let messages = await messagesBeforeLive(&events, threadID: fixture.firstID)
             XCTAssertEqual(messages, ["File ready"])
 
+            let resolving = Task {
+                try await fixture.client.attachmentAssetURL(
+                    threadID: fixture.firstID,
+                    attachment: .init(id: "file", name: name, mimeType: mimeType, sizeBytes: 20)
+                )
+            }
             while let request = await requests.next(isolation: #isolation) {
                 guard request.tag == RPCMethod.assetsCreateURL.rawValue else { continue }
                 XCTAssertEqual(request.payload["resource"]?["mimeType"], .string(mimeType))
@@ -527,17 +649,39 @@ final class NativeThreadCatchUpTests: XCTestCase {
                 ]))
                 break
             }
-            var resolved: FeatureMessageAttachment?
-            while let event = await events.next(isolation: #isolation) {
-                guard case let .detail(detail) = event, detail.thread.id == fixture.firstID,
-                      let attachment = detail.messages.first?.attachments.first else { continue }
-                resolved = attachment
-                break
-            }
-            XCTAssertEqual(resolved?.mimeType, mimeType)
-            XCTAssertEqual(resolved?.url, URL(string: "https://one.example/assets/\(name)"))
+            let resolved = try await resolving.value
+            XCTAssertEqual(resolved, URL(string: "https://one.example/assets/\(name)"))
             await fixture.client.disconnect()
         }
+    }
+
+    func testOpeningAttachmentHistoryDoesNotResolveOffscreenURLsAndVisibleURLIsReused() async throws {
+        let fixture = try await CatchUpFixture.make()
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        await fixture.http.setResponse(texts: (0..<100).map { "Image \($0)" }, sequence: 2, withImage: true)
+        let detail = try await fixture.client.loadThread(id: fixture.firstID)
+        let subscription = try await nextThreadRequest(&requests)
+        try await subscription.synchronize()
+        let attachment = try XCTUnwrap(detail.messages.last?.attachments.first)
+        let resolving = Task {
+            try await fixture.client.attachmentAssetURL(threadID: fixture.firstID, attachment: attachment)
+        }
+        while let request = await requests.next(isolation: #isolation) {
+            guard request.tag == RPCMethod.assetsCreateURL.rawValue else { continue }
+            XCTAssertEqual(request.payload["resource"]?["attachmentId"], .string(attachment.id))
+            try await request.socket.succeed(id: request.id, value: .object([
+                "relativeUrl": .string("/assets/visible.png"),
+                "expiresAt": .number(Date.now.addingTimeInterval(3_600).timeIntervalSince1970 * 1_000),
+            ]))
+            break
+        }
+        let firstURL = try await resolving.value
+        let cachedURL = try await fixture.client.attachmentAssetURL(threadID: fixture.firstID, attachment: attachment)
+        XCTAssertEqual(cachedURL, firstURL)
+        let assetReads = await subscription.socket.assetRequestCount
+        XCTAssertEqual(assetReads, 1, "Only the visible attachment needs a signed URL.")
+        await fixture.client.disconnect()
     }
 
     func testRequiredReadReplacesColdFallbackWithoutHidingItsOwnFailure() async throws {
@@ -656,7 +800,12 @@ private struct CatchUpFixture {
     var firstID: String { FeatureScopedID.thread(environmentID: "one", wireID: "first") }
     var secondID: String { FeatureScopedID.thread(environmentID: "one", wireID: "second") }
 
-    static func make(completionMarker: Bool = true) async throws -> Self {
+    static func make(
+        completionMarker: Bool = true,
+        threadRetryDelay: @escaping @Sendable (Int) async throws -> Void = { _ in
+            try await Task.sleep(for: .milliseconds(250))
+        }
+    ) async throws -> Self {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = EnvironmentStore(fileURL: directory.appendingPathComponent("environments.json"))
         try await store.save([Environment(
@@ -679,7 +828,8 @@ private struct CatchUpFixture {
             runtime: runtime, settingsStore: UserDefaults(suiteName: UUID().uuidString)!,
             fallbackPollingInitialDelay: .seconds(3_600),
             aggregateRefreshInterval: .seconds(3_600),
-            catchUpDelay: { try await delay.wait() }
+            catchUpDelay: { try await delay.wait() },
+            threadRetryDelay: threadRetryDelay
         )
         _ = try await client.initialSnapshot()
         return Self(client: client, http: http, requests: requests.stream, delay: delay, directory: directory)
@@ -786,11 +936,28 @@ private struct CatchUpConnector: WebSocketConnecting {
     }
 }
 
+private enum CatchUpStreamFailure: CaseIterable {
+    case malformed, defect, ended
+}
+
 private struct CatchUpRequest: Sendable {
     let tag: String
     let id: Int
     let payload: JSONValue
     let socket: CatchUpSocket
+
+    func terminate(_ failure: CatchUpStreamFailure) async throws {
+        switch failure {
+        case .malformed:
+            try await socket.chunk(id: id, values: [.object([
+                "kind": .number(42),
+            ])])
+        case .defect:
+            try await socket.failWithDefect(id: id)
+        case .ended:
+            try await socket.succeed(id: id, value: .null)
+        }
+    }
 
     func synchronize() async throws {
         try await socket.chunk(id: id, values: [.object(["kind": .string("synchronized")])])
@@ -835,6 +1002,7 @@ private struct CatchUpRequest: Sendable {
 private actor CatchUpSocket: WebSocketConnection {
     let requests: AsyncStream<CatchUpRequest>.Continuation
     let completionMarker: Bool
+    private(set) var assetRequestCount = 0
     private var pending: [Data] = []
     private var receiver: CheckedContinuation<Data, any Error>?
     private var closed = false
@@ -851,6 +1019,7 @@ private actor CatchUpSocket: WebSocketConnection {
             try enqueue(.object(["_tag": .string("Pong")]))
         }
         guard let tag = request["tag"]?.stringValue, case let .number(id) = request["id"] else { return }
+        if tag == RPCMethod.assetsCreateURL.rawValue { assetRequestCount += 1 }
         if tag == RPCMethod.subscribeServerConfig.rawValue {
             try chunk(id: Int(id), values: [.object([
                 "type": .string("snapshot"), "config": .object([
@@ -887,12 +1056,72 @@ private actor CatchUpSocket: WebSocketConnection {
         ]))
     }
 
+    func failWithDefect(id: Int) throws {
+        try enqueue(.object([
+            "_tag": .string("Exit"), "requestId": .number(Double(id)),
+            "exit": .object([
+                "_tag": .string("Failure"),
+                "cause": .array([.object([
+                    "_tag": .string("Die"),
+                    "defect": .string("RAW_SERVER_DEFECT_MUST_NOT_REACH_THREAD_UI"),
+                ])]),
+            ]),
+        ]))
+    }
+
+    func fail(id: Int, message: String) throws {
+        try enqueue(.object([
+            "_tag": .string("Exit"), "requestId": .number(Double(id)),
+            "exit": .object([
+                "_tag": .string("Failure"),
+                "cause": .array([.object([
+                    "_tag": .string("Fail"), "error": .object(["message": .string(message)]),
+                ])]),
+            ]),
+        ]))
+    }
+
     private func enqueue(_ value: JSONValue) throws {
         let data = try JSONEncoder.t3.encode(value)
         if let receiver {
             self.receiver = nil
             receiver.resume(returning: data)
         } else { pending.append(data) }
+    }
+}
+
+private actor CatchUpRetryGate {
+    nonisolated let attempts: AsyncStream<Int>
+    private let continuation: AsyncStream<Int>.Continuation
+    private var waiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
+
+    init() {
+        let stream = AsyncStream<Int>.makeStream()
+        attempts = stream.stream
+        continuation = stream.continuation
+    }
+
+    func wait(_ attempt: Int) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled { waiter.resume(throwing: CancellationError()) }
+                else {
+                    waiters[id] = waiter
+                    continuation.yield(attempt)
+                }
+            }
+        } onCancel: { Task { await self.cancel(id) } }
+    }
+
+    func release() {
+        let pending = waiters.values
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+
+    private func cancel(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
 }
 

@@ -476,13 +476,26 @@ private struct MarkdownListView: View {
 }
 
 private struct MarkdownImageView: View {
+    private struct Request: Equatable {
+        let image: MarkdownImage
+        let context: MarkdownImageContext?
+        let maximumPixelSize: Int
+    }
+
     let image: MarkdownImage
     let context: MarkdownImageContext?
 
     @SwiftUI.Environment(\.openURL) private var openURL
-    @State private var loadedImage: UIImage?
+    @SwiftUI.Environment(\.displayScale) private var displayScale
+    @State private var loadedImage: MarkdownDecodedImage?
+    @State private var activeRequest: Request?
+    @State private var knownSize: CGSize?
     @State private var previewURL: URL?
     @State private var failed = false
+
+    private var request: Request {
+        Request(image: image, context: context, maximumPixelSize: min(2_048, max(512, Int(ceil(480 * displayScale)))))
+    }
 
     private var classifiedSource: MarkdownImageSource {
         let basePath = context?.sourceFilePath.map {
@@ -496,17 +509,18 @@ private struct MarkdownImageView: View {
 
     var body: some View {
         if classifiedSource != .blocked {
-            Group {
-                if let loadedImage {
-                    Image(uiImage: loadedImage)
+            let currentRequest = activeRequest == request
+            let decoded = currentRequest ? loadedImage : nil
+            MarkdownImageLayout(sourceSize: decoded?.sourceSize ?? (currentRequest ? knownSize : nil)) {
+                if let decoded {
+                    Image(uiImage: decoded.image)
                         .resizable()
                         .scaledToFit()
-                        .frame(maxHeight: 480)
                 } else {
-                    Image(systemName: failed ? "exclamationmark.triangle" : "photo")
+                    Image(systemName: currentRequest && failed ? "exclamationmark.triangle" : "photo")
                         .font(.title2)
                         .foregroundStyle(T3Colors.textSecondary)
-                        .frame(maxWidth: .infinity, minHeight: 140)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(T3Colors.surfaceRaised)
                 }
             }
@@ -515,9 +529,9 @@ private struct MarkdownImageView: View {
             .accessibilityAddTraits(.isButton)
             .contentShape(Rectangle())
             .onTapGesture {
-                if let previewURL { openURL(previewURL) }
+                if currentRequest, let previewURL { openURL(previewURL) }
             }
-            .task(id: "\(image.source):\(context?.threadID ?? ""):\(context?.workspaceRoot ?? ""):\(context?.sourceFilePath ?? "")") {
+            .task(id: request) {
                 await loadImage()
             }
         }
@@ -525,6 +539,11 @@ private struct MarkdownImageView: View {
 
     @MainActor
     private func loadImage() async {
+        let loadingRequest = request
+        activeRequest = loadingRequest
+        loadedImage = nil
+        knownSize = nil
+        failed = false
         previewURL = nil
         do {
             let url: URL
@@ -545,17 +564,23 @@ private struct MarkdownImageView: View {
                     URLQueryItem(name: "kind", value: "image"),
                 ]
                 previewURL = components.url
-                url = try await context.resolver.mediaAssetURL(
+                let asset = try await context.resolver.mediaAsset(
                     threadID: context.threadID,
                     path: path
                 )
+                try Task.checkCancellation()
+                knownSize = MarkdownImageGeometry.sourceSize(asset.imageDimensions)
+                url = asset.url
             case .blocked:
                 return
             }
-            loadedImage = try await MarkdownImageLoader.load(url)
+            let decoded = try await MarkdownImageLoader.load(url, maximumPixelSize: loadingRequest.maximumPixelSize)
+            try Task.checkCancellation()
+            loadedImage = decoded
         } catch is CancellationError {
             return
         } catch {
+            guard !Task.isCancelled else { return }
             failed = true
         }
     }
@@ -587,8 +612,13 @@ private struct CodexArtifactTemplateView: View {
 
 @MainActor
 private enum MarkdownImageLoader {
-    private static let cache: NSCache<NSURL, UIImage> = {
-        let cache = NSCache<NSURL, UIImage>()
+    private final class CachedImage {
+        let decoded: MarkdownDecodedImage
+        init(_ decoded: MarkdownDecodedImage) { self.decoded = decoded }
+    }
+
+    private static let cache: NSCache<NSString, CachedImage> = {
+        let cache = NSCache<NSString, CachedImage>()
         cache.countLimit = 64
         cache.totalCostLimit = 32 * 1_024 * 1_024
         return cache
@@ -602,9 +632,10 @@ private enum MarkdownImageLoader {
         return URLSession(configuration: configuration)
     }()
 
-    static func load(_ url: URL) async throws -> UIImage {
-        if let cached = cache.object(forKey: url as NSURL) {
-            return cached
+    static func load(_ url: URL, maximumPixelSize: Int) async throws -> MarkdownDecodedImage {
+        let cacheKey = "\(url.absoluteString)#\(maximumPixelSize)" as NSString
+        if let cached = cache.object(forKey: cacheKey) {
+            return cached.decoded
         }
 
         let data: Data
@@ -624,20 +655,14 @@ private enum MarkdownImageLoader {
             }
         }
         try Task.checkCancellation()
-        let decoded = await Task.detached(priority: .utility) {
-            UIImage(data: data)
+        let decoded = try await Task.detached(priority: .utility) {
+            try MarkdownImageDecoder.decode(data, maximumPixelSize: maximumPixelSize)
         }.value
         try Task.checkCancellation()
-        guard let decoded else { throw MarkdownImageLoadingError.invalidImage }
-        let cost = decoded.cgImage.map { $0.bytesPerRow * $0.height } ?? data.count
-        cache.setObject(decoded, forKey: url as NSURL, cost: cost)
+        let cost = decoded.image.cgImage.map { $0.bytesPerRow * $0.height } ?? data.count
+        cache.setObject(CachedImage(decoded), forKey: cacheKey, cost: cost)
         return decoded
     }
-}
-
-private enum MarkdownImageLoadingError: Error {
-    case invalidImage
-    case invalidResponse
 }
 
 private struct MarkdownCodeBlockView: View {

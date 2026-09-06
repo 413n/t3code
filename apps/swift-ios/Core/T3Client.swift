@@ -112,6 +112,10 @@ public actor T3Client {
         await rpc.currentConnectionID()
     }
 
+    public func waitForConnection(after previous: UUID?) async throws -> UUID {
+        try await rpc.waitForConnection(after: previous)
+    }
+
     public func shellSnapshot(
         timeoutInterval: TimeInterval? = nil
     ) async throws -> OrchestrationShellSnapshot {
@@ -649,19 +653,17 @@ public actor T3Client {
     public func threadEvents(
         threadID: String,
         after sequence: Int? = nil,
-        turnLimit: Int? = nil,
-        reconnect: Bool = true
-    ) async -> AsyncThrowingStream<ThreadStreamItem, Error> {
+        turnLimit: Int? = nil
+    ) async throws -> (events: AsyncThrowingStream<ThreadStreamItem, Error>, connectionID: UUID) {
         var payload: [String: JSONValue] = [
             "threadId": .string(threadID),
             "requestCompletionMarker": .bool(true),
         ]
         if let sequence { payload["afterSequence"] = .number(Double(sequence)) }
         if let turnLimit { payload["turnLimit"] = .number(Double(turnLimit)) }
-        return await rpc.subscribe(
+        return try await rpc.subscribeOnCurrentConnection(
             RPCMethod.subscribeThread.rawValue,
             payload: .object(payload),
-            reconnect: reconnect,
             as: ThreadStreamItem.self
         )
     }
@@ -1163,7 +1165,8 @@ public actor T3Client {
         }
         return ResolvedAssetURL(
             url: url,
-            expiresAt: Date(timeIntervalSince1970: result.expiresAt / 1_000)
+            expiresAt: Date(timeIntervalSince1970: result.expiresAt / 1_000),
+            imageDimensions: result.imageDimensions
         )
     }
 
