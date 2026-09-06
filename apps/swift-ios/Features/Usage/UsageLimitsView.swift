@@ -260,15 +260,15 @@ private struct UsageLimitWindowView: View {
     let now: Date
 
     var body: some View {
-        let used = UsageLimitsMath.usedPercent(window)
-        let elapsed = UsageLimitsMath.elapsedShare(window, now: now)
+        let remaining = UsageLimitsMath.remainingPercent(window)
+        let timeLeft = UsageLimitsMath.elapsedShare(window, now: now).map { 1 - $0 }
         let pace = UsageLimitsMath.pace(window, now: now)
         let resetsIn = UsageLimitsMath.resetsIn(window, now: now)
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text(window.label)
                 Spacer(minLength: 8)
-                Text("\(Int(used.rounded()))%")
+                Text("\(Int(remaining))% left")
                     .monospacedDigit()
             }
             .font(T3Typography.supporting)
@@ -278,12 +278,12 @@ private struct UsageLimitWindowView: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(T3Colors.subtleStrong)
                         .frame(height: 6)
-                    Capsule().fill(barColor(used: used))
-                        .frame(width: geometry.size.width * used / 100, height: 6)
-                    if let elapsed {
+                    Capsule().fill(barColor(remaining: remaining))
+                        .frame(width: geometry.size.width * remaining / 100, height: 6)
+                    if let timeLeft {
                         Rectangle().fill(T3Colors.textSecondary)
                             .frame(width: 1, height: 12)
-                            .offset(x: max(0, geometry.size.width - 1) * elapsed)
+                            .offset(x: max(0, geometry.size.width - 1) * timeLeft)
                     }
                 }
                 .frame(height: 12)
@@ -304,9 +304,9 @@ private struct UsageLimitWindowView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func barColor(used: Double) -> Color {
-        if used >= 90 { return T3Colors.danger }
-        if used >= 70 { return T3Colors.warning }
+    private func barColor(remaining: Double) -> Color {
+        if remaining <= 10 { return T3Colors.danger }
+        if remaining <= 30 { return T3Colors.warning }
         return driver == "claudeAgent"
             ? Color(red: 0.851, green: 0.467, blue: 0.341)
             : T3Colors.textPrimary

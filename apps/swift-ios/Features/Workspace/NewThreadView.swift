@@ -789,14 +789,14 @@ public struct NewThreadView: View {
     }
 
     @discardableResult
-    private func selectProject(_ id: String) -> Bool {
+    private func selectProject(_ id: String, carryingContent: FeatureComposerDraft? = nil) -> Bool {
         guard creationProjects.contains(where: { $0.id == id }) else { return false }
         projectSelectionIsExplicit = true
         isAwaitingRecentProject = false
         guard id != projectID else { return true }
         persistCurrentDraftImmediately()
         projectID = id
-        prepareProjectIfNeeded(id)
+        prepareProjectIfNeeded(id, carryingContent: carryingContent)
         return true
     }
 
@@ -816,7 +816,13 @@ public struct NewThreadView: View {
         guard selectedProject?.environmentID != id else { return }
         let project = selectedProjectGroup?.project(in: id)
         guard let project else { return }
-        selectProject(project.id)
+        selectProject(
+            project.id,
+            carryingContent: NewTaskDraftRestoreContext.content(
+                from: composerDraft,
+                forEnvironment: id
+            )
+        )
     }
 
     private func selectInitialProject(_ id: String) {
@@ -855,7 +861,7 @@ public struct NewThreadView: View {
         selectInitialProject(nextProjectID)
     }
 
-    private func prepareProjectIfNeeded(_ id: String) {
+    private func prepareProjectIfNeeded(_ id: String, carryingContent: FeatureComposerDraft? = nil) {
         guard draftRestoreContext?.projectID != id else { return }
 
         if selectionIsExplicit, let selection {
@@ -866,8 +872,8 @@ public struct NewThreadView: View {
         draftSaveError = nil
         draftSaveTask?.cancel()
         draftSaveTask = nil
-        prompt = ""
-        attachments = []
+        prompt = carryingContent?.text ?? ""
+        attachments = carryingContent?.attachments ?? []
         selectionIsExplicit = false
         workspaceSelectionIsExplicit = false
         branches = []
@@ -904,7 +910,8 @@ public struct NewThreadView: View {
         startFromOrigin = preferences.newWorktreesStartFromOrigin
         draftRestoreContext = NewTaskDraftRestoreContext(
             projectID: id,
-            baseline: FeatureComposerDraft()
+            baseline: carryingContent ?? FeatureComposerDraft(),
+            environmentID: project.environmentID
         )
     }
 
@@ -1010,7 +1017,9 @@ public struct NewThreadView: View {
         workspaceSelectionIsExplicit = liveWorkspaceSelectionIsExplicit
             || saved?.workspace != nil
         restoredDraftProjectID = requestedProjectID
-        if liveDraft != context.baseline {
+        if context.shouldCarryContent(into: saved) {
+            persistCurrentDraftImmediately()
+        } else if liveDraft != context.baseline {
             scheduleDraftSave()
         } else if saved != nil {
             model.attachmentUploads.syncOwner(
@@ -1200,12 +1209,38 @@ enum NewTaskDraftWriteFence {
     }
 }
 
-/// Captures the clean target-project state before its persisted draft is read.
-/// Async restore results can then merge live typing without ever borrowing state
-/// from the project that was previously selected.
+/// Keeps edits made during a draft read. A computer switch carries text and
+/// local attachments only when the target has no saved content of its own.
 struct NewTaskDraftRestoreContext: Equatable {
     let projectID: String
     let baseline: FeatureComposerDraft
+    var environmentID: String? = nil
+
+    static func content(
+        from draft: FeatureComposerDraft,
+        forEnvironment environmentID: String
+    ) -> FeatureComposerDraft {
+        FeatureComposerDraft(
+            text: draft.text,
+            attachments: draft.attachments.map { attachment in
+                var attachment = attachment
+                if attachment.uploadedReference?.environmentID != environmentID {
+                    attachment.uploadedReference = nil
+                }
+                return attachment
+            }
+        )
+    }
+
+    func shouldCarryContent(into saved: FeatureComposerDraft?) -> Bool {
+        let targetHasContent = saved.map {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !$0.attachments.isEmpty
+        } ?? false
+        return !targetHasContent && (
+            !baseline.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !baseline.attachments.isEmpty
+        )
+    }
 
     func merging(
         saved: FeatureComposerDraft?,
@@ -1213,13 +1248,26 @@ struct NewTaskDraftRestoreContext: Equatable {
         fallbackSelection: FeatureSelection? = nil,
         fallbackWorkspace: FeatureComposerWorkspaceDraft? = nil
     ) -> FeatureComposerDraft {
-        FeatureComposerDraftRestoration.merge(
-            saved: saved,
+        var target = saved
+        if shouldCarryContent(into: saved) {
+            target = saved ?? FeatureComposerDraft()
+            target?.text = baseline.text
+            target?.attachments = baseline.attachments
+        }
+        var restored = FeatureComposerDraftRestoration.merge(
+            saved: target,
             baseline: baseline,
             current: current,
             fallbackSelection: fallbackSelection,
             fallbackWorkspace: fallbackWorkspace
         )
+        if let environmentID {
+            restored.attachments = Self.content(
+                from: restored,
+                forEnvironment: environmentID
+            ).attachments
+        }
+        return restored
     }
 }
 

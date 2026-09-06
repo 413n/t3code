@@ -430,6 +430,110 @@ struct DailyUXNewTaskTests {
     }
 
     @Test
+    func computerSwitchCarriesLocalContentAndDropsAnotherServersUpload() {
+        let oldUpload = FeatureUploadedAttachmentReference(
+            environmentID: "source", attachmentID: "old-upload"
+        )
+        let currentUpload = FeatureUploadedAttachmentReference(
+            environmentID: "target", attachmentID: "target-upload"
+        )
+        let localFile = FeatureOwnedAttachmentFile(
+            fileName: "screenshot.png",
+            url: URL(fileURLWithPath: "/drafts/screenshot.png"),
+            byteCount: 1_024
+        )
+        let source = FeatureComposerDraft(
+            text: "Fix this screenshot",
+            attachments: [
+                FeatureDraftAttachment(
+                    ownedFile: localFile, thumbnailData: Data([0x01]),
+                    filename: "screenshot.png", mimeType: "image/png",
+                    uploadedReference: oldUpload
+                ),
+                FeatureDraftAttachment(
+                    data: Data([0x02]), filename: "target.png", mimeType: "image/png",
+                    uploadedReference: currentUpload
+                ),
+            ],
+            selection: FeatureSelection(providerID: "source-provider", modelID: "source-model"),
+            workspace: FeatureComposerWorkspaceDraft(
+                mode: .worktree, branch: "source-branch", worktreePath: "/source/tree",
+                startFromOrigin: false
+            )
+        )
+        let content = NewTaskDraftRestoreContext.content(from: source, forEnvironment: "target")
+        let context = NewTaskDraftRestoreContext(projectID: "target-project", baseline: content)
+        let targetSelection = FeatureSelection(providerID: "target-provider", modelID: "target-model")
+        let targetWorkspace = FeatureComposerWorkspaceDraft(
+            mode: .local, branch: nil, worktreePath: nil, startFromOrigin: true
+        )
+        let restored = context.merging(
+            saved: FeatureComposerDraft(selection: targetSelection, workspace: targetWorkspace),
+            current: content
+        )
+
+        #expect(context.shouldCarryContent(into: nil))
+        #expect(restored.text == source.text)
+        #expect(restored.attachments.map(\.id) == source.attachments.map(\.id))
+        #expect(restored.attachments[0].ownedFile == localFile)
+        #expect(restored.attachments[0].thumbnailData == Data([0x01]))
+        #expect(restored.attachments[0].uploadedReference == nil)
+        #expect(restored.attachments[1].uploadedReference == currentUpload)
+        #expect(restored.selection == targetSelection)
+        #expect(restored.workspace == targetWorkspace)
+        #expect(source.attachments[0].uploadedReference == oldUpload)
+    }
+
+    @Test
+    func computerSwitchKeepsExistingTargetDraftAndLiveEdits() {
+        let content = FeatureComposerDraft(text: "Prompt from the first computer")
+        let context = NewTaskDraftRestoreContext(projectID: "target-project", baseline: content)
+        let targetAttachment = FeatureDraftAttachment(
+            data: Data([0x01]), filename: "saved.png", mimeType: "image/png"
+        )
+        let saved = FeatureComposerDraft(
+            text: "Draft already on the target", attachments: [targetAttachment]
+        )
+
+        #expect(!context.shouldCarryContent(into: saved))
+        #expect(context.merging(saved: saved, current: content) == saved)
+        #expect(!context.shouldCarryContent(into: FeatureComposerDraft(attachments: [targetAttachment])))
+
+        let edited = context.merging(
+            saved: saved,
+            current: FeatureComposerDraft(text: "Typed while the target draft loaded")
+        )
+        #expect(edited.text == "Typed while the target draft loaded")
+        #expect(edited.attachments == [targetAttachment])
+
+        let cleared = context.merging(saved: nil, current: FeatureComposerDraft())
+        #expect(cleared.text.isEmpty)
+    }
+
+    @Test
+    func sharedProjectDraftRestorationDoesNotReuseAnotherEnvironmentsUpload() {
+        let source = FeatureComposerDraft(
+            text: "Shared repo draft",
+            attachments: [FeatureDraftAttachment(
+                data: Data([0x01]), filename: "screenshot.png", mimeType: "image/png",
+                uploadedReference: FeatureUploadedAttachmentReference(
+                    environmentID: "source", attachmentID: "source-upload"
+                )
+            )]
+        )
+        let content = NewTaskDraftRestoreContext.content(from: source, forEnvironment: "target")
+        let context = NewTaskDraftRestoreContext(
+            projectID: "target-project", baseline: content, environmentID: "target"
+        )
+        let restored = context.merging(saved: source, current: content)
+
+        #expect(restored.text == source.text)
+        #expect(restored.attachments[0].id == source.attachments[0].id)
+        #expect(restored.attachments[0].data == source.attachments[0].data)
+        #expect(restored.attachments[0].uploadedReference == nil)
+    }
+
+    @Test
     func passiveProjectsExposeTheirFullEnvironmentModelCatalogAndDefault() throws {
         let passiveDefault = FeatureSelection(
             providerID: "claudeAgent",

@@ -168,6 +168,10 @@ enum UsageLimitsMath {
         window.usedPercent.isFinite ? min(100, max(0, window.usedPercent)) : 0
     }
 
+    static func remainingPercent(_ window: ServerProviderUsageWindow) -> Double {
+        (100 - usedPercent(window)).rounded()
+    }
+
     static func elapsedShare(_ window: ServerProviderUsageWindow, now: Date) -> Double? {
         guard let minutes = window.windowDurationMins,
               minutes > 0,

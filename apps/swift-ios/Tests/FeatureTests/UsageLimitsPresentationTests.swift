@@ -90,6 +90,19 @@ struct UsageLimitsPresentationTests {
     }
 
     @Test
+    func remainingQuotaRoundsAfterSubtractingAndClampsServerValues() {
+        let cases: [(Double, Double)] = [
+            (0, 100), (25, 75), (25.5, 75), (89.6, 10), (100, 0), (-10, 100), (110, 0),
+        ]
+        for (used, expected) in cases {
+            let window = ServerProviderUsageWindow(
+                id: "session", kind: .session, label: "Session", usedPercent: used
+            )
+            #expect(UsageLimitsMath.remainingPercent(window) == expected)
+        }
+    }
+
+    @Test
     func reconnectKeepsBarsUntilThatEnvironmentAnswersAndThenClearsOldSources() throws {
         let previous = FeatureEnvironmentUsageLimits(
             environmentID: "environment", label: "Environment", providers: [try provider()],
