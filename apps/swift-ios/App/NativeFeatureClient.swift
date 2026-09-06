@@ -2181,6 +2181,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func saveSettings(_ settings: FeatureSettings) async throws {
         let data = try JSONEncoder().encode(settings)
         settingsStore.set(data, forKey: Self.settingsKey)
+        latestSnapshot?.settings = settings
     }
 
     func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws {
