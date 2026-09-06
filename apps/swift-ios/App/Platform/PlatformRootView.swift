@@ -202,21 +202,20 @@ struct PlatformRootView: View {
         lastNotificationPreference = preference
 
         Task {
-            let authorized: Bool
+            let authorized: Bool?
             if preference, previous == false {
-                // The model changes only after Settings is explicitly saved.
+                // Ask for permission when the user enables notifications.
                 authorized = await PlatformNotificationService.shared.requestAuthorization()
             } else {
                 authorized = await PlatformNotificationService.shared.synchronize(enabled: preference)
             }
-            guard preference, !authorized, model.snapshot.settings.notificationsEnabled else {
+            guard let authorized, preference, !authorized,
+                  model.snapshot.settings.notificationsEnabled else {
                 return
             }
 
             // Keep the app toggle honest when authorization is absent or revoked.
-            var settings = model.snapshot.settings
-            settings.notificationsEnabled = false
-            await model.saveSettings(settings)
+            await model.savePreference(\.notificationsEnabled, value: false)
         }
     }
 

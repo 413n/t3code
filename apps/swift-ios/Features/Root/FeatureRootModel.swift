@@ -94,6 +94,7 @@ public final class FeatureRootModel {
     private var lastPersistedSettings = FeatureSettings()
     private var settingsWriteTask: Task<Void, Error>?
     private var settingsWriteGeneration: UInt64 = 0
+    private var settingsChangeRevision: UInt64 = 0
 
     public init(
         client: any FeatureClient,
@@ -859,10 +860,12 @@ public final class FeatureRootModel {
     @discardableResult
     public func saveSettings(_ settings: FeatureSettings) async -> Bool {
         snapshot.settings = settings
+        settingsChangeRevision &+= 1
+        let revision = settingsChangeRevision
         let saved = await perform {
             try await enqueueSettingsWrite(settings)
         }
-        if !saved, snapshot.settings == settings {
+        if !saved, settingsChangeRevision == revision {
             snapshot.settings = lastPersistedSettings
         }
         return saved
@@ -887,12 +890,18 @@ public final class FeatureRootModel {
         }
     }
 
-    /// Applies appearance optimistically so selecting a theme updates every
-    /// surface immediately, then persists just that preference in the current
-    /// settings snapshot. Other unsaved Settings edits remain drafts.
+    /// Applies one preference immediately and queues it with any other pending changes.
+    @discardableResult
+    public func savePreference<Value>(
+        _ keyPath: WritableKeyPath<FeatureSettings, Value>,
+        value: Value
+    ) async -> Bool {
+        await saveSettingsChange { $0[keyPath: keyPath] = value }
+    }
+
     @discardableResult
     public func saveAppearance(_ appearance: FeatureAppearance) async -> Bool {
-        await savePresentationPreference { $0.appearance = appearance }
+        await savePreference(\.appearance, value: appearance)
     }
 
     @discardableResult
@@ -900,13 +909,13 @@ public final class FeatureRootModel {
         textSize: FeatureTextSizeAdjustment,
         codeSize: FeatureTextSizeAdjustment
     ) async -> Bool {
-        await savePresentationPreference {
+        await saveSettingsChange {
             $0.textSize = textSize
             $0.codeSize = codeSize
         }
     }
 
-    private func savePresentationPreference(
+    private func saveSettingsChange(
         _ change: (inout FeatureSettings) -> Void
     ) async -> Bool {
         let previous = snapshot.settings
@@ -914,14 +923,15 @@ public final class FeatureRootModel {
         change(&updated)
         guard updated != previous else { return true }
         snapshot.settings = updated
+        settingsChangeRevision &+= 1
+        let revision = settingsChangeRevision
 
         do {
             try await enqueueSettingsWrite(updated)
             return true
         } catch {
-            if snapshot.settings == updated {
-                snapshot.settings = lastPersistedSettings
-            }
+            guard settingsChangeRevision == revision else { return false }
+            snapshot.settings = lastPersistedSettings
             if !Self.isBenignCancellation(error) {
                 errorMessage = error.localizedDescription
             }

@@ -3,39 +3,23 @@ import SwiftUI
 public struct SettingsView: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
     @Bindable private var model: FeatureRootModel
-    @State private var settings: FeatureSettings
-    @State private var isSaving = false
-    @State private var appearanceSaveTask: Task<Bool, Never>?
-    @State private var textSizeSaveTask: Task<Bool, Never>?
     @State private var saveErrorMessage: String?
-    @State private var showingDiscardConfirmation = false
+    @State private var isPresented = false
 
     public init(model: FeatureRootModel) {
         self.model = model
-        _settings = State(initialValue: model.snapshot.settings)
-    }
-
-    static func shouldRollbackTextSizes(
-        currentTextSize: FeatureTextSizeAdjustment,
-        currentCodeSize: FeatureTextSizeAdjustment,
-        failedTextSize: FeatureTextSizeAdjustment,
-        failedCodeSize: FeatureTextSizeAdjustment
-    ) -> Bool {
-        currentTextSize == failedTextSize && currentCodeSize == failedCodeSize
     }
 
     public var body: some View {
         NavigationStack {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 36) {
-                    connectionSection
-                    generalSection
-                    preferencesSection
-                    textSizeSection
+                VStack(alignment: .leading, spacing: 28) {
+                    workspaceSection
+                    appSection
+                    activitySection
                     aboutSection
                 }
-                .padding(.top, 24)
-                .padding(.bottom, 36)
+                .padding(.vertical, 20)
             }
             .scrollDismissesKeyboard(.interactively)
             .background(T3Colors.background)
@@ -43,94 +27,75 @@ public struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .t3NavigationChrome()
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") {
-                        if hasUnsavedChanges {
-                            showingDiscardConfirmation = true
-                        } else {
-                            dismiss()
-                        }
-                    }
-                    .disabled(isSaving)
-                    .accessibilityHint(
-                        hasUnsavedChanges
-                            ? "Asks before discarding unsaved changes"
-                            : "Closes settings"
-                    )
-                }
-
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isSaving ? "Saving" : "Save", action: save)
-                        .disabled(!canSave)
-                        .accessibilityHint("Saves your preferences")
+                    Button("Done") { dismiss() }
+                        .accessibilityIdentifier("settings-done")
                 }
             }
-            .alert(
-                "Couldn’t save settings",
-                isPresented: Binding(
-                    get: { saveErrorMessage != nil },
-                    set: { if !$0 { saveErrorMessage = nil } }
-                )
-            ) {
-                Button("OK") { saveErrorMessage = nil }
-            } message: {
-                Text(saveErrorMessage ?? "Something went wrong.")
-            }
-            .confirmationDialog(
-                "Discard unsaved changes?",
-                isPresented: $showingDiscardConfirmation,
-                titleVisibility: .visible
-            ) {
-                Button("Discard changes", role: .destructive) { dismiss() }
-                Button("Keep editing", role: .cancel) {}
-            }
-            .onAppear {
-                model.setConnectionManagementPresented(true)
-            }
-            .onDisappear {
-                model.setConnectionManagementPresented(false)
-            }
-            .onChange(of: settings.appearance) { _, appearance in
-                saveAppearance(appearance)
-            }
-            .onChange(of: settings.textSize) { _, _ in saveTextSizes() }
-            .onChange(of: settings.codeSize) { _, _ in saveTextSizes() }
         }
-        .interactiveDismissDisabled(isSaving || hasUnsavedChanges)
+        .alert(
+            "Couldn't save settings",
+            isPresented: Binding(
+                get: { saveErrorMessage != nil },
+                set: { if !$0 { saveErrorMessage = nil } }
+            )
+        ) {
+            Button("OK") { saveErrorMessage = nil }
+        } message: {
+            Text(saveErrorMessage ?? "Try changing the setting again.")
+        }
+        .onAppear {
+            isPresented = true
+            model.setConnectionManagementPresented(true)
+        }
+        .onDisappear {
+            isPresented = false
+            model.setConnectionManagementPresented(false)
+        }
         .presentationBackground(T3Colors.background)
         .presentationDragIndicator(.visible)
         .t3CodeSizing(steps: model.snapshot.settings.codeSize.steps)
     }
 
-    private var connectionSection: some View {
-        SettingsSection(title: "Connection") {
-            NavigationLink {
-                ConnectionsView(model: model)
-            } label: {
-                SettingsNavigationRow(
-                    title: "Environments",
-                    value: environmentCountLabel,
-                    subtitle: environmentSummary.text,
-                    systemImage: "server.rack",
-                    statusColor: environmentSummary.color
-                )
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Environments")
-            .accessibilityValue(environmentAccessibilityValue)
-            .accessibilityHint("Manage saved environments")
-        }
-    }
-
-    private var generalSection: some View {
+    private var workspaceSection: some View {
         SettingsSection(title: "Workspace") {
             VStack(spacing: 0) {
+                NavigationLink {
+                    ConnectionsView(model: model)
+                } label: {
+                    SettingsNavigationRow(
+                        title: "Environments",
+                        value: environmentCountLabel,
+                        subtitle: environmentSummary.text,
+                        systemImage: "server.rack",
+                        statusColor: environmentSummary.color
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Environments")
+                .accessibilityValue(environmentAccessibilityValue)
+                .accessibilityHint("Manage saved environments")
+                settingsDivider
                 NavigationLink {
                     ProvidersSettingsView(model: model)
                 } label: {
                     SettingsNavigationRow(title: "Providers", systemImage: "cpu")
                 }
                 .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var activitySection: some View {
+        SettingsSection(title: "Activity") {
+            VStack(spacing: 0) {
+                NavigationLink {
+                    UsageView(client: model.client)
+                } label: {
+                    SettingsNavigationRow(title: "Usage", systemImage: "chart.bar.xaxis")
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Shows provider usage")
                 settingsDivider
                 NavigationLink {
                     PullRequestsView(model: model)
@@ -142,84 +107,47 @@ public struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint("Shows pull requests")
-                settingsDivider
-                NavigationLink {
-                    UsageView(client: model.client)
-                } label: {
-                    SettingsNavigationRow(
-                        title: "Usage",
-                        systemImage: "chart.bar.xaxis"
-                    )
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint("Shows provider usage")
             }
         }
     }
 
-    private var preferencesSection: some View {
-        SettingsSection(title: "Preferences") {
+    private var appSection: some View {
+        SettingsSection(title: "App") {
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    SettingsRowIcon(systemName: "circle.lefthalf.filled")
-                    Text("Theme")
-                        .font(T3Typography.threadBody)
-                        .foregroundStyle(T3Colors.textPrimary)
-                    Spacer(minLength: 12)
-                    Picker("Theme", selection: $settings.appearance) {
-                        Text("System").tag(FeatureAppearance.system)
-                        Text("Light").tag(FeatureAppearance.light)
-                        Text("Dark").tag(FeatureAppearance.dark)
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .tint(T3Colors.textSecondary)
-                    .accessibilityLabel("Theme")
+                NavigationLink {
+                    SettingsAppearanceView(
+                        appearance: preference(\.appearance),
+                        textSize: preference(\.textSize),
+                        codeSize: preference(\.codeSize)
+                    )
+                } label: {
+                    SettingsNavigationRow(
+                        title: "Appearance",
+                        systemImage: "circle.lefthalf.filled"
+                    )
                 }
-                .padding(.horizontal, 20)
-                .frame(minHeight: 56)
-
+                .buttonStyle(.plain)
+                .accessibilityHint("Theme, text size, and code size")
+                .accessibilityIdentifier("settings-appearance")
+                settingsDivider
+                NavigationLink {
+                    SettingsNotificationsView(
+                        notificationsEnabled: preference(\.notificationsEnabled),
+                        liveActivitiesEnabled: preference(\.liveActivitiesEnabled)
+                    )
+                } label: {
+                    SettingsNavigationRow(title: "Notifications", systemImage: "bell")
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Notifications and Live Activities")
+                .accessibilityIdentifier("settings-notifications")
                 settingsDivider
                 SettingsToggleRow(
                     title: "Haptics",
                     systemImage: "iphone.radiowaves.left.and.right",
-                    isOn: $settings.hapticsEnabled
+                    isOn: preference(\.hapticsEnabled)
                 )
-                settingsDivider
-                SettingsToggleRow(
-                    title: "Notifications",
-                    systemImage: "bell",
-                    isOn: $settings.notificationsEnabled
-                )
-                settingsDivider
-                SettingsToggleRow(
-                    title: "Live Activities",
-                    systemImage: "waveform.path.ecg.rectangle",
-                    isOn: $settings.liveActivitiesEnabled
-                )
-            }
-        }
-    }
-
-    private var textSizeSection: some View {
-        SettingsSection(
-            title: "Text & Code",
-            footer: "Sizes stay relative to your iOS Dynamic Type setting. Code size applies to code blocks, diffs, file contents, and tool output."
-        ) {
-            VStack(spacing: 0) {
-                SettingsTextSizePreview()
-                settingsDivider
-                SettingsTextSizeRow(
-                    title: "Text size",
-                    systemImage: "textformat.size",
-                    adjustment: $settings.textSize
-                )
-                settingsDivider
-                SettingsTextSizeRow(
-                    title: "Code size",
-                    systemImage: "chevron.left.forwardslash.chevron.right",
-                    adjustment: $settings.codeSize
-                )
+                .accessibilityIdentifier("settings-haptics")
             }
         }
     }
@@ -315,77 +243,104 @@ public struct SettingsView: View {
         return "\(version) (\(build))"
     }
 
-    private var hasUnsavedChanges: Bool {
-        settings != model.snapshot.settings
-    }
-
-    private var canSave: Bool {
-        !isSaving && hasUnsavedChanges
-    }
-
-    @MainActor
-    private func saveAppearance(_ appearance: FeatureAppearance) {
-        let previousSave = appearanceSaveTask
-        appearanceSaveTask = Task {
-            _ = await previousSave?.value
-
-            let didSave = await model.saveAppearance(appearance)
-            if !didSave, settings.appearance == appearance {
-                settings.appearance = model.snapshot.settings.appearance
-                saveErrorMessage = model.errorMessage
-                    ?? "Theme preference could not be saved."
+    private func preference<Value>(
+        _ keyPath: WritableKeyPath<FeatureSettings, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { model.snapshot.settings[keyPath: keyPath] },
+            set: { value in
+                // The model owns queued writes, including after this sheet closes.
+                Task {
+                    let didSave = await model.savePreference(keyPath, value: value)
+                    if !didSave, isPresented, let message = model.errorMessage {
+                        saveErrorMessage = message
+                        model.errorMessage = nil
+                    }
+                }
             }
-            return didSave
+        )
+    }
+}
+
+private struct SettingsAppearanceView: View {
+    @Binding var appearance: FeatureAppearance
+    @Binding var textSize: FeatureTextSizeAdjustment
+    @Binding var codeSize: FeatureTextSizeAdjustment
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                SettingsSection(title: "Theme") {
+                    Picker("Theme", selection: $appearance) {
+                        Text("System").tag(FeatureAppearance.system)
+                        Text("Light").tag(FeatureAppearance.light)
+                        Text("Dark").tag(FeatureAppearance.dark)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 20)
+                    .accessibilityIdentifier("settings-theme")
+                }
+                SettingsSection(
+                    title: "Text and code",
+                    footer: "Sizes follow your iOS text size. Code size also applies to diffs, files, and tool output."
+                ) {
+                    VStack(spacing: 12) {
+                        SettingsTextSizePreview()
+                        SettingsTextSizeRow(
+                            title: "Text size", systemImage: "textformat.size",
+                            adjustment: $textSize
+                        )
+                        .accessibilityIdentifier("settings-text-size")
+                        SettingsTextSizeRow(
+                            title: "Code size", systemImage: "chevron.left.forwardslash.chevron.right",
+                            adjustment: $codeSize
+                        )
+                        .accessibilityIdentifier("settings-code-size")
+                    }
+                }
+            }
+            .padding(.vertical, 20)
         }
+        .background(T3Colors.background)
+        .navigationTitle("Appearance")
+        .navigationBarTitleDisplayMode(.inline)
+        .t3NavigationChrome()
     }
+}
 
-    @MainActor
-    private func saveTextSizes() {
-        let textSize = settings.textSize
-        let codeSize = settings.codeSize
-        let previousSave = textSizeSaveTask
-        textSizeSaveTask = Task {
-            _ = await previousSave?.value
+private struct SettingsNotificationsView: View {
+    @Binding var notificationsEnabled: Bool
+    @Binding var liveActivitiesEnabled: Bool
 
-            let didSave = await model.saveTextSizes(textSize: textSize, codeSize: codeSize)
-            if !didSave,
-               Self.shouldRollbackTextSizes(
-                   currentTextSize: settings.textSize,
-                   currentCodeSize: settings.codeSize,
-                   failedTextSize: textSize,
-                   failedCodeSize: codeSize
-               ) {
-                settings.textSize = model.snapshot.settings.textSize
-                settings.codeSize = model.snapshot.settings.codeSize
-                saveErrorMessage = model.errorMessage
-                    ?? "Text size preference could not be saved."
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                SettingsToggleRow(
+                    title: "Notifications", systemImage: "bell",
+                    isOn: $notificationsEnabled
+                )
+                .accessibilityIdentifier("settings-notifications-enabled")
+                Divider()
+                    .overlay(T3Colors.separator)
+                    .padding(.leading, 54)
+                    .padding(.trailing, 20)
+                SettingsToggleRow(
+                    title: "Live Activities", systemImage: "waveform.path.ecg.rectangle",
+                    isOn: $liveActivitiesEnabled
+                )
+                .accessibilityIdentifier("settings-live-activities-enabled")
+                Text("Show thread progress on the Lock Screen and Dynamic Island.")
+                    .font(T3Typography.supporting)
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .padding(.leading, 54)
+                    .padding(.trailing, 20)
             }
-            return didSave
+            .padding(.vertical, 20)
         }
-    }
-
-    @MainActor
-    private func save() {
-        let pendingAppearanceSave = appearanceSaveTask
-        let pendingTextSizeSave = textSizeSaveTask
-        isSaving = true
-        Task {
-            let appearanceDidSave = await pendingAppearanceSave?.value ?? true
-            let textSizeDidSave = await pendingTextSizeSave?.value ?? true
-            if (!appearanceDidSave || !textSizeDidSave), !hasUnsavedChanges {
-                isSaving = false
-                return
-            }
-
-            let didSave = await model.saveSettings(settings)
-            isSaving = false
-            if didSave {
-                saveErrorMessage = nil
-                dismiss()
-            } else {
-                saveErrorMessage = model.errorMessage ?? "Settings could not be saved."
-            }
-        }
+        .background(T3Colors.background)
+        .navigationTitle("Notifications")
+        .navigationBarTitleDisplayMode(.inline)
+        .t3NavigationChrome()
     }
 }
 

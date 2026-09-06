@@ -143,7 +143,7 @@ struct FeatureRootModelTests {
     }
 
     @Test
-    func appearanceAppliesImmediatelyAndPersistsWithoutSavingTheDraft() async {
+    func appearanceAppliesImmediatelyAndPersists() async {
         let client = FeatureClientStub()
         let model = testRootModel(client: client)
 
@@ -182,6 +182,97 @@ struct FeatureRootModelTests {
 
         #expect(await model.saveTextSizes(textSize: .standard, codeSize: .standard))
         #expect(client.savedSettings.isEmpty)
+    }
+
+    @Test
+    func preferenceAutosavesMergeDifferentFieldsDuringSnapshotRefresh() async {
+        let gate = FeatureSettingsSaveGate()
+        let client = FeatureClientStub()
+        client.beforeSaveSettings = { await gate.enter() }
+        let model = testRootModel(client: client)
+
+        let firstSave = Task { await model.savePreference(\.hapticsEnabled, value: false) }
+        await gate.waitUntilCallCount(1)
+        let secondSave = Task {
+            await model.savePreference(\.textSize, value: FeatureTextSizeAdjustment(steps: 2))
+        }
+        await Task.yield()
+        #expect(model.snapshot.settings.hapticsEnabled == false)
+        #expect(model.snapshot.settings.textSize.steps == 2)
+        let requested = model.snapshot.settings
+
+        await model.reload()
+        #expect(model.snapshot.settings == requested)
+        gate.releaseFirst()
+        #expect(await firstSave.value)
+        #expect(await secondSave.value)
+        #expect(client.savedSettings.count == 2)
+        #expect(client.savedSettings.last == requested)
+        #expect(await model.savePreference(\.textSize, value: requested.textSize))
+        #expect(client.savedSettings.count == 2)
+    }
+
+    @Test
+    func preferenceAutosaveFailureRestoresTheLastSuccessfulWrite() async {
+        let firstGate = FeatureSettingsSaveGate()
+        let secondGate = FeatureSettingsSaveGate()
+        let client = FeatureClientStub()
+        var callCount = 0
+        client.beforeSaveSettings = {
+            callCount += 1
+            if callCount == 1 {
+                await firstGate.enter()
+                throw URLError(.cannotConnectToHost)
+            }
+            if callCount == 2 { await secondGate.enter() }
+        }
+        let model = testRootModel(client: client)
+
+        let firstSave = Task { await model.savePreference(\.appearance, value: .light) }
+        await firstGate.waitUntilCallCount(1)
+        let secondSave = Task { await model.savePreference(\.appearance, value: .dark) }
+        await Task.yield()
+        #expect(model.snapshot.settings.appearance == .dark)
+        let thirdSave = Task { await model.savePreference(\.appearance, value: .light) }
+        await Task.yield()
+        #expect(model.snapshot.settings.appearance == .light)
+        let requested = model.snapshot.settings
+        firstGate.releaseFirst()
+
+        await secondGate.waitUntilCallCount(1)
+        #expect(await firstSave.value == false)
+        // Equal values belong to separate edits. The older failure must not undo the latest one.
+        #expect(model.snapshot.settings == requested)
+        #expect(model.errorMessage == nil)
+        secondGate.releaseFirst()
+        #expect(await secondSave.value)
+        #expect(await thirdSave.value)
+        #expect(model.snapshot.settings == requested)
+        #expect(client.savedSettings.map(\.appearance) == [.dark, .light])
+        client.beforeSaveSettings = { throw URLError(.cannotConnectToHost) }
+        #expect(await model.savePreference(\.hapticsEnabled, value: false) == false)
+        #expect(model.snapshot.settings == requested)
+        #expect(client.savedSettings.last == requested)
+    }
+
+    @Test
+    func preferenceWriteFinishesIfItsCallerIsCancelled() async {
+        let gate = FeatureSettingsSaveGate()
+        let client = FeatureClientStub()
+        client.beforeSaveSettings = {
+            await gate.enter()
+            try Task.checkCancellation()
+        }
+        let model = testRootModel(client: client)
+
+        let save = Task { await model.savePreference(\.liveActivitiesEnabled, value: false) }
+        await gate.waitUntilCallCount(1)
+        save.cancel()
+        gate.releaseFirst()
+
+        #expect(await save.value)
+        #expect(model.snapshot.settings.liveActivitiesEnabled == false)
+        #expect(client.savedSettings.last?.liveActivitiesEnabled == false)
     }
 
     @Test

@@ -93,14 +93,36 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
 
     private let center: UNUserNotificationCenter
     private let tokenSink: any PlatformDeviceTokenSink
+    private let authorizationStatus: @MainActor () async -> UNAuthorizationStatus
+    private let authorizationRequest: @MainActor () async -> Bool
+    private let updateRemoteRegistration: @MainActor (Bool) -> Void
+    private var preferenceRevision: UInt64 = 0
     private(set) var enabled = false
 
     init(
         center: UNUserNotificationCenter = .current(),
-        tokenSink: (any PlatformDeviceTokenSink)? = nil
+        tokenSink: (any PlatformDeviceTokenSink)? = nil,
+        authorizationStatus: (@MainActor () async -> UNAuthorizationStatus)? = nil,
+        authorizationRequest: (@MainActor () async -> Bool)? = nil,
+        updateRemoteRegistration: (@MainActor (Bool) -> Void)? = nil
     ) {
         self.center = center
         self.tokenSink = tokenSink ?? PlatformPersistedDeviceTokenSink.shared
+        self.authorizationStatus = authorizationStatus ?? {
+            await center.notificationSettings().authorizationStatus
+        }
+        self.authorizationRequest = authorizationRequest ?? {
+            (try? await center.requestAuthorization(options: [.alert, .badge, .sound])) == true
+        }
+        self.updateRemoteRegistration = updateRemoteRegistration ?? { enabled in
+            if enabled {
+                UIApplication.shared.registerForRemoteNotifications()
+            } else {
+                UIApplication.shared.unregisterForRemoteNotifications()
+                center.removeAllPendingNotificationRequests()
+                center.removeAllDeliveredNotifications()
+            }
+        }
         super.init()
     }
 
@@ -108,38 +130,43 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
         center.delegate = self
     }
 
+    /// Returns nil when a newer preference change supersedes this check.
     @discardableResult
-    func synchronize(enabled: Bool) async -> Bool {
+    func synchronize(enabled: Bool) async -> Bool? {
         installDelegate()
+        preferenceRevision &+= 1
+        let revision = preferenceRevision
 
         guard enabled else {
             self.enabled = false
-            UIApplication.shared.unregisterForRemoteNotifications()
-            center.removeAllPendingNotificationRequests()
-            center.removeAllDeliveredNotifications()
+            updateRemoteRegistration(false)
             tokenSink.invalidated()
             return false
         }
 
-        let settings = await center.notificationSettings()
-        let authorized = isAuthorized(settings.authorizationStatus)
+        let status = await authorizationStatus()
+        guard preferenceRevision == revision else { return nil }
+        let authorized = isAuthorized(status)
         self.enabled = authorized
         if authorized {
-            UIApplication.shared.registerForRemoteNotifications()
+            updateRemoteRegistration(true)
         }
         return authorized
     }
 
-    /// Call only in response to an explicit user action such as saving the
+    /// Call only in response to an explicit user action such as enabling the
     /// Notifications toggle. Startup synchronization never presents a prompt.
     @discardableResult
-    func requestAuthorization() async -> Bool {
+    func requestAuthorization() async -> Bool? {
         installDelegate()
-        let settings = await center.notificationSettings()
+        preferenceRevision &+= 1
+        let revision = preferenceRevision
+        let status = await authorizationStatus()
+        guard preferenceRevision == revision else { return nil }
         let authorized: Bool
-        switch settings.authorizationStatus {
+        switch status {
         case .notDetermined:
-            authorized = (try? await center.requestAuthorization(options: [.alert, .badge, .sound])) == true
+            authorized = await authorizationRequest()
         case .authorized, .provisional, .ephemeral:
             authorized = true
         case .denied:
@@ -148,17 +175,20 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
             authorized = false
         }
 
+        guard preferenceRevision == revision else { return nil }
         enabled = authorized
         if authorized {
-            UIApplication.shared.registerForRemoteNotifications()
+            updateRemoteRegistration(true)
         }
         return authorized
     }
 
     func schedule(_ signal: PlatformThreadSignal) async {
         guard enabled else { return }
+        let revision = preferenceRevision
         let settings = await center.notificationSettings()
-        guard [.authorized, .provisional, .ephemeral].contains(settings.authorizationStatus) else {
+        guard enabled, preferenceRevision == revision,
+              [.authorized, .provisional, .ephemeral].contains(settings.authorizationStatus) else {
             return
         }
 
@@ -183,10 +213,12 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
     }
 
     func didRegisterForRemoteNotifications(deviceToken: Data) {
+        guard enabled else { return }
         tokenSink.registered(token: deviceToken.map { String(format: "%02x", $0) }.joined())
     }
 
     func didFailToRegisterForRemoteNotifications(_ error: Error) {
+        guard enabled else { return }
         tokenSink.registrationFailed(error)
     }
 

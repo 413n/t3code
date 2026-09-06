@@ -69,24 +69,4 @@ struct TextSizePreferenceTests {
         #expect(decoded.textSize.steps == 2)
         #expect(decoded.codeSize.steps == -1)
     }
-
-    @Test
-    func staleFailedSaveCannotRollbackANewerSliderChoice() {
-        #expect(
-            !SettingsView.shouldRollbackTextSizes(
-                currentTextSize: .init(steps: 3),
-                currentCodeSize: .init(steps: 1),
-                failedTextSize: .init(steps: 2),
-                failedCodeSize: .init(steps: 1)
-            )
-        )
-        #expect(
-            SettingsView.shouldRollbackTextSizes(
-                currentTextSize: .init(steps: 2),
-                currentCodeSize: .init(steps: 1),
-                failedTextSize: .init(steps: 2),
-                failedCodeSize: .init(steps: 1)
-            )
-        )
-    }
 }
