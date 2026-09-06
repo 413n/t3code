@@ -5114,7 +5114,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 backgroundWorkIsActive: backgroundWorkIsActive,
                 fallbackUpdatedAt: thread.updatedAt
             ),
-            latestTurnCompletedAt: thread.latestTurn?.completedAt.map(parseDate),
+            latestTurnCompletedAt: thread.latestTurn?.completedAt.flatMap(parseValidDate),
             settlementFacts: settlementFacts(
                 override: thread.settledOverride,
                 session: thread.session,
@@ -5195,7 +5195,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 backgroundWorkIsActive: backgroundWorkIsActive,
                 fallbackUpdatedAt: thread.updatedAt
             ),
-            latestTurnCompletedAt: thread.latestTurn?.completedAt.map(parseDate),
+            latestTurnCompletedAt: thread.latestTurn?.completedAt.flatMap(parseValidDate),
             settlementFacts: settlementFacts(
                 override: thread.settledOverride,
                 session: thread.session,
