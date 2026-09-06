@@ -813,8 +813,9 @@ export const make = Effect.gen(function* () {
   };
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuth["Service"]["exchangeBootstrapCredentialForAccessToken"] =
-    (credential, requestedScopes, requestMetadata, input) =>
-      resolveBootstrapGrant(credential, {
+    (credential, requestedScopesInput, requestMetadata, input) => {
+      const requestedScopes = requestedScopesInput?.length ? requestedScopesInput : undefined;
+      return resolveBootstrapGrant(credential, {
         ...input,
         ...(requestedScopes !== undefined ? { requestedScopes } : {}),
       }).pipe(
@@ -868,6 +869,7 @@ export const make = Effect.gen(function* () {
         ),
         Effect.withSpan("EnvironmentAuth.exchangeBootstrapCredentialForAccessToken"),
       );
+    };
 
   const issuePairingCredentialForSubject = (input: {
     readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
