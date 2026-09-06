@@ -5,6 +5,137 @@ import XCTest
 @MainActor
 @available(iOS 18.0, *)
 final class NativeThreadCatchUpTests: XCTestCase {
+    func testRequestSnapshotsKeepTerminalRequestsClosedAndOtherFailuresRetryable() async throws {
+        var activities: [OrchestrationActivity] = []
+        for kind in ["approval", "user-input"] {
+            activities += [
+                requestActivity("\(kind).resolved", id: "resolved-\(kind)"),
+                requestActivity("\(kind).requested", id: "resolved-\(kind)"),
+                requestActivity("\(kind).requested", id: "retry-\(kind)"),
+                requestActivity(
+                    "provider.\(kind).respond.failed", id: "retry-\(kind)",
+                    detail: "Unknown network failure with stale connection metadata"
+                ),
+            ]
+        }
+        let failures = [
+            "approval": [
+                "stale pending approval request", "unknown pending approval request",
+                "unknown pending permission request", "unknown pending codex approval request",
+            ],
+            "user-input": [
+                "stale pending user-input request", "unknown pending user-input request",
+                "unknown pending user input request", "unknown pending codex user input request",
+            ],
+        ]
+        for (kind, fragments) in failures {
+            for (index, fragment) in fragments.enumerated() {
+                let id = "stale-\(kind)-\(index)"
+                activities += [
+                    requestActivity("provider.\(kind).respond.failed", id: id, detail: fragment.uppercased()),
+                    requestActivity("\(kind).requested", id: id),
+                ]
+            }
+        }
+        activities += [
+            requestActivity("approval.requested", id: "legacy-file", requestType: "apply_patch_approval"),
+            requestActivity("approval.requested", id: "legacy-input", requestType: "tool_user_input"),
+            requestActivity("approval.requested", id: "legacy-auth", requestType: "auth_tokens_refresh"),
+        ]
+        let fixture = try await CatchUpFixture.make(activities: activities)
+        defer { fixture.cleanUp() }
+        let detail = try await fixture.client.loadThread(id: fixture.firstID)
+        XCTAssertEqual(Set(detail.approvals.compactMap(\.wireID)), ["retry-approval", "legacy-file"])
+        XCTAssertEqual(detail.approvals.first { $0.wireID == "legacy-file" }?.kind, .fileChange)
+        XCTAssertEqual(detail.userInputs.compactMap(\.wireID), ["retry-user-input"])
+        await fixture.client.disconnect()
+    }
+
+    func testLiveRequestsKeepTerminalStateAcrossBatchesAndResetWithSnapshots() async throws {
+        let resolved = ["approval", "user-input"].map {
+            requestActivity("\($0).resolved", id: "closed-\($0)")
+        }
+        let fixture = try await CatchUpFixture.make(activities: resolved)
+        defer { fixture.cleanUp() }
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        _ = try await fixture.client.loadThread(id: fixture.firstID)
+        let stream = try await nextThreadRequest(&requests)
+
+        var activities: [OrchestrationActivity] = []
+        for kind in ["approval", "user-input"] {
+            activities += [
+                requestActivity("\(kind).requested", id: "closed-\(kind)"),
+                requestActivity("\(kind).resolved", id: "live-\(kind)"),
+                requestActivity("\(kind).requested", id: "retry-\(kind)"),
+                requestActivity(
+                    "provider.\(kind).respond.failed", id: "retry-\(kind)",
+                    detail: "Unknown transport error"
+                ),
+            ]
+        }
+        try await stream.sendActivities(activities, startingAt: 3)
+        try await stream.synchronize()
+        let first = try await requestsBeforeLive(&events, threadID: fixture.firstID)
+        XCTAssertEqual(first.approvals.compactMap(\.wireID), ["retry-approval"])
+        XCTAssertEqual(first.userInputs.compactMap(\.wireID), ["retry-user-input"])
+
+        let lateRequests = ["approval", "user-input"].map {
+            requestActivity("\($0).requested", id: "live-\($0)")
+        }
+        try await stream.sendActivities(lateRequests, startingAt: 20)
+        try await stream.synchronize()
+        let second = try await requestsBeforeLive(&events, threadID: fixture.firstID)
+        XCTAssertEqual(second.approvals.compactMap(\.wireID), ["retry-approval"])
+        XCTAssertEqual(second.userInputs.compactMap(\.wireID), ["retry-user-input"])
+
+        // A replacement snapshot is authoritative, including its request history.
+        await fixture.http.setActivities(lateRequests)
+        let replaced = try await fixture.client.loadThread(id: fixture.firstID, fresh: true)
+        XCTAssertEqual(replaced.approvals.compactMap(\.wireID), ["live-approval"])
+        XCTAssertEqual(replaced.userInputs.compactMap(\.wireID), ["live-user-input"])
+        await fixture.client.disconnect()
+    }
+
+    private func requestActivity(
+        _ kind: String, id: String, detail: String? = nil, requestType: String? = nil
+    ) -> OrchestrationActivity {
+        var payload: [String: JSONValue] = ["requestId": .string(id)]
+        payload["detail"] = detail.map(JSONValue.string)
+        payload["requestType"] = requestType.map(JSONValue.string)
+        if kind == "user-input.requested" {
+            payload["questions"] = .array([.object([
+                "id": .string("choice"), "header": .string("Choice"),
+                "question": .string("Which option?"), "options": .array([
+                    .object(["label": .string("First"), "description": .string("First option")]),
+                ]),
+            ])])
+        }
+        return OrchestrationActivity(
+            id: UUID().uuidString, tone: "info", kind: kind, summary: kind,
+            payload: .object(payload), turnId: nil, sequence: nil,
+            createdAt: "2026-09-02T12:00:00Z"
+        )
+    }
+
+    private func requestsBeforeLive(
+        _ iterator: inout AsyncStream<FeatureEvent>.Iterator, threadID: String
+    ) async throws -> FeatureThreadDetail {
+        var latest: FeatureThreadDetail?
+        while let event = await iterator.next(isolation: #isolation) {
+            switch event {
+            case let .detail(detail), let .detailDelta(detail, _):
+                if detail.thread.id == threadID { latest = detail }
+            case .threadSync(threadID, .live): return try XCTUnwrap(latest)
+            case let .threadSync(id, .failed(message)) where id == threadID:
+                XCTFail("Request stream failed: \(message)")
+                throw CancellationError()
+            default: break
+            }
+        }
+        throw CancellationError()
+    }
+
     func testDomainFailureBacksOffAndKeepsItsErrorUntilTheStreamRecovers() async throws {
         let retry = CatchUpRetryGate()
         let fixture = try await CatchUpFixture.make(threadRetryDelay: { try await retry.wait($0) })
@@ -802,6 +933,7 @@ private struct CatchUpFixture {
 
     static func make(
         completionMarker: Bool = true,
+        activities: [OrchestrationActivity] = [],
         threadRetryDelay: @escaping @Sendable (Int) async throws -> Void = { _ in
             try await Task.sleep(for: .milliseconds(250))
         }
@@ -814,6 +946,7 @@ private struct CatchUpFixture {
         )])
         try await store.setActiveEnvironment(id: "one")
         let http = CatchUpHTTPTransport()
+        await http.setActivities(activities)
         let requests = AsyncStream<CatchUpRequest>.makeStream()
         let delay = CatchUpDelay()
         let runtime = EnvironmentRuntime(
@@ -841,6 +974,7 @@ private struct CatchUpFixture {
 private actor CatchUpHTTPTransport: HTTPTransport {
     private(set) var threadRequests: [URLRequest] = []
     private var messages: [OrchestrationMessage] = []
+    private var activities: [OrchestrationActivity] = []
     private var sequence = 2
     private var holdsThreadReads = false
     private let heldReadContinuation: AsyncStream<CatchUpHTTPRead>.Continuation
@@ -866,6 +1000,8 @@ private actor CatchUpHTTPTransport: HTTPTransport {
 
     func holdThreadReads(_ hold: Bool) { holdsThreadReads = hold }
 
+    func setActivities(_ activities: [OrchestrationActivity]) { self.activities = activities }
+
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let value: JSONValue
         switch request.url!.path {
@@ -883,9 +1019,14 @@ private actor CatchUpHTTPTransport: HTTPTransport {
                 throw URLError(.unsupportedURL)
             }
             threadRequests.append(request)
-            value = try .encode(multiEnvironmentDetail(
+            let snapshot = multiEnvironmentDetail(
                 projectID: "project", threadID: request.url!.lastPathComponent,
                 snapshotSequence: sequence, messages: messages
+            )
+            var thread = snapshot.thread
+            thread.activities = activities
+            value = try .encode(OrchestrationThreadDetailSnapshot(
+                snapshotSequence: snapshot.snapshotSequence, thread: thread, page: snapshot.page
             ))
         }
         let response = (try JSONEncoder.t3.encode(value), HTTPURLResponse(
@@ -961,6 +1102,22 @@ private struct CatchUpRequest: Sendable {
 
     func synchronize() async throws {
         try await socket.chunk(id: id, values: [.object(["kind": .string("synchronized")])])
+    }
+
+    func sendActivities(_ activities: [OrchestrationActivity], startingAt sequence: Int) async throws {
+        let values = try activities.enumerated().map { index, activity in
+            JSONValue.object([
+                "kind": .string("event"), "event": .object([
+                    "type": .string("thread.activity-appended"),
+                    "sequence": .number(Double(sequence + index)),
+                    "occurredAt": .string(activity.createdAt),
+                    "payload": .object([
+                        "threadId": payload["threadId"]!, "activity": try .encode(activity),
+                    ]),
+                ]),
+            ])
+        }
+        try await socket.chunk(id: id, values: values)
     }
 
     func invalidate(sequence: Int) async throws {

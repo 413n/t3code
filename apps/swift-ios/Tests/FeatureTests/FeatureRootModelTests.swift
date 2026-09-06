@@ -185,6 +185,63 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func snapshotRefreshPreservesPendingTextSizesAndLaterExternalSettings() async {
+        let gate = FeatureSettingsSaveGate()
+        let client = FeatureClientStub()
+        client.beforeSaveSettings = { await gate.enter() }
+        let model = testRootModel(client: client)
+
+        let save = Task {
+            await model.saveTextSizes(
+                textSize: FeatureTextSizeAdjustment(steps: 2),
+                codeSize: FeatureTextSizeAdjustment(steps: -1)
+            )
+        }
+        await gate.waitUntilCallCount(1)
+        let requestedSettings = model.snapshot.settings
+        client.snapshot.threads = [
+            FeatureThread(id: "refreshed", projectID: "project", title: "Updated thread")
+        ]
+        await model.reload()
+
+        #expect(model.snapshot.settings == requestedSettings)
+        #expect(model.snapshot.threads == client.snapshot.threads)
+        gate.releaseFirst()
+        #expect(await save.value)
+        #expect(model.snapshot.settings == requestedSettings)
+
+        client.snapshot.settings.appearance = .light
+        await model.reload()
+        #expect(model.snapshot.settings == client.snapshot.settings)
+    }
+
+    @Test
+    func staleSnapshotDuringFailedWriteKeepsLastSuccessfulSettings() async {
+        let gate = FeatureSettingsSaveGate()
+        let client = FeatureClientStub()
+        let model = testRootModel(client: client)
+        var persisted = model.snapshot.settings
+        persisted.hapticsEnabled = false
+        #expect(await model.saveSettings(persisted))
+        client.beforeSaveSettings = {
+            await gate.enter()
+            throw URLError(.cannotConnectToHost)
+        }
+
+        var requested = persisted
+        requested.textSize = FeatureTextSizeAdjustment(steps: 2)
+        let save = Task { await model.saveSettings(requested) }
+        await gate.waitUntilCallCount(1)
+        await model.reload()
+        #expect(model.snapshot.settings == requested)
+
+        gate.releaseFirst()
+        #expect(await save.value == false)
+        #expect(model.snapshot.settings == persisted)
+        #expect(client.savedSettings == [persisted])
+    }
+
+    @Test
     func orderedSettingsWritesPreserveNewerValues() async {
         let gate = FeatureSettingsSaveGate()
         let client = FeatureClientStub()

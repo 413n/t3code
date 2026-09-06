@@ -86,6 +86,46 @@ struct DailyUXSidebarTests {
     }
 
     @Test
+    func activeOrderKeepsNewThreadsAboveTheSavedManualOrder() {
+        var first = thread(id: "first", created: -500, updated: -500)
+        first.activeOrderKey = "bc"
+        var second = thread(id: "second", created: -100, updated: -100)
+        second.activeOrderKey = "mn"
+        let new = thread(id: "new", created: -200, updated: -200)
+        var reopened = thread(id: "reopened", created: -1_000, updated: -5)
+        reopened.unsettledAt = now.addingTimeInterval(-10)
+
+        #expect(makeIndex([second, new, first, reopened]).active.map(\.id)
+            == ["reopened", "new", "first", "second"])
+
+        first.updatedAt = now
+        second.unsettledAt = now
+        #expect(makeIndex([second, new, first, reopened]).active.map(\.id)
+            == ["reopened", "new", "first", "second"])
+    }
+
+    @Test
+    func activeOrderTiesUseWireThreadIDBeforeEnvironment() {
+        var first = thread(id: "z-env:a-thread", created: -100, updated: -100)
+        first.wireID = "a-thread"
+        first.environmentID = "z-env"
+        var second = thread(id: "a-env:z-thread", created: -100, updated: -100)
+        second.wireID = "z-thread"
+        second.environmentID = "a-env"
+        var sameWire = thread(id: "a-env:a-thread", created: -100, updated: -100)
+        sameWire.wireID = "a-thread"
+        sameWire.environmentID = "a-env"
+
+        let expected = [sameWire.id, first.id, second.id]
+        #expect(makeIndex([second, first, sameWire]).active.map(\.id) == expected)
+
+        first.activeOrderKey = "nm"
+        second.activeOrderKey = "nm"
+        sameWire.activeOrderKey = "nm"
+        #expect(makeIndex([second, first, sameWire]).active.map(\.id) == expected)
+    }
+
+    @Test
     func settlementShelfUsesOnlyTheServerOverride() {
         var explicitlySettled = thread(
             id: "explicit",

@@ -12,6 +12,9 @@ final class WireFixtureContractTests: XCTestCase {
         XCTAssertEqual(shell.projects.map(\.id), ["project-fixture"])
         XCTAssertEqual(shell.threads.map(\.id), ["thread-fixture"])
         XCTAssertEqual(shell.threads.first?.modelSelection.instanceId, "codex")
+        XCTAssertEqual(shell.threads.first?.branchPullRequest?.number, 42)
+        XCTAssertEqual(shell.threads.first?.branchPullRequest?.repository, "fixture/repository")
+        XCTAssertEqual(shell.threads.first?.activeOrderKey, "nm")
 
         let detail = try decodeFixture(
             "thread-detail-snapshot",
@@ -20,6 +23,8 @@ final class WireFixtureContractTests: XCTestCase {
         XCTAssertEqual(detail.thread.messages.map(\.id), ["message-fixture"])
         XCTAssertEqual(detail.page?.beforeCursor, "fixture-cursor")
         XCTAssertEqual(detail.page?.threadSequence, 40)
+        XCTAssertEqual(detail.thread.branchPullRequest, shell.threads.first?.branchPullRequest)
+        XCTAssertEqual(detail.thread.activeOrderKey, "nm")
 
         let shellItem = try decodeFixture(
             "shell-stream-snapshot",

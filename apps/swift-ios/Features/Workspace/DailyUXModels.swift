@@ -733,9 +733,18 @@ struct DailyUXSidebarIndex {
                     && !($0.supportsSettlement == true && $0.isEffectivelySettled())
             }
             .sorted { lhs, rhs in
+                switch (lhs.activeOrderKey, rhs.activeOrderKey) {
+                case (.none, .some): return true
+                case (.some, .none): return false
+                case let (.some(left), .some(right)):
+                    return left == right ? Self.activeIdentityOrder(lhs, rhs) : left < right
+                case (.none, .none): break
+                }
                 let leftAnchor = max(lhs.createdAt, lhs.unsettledAt ?? lhs.createdAt)
                 let rightAnchor = max(rhs.createdAt, rhs.unsettledAt ?? rhs.createdAt)
-                return leftAnchor == rightAnchor ? lhs.id < rhs.id : leftAnchor > rightAnchor
+                return leftAnchor == rightAnchor
+                    ? Self.activeIdentityOrder(lhs, rhs)
+                    : leftAnchor > rightAnchor
             }
 
         snoozed = visible
@@ -773,6 +782,13 @@ struct DailyUXSidebarIndex {
             return lhs.createdAt > rhs.createdAt
         }
         return lhs.id < rhs.id
+    }
+
+    private static func activeIdentityOrder(_ lhs: FeatureThread, _ rhs: FeatureThread) -> Bool {
+        let leftID = lhs.wireID ?? lhs.id
+        let rightID = rhs.wireID ?? rhs.id
+        if leftID != rightID { return leftID < rightID }
+        return (lhs.environmentID ?? "") < (rhs.environmentID ?? "")
     }
 
     static func matchingThreads(

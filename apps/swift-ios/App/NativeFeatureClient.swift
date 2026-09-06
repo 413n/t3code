@@ -3196,6 +3196,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            branchPullRequest: thread.branchPullRequest,
             latestTurn: thread.latestTurn,
             createdAt: thread.createdAt,
             updatedAt: thread.updatedAt,
@@ -3203,6 +3204,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settledOverride: thread.settledOverride,
             settledAt: thread.settledAt,
             unsettledAt: thread.unsettledAt,
+            activeOrderKey: thread.activeOrderKey,
             snoozedUntil: thread.snoozedUntil,
             snoozedAt: thread.snoozedAt,
             pinnedAt: thread.pinnedAt,
@@ -4772,7 +4774,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             fallbackUpdatedAt: shellThread.updatedAt
         )
         if shell.snapshotSequence >= (activeThreadSequence ?? .min) {
-            applySettlementAuthority(from: shellThread, to: &detail.thread)
+            applyShellMetadataAuthority(from: shellThread, to: &detail.thread)
             if let compaction = detailRenderCaches[threadID]?.compaction {
                 detail.isCompacting = compaction.isActive(
                     sessionStatus: shellThread.session?.status,
@@ -5041,8 +5043,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             var threadCountByProjectID: [String: Int] = [:]
             for thread in live { threadCountByProjectID[thread.projectID, default: 0] += 1 }
             for thread in cached { threadCountByProjectID[thread.projectID, default: 0] += 1 }
-            let mappedProjects = projection.projects.map(
-                shellsByEnvironmentID[environment.id]?.projects ?? []
+            let serverDefault = serverConfigsByEnvironmentID[environment.id]?.settings?.defaultModelSelection
+            let mappedProjects = projection.mapProjects(
+                shellsByEnvironmentID[environment.id]?.projects ?? [],
+                defaultModelSelection: serverDefault
             ) { project in
                 let uiID = FeatureScopedID.project(
                     environmentID: environment.id,
@@ -5055,7 +5059,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     name: project.title,
                     path: project.workspaceRoot,
                     threadCount: 0,
-                    defaultSelection: project.defaultModelSelection.map(mapSelection),
+                    defaultSelection: (project.defaultModelSelection ?? serverDefault).map(mapSelection),
                     repositoryIdentity: project.repositoryIdentity.map {
                         FeatureRepositoryIdentity(
                             canonicalKey: $0.canonicalKey,
@@ -5199,6 +5203,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            branchPullRequest: thread.branchPullRequest,
             createdAt: parseDate(thread.createdAt),
             updatedAt: parseDate(thread.updatedAt),
             state: Self.resolveThreadState(
@@ -5221,6 +5226,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             keepsActive: thread.settledOverride == "active",
             settledAt: thread.settledAt.map(parseDate),
             unsettledAt: thread.unsettledAt.flatMap(parseValidDate),
+            activeOrderKey: thread.activeOrderKey,
             lastActivityAt: lastActivityDate(
                 latestUserMessageAt: thread.latestUserMessageAt,
                 latestTurn: thread.latestTurn
@@ -5280,6 +5286,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            branchPullRequest: thread.branchPullRequest,
             createdAt: parseDate(thread.createdAt),
             updatedAt: parseDate(thread.updatedAt),
             state: Self.resolveThreadState(
@@ -5302,6 +5309,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             keepsActive: thread.settledOverride == "active",
             settledAt: thread.settledAt.map(parseDate),
             unsettledAt: thread.unsettledAt.flatMap(parseValidDate),
+            activeOrderKey: thread.activeOrderKey,
             lastActivityAt: lastActivityDate(
                 latestUserMessageAt: thread.messages.last(where: { $0.role == "user" })?.createdAt,
                 latestTurn: thread.latestTurn
@@ -5359,8 +5367,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 result[raw.id] = mapMessage(raw, environmentID: environment.id)
                 cache.compaction.apply(raw, createdAt: parseDate(raw.createdAt))
             }
-            cache.approvals = pendingApprovals(thread, environment: environment)
-            cache.userInputs = pendingUserInputs(thread, environment: environment)
+            resetPendingRequests(thread, environment: environment, cache: cache)
             let notices = thread.activities.compactMap { activity in
                 cache.compaction.apply(activity)
                 return NativeActivityNotice.message(activity, createdAt: parseDate(activity.createdAt))
@@ -5426,7 +5433,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if let shell = shellsByEnvironmentID[environment.id],
            let shellThread = shell.threads.first(where: { $0.id == thread.id }),
            shell.snapshotSequence >= sourceSequence {
-            applySettlementAuthority(from: shellThread, to: &mappedThread)
+            applyShellMetadataAuthority(from: shellThread, to: &mappedThread)
         }
         return FeatureThreadDetail(
             thread: mappedThread,
@@ -5609,6 +5616,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: loaded.branch,
             worktreePath: loaded.worktreePath,
             linkedPullRequest: loaded.linkedPullRequest,
+            branchPullRequest: loaded.branchPullRequest,
             latestTurn: loaded.latestTurn,
             createdAt: loaded.createdAt,
             updatedAt: loaded.updatedAt,
@@ -5616,6 +5624,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settledOverride: loaded.settledOverride,
             settledAt: loaded.settledAt,
             unsettledAt: loaded.unsettledAt,
+            activeOrderKey: loaded.activeOrderKey,
             snoozedUntil: loaded.snoozedUntil,
             snoozedAt: loaded.snoozedAt,
             pinnedAt: loaded.pinnedAt,
@@ -5755,6 +5764,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         switch activity.kind {
         case "approval.requested":
+            guard !cache.closedApprovalRequestIDs.contains(requestID),
+                  activity.payload["requestType"]?.stringValue != "tool_user_input",
+                  activity.payload["requestType"]?.stringValue != "auth_tokens_refresh" else {
+                return
+            }
             let kind = Self.approvalKind(activity.payload)
             let appName = activity.payload["appName"]?.stringValue
             let approval = FeatureApproval(
@@ -5775,11 +5789,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 wireID: requestID
             )
         case "approval.resolved":
+            cache.closedApprovalRequestIDs.insert(requestID)
             cache.approvals.removeAll { $0.id == uiRequestID }
             approvalRoutes[uiRequestID] = nil
         case "provider.approval.respond.failed":
-            let detail = activity.payload["detail"]?.stringValue?.lowercased() ?? ""
-            guard detail.contains("stale") || detail.contains("unknown") else { return }
+            guard Self.isTerminalRequestFailure(activity) else { return }
+            cache.closedApprovalRequestIDs.insert(requestID)
             cache.approvals.removeAll { $0.id == uiRequestID }
             approvalRoutes[uiRequestID] = nil
         default:
@@ -5800,7 +5815,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         switch activity.kind {
         case "user-input.requested":
-            guard let questions = parseInputQuestions(activity.payload), !questions.isEmpty else {
+            guard !cache.closedUserInputRequestIDs.contains(requestID),
+                  let questions = parseInputQuestions(activity.payload), !questions.isEmpty else {
                 return
             }
             let request = FeatureUserInput(
@@ -5817,11 +5833,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 wireID: requestID
             )
         case "user-input.resolved":
+            cache.closedUserInputRequestIDs.insert(requestID)
             cache.userInputs.removeAll { $0.id == uiRequestID }
             inputRoutes[uiRequestID] = nil
         case "provider.user-input.respond.failed":
-            let detail = activity.payload["detail"]?.stringValue?.lowercased() ?? ""
-            guard detail.contains("stale") || detail.contains("unknown") else { return }
+            guard Self.isTerminalRequestFailure(activity) else { return }
+            cache.closedUserInputRequestIDs.insert(requestID)
             cache.userInputs.removeAll { $0.id == uiRequestID }
             inputRoutes[uiRequestID] = nil
         default:
@@ -5877,63 +5894,66 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
-    private func pendingApprovals(
+    /// Snapshot replay and live updates share terminal request rules. Request IDs
+    /// are unique, so a late requested activity must not reopen a resolved request.
+    private func resetPendingRequests(
         _ thread: OrchestrationThread,
-        environment: Environment
-    ) -> [FeatureApproval] {
-        var open: [String: FeatureApproval] = [:]
+        environment: Environment,
+        cache: NativeDetailRenderCache
+    ) {
+        for approval in cache.approvals { approvalRoutes[approval.id] = nil }
+        for input in cache.userInputs { inputRoutes[input.id] = nil }
+        cache.approvals.removeAll(keepingCapacity: true)
+        cache.userInputs.removeAll(keepingCapacity: true)
+        cache.closedApprovalRequestIDs.removeAll(keepingCapacity: true)
+        cache.closedUserInputRequestIDs.removeAll(keepingCapacity: true)
         let threadID = FeatureScopedID.thread(
             environmentID: environment.id,
             wireID: thread.id
         )
         for activity in sortedByCreation(thread.activities) {
-            let requestID = activity.payload["requestId"]?.stringValue
-            let uiRequestID = requestID.map {
-                FeatureScopedID.approval(environmentID: environment.id, wireID: $0)
-            }
-            if activity.kind == "approval.requested", let requestID {
-                let kind = Self.approvalKind(activity.payload)
-                let detail = activity.payload["detail"]?.stringValue ?? activity.summary
-                let appName = activity.payload["appName"]?.stringValue
-                let uiRequestID = FeatureScopedID.approval(
-                    environmentID: environment.id,
-                    wireID: requestID
-                )
-                open[uiRequestID] = FeatureApproval(
-                    id: uiRequestID,
-                    wireID: requestID,
-                    threadID: threadID,
-                    kind: kind,
-                    title: appName ?? activity.summary,
-                    detail: detail,
-                    appName: appName,
-                    options: Self.approvalOptions(activity.payload)
-                )
-                approvalRoutes[uiRequestID] = PendingRequestRoute(
-                    threadID: threadID,
-                    wireID: requestID
-                )
-            } else if activity.kind == "approval.resolved", let uiRequestID {
-                open[uiRequestID] = nil
-                approvalRoutes[uiRequestID] = nil
-            } else if activity.kind == "provider.approval.respond.failed", let uiRequestID {
-                let detail = activity.payload["detail"]?.stringValue?.lowercased() ?? ""
-                if detail.contains("stale") || detail.contains("unknown") {
-                    open[uiRequestID] = nil
-                    approvalRoutes[uiRequestID] = nil
-                }
-            }
+            applyApprovalActivity(activity, threadID: threadID, environment: environment, cache: cache)
+            applyUserInputActivity(activity, threadID: threadID, environment: environment, cache: cache)
         }
-        return open.values.sorted { $0.id < $1.id }
+    }
+
+    private static func isTerminalRequestFailure(_ activity: OrchestrationActivity) -> Bool {
+        let fragments: [String]
+        switch activity.kind {
+        case "provider.approval.respond.failed":
+            fragments = [
+                "stale pending approval request",
+                "unknown pending approval request",
+                "unknown pending permission request",
+                "unknown pending codex approval request",
+            ]
+        case "provider.user-input.respond.failed":
+            fragments = [
+                "stale pending user-input request",
+                "unknown pending user-input request",
+                "unknown pending user input request",
+                "unknown pending codex user input request",
+            ]
+        default:
+            return false
+        }
+        let detail = activity.payload["detail"]?.stringValue?.lowercased() ?? ""
+        return fragments.contains { detail.contains($0) }
     }
 
     private static func approvalKind(_ payload: JSONValue) -> FeatureApprovalKind {
         switch payload["requestKind"]?.stringValue {
-        case "command": .command
-        case "file-read": .fileRead
-        case "file-change": .fileChange
-        case "mcp-elicitation": .mcpElicitation
-        default: .other
+        case "command": return .command
+        case "file-read": return .fileRead
+        case "file-change": return .fileChange
+        case "mcp-elicitation": return .mcpElicitation
+        default: break
+        }
+        switch payload["requestType"]?.stringValue {
+        case "file_read_approval": return .fileRead
+        case "file_change_approval", "apply_patch_approval": return .fileChange
+        case "mcp_elicitation_approval": return .mcpElicitation
+        default: return .command
         }
     }
 
@@ -5949,52 +5969,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             return FeatureApprovalOption(decision: decision, label: label)
         }
         return options.isEmpty ? nil : options
-    }
-
-    private func pendingUserInputs(
-        _ thread: OrchestrationThread,
-        environment: Environment
-    ) -> [FeatureUserInput] {
-        var open: [String: FeatureUserInput] = [:]
-        let threadID = FeatureScopedID.thread(
-            environmentID: environment.id,
-            wireID: thread.id
-        )
-        for activity in sortedByCreation(thread.activities) {
-            let requestID = activity.payload["requestId"]?.stringValue
-            let uiRequestID = requestID.map {
-                FeatureScopedID.input(environmentID: environment.id, wireID: $0)
-            }
-            if activity.kind == "user-input.requested",
-               let requestID,
-               let questions = parseInputQuestions(activity.payload),
-               !questions.isEmpty {
-                let uiRequestID = FeatureScopedID.input(
-                    environmentID: environment.id,
-                    wireID: requestID
-                )
-                open[uiRequestID] = FeatureUserInput(
-                    id: uiRequestID,
-                    wireID: requestID,
-                    threadID: threadID,
-                    questions: questions
-                )
-                inputRoutes[uiRequestID] = PendingRequestRoute(
-                    threadID: threadID,
-                    wireID: requestID
-                )
-            } else if activity.kind == "user-input.resolved", let uiRequestID {
-                open[uiRequestID] = nil
-                inputRoutes[uiRequestID] = nil
-            } else if activity.kind == "provider.user-input.respond.failed", let uiRequestID {
-                let detail = activity.payload["detail"]?.stringValue?.lowercased() ?? ""
-                if detail.contains("stale") || detail.contains("unknown") {
-                    open[uiRequestID] = nil
-                    inputRoutes[uiRequestID] = nil
-                }
-            }
-        }
-        return open.values.sorted { $0.id < $1.id }
     }
 
     private func parseInputQuestions(_ payload: JSONValue) -> [FeatureInputQuestion]? {
@@ -6096,7 +6070,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
     }
 
-    private func applySettlementAuthority(
+    private func applyShellMetadataAuthority(
         from shell: OrchestrationThreadShell,
         to thread: inout FeatureThread
     ) {
@@ -6104,6 +6078,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         thread.keepsActive = shell.settledOverride == "active"
         thread.settledAt = shell.settledAt.flatMap(parseValidDate)
         thread.unsettledAt = shell.unsettledAt.flatMap(parseValidDate)
+        thread.activeOrderKey = shell.activeOrderKey
+        thread.linkedPullRequest = shell.linkedPullRequest
+        thread.branchPullRequest = shell.branchPullRequest
         thread.settlementFacts = settlementFacts(
             override: shell.settledOverride,
             session: shell.session,
@@ -6303,6 +6280,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             .first(where: { $0.id == projectID })?
             .defaultModelSelection {
             return projectDefault
+        }
+        if let serverDefault = serverConfigsByEnvironmentID[environmentID]?.settings?.defaultModelSelection {
+            return serverDefault
         }
         return fallbackModelSelection(
             environmentID: environmentID,
@@ -6789,6 +6769,8 @@ private final class NativeDetailRenderCache {
     var workLogActivityIDs: Set<String> = []
     var approvals: [FeatureApproval] = []
     var userInputs: [FeatureUserInput] = []
+    var closedApprovalRequestIDs: Set<String> = []
+    var closedUserInputRequestIDs: Set<String> = []
     var subagents = FeatureActiveSubagentTracker()
     var compaction = NativeContextCompactionState()
 }
@@ -7104,17 +7086,17 @@ enum NativeThreadDetailReducer {
               let updatedAt = payload["updatedAt"]?.stringValue else {
             return .refresh
         }
-        return .updated(
-            replacing(
-                thread,
-                settlement: SettlementReplacement(
-                    override: "settled",
-                    settledAt: settledAt,
-                    unsettledAt: nil
-                ),
-                updatedAt: updatedAt
-            )
+        var updated = replacing(
+            thread,
+            settlement: SettlementReplacement(
+                override: "settled",
+                settledAt: settledAt,
+                unsettledAt: nil
+            ),
+            updatedAt: updatedAt
         )
+        updated.activeOrderKey = nil
+        return .updated(updated)
     }
 
     private static func reduceUnsettled(
@@ -7146,7 +7128,9 @@ enum NativeThreadDetailReducer {
         thread: OrchestrationThread
     ) -> NativeThreadDetailReductionResult {
         guard case let .object(values) = payload,
-              let rawLink = values["linkedPullRequest"] else {
+              values["linkedPullRequest"] != nil
+                || values["branchPullRequest"] != nil
+                || values["activeOrderKey"] != nil else {
             return .refresh
         }
         guard !["title", "modelSelection", "branch", "worktreePath"].contains(where: {
@@ -7154,20 +7138,41 @@ enum NativeThreadDetailReducer {
         }) else {
             return .refresh
         }
-        let linkedPullRequest: ThreadLinkedPullRequest?
-        if rawLink == .null {
-            linkedPullRequest = nil
-        } else {
-            guard let decoded = try? rawLink.decode(ThreadLinkedPullRequest.self) else {
-                return .refresh
-            }
-            linkedPullRequest = decoded
-        }
         var updated = replacing(
             thread,
             updatedAt: payload["updatedAt"]?.stringValue ?? occurredAt
         )
-        updated.linkedPullRequest = linkedPullRequest
+        if let rawLink = values["linkedPullRequest"] {
+            if rawLink == .null {
+                updated.linkedPullRequest = nil
+            } else {
+                guard let decoded = try? rawLink.decode(ThreadLinkedPullRequest.self) else {
+                    return .refresh
+                }
+                updated.linkedPullRequest = decoded
+            }
+        }
+        if let rawBranchLink = values["branchPullRequest"] {
+            if rawBranchLink == .null {
+                updated.branchPullRequest = nil
+            } else {
+                guard let decoded = try? rawBranchLink.decode(ThreadLinkedPullRequest.self) else {
+                    return .refresh
+                }
+                updated.branchPullRequest = decoded
+            }
+        }
+        if let rawOrder = values["activeOrderKey"] {
+            if rawOrder == .null {
+                updated.activeOrderKey = nil
+            } else {
+                guard let order = rawOrder.stringValue,
+                      !order.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return .refresh
+                }
+                updated.activeOrderKey = order
+            }
+        }
         return .updated(updated)
     }
 
@@ -7416,6 +7421,7 @@ enum NativeThreadDetailReducer {
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            branchPullRequest: thread.branchPullRequest,
             latestTurn: latestTurn ?? thread.latestTurn,
             createdAt: thread.createdAt,
             updatedAt: updatedAt,
@@ -7423,6 +7429,7 @@ enum NativeThreadDetailReducer {
             settledOverride: settlement == nil ? thread.settledOverride : settlement?.override,
             settledAt: settlement == nil ? thread.settledAt : settlement?.settledAt,
             unsettledAt: settlement == nil ? thread.unsettledAt : settlement?.unsettledAt,
+            activeOrderKey: thread.activeOrderKey,
             snoozedUntil: thread.snoozedUntil,
             snoozedAt: thread.snoozedAt,
             pinnedAt: thread.pinnedAt,
@@ -7493,7 +7500,20 @@ struct NativeShellProjection {
 
     private var threadContext: ThreadContext?
     private var threads = NativeShellRowProjection<OrchestrationThreadShell, FeatureThread>()
-    var projects = NativeShellRowProjection<OrchestrationProject, FeatureProject>()
+    private var projectDefaultModelSelection: ModelSelection?
+    private var projects = NativeShellRowProjection<OrchestrationProject, FeatureProject>()
+
+    mutating func mapProjects(
+        _ source: [OrchestrationProject],
+        defaultModelSelection: ModelSelection?,
+        transform: (OrchestrationProject) -> FeatureProject
+    ) -> [FeatureProject] {
+        if projectDefaultModelSelection != defaultModelSelection {
+            projects = NativeShellRowProjection()
+            projectDefaultModelSelection = defaultModelSelection
+        }
+        return projects.map(source, transform: transform)
+    }
 
     mutating func mapThreads(
         _ source: [OrchestrationThreadShell],

@@ -530,7 +530,7 @@ public struct ThreadDetailView: View {
             return
         }
 
-        if let linked = currentThread.linkedPullRequest,
+        if let linked = currentThread.effectivePullRequest,
            let environmentID = currentThread.environmentID {
             let target = FeaturePullRequestTarget(
                 environmentID: environmentID,
@@ -1256,7 +1256,7 @@ struct ThreadPullRequestDestination: Equatable {
         thread: FeatureThread,
         branchPullRequest: FeaturePullRequest?
     ) -> Self? {
-        if let linked = thread.linkedPullRequest,
+        if let linked = thread.effectivePullRequest,
            let url = URL(string: linked.url) {
             return Self(number: linked.number, url: url)
         }

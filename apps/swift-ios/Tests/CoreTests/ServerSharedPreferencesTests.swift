@@ -2,6 +2,16 @@ import XCTest
 @testable import T3Code
 
 final class ServerSharedPreferencesTests: XCTestCase {
+    func testMachineDefaultModelDecodesWithoutBecomingACrossMachinePreference() throws {
+        let selection = ModelSelection(instanceId: "claude-work", model: "claude-opus-5")
+        let settings = try JSONValue.object([
+            "defaultModelSelection": try JSONValue.encode(selection),
+        ]).decode(ServerSettingsSnapshot.self)
+        XCTAssertEqual(settings.defaultModelSelection, selection)
+        XCTAssertNil(settings.sharedPatch["defaultModelSelection"])
+        XCTAssertNil(try JSONValue.object([:]).decode(ServerSettingsSnapshot.self).defaultModelSelection)
+    }
+
     func testRestartContinuationDefaultsToOffOnOlderServers() throws {
         let settings = try JSONDecoder.t3.decode(ServerSettingsSnapshot.self, from: Data("{}".utf8))
         let capabilities = try JSONDecoder.t3.decode(

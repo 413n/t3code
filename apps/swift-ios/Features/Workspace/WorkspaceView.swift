@@ -985,7 +985,7 @@ struct HomeThreadPullRequestPresentation: Equatable {
 extension FeatureThread {
     var pullRequestObservationIdentity: String? {
         let environment = environmentID ?? ""
-        if let linkedPullRequest {
+        if let linkedPullRequest = effectivePullRequest {
             return [
                 id,
                 environment,
@@ -1256,7 +1256,7 @@ struct FeatureThreadRow: View {
             return
         }
 
-        if let linked = thread.linkedPullRequest,
+        if let linked = thread.effectivePullRequest,
            let environmentID = thread.environmentID {
             let target = FeaturePullRequestTarget(
                 environmentID: environmentID,

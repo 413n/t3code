@@ -72,10 +72,6 @@ public struct ProviderModelPicker: View {
                     Text(compactModelName)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let compactReasoningSummary {
-                        Text("· \(compactReasoningSummary)")
-                            .fixedSize()
-                    }
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 8, weight: .bold))
                         .fixedSize()
@@ -169,14 +165,6 @@ public struct ProviderModelPicker: View {
             return unavailableSelectionLabel
         }
         return selectedOption.model.name
-    }
-
-    private var compactReasoningSummary: String? {
-        guard let selectedOption, let resolvedSelection else { return nil }
-        return DailyUXModelOptions.reasoningSummary(
-            for: selectedOption.model,
-            selections: resolvedSelection.options
-        )
     }
 
     private var unavailableSelectionLabel: String {

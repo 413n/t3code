@@ -39,6 +39,13 @@ const threadShell = {
   interactionMode: "default",
   branch: "main",
   worktreePath: null,
+  branchPullRequest: {
+    projectId: project.id,
+    repository: "fixture/repository",
+    number: 42,
+    url: "https://example.com/fixture/repository/pull/42",
+  },
+  activeOrderKey: "nm",
   latestTurn: null,
   createdAt: timestamp,
   updatedAt: timestamp,

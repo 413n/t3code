@@ -460,6 +460,7 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let branch: String?
     public let worktreePath: String?
     public var linkedPullRequest: ThreadLinkedPullRequest? = nil
+    public var branchPullRequest: ThreadLinkedPullRequest? = nil
     public let latestTurn: OrchestrationLatestTurn?
     public let createdAt: String
     public let updatedAt: String
@@ -467,6 +468,7 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let settledOverride: String?
     public let settledAt: String?
     public var unsettledAt: String? = nil
+    public var activeOrderKey: String? = nil
     public let snoozedUntil: String?
     public let snoozedAt: String?
     public let pinnedAt: String?
@@ -535,6 +537,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     public let branch: String?
     public let worktreePath: String?
     public var linkedPullRequest: ThreadLinkedPullRequest? = nil
+    public var branchPullRequest: ThreadLinkedPullRequest? = nil
     public let latestTurn: OrchestrationLatestTurn?
     public let createdAt: String
     public let updatedAt: String
@@ -542,6 +545,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     public let settledOverride: String?
     public let settledAt: String?
     public var unsettledAt: String? = nil
+    public var activeOrderKey: String? = nil
     public let snoozedUntil: String?
     public let snoozedAt: String?
     public let pinnedAt: String?

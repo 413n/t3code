@@ -448,6 +448,7 @@ struct FeatureComposerView: View {
             if let traitsControl {
                 traitsPicker(traitsControl)
                     .frame(minWidth: 28, maxWidth: 148, alignment: .trailing)
+                    .fixedSize(horizontal: true, vertical: false)
                     .layoutPriority(2)
             }
 

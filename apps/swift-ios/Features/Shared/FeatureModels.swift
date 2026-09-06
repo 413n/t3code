@@ -268,6 +268,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var branch: String?
     public var worktreePath: String?
     public var linkedPullRequest: ThreadLinkedPullRequest?
+    public var branchPullRequest: ThreadLinkedPullRequest?
     public var createdAt: Date
     public var updatedAt: Date
     public var state: FeatureThreadState
@@ -280,6 +281,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var keepsActive: Bool
     public var settledAt: Date?
     public var unsettledAt: Date?
+    public var activeOrderKey: String?
     public var lastActivityAt: Date?
     public var snoozedUntil: Date?
     public var snoozedAt: Date?
@@ -307,6 +309,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         branch: String? = nil,
         worktreePath: String? = nil,
         linkedPullRequest: ThreadLinkedPullRequest? = nil,
+        branchPullRequest: ThreadLinkedPullRequest? = nil,
         createdAt: Date = .now,
         updatedAt: Date = .now,
         state: FeatureThreadState = .idle,
@@ -319,6 +322,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         keepsActive: Bool = false,
         settledAt: Date? = nil,
         unsettledAt: Date? = nil,
+        activeOrderKey: String? = nil,
         lastActivityAt: Date? = nil,
         snoozedUntil: Date? = nil,
         snoozedAt: Date? = nil,
@@ -345,6 +349,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.branch = branch
         self.worktreePath = worktreePath
         self.linkedPullRequest = linkedPullRequest
+        self.branchPullRequest = branchPullRequest
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.state = state
@@ -357,6 +362,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.keepsActive = keepsActive
         self.settledAt = settledAt
         self.unsettledAt = unsettledAt
+        self.activeOrderKey = activeOrderKey
         self.lastActivityAt = lastActivityAt
         self.snoozedUntil = snoozedUntil
         self.snoozedAt = snoozedAt
@@ -372,6 +378,10 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.settlementFacts = settlementFacts
         self.runtimeMode = runtimeMode
         self.interactionMode = interactionMode
+    }
+
+    public var effectivePullRequest: ThreadLinkedPullRequest? {
+        linkedPullRequest ?? branchPullRequest
     }
 
     /// Missing capabilities mean unsupported. Existing states remain reversible

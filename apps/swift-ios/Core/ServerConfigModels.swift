@@ -153,6 +153,7 @@ public enum ServerProjectGroupingMode: String, Codable, Equatable, Sendable {
 /// New-thread preferences are server-authoritative, so every saved environment
 /// can resolve these differently even though they share one mobile client.
 public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
+    public var defaultModelSelection: ModelSelection? = nil
     public let defaultThreadEnvMode: ServerThreadEnvironmentMode
     public let newWorktreesStartFromOrigin: Bool
     public let sidebarProjectGroupingMode: ServerProjectGroupingMode?
@@ -201,6 +202,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case defaultModelSelection
         case defaultThreadEnvMode
         case newWorktreesStartFromOrigin
         case sidebarProjectGroupingMode
@@ -214,6 +216,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        defaultModelSelection = try container.decodeIfPresent(ModelSelection.self, forKey: .defaultModelSelection)
         environmentIcon = try container.decodeIfPresent(String.self, forKey: .environmentIcon)
         sourceControlWritingStyle = try container.decodeIfPresent(JSONValue.self, forKey: .sourceControlWritingStyle)
         continueThreadsAfterServerUpdate = try container.decodeIfPresent(

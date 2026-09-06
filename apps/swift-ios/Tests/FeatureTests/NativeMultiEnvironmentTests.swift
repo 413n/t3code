@@ -215,6 +215,43 @@ final class NativeMultiEnvironmentTests: XCTestCase {
         await fixture.client.disconnect()
     }
 
+    func testMachineModelDefaultsRefreshCachedProjectsWithoutChangingOtherEnvironments() async throws {
+        let server = MultiEnvironmentConfigurationServer()
+        let fixture = try await Self.makeFixture(
+            webSocketConnector: MultiEnvironmentConfigurationConnector(server: server),
+            rpcConnectionWaitTimeout: .seconds(1),
+            fallbackPollingInitialDelay: .seconds(60),
+            aggregateRefreshInterval: .seconds(60)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let source = multiEnvironmentShell(projectID: "project-two", threadID: "thread-two", title: "Remote work")
+        var projectFields = try JSONValue.encode(source.projects[0]).decode([String: JSONValue].self)
+        projectFields["defaultModelSelection"] = .null
+        let project = try JSONValue.object(projectFields).decode(OrchestrationProject.self)
+        await fixture.transport.setShell(OrchestrationShellSnapshot(
+            snapshotSequence: source.snapshotSequence, projects: [project],
+            threads: source.threads, updatedAt: source.updatedAt
+        ), host: "two.example")
+        let initial = try await fixture.client.initialSnapshot()
+        XCTAssertNil(initial.projects.first { $0.environmentID == "two" }?.defaultSelection)
+        let localDefault = initial.projects.first { $0.environmentID == "one" }?.defaultSelection
+
+        for model in ["claude-opus-5", "claude-sonnet-5"] {
+            let selection = ModelSelection(instanceId: "claude-work", model: model)
+            try await fixture.client.updateServerPreferences(environmentID: "two", change: .sharedPreferences(.object([
+                "defaultModelSelection": try JSONValue.encode(selection),
+            ])))
+            let snapshot = try await fixture.client.initialSnapshot()
+            XCTAssertEqual(snapshot.projects.first { $0.environmentID == "two" }?.defaultSelection?.modelID, model)
+            XCTAssertEqual(snapshot.projects.first { $0.environmentID == "one" }?.defaultSelection, localDefault)
+        }
+
+        await fixture.transport.setShell(source, host: "two.example")
+        let overridden = try await fixture.client.initialSnapshot()
+        XCTAssertEqual(overridden.projects.first { $0.environmentID == "two" }?.defaultSelection?.modelID, "gpt-5.6-sol")
+        await fixture.client.disconnect()
+    }
+
     func testSharedSettingsFanOutDoesNotReplaceActiveThreads() async throws {
         let server = MultiEnvironmentConfigurationServer()
         let fixture = try await Self.makeFixture(

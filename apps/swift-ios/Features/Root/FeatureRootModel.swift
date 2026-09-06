@@ -1074,6 +1074,13 @@ public final class FeatureRootModel {
 
     private func install(_ value: FeatureSnapshot) {
         var value = value
+        if settingsWriteTask != nil {
+            // A shell refresh can still contain the settings from before a
+            // queued write. Keep both the visible choice and its rollback point.
+            value.settings = snapshot.settings
+        } else {
+            lastPersistedSettings = value.settings
+        }
         for index in value.threads.indices {
             value.threads[index] = retainingPendingSettlement(in: value.threads[index])
         }
@@ -1128,7 +1135,6 @@ public final class FeatureRootModel {
             threadCollectionRevision &+= 1
         }
         snapshot = value
-        lastPersistedSettings = value.settings
         if value.connection.state == .connected
             || value.environments.contains(where: { $0.connectionState == .connected }) {
             scheduleOutboxDrain()
