@@ -17,6 +17,7 @@ import {
 import {
   CommandId,
   defaultInstanceIdForDriver,
+  AuthOrchestrationOperateScope,
   ProviderDriverKind,
   ThreadId,
 } from "@t3tools/contracts";
@@ -1213,8 +1214,14 @@ function ImportStep({
   );
   const selected = candidates.filter((candidate) => selectedKeys.has(candidate.key));
 
-  const canImport = selected.every((candidate) => writableEnvironments.has(candidate.environmentId));
-  const visibleImportError = !canImport ? IMPORT_PERMISSION_MESSAGE : importError === IMPORT_PERMISSION_MESSAGE ? "" : importError;
+  const canImport = selected.every((candidate) =>
+    writableEnvironments.has(candidate.environmentId),
+  );
+  const visibleImportError = !canImport
+    ? IMPORT_PERMISSION_MESSAGE
+    : importError === IMPORT_PERMISSION_MESSAGE
+      ? ""
+      : importError;
 
   const finishAfterImport = () => {
     const projectRef = resolveOnboardingLandingProject(
@@ -1232,12 +1239,18 @@ function ImportStep({
 
   const runImport = async (selection: typeof candidates) => {
     if (isImporting) return;
-    const hasAccess = () => selection.every((candidate) => readEnvironmentScope(candidate.environmentId, AuthOrchestrationOperateScope));
+    const hasAccess = () =>
+      selection.every((candidate) =>
+        readEnvironmentScope(candidate.environmentId, AuthOrchestrationOperateScope),
+      );
     const stopForDeniedAccess = () => {
       setIsImporting(false);
       setImportError(IMPORT_PERMISSION_MESSAGE);
     };
-    if (!hasAccess()) { stopForDeniedAccess(); return; }
+    if (!hasAccess()) {
+      stopForDeniedAccess();
+      return;
+    }
     if (selection.length === 0) {
       void onDone();
       return;
@@ -1269,7 +1282,10 @@ function ImportStep({
       ) {
         return;
       }
-      if (!hasAccess()) { stopForDeniedAccess(); return; }
+      if (!hasAccess()) {
+        stopForDeniedAccess();
+        return;
+      }
       if (importedProjects.has(candidate.key)) continue;
       let projectId = resolveOnboardingProjectId(readProjects(), environmentId, candidate);
       if (projectId === null) {
@@ -1309,7 +1325,10 @@ function ImportStep({
         }
       }
 
-      if (!hasAccess()) { stopForDeniedAccess(); return; }
+      if (!hasAccess()) {
+        stopForDeniedAccess();
+        return;
+      }
       const threadImportResult = await importThreads({
         environmentId,
         input: { projectId, expectedWorkspaceRoot: candidate.path },
@@ -1459,7 +1478,9 @@ function ImportStep({
           })}
         </div>
       </ScrollArea>
-      {visibleImportError ? <p className="mt-3 text-sm text-destructive">{visibleImportError}</p> : null}
+      {visibleImportError ? (
+        <p className="mt-3 text-sm text-destructive">{visibleImportError}</p>
+      ) : null}
       <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
         <Button variant="ghost-muted" disabled={isImporting} onClick={finishAfterImport}>
           Do not import projects
