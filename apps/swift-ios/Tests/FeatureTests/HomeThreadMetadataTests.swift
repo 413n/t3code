@@ -4,6 +4,42 @@ import Testing
 
 @Suite("Web V2 home thread metadata")
 struct HomeThreadMetadataTests {
+    @Test
+    func providerAccountBadgesUseTheSessionAndOwningEnvironment() throws {
+        var personal = FeatureProvider(id: "codex", name: "Personal", driver: "codex")
+        personal.accentColor = " #12aBcD "
+        let work = FeatureProvider(id: "work", name: "Work Account", driver: "codex")
+        let otherComputer = FeatureProvider(id: "codex", name: "Codex", driver: "codex")
+        var snapshot = FeatureSnapshot(
+            threads: [
+                FeatureThread(id: "one", projectID: "p", environmentID: "one", title: "One", providerID: "codex"),
+                FeatureThread(id: "session", projectID: "p", environmentID: "one", title: "Session",
+                              providerID: "codex", sessionProviderID: "work"),
+                FeatureThread(id: "two", projectID: "p", environmentID: "two", title: "Two", providerID: "codex"),
+            ],
+            providersByEnvironment: ["one": [personal, work], "two": [otherComputer]]
+        )
+        let contexts = HomeThreadRowContext.index(snapshot: snapshot)
+        #expect(contexts["one"]?.providerBadge == ProviderAccountBadge(initials: "PE", accentColor: "#12aBcD"))
+        #expect(contexts["session"]?.providerName == "Work Account")
+        #expect(contexts["session"]?.providerBadge?.initials == "WA")
+        #expect(contexts["two"]?.providerBadge == nil)
+
+        personal.accentColor = "invalid"
+        snapshot.providersByEnvironment?["one"] = [personal]
+        #expect(HomeThreadRowContext.index(snapshot: snapshot)["one"]?.providerBadge == nil)
+    }
+
+    @Test
+    func providerInstanceNamesMatchTheSharedClientRules() {
+        #expect(ProviderInstanceDisplay.name(instanceID: "codex", driver: "codex", displayName: nil) == "Codex")
+        #expect(ProviderInstanceDisplay.name(instanceID: "codex_personal", driver: "codex", displayName: "Codex") == "Codex Personal")
+        #expect(ProviderInstanceDisplay.name(instanceID: "myWorkAccount", driver: "codex", displayName: nil) == "My Work Account")
+        #expect(ProviderInstanceDisplay.name(instanceID: "claudeAgent", driver: "claudeAgent", displayName: nil) == "Claude")
+        #expect(ProviderInstanceDisplay.initials("👩🏽‍💻 Team") == "👩🏽‍💻T")
+        #expect(ProviderInstanceDisplay.accentColor("#fff") == nil)
+    }
+
     private let now = Date(timeIntervalSince1970: 10_000)
 
     @Test

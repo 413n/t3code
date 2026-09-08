@@ -1,5 +1,43 @@
 import SwiftUI
 
+enum ProviderInstanceDisplay {
+    static func name(instanceID: String, driver: String, displayName: String?) -> String {
+        let brand = UsageLimitsPresentation.providerLabel(driver: driver)
+        let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty, trimmed != brand { return trimmed }
+        if instanceID != driver {
+            let label = instanceID
+                .replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression)
+                .replacingOccurrences(of: "[_-]+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: \.isWhitespace)
+                .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+                .joined(separator: " ")
+            if !label.isEmpty { return label }
+        }
+        if let trimmed, !trimmed.isEmpty { return trimmed }
+        return brand
+    }
+
+    static func initials(_ name: String) -> String {
+        let words = name.replacingOccurrences(of: "[_-]+", with: " ", options: .regularExpression)
+            .split(whereSeparator: \.isWhitespace)
+        if words.count == 1 { return String(words[0].prefix(2)).uppercased() }
+        return words.prefix(2).compactMap(\.first).map(String.init).joined().uppercased()
+    }
+
+    static func accentColor(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              value.range(of: "^#[0-9a-fA-F]{6}$", options: .regularExpression) != nil else { return nil }
+        return value
+    }
+}
+
+struct ProviderAccountBadge: Equatable {
+    let initials: String
+    let accentColor: String?
+}
+
 enum ProviderBrand: String {
     case openAI = "ProviderOpenAI"
     case claude = "ProviderClaude"
@@ -52,6 +90,7 @@ struct ProviderIcon: View {
     let providerID: String
     let fallbackName: String
     let size: CGFloat
+    var accountBadge: ProviderAccountBadge? = nil
 
     var body: some View {
         Group {
@@ -77,6 +116,20 @@ struct ProviderIcon: View {
             }
         }
         .frame(width: size, height: size)
+        .overlay(alignment: .bottomTrailing) {
+            if let accountBadge {
+                Text(accountBadge.initials)
+                    .font(.system(size: max(8, size * 0.45), weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 2)
+                    .frame(minWidth: 12, minHeight: 12)
+                    .background(badgeColor(accountBadge.accentColor), in: RoundedRectangle(cornerRadius: 3))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 3).stroke(T3Colors.background, lineWidth: 1)
+                    }
+                    .offset(x: 5, y: 5)
+            }
+        }
         .accessibilityHidden(true)
     }
 
@@ -84,5 +137,11 @@ struct ProviderIcon: View {
         fallbackName.trimmingCharacters(in: .whitespacesAndNewlines)
             .first
             .map { String($0).uppercased() } ?? "?"
+    }
+
+    private func badgeColor(_ value: String?) -> Color {
+        guard let value = ProviderInstanceDisplay.accentColor(value),
+              let rgb = UInt32(value.dropFirst(), radix: 16) else { return Color(white: 0.3) }
+        return Color(red: Double(rgb >> 16) / 255, green: Double((rgb >> 8) & 255) / 255, blue: Double(rgb & 255) / 255)
     }
 }

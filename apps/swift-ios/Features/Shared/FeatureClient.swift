@@ -60,6 +60,9 @@ public protocol FeatureClient: AnyObject {
         projectID: String,
         refresh: Bool
     ) async throws -> [FeatureWorkspaceBranch]
+    func selectWorkspaceBranch(
+        projectID: String, branch: FeatureWorkspaceBranch, mode: FeatureWorkspaceMode
+    ) async throws -> FeatureWorkspaceBranch
     func renameThread(id: String, title: String) async throws
     func regenerateThreadTitle(id: String) async throws
     func setThreadArchived(id: String, archived: Bool) async throws
@@ -465,6 +468,14 @@ public extension FeatureClient {
         refresh: Bool
     ) async throws -> [FeatureWorkspaceBranch] {
         []
+    }
+
+    func selectWorkspaceBranch(
+        projectID: String, branch: FeatureWorkspaceBranch, mode: FeatureWorkspaceMode
+    ) async throws -> FeatureWorkspaceBranch {
+        try await NewTaskWorkspaceDefaults.selectBranch(branch, mode: mode) { _ in
+            throw FeatureCapabilityUnavailable("Branch checkout")
+        }
     }
 
     /// Legacy clients still create in the current checkout. Native clients

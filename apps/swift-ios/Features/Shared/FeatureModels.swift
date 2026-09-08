@@ -273,6 +273,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var updatedAt: Date
     public var state: FeatureThreadState
     public var providerID: String?
+    public var sessionProviderID: String?
     public var providerName: String?
     public var modelID: String?
     public var modelOptions: [FeatureModelOptionSelection]
@@ -314,6 +315,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         updatedAt: Date = .now,
         state: FeatureThreadState = .idle,
         providerID: String? = nil,
+        sessionProviderID: String? = nil,
         providerName: String? = nil,
         modelID: String? = nil,
         modelOptions: [FeatureModelOptionSelection] = [],
@@ -354,6 +356,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.updatedAt = updatedAt
         self.state = state
         self.providerID = providerID
+        self.sessionProviderID = sessionProviderID
         self.providerName = providerName
         self.modelID = modelID
         self.modelOptions = modelOptions
@@ -940,6 +943,7 @@ public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Coda
     public var isInstalled: Bool? = nil
     public var authStatus: String? = nil
     public var statusMessage: String? = nil
+    public var accentColor: String? = nil
 
     func workspaceCatalog(cwd: String?) -> FeatureProviderWorkspace {
         if let cwd, let workspace = workspaceSnapshots?.first(where: { $0.cwd == cwd }) {

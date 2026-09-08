@@ -1272,6 +1272,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
+    func selectWorkspaceBranch(
+        projectID: String, branch: FeatureWorkspaceBranch, mode: FeatureWorkspaceMode
+    ) async throws -> FeatureWorkspaceBranch {
+        let route = try projectRoute(for: projectID)
+        let project = try project(for: route)
+        return try await NewTaskWorkspaceDefaults.selectBranch(branch, mode: mode) { name in
+            try await route.client.switchVCSRef(cwd: project.workspaceRoot, name: name).refName
+        }
+    }
+
     func createThread(
         projectID: String,
         title: String?,
@@ -5233,6 +5243,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 backgroundLiveness: backgroundLiveness
             ),
             providerID: thread.modelSelection.instanceId,
+            sessionProviderID: thread.session?.providerInstanceId,
             providerName: threadProviderName(
                 session: thread.session,
                 modelSelection: thread.modelSelection,
@@ -5316,6 +5327,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 backgroundLiveness: backgroundLiveness
             ),
             providerID: thread.modelSelection.instanceId,
+            sessionProviderID: thread.session?.providerInstanceId,
             providerName: threadProviderName(
                 session: thread.session,
                 modelSelection: thread.modelSelection,
@@ -6170,7 +6182,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         Self.normalizedProviders(providers.map { provider in
                 var mapped = FeatureProvider(
                     id: provider.instanceId,
-                    name: provider.displayName ?? providerDisplayName(provider.driver),
+                    name: ProviderInstanceDisplay.name(
+                        instanceID: provider.instanceId, driver: provider.driver,
+                        displayName: provider.displayName
+                    ),
                     isAvailable: provider.enabled
                         && provider.installed
                         && provider.status != "disabled"
@@ -6208,6 +6223,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     skills: (provider.skills ?? []).map(Self.mapSkill)
                 )
                 mapped.setup = provider.setup
+                mapped.accentColor = ProviderInstanceDisplay.accentColor(provider.accentColor)
                 mapped.isEnabled = provider.enabled
                 mapped.isInstalled = provider.installed
                 mapped.authStatus = provider.auth.status

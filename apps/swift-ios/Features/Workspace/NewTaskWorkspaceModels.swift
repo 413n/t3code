@@ -54,6 +54,25 @@ public struct FeatureWorkspaceBranch: Identifiable, Sendable, Equatable, Hashabl
 }
 
 enum NewTaskWorkspaceDefaults {
+    /// Existing worktrees already identify a checkout. A new worktree only needs its base.
+    @MainActor
+    static func selectBranch(
+        _ branch: FeatureWorkspaceBranch,
+        mode: FeatureWorkspaceMode,
+        checkout: (String) async throws -> String?
+    ) async throws -> FeatureWorkspaceBranch {
+        guard mode == .local, !branch.isCurrent,
+              branch.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
+            return branch
+        }
+        let checkedOutName = try await checkout(branch.name)
+        var checkedOut = branch
+        checkedOut.name = checkedOutName ?? branch.name
+        checkedOut.isRemote = false
+        checkedOut.isCurrent = true
+        return checkedOut
+    }
+
     static func localBranch(in branches: [FeatureWorkspaceBranch]) -> FeatureWorkspaceBranch? {
         branches.first { $0.isCurrent }
             ?? branches.first { $0.isDefault && !$0.isRemote }

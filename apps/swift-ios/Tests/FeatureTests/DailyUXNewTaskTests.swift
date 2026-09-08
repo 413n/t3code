@@ -5,6 +5,47 @@ import UIKit
 
 @Suite("Message-first task creation")
 struct DailyUXNewTaskTests {
+    @Test @MainActor
+    func branchSelectionOnlyChecksOutLocalBranchesWithoutAWorktree() async throws {
+        let branches = [
+            FeatureWorkspaceBranch(name: "current", isCurrent: true),
+            FeatureWorkspaceBranch(name: "existing", worktreePath: "/worktrees/existing"),
+        ]
+        var calls: [String] = []
+        for branch in branches {
+            let result = try await NewTaskWorkspaceDefaults.selectBranch(branch, mode: .local) {
+                calls.append($0)
+                return $0
+            }
+            #expect(result == branch)
+        }
+        let remote = FeatureWorkspaceBranch(name: "origin/feature", isRemote: true)
+        let base = try await NewTaskWorkspaceDefaults.selectBranch(remote, mode: .worktree) {
+            calls.append($0)
+            return $0
+        }
+        #expect(base == remote)
+        #expect(calls.isEmpty)
+
+        let checkedOut = try await NewTaskWorkspaceDefaults.selectBranch(remote, mode: .local) {
+            calls.append($0)
+            return "feature"
+        }
+        #expect(calls == ["origin/feature"])
+        #expect(checkedOut.name == "feature")
+        #expect(checkedOut.isCurrent)
+        #expect(!checkedOut.isRemote)
+
+        do {
+            _ = try await NewTaskWorkspaceDefaults.selectBranch(remote, mode: .local) { _ in
+                throw URLError(.notConnectedToInternet)
+            }
+            Issue.record("A failed checkout must not return a new selection")
+        } catch {
+            #expect((error as? URLError)?.code == .notConnectedToInternet)
+        }
+    }
+
     @Test
     func recentProjectRankingDrivesTheDefaultAndKeepsUnusedProjectsOut() {
         let alpha = rankedProject("alpha", name: "Alpha")

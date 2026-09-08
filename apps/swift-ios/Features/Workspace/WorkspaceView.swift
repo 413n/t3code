@@ -836,6 +836,7 @@ struct HomeThreadRowContext: Equatable {
     let providerDriver: String
     let providerName: String
     let connectionState: FeatureConnection.State?
+    var providerBadge: ProviderAccountBadge? = nil
 
     static let fallback = HomeThreadRowContext(
         projectName: "Project",
@@ -880,6 +881,22 @@ struct HomeThreadRowContext: Equatable {
         let environmentByID = snapshot.environments.reduce(into: [String: FeatureEnvironment]()) {
             $0[$1.id] = $1
         }
+        let providersByEnvironment = (snapshot.providersByEnvironment ?? [:]).mapValues { providers in
+            providers.reduce(into: [String: FeatureProvider]()) { result, provider in
+                if result[provider.id] == nil { result[provider.id] = provider }
+            }
+        }
+        let badgesByEnvironment = providersByEnvironment.mapValues { providers in
+            let counts = providers.values.reduce(into: [String: Int]()) { $0[$1.driver, default: 0] += 1 }
+            return providers.reduce(into: [String: ProviderAccountBadge]()) { result, entry in
+                let provider = entry.value
+                let accent = ProviderInstanceDisplay.accentColor(provider.accentColor)
+                guard accent != nil || counts[provider.driver, default: 0] > 1 else { return }
+                result[provider.id] = ProviderAccountBadge(
+                    initials: ProviderInstanceDisplay.initials(provider.name), accentColor: accent
+                )
+            }
+        }
         return snapshot.threads.reduce(into: [String: HomeThreadRowContext]()) { result, thread in
             let project = projectByID[thread.projectID]
             let normalizedThreadEnvironmentID = thread.environmentID?
@@ -892,17 +909,18 @@ struct HomeThreadRowContext: Equatable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let explicitProvider = thread.providerName?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let configuredProvider = thread.providerID.flatMap { providerID in
+            let instanceID = thread.sessionProviderID ?? thread.providerID
+            let configuredProvider = instanceID.flatMap { providerID in
                 environmentID.flatMap {
-                    snapshot.providersByEnvironment?[$0]?.first(where: { $0.id == providerID })
+                    providersByEnvironment[$0]?[providerID]
                 }
             }
-            let providerName = (explicitProvider?.isEmpty == false ? explicitProvider : nil)
-                ?? configuredProvider?.name
-                ?? thread.providerID
+            let providerName = configuredProvider?.name
+                ?? (explicitProvider?.isEmpty == false ? explicitProvider : nil)
+                ?? instanceID
                 ?? "Agent"
-            let providerID = thread.providerID ?? providerName
-            let providerDriver = configuredProvider?.driver ?? thread.providerID ?? ""
+            let providerID = instanceID ?? providerName
+            let providerDriver = configuredProvider?.driver ?? instanceID ?? ""
 
             let connectionState = environment?.isEnabled == false
                 ? FeatureConnection.State.disconnected
@@ -917,7 +935,8 @@ struct HomeThreadRowContext: Equatable {
                 providerID: providerID,
                 providerDriver: providerDriver,
                 providerName: providerName,
-                connectionState: connectionState
+                connectionState: connectionState,
+                providerBadge: environmentID.flatMap { badgesByEnvironment[$0]?[providerID] }
             )
         }
     }
@@ -1334,7 +1353,8 @@ struct FeatureThreadRow: View {
             driver: context.providerDriver,
             providerID: context.providerID,
             fallbackName: context.providerName,
-            size: size
+            size: size,
+            accountBadge: context.providerBadge
         )
     }
 

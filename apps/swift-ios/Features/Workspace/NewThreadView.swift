@@ -25,6 +25,8 @@ public struct NewThreadView: View {
     @State private var startFromOrigin = true
     @State private var branchesLoading = false
     @State private var branchLoadFailed = false
+    @State private var isSwitchingBranch = false
+    @State private var branchSelectionError: String?
     @State private var activePicker: NewTaskPicker?
     @State private var isSubmitting = false
     @State private var submissionFailed = false
@@ -216,14 +218,15 @@ public struct NewThreadView: View {
                 )
             case .branch:
                 NewTaskBranchPicker(
+                    title: workspaceMode == .local ? "Branch" : "Base branch",
                     branches: branches,
                     selection: selectedBranch,
                     isLoading: branchesLoading,
                     loadFailed: branchLoadFailed,
+                    isSwitching: isSwitchingBranch,
+                    selectionError: branchSelectionError,
                     onSelect: { branch in
-                        workspaceSelectionIsExplicit = true
-                        selectedBranch = branch
-                        activePicker = nil
+                        Task { await selectBranch(branch) }
                     },
                     onRefresh: { Task { await loadBranches(refresh: true) } }
                 )
@@ -236,7 +239,7 @@ public struct NewThreadView: View {
         } message: {
             Text("Check your connection and try again.")
         }
-        .interactiveDismissDisabled(isSubmitting)
+        .interactiveDismissDisabled(isSubmitting || isSwitchingBranch)
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
     }
@@ -514,7 +517,6 @@ public struct NewThreadView: View {
                 .accessibilityLabel("Workspace")
                 .accessibilityValue(workspaceMode.title)
 
-                if workspaceMode == .worktree {
                     Button {
                         presentPicker(.branch)
                     } label: {
@@ -526,10 +528,11 @@ public struct NewThreadView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(isSubmitting)
-                    .accessibilityLabel("Base branch")
+                    .disabled(isSubmitting || isSwitchingBranch)
+                    .accessibilityLabel(workspaceMode == .local ? "Branch" : "Base branch")
                     .accessibilityValue(selectedBranch?.name ?? "Not selected")
 
+                if workspaceMode == .worktree {
                     Button {
                         workspaceSelectionIsExplicit = true
                         startFromOrigin.toggle()
@@ -549,11 +552,6 @@ public struct NewThreadView: View {
                     .disabled(isSubmitting)
                     .accessibilityLabel("Start from latest origin")
                     .accessibilityValue(startFromOrigin ? "On" : "Off")
-                } else if let selectedBranch {
-                    Label(selectedBranch.name, systemImage: "arrow.triangle.branch")
-                        .lineLimit(1)
-                        .foregroundStyle(T3Colors.textTertiary)
-                        .accessibilityLabel("Current branch, \(selectedBranch.name)")
                 }
             }
             .padding(.horizontal, 18)
@@ -716,7 +714,7 @@ public struct NewThreadView: View {
     }
 
     private var canSubmit: Bool {
-        !isSubmitting && submissionValidationMessage == nil
+        !isSubmitting && !isSwitchingBranch && submissionValidationMessage == nil
     }
 
     private var submissionValidationMessage: String? {
@@ -771,6 +769,7 @@ public struct NewThreadView: View {
     }
 
     private func presentPicker(_ picker: NewTaskPicker) {
+        branchSelectionError = nil
         restoresPromptAfterPickerDismissal = promptFocused
         promptFocused = false
         activePicker = picker
@@ -979,6 +978,38 @@ public struct NewThreadView: View {
         selectedBranch = switch mode {
         case .local: NewTaskWorkspaceDefaults.localBranch(in: branches)
         case .worktree: NewTaskWorkspaceDefaults.worktreeBase(in: branches)
+        }
+    }
+
+    @MainActor
+    private func selectBranch(_ branch: FeatureWorkspaceBranch) async {
+        guard !isSwitchingBranch else { return }
+        let requestedProjectID = projectID
+        let requestedMode = workspaceMode
+        isSwitchingBranch = true
+        branchSelectionError = nil
+        defer { isSwitchingBranch = false }
+        do {
+            let selected = try await model.client.selectWorkspaceBranch(
+                projectID: requestedProjectID, branch: branch, mode: requestedMode
+            )
+            guard projectID == requestedProjectID, workspaceMode == requestedMode else { return }
+            workspaceSelectionIsExplicit = true
+            selectedBranch = selected
+            // A checkout can change a remote ref into a local one.
+            if selected.isCurrent {
+                branches = branches.map { existing in
+                    if existing.id == branch.id { return selected }
+                    var other = existing
+                    if other.isCurrent { other.worktreePath = nil }
+                    other.isCurrent = false
+                    return other
+                }
+            }
+            activePicker = nil
+        } catch {
+            guard projectID == requestedProjectID else { return }
+            branchSelectionError = error.localizedDescription
         }
     }
 
@@ -1556,10 +1587,13 @@ private struct NewTaskProjectPicker: View {
 private struct NewTaskBranchPicker: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
 
+    let title: String
     let branches: [FeatureWorkspaceBranch]
     let selection: FeatureWorkspaceBranch?
     let isLoading: Bool
     let loadFailed: Bool
+    let isSwitching: Bool
+    let selectionError: String?
     let onSelect: (FeatureWorkspaceBranch) -> Void
     let onRefresh: () -> Void
 
@@ -1622,6 +1656,7 @@ private struct NewTaskBranchPicker: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(isSwitching)
                         .accessibilityLabel(
                             branch.badge.map { "\(branch.name), \($0)" } ?? branch.name
                         )
@@ -1637,23 +1672,35 @@ private struct NewTaskBranchPicker: View {
                 }
             }
             .background(T3Colors.background)
-            .navigationTitle("Base branch")
+            .safeAreaInset(edge: .bottom) {
+                if isSwitching || selectionError != nil {
+                    Text(isSwitching ? "Switching branch..." : selectionError ?? "")
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(selectionError == nil ? T3Colors.textSecondary : T3Colors.danger)
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(T3Colors.background)
+                }
+            }
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query, prompt: "Search branches")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .disabled(isSwitching)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button(action: onRefresh) {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(isLoading)
+                    .disabled(isLoading || isSwitching)
                     .accessibilityLabel("Refresh branches")
                 }
             }
         }
         .presentationDetents([.medium, .large])
+        .interactiveDismissDisabled(isSwitching)
         .presentationBackground(T3Colors.background)
     }
 
