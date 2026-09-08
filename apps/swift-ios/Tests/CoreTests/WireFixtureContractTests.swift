@@ -8,7 +8,7 @@ final class WireFixtureContractTests: XCTestCase {
         XCTAssertEqual(
             OrchestrationCommands.respondToUserInput(
                 threadID: "thread-fixture", requestID: "question-fixture",
-                answers: ["scope": .array([.string("Server"), .string("Web")])],
+                answers: ["scope": .string("Server and Web")],
                 attachmentsByQuestionID: ["scope": [image.uploadedJSONValue(id: "attachment-fixture")]],
                 commandID: "command-fixture", createdAt: "2026-08-07T12:00:00.000Z"
             ),

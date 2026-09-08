@@ -128,7 +128,7 @@ const fixtures = new Map<string, string>([
           threadId: threadShell.id,
           requestId: "question-fixture",
           createdAt: timestamp,
-          answers: { scope: ["Server", "Web"] },
+          answers: { scope: "Server and Web" },
           attachmentsByQuestionId: {
             scope: [
               {

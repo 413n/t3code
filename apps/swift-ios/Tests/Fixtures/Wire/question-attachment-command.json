@@ -4,7 +4,7 @@
   "threadId": "thread-fixture",
   "requestId": "question-fixture",
   "answers": {
-    "scope": ["Server", "Web"]
+    "scope": "Server and Web"
   },
   "attachmentsByQuestionId": {
     "scope": [
