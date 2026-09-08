@@ -647,7 +647,7 @@ export function AddProviderInstanceDialog({
                   Next
                 </Button>
               ) : (
-                <Button size="sm" disabled={isSaving} onClick={() => void handleSave()}>
+                <Button size="sm" disabled={isSaving || !canManageProviders} onClick={() => void handleSave()}>
                   {isSaving ? "Adding..." : isAcpRegistry ? "Continue to sign-in" : "Add instance"}
                 </Button>
               )}
