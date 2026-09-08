@@ -636,13 +636,13 @@ public actor T3Client {
         }
     }
 
-    public func shellEvents(
+    public func shellEventBatches(
         after sequence: Int? = nil,
         reconnect: Bool = true
-    ) async -> AsyncThrowingStream<ShellStreamItem, Error> {
+    ) async -> AsyncThrowingStream<[ShellStreamItem], Error> {
         var payload: [String: JSONValue] = ["requestCompletionMarker": .bool(true)]
         if let sequence { payload["afterSequence"] = .number(Double(sequence)) }
-        return await rpc.subscribe(
+        return await rpc.subscribeBatches(
             RPCMethod.subscribeShell.rawValue,
             payload: .object(payload),
             reconnect: reconnect,

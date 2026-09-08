@@ -3,6 +3,50 @@ import XCTest
 
 @MainActor
 final class WebSocketRPCRaceTests: XCTestCase {
+    func testServerBatchesPreserveOrderAndSplitAtTheEventBudget() async throws {
+        let connection = SubscriptionTrafficConnection()
+        let client = WebSocketRPCClient(
+            connector: SequencedConnector(connections: [connection]),
+            subscriptionBufferLimit: 256,
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+        let stream = await client.subscribeBatches("thread.events", reconnect: false, as: Int.self)
+        await connection.waitUntilSubscriptionStarted()
+        try await connection.sendSubscriptionValues((0..<130).map { .number(Double($0)) })
+        var iterator = stream.makeAsyncIterator()
+        let first = try await iterator.next()
+        let second = try await iterator.next()
+        let third = try await iterator.next()
+        XCTAssertEqual(first, Array(0..<64))
+        XCTAssertEqual(second, Array(64..<128))
+        XCTAssertEqual(third, [128, 129])
+        await client.stop()
+    }
+
+    func testBatchOverflowDoesNotAcknowledgeDroppedEvents() async throws {
+        let connection = OverflowingSubscriptionConnection()
+        let client = WebSocketRPCClient(
+            connector: SequencedConnector(connections: [connection]),
+            subscriptionBufferLimit: 2,
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+        let stream = await client.subscribeBatches("thread.events", reconnect: false, as: String.self)
+        // A unary request is not needed: the connection closes only after overflow.
+        await connection.waitUntilClosed()
+        var iterator = stream.makeAsyncIterator()
+        let buffered = try await iterator.next()
+        XCTAssertEqual(buffered, ["first", "second"])
+        do {
+            _ = try await iterator.next()
+            XCTFail("Overflow must require resynchronization.")
+        } catch let error as RPCError {
+            guard case .protocolViolation = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let acknowledgements = await connection.acknowledgementCount()
+        XCTAssertEqual(acknowledgements, 0)
+        await client.stop()
+    }
+
     func testColdSubscriptionRetainsFailedSocketIdentity() async throws {
         let connection = SubscriptionTrafficConnection(sendsInvalidSubscriptionValue: true)
         let connector = GatedConnector(connection: connection)
@@ -773,6 +817,15 @@ private actor SubscriptionTrafficConnection: WebSocketConnection {
         enqueue(try chunk(requestID: subscriptionRequestID, value: value))
     }
 
+    func sendSubscriptionValues(_ values: [JSONValue]) throws {
+        guard let subscriptionRequestID else { return }
+        enqueue(try JSONEncoder.t3.encode(JSONValue.object([
+            "_tag": .string("Chunk"),
+            "requestId": .number(Double(subscriptionRequestID)),
+            "values": .array(values),
+        ])))
+    }
+
     func requestTags() -> [String] {
         sentRequestTags
     }
@@ -822,6 +875,13 @@ private actor OverflowingSubscriptionConnection: WebSocketConnection {
     private var queuedResponses: [Data] = []
     private var receiver: CheckedContinuation<Data, Error>?
     private var acknowledgements = 0
+    private var closed = false
+    private var closeWaiter: CheckedContinuation<Void, Never>?
+
+    func waitUntilClosed() async {
+        guard !closed else { return }
+        await withCheckedContinuation { closeWaiter = $0 }
+    }
 
     func send(_ data: Data) throws {
         let envelope = try JSONDecoder.t3.decode(JSONValue.self, from: data)
@@ -857,6 +917,9 @@ private actor OverflowingSubscriptionConnection: WebSocketConnection {
     }
 
     func close() {
+        closed = true
+        closeWaiter?.resume()
+        closeWaiter = nil
         receiver?.resume(throwing: CancellationError())
         receiver = nil
     }

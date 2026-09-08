@@ -181,7 +181,8 @@ public actor WebSocketRPCClient {
         /// The connection that assigned `requestID`. Request IDs are reissued
         /// after reconnects, so an Interrupt is only valid on this connection.
         var requestConnectionID: UUID?
-        let yield: @Sendable (JSONValue) -> SubscriptionYieldResult
+        let batchSize: Int
+        let yield: @Sendable ([JSONValue]) -> SubscriptionYieldResult
         let finish: @Sendable (Error?) -> Void
     }
 
@@ -399,17 +400,44 @@ public actor WebSocketRPCClient {
         reconnect: Bool = true,
         as type: Value.Type
     ) -> AsyncThrowingStream<Value, Error> {
+        subscribe(tag, payload: payload, reconnect: reconnect, batchSize: 1) {
+            try $0[0].decode(type)
+        }
+    }
+
+    /// Preserve server batches for consumers that can apply several events at once.
+    /// Bound both batch size and queued batches to the existing event budget.
+    public func subscribeBatches<Value: Decodable & Sendable>(
+        _ tag: String,
+        payload: JSONValue = .object([:]),
+        reconnect: Bool = true,
+        as type: Value.Type
+    ) -> AsyncThrowingStream<[Value], Error> {
+        subscribe(tag, payload: payload, reconnect: reconnect,
+                  batchSize: min(64, subscriptionBufferLimit)) { values in
+            try values.map { try $0.decode(type) }
+        }
+    }
+
+    private func subscribe<Value: Sendable>(
+        _ tag: String,
+        payload: JSONValue,
+        reconnect: Bool,
+        batchSize: Int,
+        decode: @escaping @Sendable ([JSONValue]) throws -> Value
+    ) -> AsyncThrowingStream<Value, Error> {
         let subscriptionID = UUID()
-        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(subscriptionBufferLimit)) {
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(max(1, subscriptionBufferLimit / batchSize))) {
             continuation in
             subscriptions[subscriptionID] = Subscription(
                 tag: tag,
                 payload: payload,
                 reconnect: reconnect,
                 requestID: nil,
+                batchSize: batchSize,
                 yield: { value in
                     do {
-                        switch continuation.yield(try value.decode(type)) {
+                        switch continuation.yield(try decode(value)) {
                         case .enqueued:
                             return .enqueued
                         case .dropped:
@@ -683,8 +711,10 @@ public actor WebSocketRPCClient {
                   let subscriptionID = subscriptionByRequestID[requestID],
                   let subscription = subscriptions[subscriptionID]
             else { return }
-            for value in response.values ?? [] {
-                switch subscription.yield(value) {
+            let values = response.values ?? []
+            for start in stride(from: 0, to: values.count, by: subscription.batchSize) {
+                let end = min(start + subscription.batchSize, values.count)
+                switch subscription.yield(Array(values[start..<end])) {
                 case .enqueued:
                     continue
                 case .dropped:

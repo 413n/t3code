@@ -3377,10 +3377,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         return
                     }
                     let sequence = self?.latestShell?.snapshotSequence
-                    let events = await activeClient.shellEvents(after: sequence, reconnect: false)
+                    let events = await activeClient.shellEventBatches(after: sequence, reconnect: false)
                     // Re-bind self per event instead of holding it strongly across
                     // the indefinite stream, so the client can deinit mid-stream.
-                    for try await item in events {
+                    for try await batch in events {
                         guard !Task.isCancelled,
                             let self,
                             self.isCurrentSession(
@@ -3392,28 +3392,36 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         }
                         self.lastShellEventAt = .now
                         self.emitConnection(.connected)
-                        switch item {
-                        case let .snapshot(shell):
-                            await self.consume(
-                                shell: shell,
-                                client: activeClient,
-                                generation: generation,
-                                refreshActiveThread: true
-                            )
-                        case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved:
-                            await self.consume(delta: item, client: activeClient, generation: generation)
-                        case .refreshRequired:
-                            if let shell = try? await activeClient.shellSnapshot() {
+                        var deltas: [ShellStreamItem] = []
+                        for item in batch {
+                            switch item {
+                            case let .snapshot(shell):
+                                await self.consume(deltas: deltas, client: activeClient, generation: generation)
+                                deltas.removeAll(keepingCapacity: true)
                                 await self.consume(
                                     shell: shell,
                                     client: activeClient,
                                     generation: generation,
                                     refreshActiveThread: true
                                 )
+                            case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved:
+                                deltas.append(item)
+                            case .refreshRequired:
+                                await self.consume(deltas: deltas, client: activeClient, generation: generation)
+                                deltas.removeAll(keepingCapacity: true)
+                                if let shell = try? await activeClient.shellSnapshot() {
+                                    await self.consume(
+                                        shell: shell,
+                                        client: activeClient,
+                                        generation: generation,
+                                        refreshActiveThread: true
+                                    )
+                                }
+                            case .synchronized:
+                                break
                             }
-                        case .synchronized:
-                            break
                         }
+                        await self.consume(deltas: deltas, client: activeClient, generation: generation)
                     }
                 } catch is CancellationError {
                     return
@@ -3764,8 +3772,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         scheduleDetailRefresh(threadID: threadID, client: client)
     }
 
-    private func consume(delta: ShellStreamItem, client: T3Client, generation: Int) async {
-        guard !Task.isCancelled,
+    private func consume(deltas: [ShellStreamItem], client: T3Client, generation: Int) async {
+        guard !deltas.isEmpty, !Task.isCancelled,
               isCurrentSession(client: client, generation: generation) else { return }
         guard let current = latestShell else {
             if let shell = try? await client.shellSnapshot() {
@@ -3776,75 +3784,74 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             return
         }
 
-        let sequence: Int
-
-        switch delta {
-        case let .projectUpserted(nextSequence, _):
-            sequence = nextSequence
-        case let .projectRemoved(nextSequence, _):
-            sequence = nextSequence
-        case let .threadUpserted(nextSequence, _):
-            sequence = nextSequence
-        case let .threadRemoved(nextSequence, _):
-            sequence = nextSequence
-        case .snapshot, .synchronized, .refreshRequired:
-            return
-        }
-
-        // Replayed deltas are expected after reconnect. They must be entirely
-        // side-effect free, including for cached detail and selection state.
-        guard sequence > current.snapshotSequence else { return }
-
         var projects = current.projects
         var threads = current.threads
-        var changedThreadID: String?
+        var sequence = current.snapshotSequence
+        var changedThreadIDs: Set<String> = []
         var shouldRefreshArchived = false
 
-        switch delta {
-        case let .projectUpserted(_, project):
-            if let index = projects.firstIndex(where: { $0.id == project.id }) {
-                projects[index] = project
-            } else {
-                projects.append(project)
+        for delta in deltas {
+            let nextSequence: Int
+            switch delta {
+            case let .projectUpserted(value, _), let .projectRemoved(value, _),
+                 let .threadUpserted(value, _), let .threadRemoved(value, _):
+                nextSequence = value
+            case .snapshot, .synchronized, .refreshRequired:
+                continue
             }
-        case let .projectRemoved(_, projectID):
-            projects.removeAll { $0.id == projectID }
-        case let .threadUpserted(_, thread):
-            changedThreadID = FeatureScopedID.thread(
-                environmentID: client.environment.id, wireID: thread.id
-            )
-            archivedThreadsByEnvironmentID[client.environment.id]?.removeAll {
-                ($0.wireID ?? $0.id) == thread.id
+
+            // Replayed deltas are expected after reconnect. They must be entirely
+            // side-effect free, including for cached detail and selection state.
+            guard nextSequence > sequence else { continue }
+            sequence = nextSequence
+
+            switch delta {
+            case let .projectUpserted(_, project):
+                if let index = projects.firstIndex(where: { $0.id == project.id }) {
+                    projects[index] = project
+                } else {
+                    projects.append(project)
+                }
+            case let .projectRemoved(_, projectID):
+                projects.removeAll { $0.id == projectID }
+            case let .threadUpserted(_, thread):
+                changedThreadIDs.insert(FeatureScopedID.thread(
+                    environmentID: client.environment.id, wireID: thread.id
+                ))
+                archivedThreadsByEnvironmentID[client.environment.id]?.removeAll {
+                    ($0.wireID ?? $0.id) == thread.id
+                }
+                if let index = threads.firstIndex(where: { $0.id == thread.id }) {
+                    threads[index] = thread
+                } else {
+                    threads.append(thread)
+                }
+            case let .threadRemoved(_, threadID):
+                let uiThreadID = FeatureScopedID.thread(
+                    environmentID: client.environment.id, wireID: threadID
+                )
+                changedThreadIDs.insert(uiThreadID)
+                shouldRefreshArchived = true
+                threads.removeAll { $0.id == threadID }
+                latestDetails[uiThreadID] = nil
+                detailRenderCaches[uiThreadID] = nil
+                detailCacheRecency.removeAll { $0 == uiThreadID }
+                if activeThreadID == uiThreadID {
+                    resetDetailRefresh()
+                    resetDetailStream()
+                    activeThreadID = nil
+                    activeThreadEnvironmentID = nil
+                    activeRawThread = nil
+                    activeThreadSequence = nil
+                    activeThreadPage = nil
+                    threadHistoryEpoch &+= 1
+                    pendingOlderThreadPage = nil
+                }
+            case .snapshot, .synchronized, .refreshRequired:
+                continue
             }
-            if let index = threads.firstIndex(where: { $0.id == thread.id }) {
-                threads[index] = thread
-            } else {
-                threads.append(thread)
-            }
-        case let .threadRemoved(_, threadID):
-            let uiThreadID = FeatureScopedID.thread(
-                environmentID: client.environment.id, wireID: threadID
-            )
-            changedThreadID = uiThreadID
-            shouldRefreshArchived = true
-            threads.removeAll { $0.id == threadID }
-            latestDetails[uiThreadID] = nil
-            detailRenderCaches[uiThreadID] = nil
-            detailCacheRecency.removeAll { $0 == uiThreadID }
-            if activeThreadID == uiThreadID {
-                resetDetailRefresh()
-                resetDetailStream()
-                activeThreadID = nil
-                activeThreadEnvironmentID = nil
-                activeRawThread = nil
-                activeThreadSequence = nil
-                activeThreadPage = nil
-                threadHistoryEpoch &+= 1
-                pendingOlderThreadPage = nil
-            }
-        case .snapshot, .synchronized, .refreshRequired:
-            return
         }
+        guard sequence > current.snapshotSequence else { return }
 
         let shell = OrchestrationShellSnapshot(
             snapshotSequence: sequence,
@@ -3860,8 +3867,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if shouldRefreshArchived {
             scheduleArchivedRefresh(client: client, environment: client.environment)
         }
-        if let changedThreadID, activeThreadID == changedThreadID {
-            scheduleDetailRefresh(threadID: changedThreadID, client: client)
+        if let activeThreadID, changedThreadIDs.contains(activeThreadID) {
+            scheduleDetailRefresh(threadID: activeThreadID, client: client)
         }
     }
 

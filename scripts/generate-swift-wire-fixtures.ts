@@ -130,7 +130,7 @@ const fixtures = new Map<string, string>([
   ],
 ]);
 
-class StaleWireFixturesError extends Schema.TaggedErrorClass<StaleWireFixturesError>()(
+class StaleWireFixturesError extends Schema.TaggedError<StaleWireFixturesError>()(
   "StaleWireFixturesError",
   {
     staleFixtures: Schema.Array(Schema.String),
@@ -154,7 +154,7 @@ const generateSwiftWireFixtures = Effect.gen(function* () {
     if (check) {
       const current = yield* fs
         .readFileString(filePath)
-        .pipe(Effect.orElseSucceed(() => undefined));
+        .pipe(Effect.catch(() => Effect.succeed(undefined)));
       if (current !== contents) {
         yield* Effect.logError(`[swift-wire-fixtures] stale: ${name}`);
         staleFixtures.push(name);
