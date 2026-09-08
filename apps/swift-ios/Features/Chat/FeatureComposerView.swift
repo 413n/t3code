@@ -73,8 +73,8 @@ struct FeatureComposerView: View {
     private let showsKeyboardDismissControl: Bool
     private let onDismissKeyboard: (() -> Void)?
     private let onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)?
-    private let onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)?
-    private let onUserInputDismiss: ((String) -> Void)?
+    private let onUserInputSubmit: ((String, [String: FeatureInputAnswer], [String: [FeatureUploadAttachment]]) async -> Void)?
+    private let onUserInputDismiss: ((String) async -> Void)?
 
     init(
         text: Binding<String>,
@@ -103,8 +103,8 @@ struct FeatureComposerView: View {
         showsKeyboardDismissControl: Bool = false,
         onDismissKeyboard: (() -> Void)? = nil,
         onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)? = nil,
-        onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)? = nil,
-        onUserInputDismiss: ((String) -> Void)? = nil,
+        onUserInputSubmit: ((String, [String: FeatureInputAnswer], [String: [FeatureUploadAttachment]]) async -> Void)? = nil,
+        onUserInputDismiss: ((String) async -> Void)? = nil,
         onRefreshModels: (() async throws -> Void)? = nil,
         draftSaveError: String? = nil,
         onRetryDraftSave: (() -> Void)? = nil
@@ -256,10 +256,12 @@ struct FeatureComposerView: View {
                 FeatureComposerUserInputPanel(
                     input: input,
                     isResponding: isResolvingRequest,
-                    onSubmit: { answers in
-                        onUserInputSubmit(input.id, answers)
+                    onSubmit: { answers, attachments in
+                        await onUserInputSubmit(input.id, answers, attachments)
                     },
-                    onDismiss: onUserInputDismiss.map { dismiss in { dismiss(input.id) } }
+                    onDismiss: onUserInputDismiss.map { dismiss in { await dismiss(input.id) } },
+                    environmentID: environmentID,
+                    attachmentPreferences: attachmentPreferences
                 )
             } else if isExpanded {
                 expandedComposer

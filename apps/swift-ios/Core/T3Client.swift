@@ -854,13 +854,32 @@ public actor T3Client {
     public func respondToUserInput(
         threadID: String,
         requestID: String,
-        answers: [String: JSONValue]
+        answers: [String: JSONValue],
+        attachmentsByQuestionID: [String: [UploadChatAttachment]] = [:]
     ) async throws -> DispatchResult {
-        try await dispatch(
+        let count = attachmentsByQuestionID.values.reduce(0) { $0 + $1.count }
+        guard count <= 8 else { throw FileAttachmentError.tooMany(maximum: 8) }
+        var prepared: [String: [JSONValue]] = [:]
+        if count > 0 {
+            let config = try await serverConfig()
+            guard (config.environment ?? environment.descriptor)?.capabilities.questionAttachments == true else {
+                throw RPCError.protocolViolation("This environment does not support attachments in question answers.")
+            }
+            for questionID in attachmentsByQuestionID.keys.sorted() {
+                for attachment in attachmentsByQuestionID[questionID] ?? [] {
+                    guard let reference = try await prepareAttachment(attachment) else {
+                        throw FileAttachmentError.unsupported
+                    }
+                    prepared[questionID, default: []].append(attachment.uploadedJSONValue(id: reference.attachmentID))
+                }
+            }
+        }
+        return try await dispatch(
             OrchestrationCommands.respondToUserInput(
                 threadID: threadID,
                 requestID: requestID,
-                answers: answers
+                answers: answers,
+                attachmentsByQuestionID: prepared
             )
         )
     }
@@ -2208,17 +2227,28 @@ public enum OrchestrationCommands {
         threadID: String,
         requestID: String,
         answers: [String: JSONValue],
+        attachmentsByQuestionID: [String: [JSONValue]] = [:],
         commandID: String = UUID().uuidString,
         createdAt: String = now()
     ) -> JSONValue {
-        .object([
+        let attachments = attachmentsByQuestionID.filter { !$0.value.isEmpty }
+        var completeAnswers = answers
+        // Message-mode questions require a string even when the answer is only a file.
+        for questionID in attachments.keys where completeAnswers[questionID] == nil {
+            completeAnswers[questionID] = .string("")
+        }
+        var payload: [String: JSONValue] = [
             "type": .string("thread.user-input.respond"),
             "commandId": .string(commandID),
             "threadId": .string(threadID),
             "requestId": .string(requestID),
-            "answers": .object(answers),
+            "answers": .object(completeAnswers),
             "createdAt": .string(createdAt),
-        ])
+        ]
+        if !attachments.isEmpty {
+            payload["attachmentsByQuestionId"] = .object(attachments.mapValues(JSONValue.array))
+        }
+        return .object(payload)
     }
 
     public static func dismissUserInput(

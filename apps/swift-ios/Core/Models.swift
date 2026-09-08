@@ -118,6 +118,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public let serverSelfUpdateProgress: Bool?
         public var environmentIcon: Bool? = nil
         public var usageLimitSources: Bool? = nil
+        public var questionAttachments: Bool? = nil
 
         private enum CodingKeys: String, CodingKey {
             case repositoryIdentity
@@ -136,12 +137,14 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case serverSelfUpdateProgress
             case environmentIcon
             case usageLimitSources
+            case questionAttachments
         }
 
         public init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             environmentIcon = try container.decodeIfPresent(Bool.self, forKey: .environmentIcon)
             usageLimitSources = try container.decodeIfPresent(Bool.self, forKey: .usageLimitSources)
+            questionAttachments = try container.decodeIfPresent(Bool.self, forKey: .questionAttachments)
             repositoryIdentity =
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
             connectionProbe = try container.decodeIfPresent(Bool.self, forKey: .connectionProbe)

@@ -6,6 +6,9 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import {
   ClientOrchestrationCommand,
+  ProviderConsumeResetCreditInput,
+  ProviderConsumeResetCreditResult,
+  ServerProviderResetCredits,
   OrchestrationShellSnapshot,
   OrchestrationShellStreamItem,
   OrchestrationThreadDetailSnapshot,
@@ -115,6 +118,67 @@ const shellSnapshot = encodeShellSnapshot(decodeShellSnapshot(shellSnapshotInput
 const threadDetail = encodeThreadDetail(decodeThreadDetail(threadDetailInput));
 const serializeFixture = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 const fixtures = new Map<string, string>([
+  [
+    "question-attachment-command.json",
+    serializeFixture(
+      Schema.encodeSync(ClientOrchestrationCommand)(
+        Schema.decodeUnknownSync(ClientOrchestrationCommand)({
+          type: "thread.user-input.respond",
+          commandId: "command-fixture",
+          threadId: threadShell.id,
+          requestId: "question-fixture",
+          createdAt: timestamp,
+          answers: { scope: ["Server", "Web"] },
+          attachmentsByQuestionId: {
+            scope: [
+              {
+                type: "image",
+                id: "attachment-fixture",
+                name: "screenshot.png",
+                mimeType: "image/png",
+                sizeBytes: 2,
+              },
+            ],
+          },
+        }),
+      ),
+    ),
+  ],
+  [
+    "hub-reset-credit-input.json",
+    serializeFixture(
+      Schema.encodeSync(ProviderConsumeResetCreditInput)(
+        Schema.decodeUnknownSync(ProviderConsumeResetCreditInput)({
+          sourceId: "hub-fixture",
+          accountId: "account-fixture",
+          creditId: "credit-fixture",
+        }),
+      ),
+    ),
+  ],
+  [
+    "hub-reset-credit-result.json",
+    serializeFixture(
+      Schema.encodeSync(ProviderConsumeResetCreditResult)(
+        Schema.decodeUnknownSync(ProviderConsumeResetCreditResult)({
+          outcome: "reset",
+          warning: "Could not clear the hub cooldown.",
+        }),
+      ),
+    ),
+  ],
+  [
+    "hub-reset-credits.json",
+    serializeFixture(
+      Schema.encodeSync(ServerProviderResetCredits)(
+        Schema.decodeUnknownSync(ServerProviderResetCredits)({
+          availableCount: 1,
+          nextCreditId: "credit-fixture",
+          nextExpiresAt: timestamp,
+        }),
+      ),
+    ),
+  ],
   [
     "question-dismiss-command.json",
     serializeFixture(

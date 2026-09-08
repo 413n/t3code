@@ -156,11 +156,20 @@ struct FeatureComposerApprovalPanel: View {
 struct FeatureComposerUserInputPanel: View {
     let input: FeatureUserInput
     let isResponding: Bool
-    let onSubmit: ([String: FeatureInputAnswer]) -> Void
-    var onDismiss: (() -> Void)? = nil
+    let onSubmit: ([String: FeatureInputAnswer], [String: [FeatureUploadAttachment]]) async -> Void
+    var onDismiss: (() async -> Void)? = nil
+    var environmentID: String? = nil
+    var attachmentPreferences = FeatureEnvironmentPreferences()
 
     @State private var answers: [String: FeatureInputAnswer] = [:]
     @State private var questionIndex = 0
+    @State private var attachmentsByQuestionID: [String: [FeatureDraftAttachment]] = [:]
+    @State private var preparation = FeatureAttachmentPreparationState()
+    @State private var attachmentFlowActive = false
+    @State private var restoredInputID: String?
+    @State private var draftError: String?
+    @State private var draftWrite: Task<Void, Never>?
+    @State private var isSubmittingAnswer = false
 
     var body: some View {
         Group {
@@ -203,60 +212,111 @@ struct FeatureComposerUserInputPanel: View {
 
                     Divider().overlay(T3Colors.separator)
 
-                    ScrollView {
-                        VStack(spacing: 6) {
-                            ForEach(
-                                Array(question.options.enumerated()),
-                                id: \.element.label
-                            ) { index, option in
-                                optionButton(option, number: index + 1, question: question)
+                    if !question.options.isEmpty {
+                        ScrollView {
+                            VStack(spacing: 6) {
+                                ForEach(
+                                    Array(question.options.enumerated()),
+                                    id: \.element.label
+                                ) { index, option in
+                                    optionButton(option, number: index + 1, question: question)
+                                        .disabled(preparation.isPreparing || attachmentFlowActive)
+                                }
                             }
+                            .padding(.horizontal, 10)
+                            .padding(.top, 10)
+                        }
+                        .frame(maxHeight: 320)
+                        .scrollIndicators(.hidden)
+                    }
+
+                    if question.canWriteCustomAnswer {
+                        HStack(spacing: 8) {
+                            if input.supportsAttachments == true {
+                                FeatureImageAttachmentPicker(
+                                    attachments: attachmentBinding(questionID: question.id),
+                                    preparationState: $preparation,
+                                    isFlowActive: $attachmentFlowActive,
+                                    draftOwnerID: "\(input.id):\(question.id)",
+                                    environmentID: environmentID,
+                                    imagesAllowed: attachmentPreferences.supportsImageUploads,
+                                    maximumFileBytes: attachmentPreferences.maxFileAttachmentBytes,
+                                    maximumCount: max(0, FeatureImageAttachmentLimits.maximumCount - otherAttachmentCount(questionID: question.id))
+                                )
+                                .disabled(restoredInputID != input.id)
+                            }
+                            Image(systemName: "pencil")
+                                .font(T3Typography.supporting)
+                                .foregroundStyle(T3Colors.textTertiary)
+
+                            TextField(
+                                "Write custom answer",
+                                text: answerBinding(for: question),
+                                axis: .vertical
+                            )
+                            .font(T3Typography.composer)
+                            .lineLimit(1...4)
+                            .submitLabel(.return)
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: T3Metrics.minimumTapTarget)
+                        .background(
+                            T3Colors.input,
+                            in: RoundedRectangle(cornerRadius: 11)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 11)
+                                .stroke(T3Colors.inputBorder, lineWidth: 1)
                         }
                         .padding(.horizontal, 10)
-                        .padding(.top, 10)
+                        .padding(.top, 7)
                     }
-                    .frame(maxHeight: 320)
-                    .scrollIndicators(.hidden)
 
-                    HStack(spacing: 8) {
-                        Image(systemName: "pencil")
+                    if !(attachmentsByQuestionID[question.id] ?? []).isEmpty {
+                        FeatureAttachmentStrip(attachments: attachmentBinding(questionID: question.id))
+                            .padding(.horizontal, 10)
+                    }
+                    if preparation.isPreparing || isResponding || isSubmittingAnswer {
+                        Text(preparation.isPreparing ? preparation.statusLabel : responseStatus)
                             .font(T3Typography.supporting)
-                            .foregroundStyle(T3Colors.textTertiary)
-
-                        TextField(
-                            "Write custom answer",
-                            text: answerBinding(for: question),
-                            axis: .vertical
-                        )
-                        .font(T3Typography.composer)
-                        .lineLimit(1...4)
-                        .submitLabel(.return)
+                            .foregroundStyle(T3Colors.textSecondary)
+                            .padding(.top, 6)
                     }
-                    .padding(.horizontal, 12)
-                    .frame(minHeight: T3Metrics.minimumTapTarget)
-                    .background(
-                        T3Colors.input,
-                        in: RoundedRectangle(cornerRadius: 11)
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 11)
-                            .stroke(T3Colors.inputBorder, lineWidth: 1)
+                    if let draftError {
+                        Text(draftError)
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.danger)
+                            .padding(.horizontal, 10)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.top, 7)
+                    if let attachmentBlocker {
+                        Text(attachmentBlocker)
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.danger)
+                            .padding(.horizontal, 10)
+                    }
 
                     HStack(spacing: 8) {
                         if input.canDismiss, let onDismiss {
-                            Button("Dismiss", action: onDismiss)
+                            Button("Dismiss") {
+                                let pendingWrite = draftWrite
+                                isSubmittingAnswer = true
+                                Task { @MainActor in
+                                    defer { isSubmittingAnswer = false }
+                                    await pendingWrite?.value
+                                    await onDismiss()
+                                }
+                            }
                                 .font(T3Typography.control)
                                 .foregroundStyle(T3Colors.textSecondary)
                                 .frame(minHeight: T3Metrics.minimumTapTarget)
                                 .accessibilityLabel("Dismiss question without replying")
+                                .disabled(preparation.isPreparing || attachmentFlowActive)
                         }
                         if questionIndex > 0 {
                             Button("Back") {
                                 questionIndex -= 1
                             }
+                            .disabled(preparation.isPreparing || attachmentFlowActive)
                             .font(T3Typography.control.weight(.semibold))
                             .foregroundStyle(T3Colors.textSecondary)
                             .frame(
@@ -283,13 +343,50 @@ struct FeatureComposerUserInputPanel: View {
                     .padding(.top, 9)
                     .padding(.bottom, 11)
                 }
-                .disabled(isResponding)
-                .opacity(isResponding ? 0.56 : 1)
+                .disabled(isResponding || isSubmittingAnswer)
+                .opacity(isResponding || isSubmittingAnswer ? 0.56 : 1)
             }
         }
         .onChange(of: input.id) {
             answers = [:]
             questionIndex = 0
+            restoredInputID = nil
+            attachmentsByQuestionID = [:]
+            draftError = nil
+        }
+        .task(id: input.id) {
+            let requestID = input.id
+            do {
+                let stored = try await FeatureComposerDraftStore.shared.draft(
+                    for: FeatureQuestionAttachmentDraft.key(inputID: requestID)
+                )
+                try Task.checkCancellation()
+                guard requestID == input.id else { return }
+                attachmentsByQuestionID = try FeatureQuestionAttachmentDraft.decode(stored)
+                    .filter { questionIDs.contains($0.key) }
+                restoredInputID = requestID
+            } catch is CancellationError {
+                return
+            } catch {
+                restoredInputID = requestID
+                draftError = "Could not restore question attachments."
+            }
+        }
+        .onChange(of: attachmentsByQuestionID) { _, current in
+            guard restoredInputID == input.id else { return }
+            let key = FeatureQuestionAttachmentDraft.key(inputID: input.id)
+            let previousWrite = draftWrite
+            draftWrite = Task {
+                await previousWrite?.value
+                do {
+                    try await FeatureComposerDraftStore.shared.setDraft(
+                        FeatureQuestionAttachmentDraft.encode(current), for: key
+                    )
+                    draftError = nil
+                } catch {
+                    draftError = "Could not save question attachments. Keep this thread open to send them."
+                }
+            }
         }
         .onChange(of: questionIDs) { previousIDs, currentIDs in
             questionIndex = FeatureComposerQuestionReconciliation.index(
@@ -301,6 +398,7 @@ struct FeatureComposerUserInputPanel: View {
                 answers,
                 currentQuestionIDs: currentIDs
             )
+            attachmentsByQuestionID = attachmentsByQuestionID.filter { currentIDs.contains($0.key) }
         }
     }
 
@@ -318,15 +416,19 @@ struct FeatureComposerUserInputPanel: View {
     }
 
     private var canAdvance: Bool {
-        guard let activeQuestion else { return false }
-        return normalizedAnswer(for: activeQuestion.id) != nil
+        guard let activeQuestion, !isSubmittingAnswer, !preparation.isPreparing, !attachmentFlowActive,
+              restoredInputID == input.id, attachmentBlocker == nil else { return false }
+        return normalizedAnswer(for: activeQuestion.id) != nil || hasAttachments(for: activeQuestion.id)
     }
 
     private var normalizedAnswers: [String: FeatureInputAnswer]? {
         var result: [String: FeatureInputAnswer] = [:]
         for question in input.questions {
-            guard let answer = normalizedAnswer(for: question.id) else { return nil }
-            result[question.id] = answer
+            if let answer = normalizedAnswer(for: question.id) {
+                result[question.id] = answer
+            } else if !hasAttachments(for: question.id) {
+                return nil
+            }
         }
         return result
     }
@@ -431,12 +533,56 @@ struct FeatureComposerUserInputPanel: View {
         if !isLastQuestion {
             questionIndex += 1
         } else if let normalizedAnswers {
-            onSubmit(normalizedAnswers)
+            let submitted = attachmentsByQuestionID.filter { hasAttachments(for: $0.key) }
+                .mapValues { $0.map(FeatureUploadAttachment.init) }
+            let pendingWrite = draftWrite
+            isSubmittingAnswer = true
+            Task { @MainActor in
+                defer { isSubmittingAnswer = false }
+                await pendingWrite?.value
+                await onSubmit(normalizedAnswers, submitted)
+            }
         } else if let unanswered = input.questions.firstIndex(where: {
-            normalizedAnswer(for: $0.id) == nil
+            normalizedAnswer(for: $0.id) == nil && !hasAttachments(for: $0.id)
         }) {
             questionIndex = unanswered
         }
+    }
+
+    private func hasAttachments(for questionID: String) -> Bool {
+        input.supportsAttachments == true
+            && input.questions.contains { $0.id == questionID && $0.canWriteCustomAnswer }
+            && !(attachmentsByQuestionID[questionID] ?? []).isEmpty
+    }
+
+    private var responseStatus: String {
+        attachmentsByQuestionID.values.contains { !$0.isEmpty }
+            ? "Uploading attachments and sending answer..."
+            : "Sending answer..."
+    }
+
+    private var attachmentBlocker: String? {
+        if attachmentsByQuestionID.contains(where: { !$0.value.isEmpty && !hasAttachments(for: $0.key) }) {
+            return "Attachments are no longer supported for this question. Remove them to send the answer."
+        }
+        return nil
+    }
+
+    private func otherAttachmentCount(questionID: String) -> Int {
+        attachmentsByQuestionID.reduce(0) { count, entry in
+            count + (entry.key == questionID ? 0 : entry.value.count)
+        }
+    }
+
+    private func attachmentBinding(questionID: String) -> Binding<[FeatureDraftAttachment]> {
+        let requestID = input.id
+        return Binding(
+            get: { attachmentsByQuestionID[questionID] ?? [] },
+            set: { next in
+                guard requestID == input.id else { return }
+                attachmentsByQuestionID[questionID] = next
+            }
+        )
     }
 
     private func normalizedAnswer(for questionID: String) -> FeatureInputAnswer? {

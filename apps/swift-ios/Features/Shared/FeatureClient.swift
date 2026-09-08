@@ -102,6 +102,10 @@ public protocol FeatureClient: AnyObject {
     func cancelTurn(threadID: String) async throws
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws
+    func resolveUserInput(
+        id: String, answers: [String: FeatureInputAnswer],
+        attachmentsByQuestionID: [String: [FeatureUploadAttachment]]
+    ) async throws
     func dismissUserInput(id: String) async throws
 
     func saveSettings(_ settings: FeatureSettings) async throws
@@ -438,6 +442,16 @@ public extension FeatureClient {
     }
     func releaseThread(id: String) {}
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws {}
+
+    func resolveUserInput(
+        id: String, answers: [String: FeatureInputAnswer],
+        attachmentsByQuestionID: [String: [FeatureUploadAttachment]]
+    ) async throws {
+        guard attachmentsByQuestionID.values.allSatisfy(\.isEmpty) else {
+            throw FeatureCapabilityUnavailable("Question attachments")
+        }
+        try await resolveUserInput(id: id, answers: answers)
+    }
 
     func dismissUserInput(id: String) async throws {
         throw FeatureCapabilityUnavailable("Question dismissal")

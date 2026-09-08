@@ -3,6 +3,60 @@ import XCTest
 
 @MainActor
 final class T3ClientServerConfigTests: XCTestCase {
+    func testQuestionAttachmentsRequireTheServerCapabilityBeforeUploading() async throws {
+        let connection = ServerConfigTestConnection(mode: .snapshot)
+        let client = makeClient(connection: connection)
+        let image = try UploadChatAttachment(data: Data([1]), name: "test.png", mimeType: "image/png")
+        do {
+            _ = try await client.respondToUserInput(
+                threadID: "thread", requestID: "question", answers: [:],
+                attachmentsByQuestionID: ["choice": [image]]
+            )
+            XCTFail("Older servers must not receive question attachments")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("does not support attachments in question answers"))
+        }
+        let tags = await connection.tags()
+        XCTAssertEqual(tags, ["subscribeServerConfig"])
+        await client.disconnect()
+    }
+
+    func testQuestionAttachmentsUploadBeforeDispatchAndDoNotSendInlineData() async throws {
+        let connection = ServerConfigTestConnection(mode: .snapshot, supportsQuestionAttachments: true)
+        let client = makeClient(connection: connection)
+        let image = try UploadChatAttachment(data: Data([1, 2]), name: "test.png", mimeType: "image/png")
+        _ = try await client.respondToUserInput(
+            threadID: "thread", requestID: "question", answers: [:],
+            attachmentsByQuestionID: ["choice": [image]]
+        )
+        let tags = await connection.tags()
+        XCTAssertEqual(tags, ["subscribeServerConfig", "attachments.createUploadUrl", RPCMethod.dispatchCommand.rawValue])
+        let commands = await connection.payloads(for: RPCMethod.dispatchCommand.rawValue)
+        let command = try XCTUnwrap(commands.first)
+        XCTAssertEqual(command["threadId"], .string("thread"))
+        XCTAssertEqual(command["answers"], .object(["choice": .string("")]))
+        XCTAssertEqual(command["attachmentsByQuestionId"]?["choice"], .array([
+            image.uploadedJSONValue(id: "uploaded-question-image"),
+        ]))
+        await client.disconnect()
+    }
+
+    func testFailedQuestionAttachmentUploadDoesNotSubmitTheAnswer() async throws {
+        let connection = ServerConfigTestConnection(mode: .snapshot, supportsQuestionAttachments: true)
+        let client = makeClient(connection: connection, failAttachmentUploads: true)
+        let image = try UploadChatAttachment(data: Data([1]), name: "test.png", mimeType: "image/png")
+        do {
+            _ = try await client.respondToUserInput(
+                threadID: "thread", requestID: "question", answers: ["choice": .string("Answer")],
+                attachmentsByQuestionID: ["choice": [image]]
+            )
+            XCTFail("A failed upload must keep the question open")
+        } catch {}
+        let commands = await connection.payloads(for: RPCMethod.dispatchCommand.rawValue)
+        XCTAssertTrue(commands.isEmpty)
+        await client.disconnect()
+    }
+
     func testUnknownUsageUnavailableReasonKeepsTheProviderInConfig() throws {
         let config = try JSONDecoder.t3.decode(ServerConfigSnapshot.self, from: Data(
             #"""
@@ -342,7 +396,8 @@ final class T3ClientServerConfigTests: XCTestCase {
     private func makeClient(
         connection: ServerConfigTestConnection,
         reconnectConnection: ServerConfigTestConnection? = nil,
-        waitTimeout: Duration = .seconds(4)
+        waitTimeout: Duration = .seconds(4),
+        failAttachmentUploads: Bool = false
     ) -> T3Client {
         let environment = Environment(
             id: "environment-1",
@@ -355,7 +410,7 @@ final class T3ClientServerConfigTests: XCTestCase {
             credentialStore: InMemoryCredentialStore(credentials: [
                 environment.id: EnvironmentCredential(accessToken: "token"),
             ]),
-            httpTransport: ServerConfigTicketTransport(),
+            httpTransport: ServerConfigTicketTransport(failAttachmentUploads: failAttachmentUploads),
             webSocketConnector: ServerConfigTestConnector(
                 connections: [connection] + (reconnectConnection.map { [$0] } ?? [])
             ),
@@ -365,7 +420,12 @@ final class T3ClientServerConfigTests: XCTestCase {
 }
 
 private struct ServerConfigTicketTransport: HTTPTransport {
+    var failAttachmentUploads = false
+
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        if failAttachmentUploads, request.url?.path.hasPrefix("/api/attachments/upload/") == true {
+            throw URLError(.networkConnectionLost)
+        }
         let data = Data(#"{"ticket":"ticket","expiresAt":"2026-09-01T12:05:00.000Z"}"#.utf8)
         return (data, HTTPURLResponse(
             url: request.url!,
@@ -393,6 +453,7 @@ private actor ServerConfigTestConnection: WebSocketConnection {
     private let mode: Mode
     private let supportsUsageLimitSources: Bool?
     private let failResetCreditSend: Bool
+    private let supportsQuestionAttachments: Bool?
     private var requestTags: [String] = []
     private var requestPayloads: [String: [JSONValue]] = [:]
     private var subscriptionRequestID: Int?
@@ -401,10 +462,12 @@ private actor ServerConfigTestConnection: WebSocketConnection {
     private var receiver: CheckedContinuation<Data, any Error>?
     private var requestWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
-    init(mode: Mode, supportsUsageLimitSources: Bool? = true, failResetCreditSend: Bool = false) {
+    init(mode: Mode, supportsUsageLimitSources: Bool? = true, failResetCreditSend: Bool = false,
+         supportsQuestionAttachments: Bool? = nil) {
         self.mode = mode
         self.supportsUsageLimitSources = supportsUsageLimitSources
         self.failResetCreditSend = failResetCreditSend
+        self.supportsQuestionAttachments = supportsQuestionAttachments
     }
 
     func send(_ data: Data) throws {
@@ -430,6 +493,16 @@ private actor ServerConfigTestConnection: WebSocketConnection {
             try enqueue(success(id: id, value: config(id: "codex-old")))
         case "server.refreshProviders":
             refreshRequestID = id
+        case "attachments.createUploadUrl":
+            try enqueue(success(id: id, value: .object([
+                "attachmentId": .string("uploaded-question-image"),
+                "relativeUrl": .string("/api/attachments/upload/test"),
+                "expiresAt": .number(9_999_999_999_999),
+            ])))
+        case "attachments.delete":
+            try enqueue(success(id: id, value: .null))
+        case RPCMethod.dispatchCommand.rawValue:
+            try enqueue(success(id: id, value: .object(["sequence": .number(1)])))
         case "provider.consumeResetCredit":
             if failResetCreditSend { throw RPCError.disconnected }
             try enqueue(success(id: id, value: .object(["outcome": .string("reset")])))
@@ -503,7 +576,12 @@ private actor ServerConfigTestConnection: WebSocketConnection {
     }
 
     private func config(id: String) -> JSONValue {
-        .object([
+        var capabilities = supportsUsageLimitSources.map { ["usageLimitSources": JSONValue.bool($0)] } ?? [:]
+        if let supportsQuestionAttachments {
+            capabilities["questionAttachments"] = .bool(supportsQuestionAttachments)
+            capabilities["attachmentUploads"] = .bool(true)
+        }
+        return .object([
             "providers": .array([provider(id: id)]),
             "settings": .object([
                 "defaultThreadEnvMode": .string("worktree"),
@@ -516,9 +594,7 @@ private actor ServerConfigTestConnection: WebSocketConnection {
                 "label": .string("Studio"),
                 "platform": .object(["os": .string("darwin"), "arch": .string("arm64")]),
                 "serverVersion": .string("1.0.0"),
-                "capabilities": .object(supportsUsageLimitSources.map {
-                    ["usageLimitSources": .bool($0)]
-                } ?? [:]),
+                "capabilities": .object(capabilities),
             ]),
         ])
     }

@@ -727,11 +727,11 @@ public struct ThreadDetailView: View {
                     onApprovalDecision: { id, decision in
                         Task { await model.resolveApproval(id, decision: decision) }
                     },
-                    onUserInputSubmit: { id, answers in
-                        Task { await model.resolveUserInput(id, answers: answers) }
+                    onUserInputSubmit: { id, answers, attachments in
+                        await model.resolveUserInput(id, answers: answers, attachmentsByQuestionID: attachments)
                     },
                     onUserInputDismiss: { id in
-                        Task { await model.dismissUserInput(id) }
+                        await model.dismissUserInput(id)
                     },
                     onRefreshModels: refreshThreadEnvironmentModels,
                     draftSaveError: draftSaveError,

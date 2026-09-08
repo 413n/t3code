@@ -668,6 +668,9 @@ public struct FeatureInputQuestion: Identifiable, Sendable, Equatable, Hashable,
     public var question: String
     public var options: [FeatureInputOption]
     public var allowsMultiple: Bool
+    public var allowCustomAnswer: Bool? = nil
+
+    public var canWriteCustomAnswer: Bool { allowCustomAnswer != false }
 
     public init(
         id: String,
@@ -692,6 +695,7 @@ public struct FeatureUserInput: Identifiable, Sendable, Equatable, Hashable, Cod
     public var questions: [FeatureInputQuestion]
     /// Only message-based questions can close without a provider callback.
     public var dismissible: Bool? = nil
+    public var supportsAttachments: Bool? = nil
 
     public var canDismiss: Bool { dismissible == true }
 

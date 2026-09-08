@@ -42,6 +42,27 @@ public struct FeatureComposerWorkspaceDraft: Sendable, Equatable {
     }
 }
 
+enum FeatureQuestionAttachmentDraft {
+    static func key(inputID: String) -> String { "question-attachments:\(inputID)" }
+
+    static func encode(_ attachments: [String: [FeatureDraftAttachment]]) throws -> FeatureComposerDraft {
+        let nonempty = attachments.filter { !$0.value.isEmpty }
+        guard !nonempty.isEmpty else { return FeatureComposerDraft() }
+        let data = try JSONEncoder().encode(nonempty.mapValues { $0.map(\.id) })
+        return FeatureComposerDraft(
+            text: String(decoding: data, as: UTF8.self),
+            attachments: nonempty.keys.sorted().flatMap { nonempty[$0] ?? [] }
+        )
+    }
+
+    static func decode(_ draft: FeatureComposerDraft?) throws -> [String: [FeatureDraftAttachment]] {
+        guard let draft, !draft.isEmpty else { return [:] }
+        let ids = try JSONDecoder().decode([String: [UUID]].self, from: Data(draft.text.utf8))
+        let byID = Dictionary(draft.attachments.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return ids.mapValues { $0.compactMap { byID[$0] } }
+    }
+}
+
 public enum FeatureComposerDraftImportError: LocalizedError, Equatable, Sendable {
     case attachmentLimitExceeded(available: Int)
 
@@ -311,9 +332,13 @@ public actor FeatureComposerDraftStore {
     ) throws {
         var drafts = try loadIfNeeded()
         let environmentPrefix = "environment:\(environmentID):"
+        let questionPrefix = FeatureQuestionAttachmentDraft.key(
+            inputID: FeatureScopedID.input(environmentID: environmentID, wireID: "")
+        )
         let logicalKeys = Set(logicalProjectIDs.map(Self.newTaskKey(logicalProjectID:)))
         drafts = drafts.filter {
-            !$0.key.hasPrefix(environmentPrefix) && !logicalKeys.contains($0.key)
+            !$0.key.hasPrefix(environmentPrefix) && !$0.key.hasPrefix(questionPrefix)
+                && !logicalKeys.contains($0.key)
         }
         try persist(drafts)
         loadedDrafts = drafts

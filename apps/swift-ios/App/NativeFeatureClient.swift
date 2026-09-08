@@ -2174,6 +2174,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws {
+        try await resolveUserInput(id: id, answers: answers, attachmentsByQuestionID: [:])
+    }
+
+    func resolveUserInput(
+        id: String, answers: [String: FeatureInputAnswer],
+        attachmentsByQuestionID: [String: [FeatureUploadAttachment]]
+    ) async throws {
         guard let request = inputRoutes[id] else {
             throw NativeFeatureClientError.inputRequestNotFound
         }
@@ -2181,7 +2188,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         _ = try await route.client.respondToUserInput(
             threadID: route.wireID,
             requestID: request.wireID,
-            answers: answers.mapValues(\.jsonValue)
+            answers: answers.mapValues(\.jsonValue),
+            attachmentsByQuestionID: try attachmentsByQuestionID.mapValues(makeUploadAttachments)
         )
         inputRoutes[id] = nil
         removeCachedInput(id: id, threadID: route.uiID)
@@ -4939,6 +4947,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
         var changedIDs = Set(mutations.messages.map(\.id))
         for activity in mutations.activities {
+            if activity.kind == "user-input.answer-submitted" {
+                changedIDs.formUnion(NativeQuestionAnswerHistory.messages(
+                    activity, createdAt: parseDate(activity.createdAt)
+                ).map(\.id))
+            }
             if NativeActivityNotice.accepts(activity) {
                 changedIDs.insert("activity-\(activity.id)")
             } else if NativeWorkLogAccumulator.accepts(activity) {
@@ -5720,6 +5733,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if let notice = NativeActivityNotice.message(activity, createdAt: parseDate(activity.createdAt)) {
             upsertMergedMessage(notice, cache: cache)
         }
+        for answer in NativeQuestionAnswerHistory.messages(activity, createdAt: parseDate(activity.createdAt)) {
+            upsertMergedMessage(answer, cache: cache)
+        }
         guard NativeWorkLogAccumulator.accepts(activity),
               cache.workLogActivityIDs.insert(activity.id).inserted else {
             return
@@ -5857,6 +5873,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 questions: questions
             )
             request.dismissible = activity.payload["responseMode"]?.stringValue == "message"
+            request.supportsAttachments = (serverConfigsByEnvironmentID[environment.id]?.environment
+                ?? environment.descriptor)?.capabilities.questionAttachments == true
             cache.userInputs.removeAll { $0.id == uiRequestID }
             cache.userInputs.append(request)
             cache.userInputs.sort { $0.id < $1.id }
@@ -6033,13 +6051,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             } else {
                 allowsMultiple = false
             }
-            return FeatureInputQuestion(
+            guard !options.isEmpty || question["allowCustomAnswer"] != .bool(false) else { return nil }
+            var mapped = FeatureInputQuestion(
                 id: id,
                 header: header,
                 question: text,
                 options: options,
                 allowsMultiple: allowsMultiple
             )
+            if case let .bool(value)? = question["allowCustomAnswer"] { mapped.allowCustomAnswer = value }
+            return mapped
         }
     }
 
@@ -6809,6 +6830,38 @@ private final class NativeDetailRenderCache {
     var closedUserInputRequestIDs: Set<String> = []
     var subagents = FeatureActiveSubagentTracker()
     var compaction = NativeContextCompactionState()
+}
+
+enum NativeQuestionAnswerHistory {
+    static func messages(_ activity: OrchestrationActivity, createdAt: Date) -> [FeatureMessage] {
+        guard activity.kind == "user-input.answer-submitted",
+              case let .object(attachments)? = activity.payload["attachmentsByQuestionId"],
+              case let .object(answers)? = activity.payload["answers"] else { return [] }
+        let questionText = activity.payload["questionTextById"]
+        return Set(answers.keys).union(attachments.keys).sorted().map { questionID in
+            let answer: String
+            switch answers[questionID] {
+            case let .string(text): answer = text
+            case let .array(values): answer = values.compactMap(\.stringValue).joined(separator: ", ")
+            default: answer = ""
+            }
+            let text = [questionText?[questionID]?.stringValue, answer]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+            let files: [JSONValue]
+            if case let .array(values)? = attachments[questionID] { files = values } else { files = [] }
+            return FeatureMessage(
+                id: "question-answer:\(activity.id):\(questionID)", role: .user, text: text,
+                createdAt: createdAt,
+                attachments: files.compactMap { file in
+                    guard let file = try? file.decode(ChatAttachment.self) else { return nil }
+                    return FeatureMessageAttachment(
+                        id: file.id, name: file.name, mimeType: file.mimeType,
+                        sizeBytes: file.sizeBytes
+                    )
+                }
+            )
+        }
+    }
 }
 
 enum NativeActivityNotice {

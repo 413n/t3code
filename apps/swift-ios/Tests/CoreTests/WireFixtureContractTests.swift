@@ -3,6 +3,30 @@ import XCTest
 @testable import T3Code
 
 final class WireFixtureContractTests: XCTestCase {
+    func testQuestionAttachmentAnswerMatchesTheServerContract() throws {
+        let image = try UploadChatAttachment(data: Data([1, 2]), name: "screenshot.png", mimeType: "image/png")
+        XCTAssertEqual(
+            OrchestrationCommands.respondToUserInput(
+                threadID: "thread-fixture", requestID: "question-fixture",
+                answers: ["scope": .array([.string("Server"), .string("Web")])],
+                attachmentsByQuestionID: ["scope": [image.uploadedJSONValue(id: "attachment-fixture")]],
+                commandID: "command-fixture", createdAt: "2026-08-07T12:00:00.000Z"
+            ),
+            try decodeFixture("question-attachment-command", as: JSONValue.self)
+        )
+    }
+
+    func testHubCreditsMatchTheServerContract() throws {
+        let input = try decodeFixture("hub-reset-credit-input", as: ProviderConsumeResetCreditInput.self)
+        XCTAssertEqual(input, .source(sourceID: "hub-fixture", accountID: "account-fixture", creditID: "credit-fixture"))
+        XCTAssertEqual(try JSONValue.encode(input), try decodeFixture("hub-reset-credit-input", as: JSONValue.self))
+        let result = try decodeFixture("hub-reset-credit-result", as: ProviderConsumeResetCreditResult.self)
+        XCTAssertEqual(result.warning, "Could not clear the hub cooldown.")
+        let credits = try decodeFixture("hub-reset-credits", as: ServerProviderResetCredits.self)
+        XCTAssertEqual(credits.nextCreditId, "credit-fixture")
+        XCTAssertEqual(credits.availableCount, 1)
+    }
+
     func testQuestionDismissalMatchesTheServerContract() throws {
         XCTAssertEqual(
             OrchestrationCommands.dismissUserInput(

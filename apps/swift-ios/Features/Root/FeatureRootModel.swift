@@ -832,10 +832,14 @@ public final class FeatureRootModel {
         }
     }
 
-    public func resolveUserInput(_ id: String, answers: [String: FeatureInputAnswer]) async {
+    public func resolveUserInput(
+        _ id: String, answers: [String: FeatureInputAnswer],
+        attachmentsByQuestionID: [String: [FeatureUploadAttachment]] = [:]
+    ) async {
         let environment = currentEnvironmentIdentity
         await perform {
-            try await client.resolveUserInput(id: id, answers: answers)
+            try await client.resolveUserInput(id: id, answers: answers, attachmentsByQuestionID: attachmentsByQuestionID)
+            try? await FeatureComposerDraftStore.shared.removeDraft(for: FeatureQuestionAttachmentDraft.key(inputID: id))
             guard currentEnvironmentIdentity == environment else { return }
             for key in Array(details.keys)
                 where details[key]?.userInputs.contains(where: { $0.id == id }) == true {
@@ -853,6 +857,7 @@ public final class FeatureRootModel {
         let environment = currentEnvironmentIdentity
         await perform {
             try await client.dismissUserInput(id: id)
+            try? await FeatureComposerDraftStore.shared.removeDraft(for: FeatureQuestionAttachmentDraft.key(inputID: id))
             guard currentEnvironmentIdentity == environment else { return }
             for key in Array(details.keys)
                 where details[key]?.userInputs.contains(where: { $0.id == id }) == true {

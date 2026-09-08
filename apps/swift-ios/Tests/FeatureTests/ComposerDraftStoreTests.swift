@@ -259,10 +259,20 @@ struct ComposerDraftStoreTests {
             FeatureComposerDraft(text: "keep"),
             for: "environment:second:new-task:two"
         )
+        let questionKey = FeatureQuestionAttachmentDraft.key(
+            inputID: FeatureScopedID.input(environmentID: "first", wireID: "request")
+        )
+        let otherQuestionKey = FeatureQuestionAttachmentDraft.key(
+            inputID: FeatureScopedID.input(environmentID: "first-extra", wireID: "request")
+        )
+        try await store.setDraft(FeatureComposerDraft(text: "remove"), for: questionKey)
+        try await store.setDraft(FeatureComposerDraft(text: "keep"), for: otherQuestionKey)
 
         try await store.removeDrafts(environmentID: "first")
 
         #expect(try await store.draft(for: "environment:first:thread:one") == nil)
+        #expect(try await store.draft(for: questionKey) == nil)
+        #expect(try await store.draft(for: otherQuestionKey)?.text == "keep")
         #expect(
             try await store.draft(for: "environment:second:new-task:two")?.text == "keep"
         )
