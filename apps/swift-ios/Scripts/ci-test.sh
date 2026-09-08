@@ -55,6 +55,7 @@ xcodebuild test \
   -derivedDataPath "${DERIVED_DATA_PATH}" \
   -maximum-concurrent-test-simulator-destinations 1 \
   -parallel-testing-enabled NO \
+  -enablePerformanceTestsDiagnostics NO \
   -collect-test-diagnostics never \
   -test-timeouts-enabled YES \
   -default-test-execution-time-allowance 30 \
