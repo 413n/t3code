@@ -124,11 +124,11 @@ struct UsageLimitsView: View {
                             UsageResetCreditsView(
                                 client: client,
                                 environmentID: group.environment.environmentID,
-                                instanceID: provider.instanceId,
+                                input: .provider(instanceID: provider.instanceId),
                                 isConnected: group.environment.isConnected && !group.environment.isPending,
                                 credits: credits,
                                 now: now,
-                                state: resetState(environmentID: group.id, instanceID: provider.instanceId)
+                                state: resetState(environmentID: group.id, account: .provider(provider.instanceId))
                             )
                         }
                     }
@@ -136,12 +136,12 @@ struct UsageLimitsView: View {
             }
 
             ForEach(group.sources) { source in
-                sourceSection(source)
+                sourceSection(source, environment: group.environment)
             }
         }
     }
 
-    private func sourceSection(_ row: UsageLimitSourceRows) -> some View {
+    private func sourceSection(_ row: UsageLimitSourceRows, environment: FeatureEnvironmentUsageLimits) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(row.source.label)
                 .font(T3Typography.control)
@@ -162,6 +162,22 @@ struct UsageLimitsView: View {
                         limits: account.usageLimits,
                         now: now
                     )
+                    if let credits = account.usageLimits.resetCredits {
+                        UsageResetCreditsView(
+                            client: client,
+                            environmentID: environment.id,
+                            input: credits.nextCreditId.map {
+                                .source(sourceID: row.id, accountID: account.id, creditID: $0)
+                            },
+                            isConnected: environment.isConnected && !environment.isPending,
+                            credits: credits,
+                            now: now,
+                            state: resetState(
+                                environmentID: environment.id,
+                                account: .source(sourceID: row.id, accountID: account.id)
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -211,8 +227,8 @@ struct UsageLimitsView: View {
         }
     }
 
-    private func resetState(environmentID: String, instanceID: String) -> Binding<UsageResetCreditState> {
-        let target = UsageResetCreditTarget(environmentID: environmentID, instanceID: instanceID)
+    private func resetState(environmentID: String, account: UsageResetCreditTarget.Account) -> Binding<UsageResetCreditState> {
+        let target = UsageResetCreditTarget(environmentID: environmentID, account: account)
         return Binding(
             get: { resetCreditStates[target] ?? UsageResetCreditState() },
             set: { resetCreditStates[target] = $0 }
@@ -232,11 +248,11 @@ private struct UsageLimitsAccountView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 ProviderIcon(driver: driver, providerID: instanceID, fallbackName: label, size: 18)
-                Text(label)
+                UsageAccountLabel(value: label)
                     .font(T3Typography.control)
                     .foregroundStyle(T3Colors.textPrimary)
                 if let detail {
-                    Text(detail)
+                    UsageAccountLabel(value: detail)
                         .font(T3Typography.supporting)
                         .foregroundStyle(T3Colors.textSecondary)
                         .lineLimit(2)
@@ -250,6 +266,26 @@ private struct UsageLimitsAccountView: View {
             ForEach(UsageLimitsPresentation.visibleWindows(limits)) { window in
                 UsageLimitWindowView(window: window, driver: driver, now: now)
             }
+        }
+    }
+}
+
+private struct UsageAccountLabel: View {
+    let value: String
+    @State private var isRevealed = false
+
+    var body: some View {
+        if value.contains("@") {
+            Button {
+                isRevealed.toggle()
+            } label: {
+                Text(isRevealed ? value : "••••••@••••••")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isRevealed ? "Hide account label" : "Reveal account label")
+            .onChange(of: value) { isRevealed = false }
+        } else {
+            Text(value)
         }
     }
 }
@@ -316,21 +352,23 @@ private struct UsageLimitWindowView: View {
 private struct UsageResetCreditsView: View {
     let client: any FeatureClient
     let environmentID: String
-    let instanceID: String
+    let input: ProviderConsumeResetCreditInput?
     let isConnected: Bool
     let credits: ServerProviderResetCredits
     let now: Date
     @Binding var state: UsageResetCreditState
 
     @State private var confirmationPresented = false
+    @State private var confirmedInput: ProviderConsumeResetCreditInput?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(UsageLimitsMath.creditSummary(credits, now: now))
                 .font(T3Typography.supporting)
                 .foregroundStyle(T3Colors.textSecondary)
-            if credits.availableCount > 0 || state.isPending {
+            if (credits.availableCount > 0 && input != nil) || state.isPending {
                 Button(state.isPending ? "Using credit..." : "Use a reset credit") {
+                    confirmedInput = input
                     confirmationPresented = true
                 }
                 .font(T3Typography.control)
@@ -353,10 +391,13 @@ private struct UsageResetCreditsView: View {
     }
 
     private func redeem() async {
-        guard state.begin(availableCount: credits.availableCount, isConnected: isConnected) else { return }
+        // Live updates can replace the next credit while the confirmation is open.
+        // Send the credit the user saw, never a later one.
+        guard let confirmedInput,
+              state.begin(availableCount: credits.availableCount, isConnected: isConnected) else { return }
         do {
-            let result = try await client.consumeResetCredit(environmentID: environmentID, instanceID: instanceID)
-            state.finish(result.outcome)
+            let result = try await client.consumeResetCredit(environmentID: environmentID, input: confirmedInput)
+            state.finish(result.outcome, warning: result.warning)
         } catch {
             state.fail(error)
         }

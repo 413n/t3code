@@ -849,6 +849,20 @@ public final class FeatureRootModel {
         }
     }
 
+    public func dismissUserInput(_ id: String) async {
+        let environment = currentEnvironmentIdentity
+        await perform {
+            try await client.dismissUserInput(id: id)
+            guard currentEnvironmentIdentity == environment else { return }
+            for key in Array(details.keys)
+                where details[key]?.userInputs.contains(where: { $0.id == id }) == true {
+                mutateDetail(id: key, change: .delta(FeatureDetailDelta(changedMessages: []))) {
+                    $0.userInputs.removeAll { $0.id == id }
+                }
+            }
+        }
+    }
+
     /// Convenience for callers that only submit free-form or single-select text.
     public func resolveUserInput(_ id: String, answers: [String: String]) async {
         await resolveUserInput(

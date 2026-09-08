@@ -70,6 +70,35 @@ final class NativeUsageStreamingTests: XCTestCase {
         await fixture.client.disconnect()
         await fixture.connector.closeConnections()
     }
+
+    func testHubCreditPinsTheSelectedAccountAndCreditOnTheChosenComputer() async throws {
+        let fixture = try await UsageStreamingFixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        var requests = fixture.connector.requests.makeAsyncIterator()
+        let redemption = Task {
+            try await fixture.client.consumeResetCredit(
+                environmentID: "slow",
+                input: .source(sourceID: "hub", accountID: "account", creditID: "credit-original")
+            )
+        }
+        let next = await requests.next()
+        let request = try XCTUnwrap(next)
+        XCTAssertEqual(request.host, "slow.example")
+        XCTAssertEqual(request.payload, .object([
+            "sourceId": .string("hub"), "accountId": .string("account"),
+            "creditId": .string("credit-original"),
+        ]))
+        try await request.succeed(.object([
+            "outcome": .string("reset"), "warning": .string("Could not clear the hub cooldown."),
+        ]))
+        let result = try await redemption.value
+        XCTAssertEqual(result.warning, "Could not clear the hub cooldown.")
+        var state = UsageResetCreditState()
+        state.finish(result.outcome, warning: result.warning)
+        XCTAssertEqual(state.statusMessage, "Reset applied. Your current limits are cleared. Could not clear the hub cooldown.")
+        await fixture.client.disconnect()
+        await fixture.connector.closeConnections()
+    }
 }
 
 private struct UsageStreamingFixture {

@@ -730,6 +730,9 @@ public struct ThreadDetailView: View {
                     onUserInputSubmit: { id, answers in
                         Task { await model.resolveUserInput(id, answers: answers) }
                     },
+                    onUserInputDismiss: { id in
+                        Task { await model.dismissUserInput(id) }
+                    },
                     onRefreshModels: refreshThreadEnvironmentModels,
                     draftSaveError: draftSaveError,
                     onRetryDraftSave: persistDraftImmediately

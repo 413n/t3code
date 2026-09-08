@@ -2399,6 +2399,26 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func testDismissQuestionKeepsItVisibleUntilTheServerAcceptsIt() async {
+        let client = FeatureClientStub()
+        let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Thread")
+        var request = FeatureUserInput(id: "request-1", threadID: thread.id, questions: [])
+        request.dismissible = true
+        client.threadDetail = FeatureThreadDetail(thread: thread, userInputs: [request])
+        let model = testRootModel(client: client)
+        _ = await model.detail(for: thread.id)
+
+        client.dismissInputError = URLError(.notConnectedToInternet)
+        await model.dismissUserInput(request.id)
+        #expect(model.details[thread.id]?.userInputs == [request])
+
+        client.dismissInputError = nil
+        await model.dismissUserInput(request.id)
+        #expect(client.dismissedInputID == request.id)
+        #expect(model.details[thread.id]?.userInputs.isEmpty == true)
+    }
+
+    @Test
     func testResolveUserInputForwardsTypedAnswersAndClearsTheRequest() async {
         let client = FeatureClientStub()
         let thread = FeatureThread(id: "thread-1", projectID: "project-1", title: "Thread")
@@ -3586,6 +3606,8 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var loadEarlierCallCount = 0
     var resolvedInputID: String?
     var resolvedInputAnswers: [String: FeatureInputAnswer]?
+    var dismissedInputID: String?
+    var dismissInputError: (any Error)?
     var savedSettings: [FeatureSettings] = []
     var refreshedProviderEnvironmentID: String?
     var refreshedProviders: [FeatureProvider] = []
@@ -3778,6 +3800,10 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     ) async throws {
         resolvedInputID = id
         resolvedInputAnswers = answers
+    }
+    func dismissUserInput(id: String) async throws {
+        if let dismissInputError { throw dismissInputError }
+        dismissedInputID = id
     }
     func saveSettings(_ settings: FeatureSettings) async throws {
         try await beforeSaveSettings?()

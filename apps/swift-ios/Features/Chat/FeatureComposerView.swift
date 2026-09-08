@@ -74,6 +74,7 @@ struct FeatureComposerView: View {
     private let onDismissKeyboard: (() -> Void)?
     private let onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)?
     private let onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)?
+    private let onUserInputDismiss: ((String) -> Void)?
 
     init(
         text: Binding<String>,
@@ -103,6 +104,7 @@ struct FeatureComposerView: View {
         onDismissKeyboard: (() -> Void)? = nil,
         onApprovalDecision: ((String, FeatureApprovalDecision) -> Void)? = nil,
         onUserInputSubmit: ((String, [String: FeatureInputAnswer]) -> Void)? = nil,
+        onUserInputDismiss: ((String) -> Void)? = nil,
         onRefreshModels: (() async throws -> Void)? = nil,
         draftSaveError: String? = nil,
         onRetryDraftSave: (() -> Void)? = nil
@@ -137,6 +139,7 @@ struct FeatureComposerView: View {
         self.onDismissKeyboard = onDismissKeyboard
         self.onApprovalDecision = onApprovalDecision
         self.onUserInputSubmit = onUserInputSubmit
+        self.onUserInputDismiss = onUserInputDismiss
     }
 
     var body: some View {
@@ -255,7 +258,8 @@ struct FeatureComposerView: View {
                     isResponding: isResolvingRequest,
                     onSubmit: { answers in
                         onUserInputSubmit(input.id, answers)
-                    }
+                    },
+                    onDismiss: onUserInputDismiss.map { dismiss in { dismiss(input.id) } }
                 )
             } else if isExpanded {
                 expandedComposer

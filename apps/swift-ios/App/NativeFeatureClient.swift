@@ -646,13 +646,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func consumeResetCredit(
         environmentID: String,
-        instanceID: String
+        input: ProviderConsumeResetCreditInput
     ) async throws -> ProviderConsumeResetCreditResult {
         guard try await runtime.environments().contains(where: { $0.id == environmentID && $0.isEnabled }) else {
             throw NativeFeatureClientError.environmentNotFound
         }
         let client = try await projectCreationClient(environmentID: environmentID)
-        return try await client.consumeResetCredit(instanceID: instanceID)
+        return try await client.consumeResetCredit(input)
     }
 
     func pullRequestLists(_ input: PullRequestListInput) async throws
@@ -2173,6 +2173,18 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             requestID: request.wireID,
             answers: answers.mapValues(\.jsonValue)
         )
+        inputRoutes[id] = nil
+        removeCachedInput(id: id, threadID: route.uiID)
+        try? await refreshThread(id: route.uiID, client: route.client)
+    }
+
+    func dismissUserInput(id: String) async throws {
+        guard let request = inputRoutes[id],
+              detailRenderCaches[request.threadID]?.userInputs.first(where: { $0.id == id })?.canDismiss == true else {
+            throw NativeFeatureClientError.inputRequestNotFound
+        }
+        let route = try threadRoute(for: request.threadID)
+        _ = try await route.client.dismissUserInput(threadID: route.wireID, requestID: request.wireID)
         inputRoutes[id] = nil
         removeCachedInput(id: id, threadID: route.uiID)
         try? await refreshThread(id: route.uiID, client: route.client)
@@ -5826,12 +5838,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                   let questions = parseInputQuestions(activity.payload), !questions.isEmpty else {
                 return
             }
-            let request = FeatureUserInput(
+            var request = FeatureUserInput(
                 id: uiRequestID,
                 wireID: requestID,
                 threadID: threadID,
                 questions: questions
             )
+            request.dismissible = activity.payload["responseMode"]?.stringValue == "message"
             cache.userInputs.removeAll { $0.id == uiRequestID }
             cache.userInputs.append(request)
             cache.userInputs.sort { $0.id < $1.id }

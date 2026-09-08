@@ -226,7 +226,12 @@ enum UsageLimitsMath {
 
 struct UsageResetCreditTarget: Hashable {
     let environmentID: String
-    let instanceID: String
+    let account: Account
+
+    enum Account: Hashable {
+        case provider(String)
+        case source(sourceID: String, accountID: String)
+    }
 }
 
 /// A confirmed request can spend one credit. Keep failures visible and never retry it automatically.
@@ -241,7 +246,7 @@ struct UsageResetCreditState: Equatable {
         return true
     }
 
-    mutating func finish(_ outcome: ProviderConsumeResetCreditOutcome) {
+    mutating func finish(_ outcome: ProviderConsumeResetCreditOutcome, warning: String? = nil) {
         isPending = false
         statusMessage = switch outcome {
         case .reset: "Reset applied. Your current limits are cleared."
@@ -249,6 +254,7 @@ struct UsageResetCreditState: Equatable {
         case .noCredit: "No reset credit left."
         case .alreadyRedeemed: "That credit was already redeemed."
         }
+        if let warning, !warning.isEmpty { statusMessage = "\(statusMessage ?? "") \(warning)" }
     }
 
     mutating func fail(_ error: any Error) {

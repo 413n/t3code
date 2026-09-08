@@ -5,6 +5,25 @@ import XCTest
 @MainActor
 @available(iOS 18.0, *)
 final class NativeThreadCatchUpTests: XCTestCase {
+    func testOnlyMessageQuestionsCanBeDismissed() async throws {
+        let fixture = try await CatchUpFixture.make(activities: [
+            requestActivity("user-input.requested", id: "callback"),
+            requestActivity("user-input.requested", id: "async", responseMode: "message"),
+        ])
+        defer { fixture.cleanUp() }
+        let detail = try await fixture.client.loadThread(id: fixture.firstID)
+        XCTAssertTrue(try XCTUnwrap(detail.userInputs.first { $0.wireID == "async" }).canDismiss)
+        let callback = try XCTUnwrap(detail.userInputs.first { $0.wireID == "callback" })
+        XCTAssertFalse(callback.canDismiss)
+        do {
+            try await fixture.client.dismissUserInput(id: callback.id)
+            XCTFail("A provider callback must not be dismissed")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "The input request is no longer active.")
+        }
+        await fixture.client.disconnect()
+    }
+
     func testRequestSnapshotsKeepTerminalRequestsClosedAndOtherFailuresRetryable() async throws {
         var activities: [OrchestrationActivity] = []
         for kind in ["approval", "user-input"] {
@@ -98,11 +117,13 @@ final class NativeThreadCatchUpTests: XCTestCase {
     }
 
     private func requestActivity(
-        _ kind: String, id: String, detail: String? = nil, requestType: String? = nil
+        _ kind: String, id: String, detail: String? = nil, requestType: String? = nil,
+        responseMode: String? = nil
     ) -> OrchestrationActivity {
         var payload: [String: JSONValue] = ["requestId": .string(id)]
         payload["detail"] = detail.map(JSONValue.string)
         payload["requestType"] = requestType.map(JSONValue.string)
+        payload["responseMode"] = responseMode.map(JSONValue.string)
         if kind == "user-input.requested" {
             payload["questions"] = .array([.object([
                 "id": .string("choice"), "header": .string("Choice"),

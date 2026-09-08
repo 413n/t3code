@@ -202,9 +202,13 @@ public actor T3Client {
     }
 
     public func consumeResetCredit(instanceID: String) async throws -> ProviderConsumeResetCreditResult {
+        try await consumeResetCredit(.provider(instanceID: instanceID))
+    }
+
+    public func consumeResetCredit(_ input: ProviderConsumeResetCreditInput) async throws -> ProviderConsumeResetCreditResult {
         try await rpc.request(
             RPCMethod.providerConsumeResetCredit.rawValue,
-            payload: .object(["instanceId": .string(instanceID)]),
+            payload: try JSONValue.encode(input),
             as: ProviderConsumeResetCreditResult.self
         )
     }
@@ -859,6 +863,11 @@ public actor T3Client {
                 answers: answers
             )
         )
+    }
+
+    @discardableResult
+    public func dismissUserInput(threadID: String, requestID: String) async throws -> DispatchResult {
+        try await dispatch(OrchestrationCommands.dismissUserInput(threadID: threadID, requestID: requestID))
     }
 
     @discardableResult
@@ -2208,6 +2217,21 @@ public enum OrchestrationCommands {
             "threadId": .string(threadID),
             "requestId": .string(requestID),
             "answers": .object(answers),
+            "createdAt": .string(createdAt),
+        ])
+    }
+
+    public static func dismissUserInput(
+        threadID: String,
+        requestID: String,
+        commandID: String = UUID().uuidString,
+        createdAt: String = now()
+    ) -> JSONValue {
+        .object([
+            "type": .string("thread.user-input.dismiss"),
+            "commandId": .string(commandID),
+            "threadId": .string(threadID),
+            "requestId": .string(requestID),
             "createdAt": .string(createdAt),
         ])
     }

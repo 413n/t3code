@@ -5,6 +5,14 @@ import Testing
 @Suite("User input answers")
 struct UserInputAnswerTests {
     @Test
+    func cachedQuestionsWithoutResponseModeCannotBeDismissed() throws {
+        let input = try JSONDecoder().decode(FeatureUserInput.self, from: Data(
+            #"{"id":"old","threadID":"thread","questions":[]}"#.utf8
+        ))
+        #expect(!input.canDismiss)
+    }
+
+    @Test
     func testCodableShapeMatchesProviderWireValues() throws {
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()

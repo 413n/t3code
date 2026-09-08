@@ -157,6 +157,7 @@ struct FeatureComposerUserInputPanel: View {
     let input: FeatureUserInput
     let isResponding: Bool
     let onSubmit: ([String: FeatureInputAnswer]) -> Void
+    var onDismiss: (() -> Void)? = nil
 
     @State private var answers: [String: FeatureInputAnswer] = [:]
     @State private var questionIndex = 0
@@ -245,6 +246,13 @@ struct FeatureComposerUserInputPanel: View {
                     .padding(.top, 7)
 
                     HStack(spacing: 8) {
+                        if input.canDismiss, let onDismiss {
+                            Button("Dismiss", action: onDismiss)
+                                .font(T3Typography.control)
+                                .foregroundStyle(T3Colors.textSecondary)
+                                .frame(minHeight: T3Metrics.minimumTapTarget)
+                                .accessibilityLabel("Dismiss question without replying")
+                        }
                         if questionIndex > 0 {
                             Button("Back") {
                                 questionIndex -= 1

@@ -99,6 +99,7 @@ public protocol FeatureClient: AnyObject {
     func cancelTurn(threadID: String) async throws
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws
+    func dismissUserInput(id: String) async throws
 
     func saveSettings(_ settings: FeatureSettings) async throws
     func serverPreferences(environmentID: String) async throws -> ServerSettingsSnapshot
@@ -124,7 +125,7 @@ public protocol FeatureClient: AnyObject {
     func refreshUsageLimits() async throws -> [FeatureEnvironmentUsageLimits]
     func consumeResetCredit(
         environmentID: String,
-        instanceID: String
+        input: ProviderConsumeResetCreditInput
     ) async throws -> ProviderConsumeResetCreditResult
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
@@ -282,6 +283,13 @@ public extension FeatureClient {
         environmentID: String,
         instanceID: String
     ) async throws -> ProviderConsumeResetCreditResult {
+        try await consumeResetCredit(environmentID: environmentID, input: .provider(instanceID: instanceID))
+    }
+
+    func consumeResetCredit(
+        environmentID: String,
+        input: ProviderConsumeResetCreditInput
+    ) async throws -> ProviderConsumeResetCreditResult {
         throw FeatureCapabilityUnavailable("Usage reset credits")
     }
 
@@ -427,6 +435,10 @@ public extension FeatureClient {
     }
     func releaseThread(id: String) {}
     func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws {}
+
+    func dismissUserInput(id: String) async throws {
+        throw FeatureCapabilityUnavailable("Question dismissal")
+    }
 
     /// Keeps simple text-only callers source-compatible while the typed API
     /// preserves multi-select answers as arrays.

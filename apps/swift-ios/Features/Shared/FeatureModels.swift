@@ -687,6 +687,10 @@ public struct FeatureUserInput: Identifiable, Sendable, Equatable, Hashable, Cod
     public var wireID: String?
     public var threadID: String
     public var questions: [FeatureInputQuestion]
+    /// Only message-based questions can close without a provider callback.
+    public var dismissible: Bool? = nil
+
+    public var canDismiss: Bool { dismissible == true }
 
     public init(
         id: String,

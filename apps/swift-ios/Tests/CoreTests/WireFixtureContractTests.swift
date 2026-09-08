@@ -3,6 +3,16 @@ import XCTest
 @testable import T3Code
 
 final class WireFixtureContractTests: XCTestCase {
+    func testQuestionDismissalMatchesTheServerContract() throws {
+        XCTAssertEqual(
+            OrchestrationCommands.dismissUserInput(
+                threadID: "thread-fixture", requestID: "question-fixture",
+                commandID: "command-fixture", createdAt: "2026-08-07T12:00:00.000Z"
+            ),
+            try decodeFixture("question-dismiss-command", as: JSONValue.self)
+        )
+    }
+
     func testGeneratedContractFixturesDecodeInSwift() throws {
         let shell = try decodeFixture(
             "shell-snapshot",

@@ -5,6 +5,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import {
+  ClientOrchestrationCommand,
   OrchestrationShellSnapshot,
   OrchestrationShellStreamItem,
   OrchestrationThreadDetailSnapshot,
@@ -114,6 +115,20 @@ const shellSnapshot = encodeShellSnapshot(decodeShellSnapshot(shellSnapshotInput
 const threadDetail = encodeThreadDetail(decodeThreadDetail(threadDetailInput));
 const serializeFixture = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 const fixtures = new Map<string, string>([
+  [
+    "question-dismiss-command.json",
+    serializeFixture(
+      Schema.encodeSync(ClientOrchestrationCommand)(
+        Schema.decodeUnknownSync(ClientOrchestrationCommand)({
+          type: "thread.user-input.dismiss",
+          commandId: "command-fixture",
+          threadId: threadShell.id,
+          requestId: "question-fixture",
+          createdAt: timestamp,
+        }),
+      ),
+    ),
+  ],
   ["shell-snapshot.json", serializeFixture(shellSnapshot)],
   ["thread-detail-snapshot.json", serializeFixture(threadDetail)],
   [

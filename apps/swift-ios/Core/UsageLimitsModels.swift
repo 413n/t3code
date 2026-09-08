@@ -35,10 +35,12 @@ public struct ServerProviderUsageWindow: Codable, Identifiable, Equatable, Senda
 public struct ServerProviderResetCredits: Codable, Equatable, Sendable {
     public let availableCount: Int
     public let nextExpiresAt: String?
+    public let nextCreditId: String?
 
-    public init(availableCount: Int, nextExpiresAt: String? = nil) {
+    public init(availableCount: Int, nextExpiresAt: String? = nil, nextCreditId: String? = nil) {
         self.availableCount = availableCount
         self.nextExpiresAt = nextExpiresAt
+        self.nextCreditId = nextCreditId
     }
 }
 
@@ -147,10 +149,44 @@ public enum ProviderConsumeResetCreditOutcome: String, Codable, CaseIterable, Se
     case alreadyRedeemed
 }
 
+public enum ProviderConsumeResetCreditInput: Codable, Hashable, Sendable {
+    case provider(instanceID: String)
+    case source(sourceID: String, accountID: String, creditID: String)
+
+    private enum CodingKeys: String, CodingKey { case instanceId, sourceId, accountId, creditId }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        if let instanceID = try values.decodeIfPresent(String.self, forKey: .instanceId) {
+            self = .provider(instanceID: instanceID)
+        } else {
+            self = .source(
+                sourceID: try values.decode(String.self, forKey: .sourceId),
+                accountID: try values.decode(String.self, forKey: .accountId),
+                creditID: try values.decode(String.self, forKey: .creditId)
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .provider(instanceID):
+            try values.encode(instanceID, forKey: .instanceId)
+        case let .source(sourceID, accountID, creditID):
+            try values.encode(sourceID, forKey: .sourceId)
+            try values.encode(accountID, forKey: .accountId)
+            try values.encode(creditID, forKey: .creditId)
+        }
+    }
+}
+
 public struct ProviderConsumeResetCreditResult: Codable, Equatable, Sendable {
     public let outcome: ProviderConsumeResetCreditOutcome
+    public let warning: String?
 
-    public init(outcome: ProviderConsumeResetCreditOutcome) {
+    public init(outcome: ProviderConsumeResetCreditOutcome, warning: String? = nil) {
         self.outcome = outcome
+        self.warning = warning
     }
 }
