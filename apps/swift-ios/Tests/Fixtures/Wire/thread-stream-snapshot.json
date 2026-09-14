@@ -20,6 +20,7 @@
       "interactionMode": "default",
       "branch": "main",
       "worktreePath": null,
+      "pullRequests": [],
       "branchPullRequest": {
         "projectId": "project-fixture",
         "repository": "fixture/repository",
