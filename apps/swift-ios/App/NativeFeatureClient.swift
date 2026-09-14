@@ -25,7 +25,7 @@ private struct T3ConnectManagedCleanupError: LocalizedError {
 @MainActor
 final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     FeatureProjectCreationClient, FeatureWorkspaceAssetResolving, FeatureAttachmentAssetResolving,
-    FeatureFeedbackSubmitting, T3ConnectCapable
+    FeatureFeedbackSubmitting, FeatureContextAttachmentResolving, T3ConnectCapable
 {
     private static let maximumRetainedThreadDetails = 6
     private static let t3ConnectLogger = Logger(
@@ -1529,7 +1529,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             shell: shellsByEnvironmentID[environment.id]
         )
         let title = Self.title(from: prompt, hasAttachments: !attachments.isEmpty)
-        let uploads = try makeUploadAttachments(attachments)
+        let uploads = try await makeUploadAttachments(attachments)
         if !uploads.isEmpty { _ = try await client.serverConfig() }
         let runtime = coreRuntimeMode(runtimeMode)
         let interaction = coreInteractionMode(interactionMode)
@@ -2208,7 +2208,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             throw NativeFeatureClientError.threadNotFound
         }
         let model = selection.map(coreModelSelection)
-        let uploads = try makeUploadAttachments(attachments)
+        let uploads = try await makeUploadAttachments(attachments)
         if !uploads.isEmpty { _ = try await client.serverConfig() }
         let runtimeMode = coreRuntimeMode(
             requestedRuntimeMode ?? mapRuntimeMode(shellThread.runtimeMode)
@@ -2474,11 +2474,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             throw NativeFeatureClientError.inputRequestNotFound
         }
         let route = try threadRoute(for: request.threadID)
+        var uploads: [String: [UploadChatAttachment]] = [:]
+        for (questionID, attachments) in attachmentsByQuestionID {
+            uploads[questionID] = try await makeUploadAttachments(attachments)
+        }
         _ = try await route.client.respondToUserInput(
             threadID: route.wireID,
             requestID: request.wireID,
             answers: answers.mapValues(\.jsonValue),
-            attachmentsByQuestionID: try attachmentsByQuestionID.mapValues(makeUploadAttachments)
+            attachmentsByQuestionID: uploads
         )
         inputRoutes[id] = nil
         removeCachedInput(id: id, threadID: route.uiID)
@@ -3433,9 +3437,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ) async throws -> FeatureUploadedAttachmentReference? {
         let client = try await projectCreationClient(environmentID: environmentID)
         _ = try await client.serverConfig()
-        let prepared = try await client.prepareAttachment(
-            makeUploadAttachments([attachment])[0]
-        )
+        let uploads = try await makeUploadAttachments([attachment])
+        let prepared = try await client.prepareAttachment(uploads[0])
         return prepared.map {
             FeatureUploadedAttachmentReference(
                 environmentID: $0.environmentID,
@@ -7097,6 +7100,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return resolved.url
     }
 
+    func contextAttachmentAssetURL(
+        environmentID: String, attachment: ComposerContextRecord.Attachment
+    ) async throws -> URL {
+        try Task.checkCancellation()
+        guard try await runtime.environments().contains(where: { $0.id == environmentID && $0.isEnabled }) else {
+            throw ComposerContextClipboardError.sourceUnavailable
+        }
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let generation = environmentGeneration
+        let resolved = try await client.resolvedAsset(resource: .attachment(
+            id: attachment.attachmentId, fileName: attachment.name, mimeType: attachment.mimeType
+        ))
+        try Task.checkCancellation()
+        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
+            throw CancellationError()
+        }
+        return resolved.url
+    }
+
     private func lastActivityDate(
         latestUserMessageAt: String?,
         latestTurn: OrchestrationLatestTurn?
@@ -7161,37 +7183,47 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func makeUploadAttachments(
         _ attachments: [FeatureUploadAttachment]
-    ) throws -> [UploadChatAttachment] {
+    ) async throws -> [UploadChatAttachment] {
         guard attachments.count <= 8 else {
             throw NativeFeatureClientError.tooManyAttachments
         }
-        return try attachments.map {
-            let reference = $0.uploadedReference.map {
-                UploadedAttachmentReference(
-                    environmentID: $0.environmentID,
-                    attachmentID: $0.attachmentID
-                )
-            }
-            if let ownedFile = $0.ownedFile {
+        let uploads = try await Task.detached(priority: .userInitiated) {
+            try attachments.map {
+                let reference = $0.uploadedReference.map {
+                    UploadedAttachmentReference(
+                        environmentID: $0.environmentID,
+                        attachmentID: $0.attachmentID
+                    )
+                }
+                if let ownedFile = $0.ownedFile {
+                    if $0.mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("image/") {
+                        return try UploadChatAttachment(
+                            id: $0.id, data: Data(contentsOf: ownedFile.url),
+                            name: $0.name, mimeType: $0.mimeType, uploadedReference: reference
+                        )
+                    }
+                    return try UploadChatAttachment(
+                        id: $0.id,
+                        fileURL: ownedFile.url,
+                        name: $0.name,
+                        mimeType: $0.mimeType,
+                        sizeBytes: ownedFile.byteCount,
+                        uploadedReference: reference,
+                        contextSource: $0.source
+                    )
+                }
                 return try UploadChatAttachment(
                     id: $0.id,
-                    fileURL: ownedFile.url,
+                    data: $0.data,
                     name: $0.name,
                     mimeType: $0.mimeType,
-                    sizeBytes: ownedFile.byteCount,
                     uploadedReference: reference,
                     contextSource: $0.source
                 )
             }
-            return try UploadChatAttachment(
-                id: $0.id,
-                data: $0.data,
-                name: $0.name,
-                mimeType: $0.mimeType,
-                uploadedReference: reference,
-                contextSource: $0.source
-            )
-        }
+        }.value
+        try Task.checkCancellation()
+        return uploads
     }
 
     private func requireScope(_ scope: String, client: T3Client) async throws {
