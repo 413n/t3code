@@ -47,16 +47,21 @@ public final class FeatureRootModel {
     }
 
     public private(set) var snapshot = FeatureSnapshot()
+    /// Why the last `startTask` returned nil, for the sheet that made the request.
+    public private(set) var lastTaskStartError: String?
     private(set) var pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation] = [:]
     private var pullRequestObservationIdentities: [String: String] = [:]
     public private(set) var details: [String: FeatureThreadDetail] = [:]
     private(set) var detailLoadStates: [String: FeatureThreadLoadState] = [:]
     private(set) var threadSyncStates: [String: FeatureThreadSyncState] = [:]
     private var backgroundedAt: Date?
-    /// Advances whenever a Home presentation input changes.
+    /// Advances when a Home shelf or order input changes (see `HomeOrderKey`)
+    /// or when projects, environments, providers, or preferences change.
+    /// Streaming updates to a row's own content do not advance it.
     public private(set) var homePresentationRevision: UInt64 = 0
-    /// Advances when a Home-visible thread is inserted, removed, or changed.
-    public private(set) var threadCollectionRevision: UInt64 = 0
+    /// Advances on any thread insert, removal, or field change. Rows read this
+    /// to refresh their own content without re-sorting the list.
+    public private(set) var threadRowRevision: UInt64 = 0
     /// Advances for any selected-thread metadata, message, approval, or input change.
     public private(set) var detailRevision: UInt64 = 0
     /// The latest detail revision for each loaded thread.
@@ -64,6 +69,9 @@ public final class FeatureRootModel {
     private(set) var detailRenderUpdates: [String: FeatureDetailRenderUpdate] = [:]
     public private(set) var isLoading = true
     public private(set) var isPerformingAction = false
+    /// Approval and question IDs with a response in flight. Views disable
+    /// only that request, not every request in every thread.
+    public private(set) var resolvingRequestIDs: Set<String> = []
     public private(set) var isManagingConnections = false
     private(set) var isSigningOutT3Connect = false
     public var errorMessage: String?
@@ -370,8 +378,9 @@ public final class FeatureRootModel {
         guard !prompt.isEmpty || !request.attachments.isEmpty else { return nil }
         guard request.workspaceMode != .worktree || request.branch != nil else { return nil }
 
+        lastTaskStartError = nil
         guard let project = snapshot.projects.first(where: { $0.id == request.projectID }) else {
-            errorMessage = "That project is no longer available."
+            lastTaskStartError = "That project is no longer available."
             return nil
         }
         let identity = FeatureSubmissionIdentity()
@@ -439,7 +448,7 @@ public final class FeatureRootModel {
                 scheduleOutboxRetry()
             }
             if discarded, !Self.isBenignCancellation(error) {
-                errorMessage = error.localizedDescription
+                lastTaskStartError = error.localizedDescription
             }
             return nil
         }
@@ -470,9 +479,8 @@ public final class FeatureRootModel {
     public func setArchived(_ id: String, archived: Bool) async {
         if archived,
            let thread = snapshot.threads.first(where: { $0.id == id }),
-           [.queued, .working, .monitoring, .waitingForApproval, .waitingForInput]
-               .contains(thread.state) {
-            errorMessage = "This thread is still active. Stop it before archiving."
+           !thread.canArchive {
+            // Rows hide Archive on live work; a stale row can still race in.
             return
         }
         let environment = currentEnvironmentIdentity
@@ -697,16 +705,6 @@ public final class FeatureRootModel {
         evictOldThreadDetailsIfNeeded()
     }
 
-    public func sendMessage(threadID: String, text: String, selection: FeatureSelection?) async -> Bool {
-        await sendMessage(
-            FeatureMessageSubmission(
-                threadID: threadID,
-                text: text,
-                selection: selection
-            )
-        )
-    }
-
     public func sendMessage(_ submission: FeatureMessageSubmission) async -> Bool {
         let trimmed = submission.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !submission.attachments.isEmpty else { return false }
@@ -814,6 +812,8 @@ public final class FeatureRootModel {
     }
 
     public func resolveApproval(_ id: String, decision: FeatureApprovalDecision) async {
+        guard resolvingRequestIDs.insert(id).inserted else { return }
+        defer { resolvingRequestIDs.remove(id) }
         let environment = currentEnvironmentIdentity
         await perform {
             try await client.resolveApproval(id: id, decision: decision)
@@ -836,6 +836,8 @@ public final class FeatureRootModel {
         _ id: String, answers: [String: FeatureInputAnswer],
         attachmentsByQuestionID: [String: [FeatureUploadAttachment]] = [:]
     ) async {
+        guard resolvingRequestIDs.insert(id).inserted else { return }
+        defer { resolvingRequestIDs.remove(id) }
         let environment = currentEnvironmentIdentity
         await perform {
             try await client.resolveUserInput(id: id, answers: answers, attachmentsByQuestionID: attachmentsByQuestionID)
@@ -854,6 +856,8 @@ public final class FeatureRootModel {
     }
 
     public func dismissUserInput(_ id: String) async {
+        guard resolvingRequestIDs.insert(id).inserted else { return }
+        defer { resolvingRequestIDs.remove(id) }
         let environment = currentEnvironmentIdentity
         await perform {
             try await client.dismissUserInput(id: id)
@@ -866,14 +870,6 @@ public final class FeatureRootModel {
                 }
             }
         }
-    }
-
-    /// Convenience for callers that only submit free-form or single-select text.
-    public func resolveUserInput(_ id: String, answers: [String: String]) async {
-        await resolveUserInput(
-            id,
-            answers: answers.mapValues(FeatureInputAnswer.text)
-        )
     }
 
     @discardableResult
@@ -1000,10 +996,8 @@ public final class FeatureRootModel {
 
     private static func isBenignCancellation(_ error: any Error) -> Bool {
         if error is CancellationError { return true }
-        let message = error.localizedDescription
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return message == "cancelled" || message == "canceled"
+        if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+        return false
     }
 
     private var currentEnvironmentIdentity: String {
@@ -1017,9 +1011,21 @@ public final class FeatureRootModel {
         switch event {
         case let .snapshot(value):
             install(value)
-        case let .connection(value):
-            guard snapshot.connection != value else { return }
-            snapshot.connection = value
+        case let .connection(value, environmentID):
+            var changed = false
+            if snapshot.connection != value {
+                snapshot.connection = value
+                changed = true
+            }
+            if let environmentID,
+               let index = snapshot.environments.firstIndex(where: { $0.id == environmentID }),
+               snapshot.environments[index].connectionState != value.state
+                || snapshot.environments[index].connectionDetail != value.detail {
+                snapshot.environments[index].connectionState = value.state
+                snapshot.environments[index].connectionDetail = value.detail
+                changed = true
+            }
+            guard changed else { return }
             homePresentationRevision &+= 1
             if value.state == .connected {
                 scheduleOutboxDrain()
@@ -1054,11 +1060,13 @@ public final class FeatureRootModel {
         let thread = retainingPendingSettlement(in: thread)
         discardStalePullRequest(for: thread)
         var metadataChanged = false
+        var orderChanged = false
         if let index = snapshot.threads.firstIndex(where: { $0.id == thread.id }) {
             let previous = snapshot.threads[index]
             if previous != thread {
                 snapshot.threads[index] = thread
                 metadataChanged = true
+                orderChanged = HomeOrderKey(previous) != HomeOrderKey(thread)
                 if previous.projectID != thread.projectID {
                     adjustProjectCount(id: previous.projectID, by: -1)
                     adjustProjectCount(id: thread.projectID, by: 1)
@@ -1068,9 +1076,12 @@ public final class FeatureRootModel {
             snapshot.threads.append(thread)
             adjustProjectCount(id: thread.projectID, by: 1)
             metadataChanged = true
+            orderChanged = true
         }
         if metadataChanged {
-            threadCollectionRevision &+= 1
+            threadRowRevision &+= 1
+        }
+        if orderChanged {
             homePresentationRevision &+= 1
         }
         let detailChanged = mutateDetail(
@@ -1092,7 +1103,7 @@ public final class FeatureRootModel {
         pullRequestsByThreadID.removeValue(forKey: id)
         pullRequestObservationIdentities.removeValue(forKey: id)
         adjustProjectCount(id: projectID, by: -1)
-        threadCollectionRevision &+= 1
+        threadRowRevision &+= 1
         homePresentationRevision &+= 1
     }
 
@@ -1151,17 +1162,24 @@ public final class FeatureRootModel {
             bumpDetailMetadataRevision(id: thread.id)
         }
 
+        let threadsChanged = snapshot.threads != value.threads
+        let orderChanged = threadsChanged && (
+            snapshot.threads.count != value.threads.count
+                || zip(snapshot.threads, value.threads).contains { previous, next in
+                    previous.id != next.id || HomeOrderKey(previous) != HomeOrderKey(next)
+                }
+        )
         if snapshot.connection != value.connection
             || snapshot.environments != value.environments
             || snapshot.projects != value.projects
             || snapshot.providers != value.providers
             || snapshot.providersByEnvironment != value.providersByEnvironment
             || snapshot.preferencesByEnvironment != value.preferencesByEnvironment
-            || snapshot.threads != value.threads {
+            || orderChanged {
             homePresentationRevision &+= 1
         }
-        if snapshot.threads != value.threads {
-            threadCollectionRevision &+= 1
+        if threadsChanged {
+            threadRowRevision &+= 1
         }
         snapshot = value
         if value.connection.state == .connected
@@ -1189,7 +1207,7 @@ public final class FeatureRootModel {
             mutation(&snapshot.threads[index])
             if snapshot.threads[index] != previous {
                 metadataChanged = true
-                threadCollectionRevision &+= 1
+                threadRowRevision &+= 1
                 homePresentationRevision &+= 1
             }
         }
@@ -1812,27 +1830,34 @@ public final class FeatureRootModel {
         return environment.isEnabled && environment.connectionState == .connected
     }
 
+    /// Only transport failures keep a submission queued. A server that
+    /// answered and rejected the command is final, so the message is dropped
+    /// and the error shown. Matching on error text queued permanent failures
+    /// (a provider "connection refused", a validation error mentioning
+    /// "network") and retried them forever.
     static func shouldQueue(
         _ error: any Error,
         environmentID: String,
         snapshot: FeatureSnapshot
     ) -> Bool {
         if error is CancellationError || error is URLError { return true }
-        if let rpcError = error as? RPCError,
-           case .responseTimedOut = rpcError {
-            return true
+        if let rpcError = error as? RPCError {
+            switch rpcError {
+            case .responseTimedOut, .connectionUnavailable, .disconnected: return true
+            case .remote, .protocolViolation: break
+            }
+        }
+        if let httpError = error as? HTTPError {
+            switch httpError {
+            case .invalidResponse: return true
+            case let .status(status, _, _): return status >= 500
+            default: break
+            }
         }
         if let environment = snapshot.environments.first(where: { $0.id == environmentID }) {
-            let disconnected = !environment.isEnabled
-                || environment.connectionState != .connected
-            if disconnected { return true }
+            return !environment.isEnabled || environment.connectionState != .connected
         }
-        let message = error.localizedDescription.lowercased()
-        return [
-            "cancelled", "canceled", "connection", "network", "offline",
-            "socket", "timed out", "timeout", "transport", "not connected",
-            "request deadline",
-        ].contains { message.contains($0) }
+        return false
     }
 }
 

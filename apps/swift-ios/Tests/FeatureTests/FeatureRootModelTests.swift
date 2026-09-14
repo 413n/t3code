@@ -98,6 +98,11 @@ struct FeatureRootModelTests {
 
     @Test
     func liveThreadSyncOutranksStaleLoadingAndEnvironmentReachability() {
+        for syncState in [FeatureThreadSyncState.live, .catchingUp, .reconnecting] {
+            #expect(ThreadRefreshPresentation.resolve(
+                loadState: nil, connectionState: .needsPairing, isOpening: false, syncState: syncState
+            ) == .needsPairing)
+        }
         for connectionState in [FeatureConnection.State.connected, .disconnected, .reconnecting] {
             #expect(ThreadRefreshPresentation.resolve(
                 loadState: nil, connectionState: connectionState, isOpening: false, syncState: .live
@@ -1464,11 +1469,7 @@ struct FeatureRootModelTests {
         await model.reload()
         _ = await model.detail(for: thread.id)
 
-        let sent = await model.sendMessage(
-            threadID: thread.id,
-            text: "  ship it  ",
-            selection: nil
-        )
+        let sent = await model.sendMessage(FeatureMessageSubmission(threadID: thread.id, text: "  ship it  ", selection: nil))
 
         #expect(sent)
         #expect(client.sentText == "ship it")
@@ -1502,11 +1503,7 @@ struct FeatureRootModelTests {
         let model = testRootModel(client: client)
         await model.reload()
 
-        let sent = await model.sendMessage(
-            threadID: thread.id,
-            text: "Use the saved permission",
-            selection: nil
-        )
+        let sent = await model.sendMessage(FeatureMessageSubmission(threadID: thread.id, text: "Use the saved permission", selection: nil))
 
         #expect(sent)
         #expect(client.sentRuntimeModes == [.automatic])
@@ -1680,9 +1677,7 @@ struct FeatureRootModelTests {
         _ = await model.detail(for: thread.id)
 
         let sent = await model.sendMessage(
-            threadID: thread.id,
-            text: "Keep this queued",
-            selection: nil
+            FeatureMessageSubmission(threadID: thread.id, text: "Keep this queued", selection: nil)
         )
 
         #expect(!sent)
@@ -1740,9 +1735,7 @@ struct FeatureRootModelTests {
         _ = await model.detail(for: thread.id)
 
         let sent = await model.sendMessage(
-            threadID: thread.id,
-            text: "Already delivered",
-            selection: nil
+            FeatureMessageSubmission(threadID: thread.id, text: "Already delivered", selection: nil)
         )
 
         #expect(sent)
@@ -2016,10 +2009,10 @@ struct FeatureRootModelTests {
 
         await model.setArchived(thread.id, archived: true)
 
+        // Rows hide Archive on live work; the model drops a stray call quietly.
         #expect(model.snapshot.threads.first?.isArchived == false)
-        #expect(model.errorMessage?.contains("still active") == true)
+        #expect(model.errorMessage == nil)
 
-        model.errorMessage = nil
         await model.setSettled(thread.id, settled: true)
 
         #expect(model.snapshot.threads.first?.isSettled == false)
@@ -2471,7 +2464,7 @@ struct FeatureRootModelTests {
 
         #expect(model.snapshot.threads.isEmpty)
         #expect(model.snapshot.projects[0].threadCount == 0)
-        #expect(model.threadCollectionRevision == 2)
+        #expect(model.threadRowRevision == 2)
         #expect(model.homePresentationRevision == 4)
     }
 
@@ -3702,25 +3695,12 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         selection: FeatureSelection?,
         runtimeMode: FeatureRuntimeMode,
         interactionMode: FeatureInteractionMode,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread {
-        if let startTaskError { throw startTaskError }
-        startedPrompt = prompt
-        startedAttachments = attachments
-        return createdThread
-    }
-
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
         workspaceMode: FeatureWorkspaceMode,
         branch: String?,
         worktreePath: String?,
         startFromOrigin: Bool,
-        attachments: [FeatureUploadAttachment]
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity
     ) async throws -> FeatureThread {
         try await beforeStartTask?()
         if let startTaskError { throw startTaskError }
@@ -3748,7 +3728,7 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         try await preuploadHandler?(attachment, environmentID)
     }
 
-    func loadThread(id: String) async throws -> FeatureThreadDetail {
+    func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail {
         if let loadThreadError {
             throw loadThreadError
         }
@@ -3767,13 +3747,6 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         return earlierThreadDetail
     }
 
-    func sendMessage(threadID: String, text: String, selection: FeatureSelection?) async throws {
-        sendMessageCallCount += 1
-        try beforeSendMessage?()
-        if let sendMessageError { throw sendMessageError }
-        sentText = text
-    }
-
     func sendMessage(
         threadID: String,
         text: String,
@@ -3783,7 +3756,10 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         identity _: FeatureSubmissionIdentity
     ) async throws {
         sentRuntimeModes.append(runtimeMode)
-        try await sendMessage(threadID: threadID, text: text, selection: selection)
+        sendMessageCallCount += 1
+        try beforeSendMessage?()
+        if let sendMessageError { throw sendMessageError }
+        sentText = text
     }
 
     func cancelTurn(threadID: String) async throws {
@@ -3796,7 +3772,8 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws {}
     func resolveUserInput(
         id: String,
-        answers: [String: FeatureInputAnswer]
+        answers: [String: FeatureInputAnswer],
+        attachmentsByQuestionID _: [String: [FeatureUploadAttachment]]
     ) async throws {
         resolvedInputID = id
         resolvedInputAnswers = answers
