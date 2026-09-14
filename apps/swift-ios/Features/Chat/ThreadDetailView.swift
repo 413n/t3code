@@ -20,6 +20,9 @@ public struct ThreadDetailView: View {
     @State private var selection: FeatureSelection?
     @State private var attachments: [FeatureDraftAttachment] = []
     @State private var isSending = false
+    @State private var pendingRewindMessageID: String?
+    @State private var isPreparingRewind = false
+    @State private var isPreparingInput = false
     @State private var submittingCompaction = false
     @State private var isLoading = true
     @State private var sendFailed = false
@@ -56,7 +59,7 @@ public struct ThreadDetailView: View {
         self.draftStore = draftStore
     }
 
-    public var body: some View {
+    private var threadContent: some View {
         Group {
             if let detail {
                 timeline(detail)
@@ -104,6 +107,7 @@ public struct ThreadDetailView: View {
         .task(id: thread.id) {
             // A cached thread can already show its composer while the server
             // is catching up. Local drafts must not wait for that request.
+            await model.checkRewindRecovery(for: currentThread)
             guard !didRestoreDraft else { return }
             await restoreDraft(from: composerDraft, key: draftKey)
         }
@@ -121,6 +125,9 @@ public struct ThreadDetailView: View {
         })
         .onChange(of: draft) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
+        .onChange(of: model.recoveredRewindDrafts[thread.id]) { _, recovered in
+            if recovered != nil { restoreRewindDraft() }
+        }
         .onChange(of: threadConnectionState) { _, state in
             if state == .connected,
                case .failed = model.detailLoadStates[thread.id],
@@ -185,6 +192,10 @@ public struct ThreadDetailView: View {
             .presentationDragIndicator(.visible)
             .t3CodeSizing(steps: codeSizeSteps)
         }
+    }
+
+    public var body: some View {
+        threadContent
         .alert("Message not sent", isPresented: $sendFailed) {
             // Refocusing happens here rather than when the send fails: the
             // alert takes first responder from the composer, so a refocus
@@ -192,6 +203,19 @@ public struct ThreadDetailView: View {
             Button("OK") { composerFocused = true }
         } message: {
             Text("Your draft is still here. Check your connection and try again.")
+        }
+        .confirmationDialog("Edit from here?", isPresented: Binding(
+            get: { pendingRewindMessageID != nil },
+            set: { if !$0 { pendingRewindMessageID = nil } }
+        ), titleVisibility: .visible) {
+            Button("Revert and keep changes") {
+                guard let messageID = pendingRewindMessageID else { return }
+                pendingRewindMessageID = nil
+                rewindConversation(before: messageID)
+            }
+            Button("Cancel", role: .cancel) { pendingRewindMessageID = nil }
+        } message: {
+            Text("Rewind chat to before this message. Your prompt and attachments return to the composer. File changes stay as they are.")
         }
         .alert(
             feedbackIdentifier == nil ? "Could not send feedback" : "Feedback sent to OpenAI",
@@ -257,6 +281,53 @@ public struct ThreadDetailView: View {
 
     private var isCompacting: Bool {
         submittingCompaction || detail?.isCompacting == true
+    }
+
+    private var isRewinding: Bool {
+        isPreparingRewind || model.rewindingThreadIDs.contains(thread.id)
+    }
+
+    private func canRewind(_ messageID: String) -> Bool {
+        !isSending && !isRewinding && !isPreparingInput && didRestoreDraft
+            && model.canRewindConversation(threadID: thread.id, messageID: messageID)
+    }
+
+    private func rewindConversation(before messageID: String) {
+        guard canRewind(messageID) else { return }
+        isPreparingRewind = true
+        dismissKeyboard()
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        let saved = composerDraft
+        Task {
+            await pendingSave?.value
+            await model.rewindConversation(threadID: thread.id, messageID: messageID, draft: saved)
+            isPreparingRewind = false
+        }
+    }
+
+    private func restoreRewindDraft() {
+        guard let recovered = model.consumeRewindDraft(threadID: thread.id) else { return }
+        draft = recovered.text
+        attachments = recovered.attachments
+        selection = recovered.selection
+        composerContext = recovered.context
+        didRestoreDraft = true
+    }
+
+    private func recoverSavedRewind() {
+        guard !isRewinding && !isSending && !isPreparingInput else { return }
+        isPreparingRewind = true
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        let saved = composerDraft
+        Task {
+            await pendingSave?.value
+            await model.recoverSavedRewind(threadID: thread.id, draft: saved)
+            isPreparingRewind = false
+        }
     }
 
     private var currentSelection: FeatureSelection? {
@@ -467,6 +538,12 @@ public struct ThreadDetailView: View {
                 }
                 Button(action: reloadThread) {
                     Label("Reload", systemImage: "arrow.clockwise")
+                }
+                if let message = detail?.messages.last(where: { $0.role == .user }),
+                   canRewind(message.id) {
+                    Button { pendingRewindMessageID = message.id } label: {
+                        Label("Edit last prompt", systemImage: "arrow.uturn.backward")
+                    }
                 }
             }
             Section("Workspace") {
@@ -712,13 +789,39 @@ public struct ThreadDetailView: View {
                     onLoadEarlier: {
                         Task { await model.loadEarlierTurns(for: thread.id) }
                     },
-                    onDismissKeyboard: dismissKeyboard
+                    onDismissKeyboard: dismissKeyboard,
+                    canEditMessage: canRewind,
+                    onEditMessage: { pendingRewindMessageID = $0 }
                 )
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
                 refreshStatus
+                if isRewinding {
+                    Text("Rewinding conversation")
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.textPrimary)
+                        .padding(.vertical, 8)
+                        .accessibilityIdentifier("conversation-rewind-status")
+                }
+                if let error = model.rewindErrors[thread.id] {
+                    Text(error)
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.danger)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                }
+                if model.pendingRewindRecoveryIDs.contains(thread.id), !isRewinding {
+                    VStack(spacing: 4) {
+                        Text("A prompt is saved from an unconfirmed rewind. Reload the thread to check its history.")
+                            .font(T3Typography.supporting)
+                        Button("Recover saved prompt", action: recoverSavedRewind)
+                            .disabled(isSending || isPreparingInput || !didRestoreDraft)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 8)
+                }
                 FeatureComposerView(
                     text: $draft,
                     selection: $selection,
@@ -734,7 +837,7 @@ public struct ThreadDetailView: View {
                     providers: threadProviders,
                     threadSelection: currentSelection,
                     materializesDefaultSelection: false,
-                    isSending: isSending,
+                    isSending: isSending || isRewinding,
                     isWorking: detail.thread.state == .working || detail.thread.state == .queued
                         || isCompacting,
                     focused: $composerFocused,
@@ -760,8 +863,10 @@ public struct ThreadDetailView: View {
                     onRefreshModels: refreshThreadEnvironmentModels,
                     draftSaveError: draftSaveError,
                     onRetryDraftSave: persistDraftImmediately,
-                    context: contextBinding
+                    context: contextBinding,
+                    onInputPreparationChange: { isPreparingInput = $0 }
                 )
+                .disabled(isRewinding)
             }
             .background(T3Colors.background)
         }
@@ -923,6 +1028,7 @@ public struct ThreadDetailView: View {
     }
 
     private func send() {
+        guard !isRewinding else { return }
         let message = draft
         let pendingContext = composerContext
         let pendingAttachments = currentThread.environmentID.map {
@@ -1110,8 +1216,16 @@ public struct ThreadDetailView: View {
 
     @MainActor
     private func restoreDraft(from baseline: FeatureComposerDraft, key: String) async {
+        if model.recoveredRewindDrafts[thread.id] != nil {
+            restoreRewindDraft()
+            return
+        }
         let saved = try? await draftStore.draft(for: key)
         guard !Task.isCancelled else { return }
+        if model.recoveredRewindDrafts[thread.id] != nil {
+            restoreRewindDraft()
+            return
+        }
 
         let liveDraft = composerDraft
         var restored = FeatureComposerDraftRestoration.merge(
@@ -1144,7 +1258,7 @@ public struct ThreadDetailView: View {
     }
 
     private func scheduleDraftSave() {
-        guard didRestoreDraft else { return }
+        guard didRestoreDraft, !isRewinding else { return }
         let previousSave = draftSaveTask
         previousSave?.cancel()
         let snapshot = composerDraft
@@ -1175,7 +1289,7 @@ public struct ThreadDetailView: View {
     }
 
     private func persistDraftImmediately() {
-        guard didRestoreDraft else { return }
+        guard didRestoreDraft, !isRewinding else { return }
         let previousSave = draftSaveTask
         previousSave?.cancel()
         let snapshot = composerDraft
@@ -1465,6 +1579,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     let isLoadingEarlier: Bool
     let onLoadEarlier: () -> Void
     let onDismissKeyboard: () -> Void
+    let canEditMessage: (String) -> Bool
+    let onEditMessage: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1488,6 +1604,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
     func updateUIView(_ collectionView: UICollectionView, context: Context) {
         context.coordinator.currentOpenURL = openURL
+        context.coordinator.canEditMessage = canEditMessage
+        context.coordinator.onEditMessage = onEditMessage
         context.coordinator.update(
             threadID: threadID,
             messages: messages,
@@ -1547,6 +1665,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
         var currentOpenURL: OpenURLAction?
+        var canEditMessage: ((String) -> Bool)?
+        var onEditMessage: ((String) -> Void)?
         private var currentImageContext: MarkdownImageContext?
         private var currentAttachmentContext: FeatureAttachmentContext?
         private var currentSkills: [FeatureProviderSkill] = []
@@ -1566,6 +1686,24 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
         deinit {
             markdownPrefetches.values.forEach { $0.task.cancel() }
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            contextMenuConfigurationForItemAt indexPath: IndexPath,
+            point: CGPoint
+        ) -> UIContextMenuConfiguration? {
+            guard let messageID = dataSource?.itemIdentifier(for: indexPath),
+                  messagesByID[messageID]?.role == .user,
+                  canEditMessage?(messageID) == true else { return nil }
+            return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+                UIMenu(children: [UIAction(
+                    title: "Edit from here", image: UIImage(systemName: "arrow.uturn.backward")
+                ) { [weak self] _ in
+                    guard self?.canEditMessage?(messageID) == true else { return }
+                    self?.onEditMessage?(messageID)
+                }])
+            }
         }
 
         func connect(to collectionView: UICollectionView) {
