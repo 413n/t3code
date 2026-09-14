@@ -137,14 +137,12 @@ final class PlatformSubscriptionUsageCoordinator {
             lastRefresh = Date()
             lastRefreshEnvironmentIDs = currentIDs
         }
-        await withTaskGroup(of: Void.self) { group in
-            if shouldRefresh {
-                group.addTask { @MainActor in
-                    // Refresh emits config events. Do not overwrite newer stream
-                    // data with the operation result if the two complete out of order.
-                    _ = try? await client.refreshUsageLimits()
-                }
-            }
+        let refreshTask: Task<Void, Never>? = shouldRefresh ? Task { @MainActor in
+            // Refresh emits config events. Do not overwrite newer stream
+            // data with the operation result if the two complete out of order.
+            _ = try? await client.refreshUsageLimits()
+        } : nil
+        await withTaskCancellationHandler {
             do {
                 for try await rows in client.usageLimitsUpdates() {
                     guard !Task.isCancelled, generation == currentGeneration else { break }
@@ -159,8 +157,11 @@ final class PlatformSubscriptionUsageCoordinator {
                 }
                 await publish()
             }
-            group.cancelAll()
+        } onCancel: {
+            refreshTask?.cancel()
         }
+        refreshTask?.cancel()
+        await refreshTask?.value
     }
 
     private func publish() async {
