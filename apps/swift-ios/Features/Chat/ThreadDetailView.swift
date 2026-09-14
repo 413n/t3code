@@ -236,11 +236,15 @@ public struct ThreadDetailView: View {
             Text(feedbackAlertMessage ?? "")
         }
         .background {
-            ThreadBackSwipeGestureView(
-                isEnabled: horizontalSizeClass == .compact,
-                onNavigateBack: onNavigateBack
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // iOS 26 owns the interactive content back-swipe. A second pan
+            // recognizer can block it or clear the selection during a pop.
+            if #unavailable(iOS 26.0) {
+                ThreadBackSwipeGestureView(
+                    isEnabled: horizontalSizeClass == .compact,
+                    onNavigateBack: onNavigateBack
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .environment(\.openURL, transcriptOpenURL)
         .fullScreenCover(item: $linkedMediaPreview) { preview in
@@ -2386,8 +2390,8 @@ struct TranscriptViewportGeometry: Equatable {
     }
 }
 
-/// The detail surface uses a native pan recognizer instead of a SwiftUI
-/// `DragGesture`. SwiftUI's broad drag recognizer can begin before it knows
+/// Full-content back-swipe fallback for iOS 17 and 18. Newer iOS versions use
+/// system navigation. SwiftUI's `DragGesture` can begin before it knows
 /// whether a gesture is vertical, which competes with the transcript's native
 /// collection-view scrolling. This recognizer fails for vertical motion at
 /// gesture-begin time and remains simultaneous with the collection view for
