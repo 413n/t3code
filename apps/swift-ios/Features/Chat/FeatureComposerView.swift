@@ -40,12 +40,16 @@ struct FeatureComposerView: View {
     @State private var pathSearchError: String?
     @State private var textSelectionRequest: FeatureComposerTextSelectionRequest?
     @State private var imageIntakeErrorMessage: String?
+    @State private var pastedTextErrorMessage: String?
+    @State private var pastedTextTask: Task<Void, Never>?
+    @State private var pastedTextGeneration = UUID()
     @State private var textRevision: UInt64 = 0
     @State private var textObservation = FeatureComposerTextObservation()
     @State private var voiceInputController = FeatureVoiceInputController()
     @Binding private var text: String
     @Binding private var selection: FeatureSelection?
     @Binding private var attachments: [FeatureDraftAttachment]
+    @Binding private var context: OrchestrationMessageContext?
 
     private let providers: [FeatureProvider]
     private let draftOwnerID: String
@@ -107,11 +111,13 @@ struct FeatureComposerView: View {
         onUserInputDismiss: ((String) async -> Void)? = nil,
         onRefreshModels: (() async throws -> Void)? = nil,
         draftSaveError: String? = nil,
-        onRetryDraftSave: (() -> Void)? = nil
+        onRetryDraftSave: (() -> Void)? = nil,
+        context: Binding<OrchestrationMessageContext?> = .constant(nil)
     ) {
         _text = text
         _selection = selection
         _attachments = attachments
+        _context = context
         self.draftOwnerID = draftOwnerID
         self.environmentID = environmentID
         self.draftStorageKey = draftStorageKey
@@ -202,6 +208,8 @@ struct FeatureComposerView: View {
             }
             .onDisappear {
                 voiceInputController.cancel()
+                pastedTextTask?.cancel()
+                pastedTextGeneration = UUID()
             }
             .onChange(of: text) {
                 textRevision &+= 1
@@ -209,6 +217,8 @@ struct FeatureComposerView: View {
             }
             .onChange(of: draftOwnerID) {
                 synchronizeVoiceDraft(ownerChanged: true)
+                pastedTextTask?.cancel()
+                pastedTextGeneration = UUID()
             }
             .onChange(of: voiceInputController.pendingCommit?.id) {
                 applyPendingVoiceCommit()
@@ -236,6 +246,17 @@ struct FeatureComposerView: View {
                 Button("OK") { imageIntakeErrorMessage = nil }
             } message: {
                 Text(imageIntakeErrorMessage ?? "")
+            }
+            .alert(
+                "Could not paste text",
+                isPresented: Binding(
+                    get: { pastedTextErrorMessage != nil },
+                    set: { if !$0 { pastedTextErrorMessage = nil } }
+                )
+            ) {
+                Button("OK") { pastedTextErrorMessage = nil }
+            } message: {
+                Text(pastedTextErrorMessage ?? "")
             }
     }
 
@@ -349,7 +370,11 @@ struct FeatureComposerView: View {
                     selectionRequest: textSelectionRequest,
                     onSelectionChange: handleTextSelectionChange,
                     onPasteImages: attachImageProviders,
-                    onDismissKeyboard: onDismissKeyboard
+                    onDismissKeyboard: onDismissKeyboard,
+                    maximumPastedTextBytes: maximumPastedTextBytes,
+                    onPasteTextAttachment: attachPastedText,
+                    onPasteTextError: { pastedTextErrorMessage = $0 },
+                    draftOwnerID: draftOwnerID
                 )
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
@@ -871,21 +896,36 @@ struct FeatureComposerView: View {
         }
     }
 
+    private func contextReference(label: String, payload: ComposerContextRecord.Payload) throws -> String {
+        let record = ComposerContextRecord(label: label, payload: payload)
+        context = try FeatureComposerContext.merge(ComposerContextReferences.referenced(context, text: text), .init(records: [record]))
+        return ComposerContextReferences.format(record) + " "
+    }
+
     private func selectCommandItem(_ item: FeatureComposerMenuItem) {
         guard let trigger = composerTrigger else { return }
         let replacement: String
-        switch item {
-        case .modelCommand:
-            replacement = "/model "
-        case let .model(nextSelection, _, _):
-            selection = nextSelection
-            replacement = ""
-        case let .providerCommand(command):
-            replacement = "/\(command.name) "
-        case let .skill(skill):
-            replacement = skill.invocation
-        case let .path(entry):
-            replacement = FeatureComposerFileLinkSerializer.markdownLink(for: entry.path) + " "
+        do {
+            switch item {
+            case .modelCommand:
+                replacement = "/model "
+            case let .model(nextSelection, _, _):
+                selection = nextSelection
+                replacement = ""
+            case let .providerCommand(command):
+                replacement = "/\(command.name) "
+            case let .skill(skill):
+                if skill.userInvocationOnly == true {
+                    replacement = skill.invocation
+                } else {
+                    replacement = try contextReference(label: skill.invocationDisplayName, payload: .skill(.init(name: skill.name)))
+                }
+            case let .path(entry):
+                replacement = try contextReference(label: entry.name, payload: .mention(.init(path: entry.path)))
+            }
+        } catch {
+            pathSearchError = error.localizedDescription
+            return
         }
         let nextCursorLocation = FeatureComposerTextSelectionPolicy.cursorLocation(
             afterReplacing: trigger.range,
@@ -1018,6 +1058,58 @@ struct FeatureComposerView: View {
                 } catch {
                     imageIntakeErrorMessage = error.localizedDescription
                 }
+            }
+        }
+    }
+
+    private var maximumPastedTextBytes: Int? {
+        FeaturePastedText.maximumAttachmentBytes(
+            advertisedMaximum: attachmentPreferences.maxFileAttachmentBytes,
+            attachmentCount: attachments.count,
+            pendingCount: attachmentPreparation.pendingItemCount
+        )
+    }
+
+    private func attachPastedText(_ pastedText: String, commitSelection: @escaping @MainActor () -> Bool) {
+        guard !voiceInputController.isBusy, !pastedText.isEmpty,
+              let maximumPastedTextBytes,
+              pastedText.utf8.count <= maximumPastedTextBytes else {
+            pastedTextErrorMessage = "Could not attach pasted text. Your draft has not changed."
+            return
+        }
+        pastedTextTask?.cancel()
+        let generation = UUID()
+        pastedTextGeneration = generation
+        let fileName = FeaturePastedText.nextFileName(existingNames: attachments.map(\.filename))
+        let fileStore = ManagedAttachmentFileStore()
+        let operation = attachmentPreparation.begin(itemCount: 1)
+        pastedTextTask = Task { @MainActor in
+            defer {
+                attachmentPreparation.finish(operation)
+                if pastedTextGeneration == generation { pastedTextTask = nil }
+            }
+            do {
+                try Task.checkCancellation()
+                let attachment = try await Task.detached(priority: .userInitiated) {
+                    try FeaturePastedText.attachment(text: pastedText, fileName: fileName, maximumBytes: maximumPastedTextBytes, fileStore: fileStore)
+                }.value
+                var adopted = false
+                defer {
+                    if !adopted, let file = attachment.ownedFile {
+                        try? fileStore.removeOwnedFile(fileName: file.fileName)
+                    }
+                }
+                guard !Task.isCancelled, pastedTextGeneration == generation else { return }
+                guard attachments.count + attachmentPreparation.pendingItemCount <= FeatureImageAttachmentLimits.maximumCount,
+                      commitSelection() else {
+                    pastedTextErrorMessage = "The draft changed while the file was prepared. Paste again to add it."
+                    return
+                }
+                attachments.append(attachment)
+                adopted = true
+            } catch {
+                guard !Task.isCancelled, pastedTextGeneration == generation else { return }
+                pastedTextErrorMessage = error.localizedDescription
             }
         }
     }

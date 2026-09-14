@@ -22,6 +22,10 @@ struct FeatureComposerTextInput: UIViewRepresentable {
     let onSelectionChange: (NSRange) -> Void
     let onPasteImages: ([NSItemProvider]) -> Void
     let onDismissKeyboard: (() -> Void)?
+    var maximumPastedTextBytes: Int? = nil
+    var onPasteTextAttachment: ((String, @escaping @MainActor () -> Bool) -> Void)? = nil
+    var onPasteTextError: ((String) -> Void)? = nil
+    var draftOwnerID: String = ""
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -34,6 +38,10 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         textView.isReadOnly = isReadOnly
         textView.onPasteImages = onPasteImages
         textView.onDismissKeyboard = onDismissKeyboard
+        textView.maximumPastedTextBytes = maximumPastedTextBytes
+        textView.onPasteTextAttachment = onPasteTextAttachment
+        textView.draftOwnerID = draftOwnerID
+        textView.onPasteTextError = onPasteTextError
         if onDismissKeyboard != nil {
             textView.installDismissPanRecognizer()
         }
@@ -64,6 +72,10 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         textView.acceptsImages = acceptsImages
         textView.onPasteImages = onPasteImages
         textView.onDismissKeyboard = onDismissKeyboard
+        textView.maximumPastedTextBytes = maximumPastedTextBytes
+        textView.onPasteTextAttachment = onPasteTextAttachment
+        textView.draftOwnerID = draftOwnerID
+        textView.onPasteTextError = onPasteTextError
         textView.isReadOnly = isReadOnly
 
         let previousAttributedText = textView.attributedText ?? NSAttributedString()
@@ -295,6 +307,21 @@ struct FeatureComposerTextInput: UIViewRepresentable {
             parent.onSelectionChange(selection)
         }
 
+        func textView(
+            _ textView: UITextView,
+            editMenuForTextIn range: NSRange,
+            suggestedActions: [UIMenuElement]
+        ) -> UIMenu? {
+            guard !parent.isReadOnly, UIPasteboard.general.hasStrings,
+                  let composerTextView = textView as? FeatureComposerUITextView else {
+                return UIMenu(children: suggestedActions)
+            }
+            let pasteAsText = UIAction(title: "Paste as Text") { [weak composerTextView] _ in
+                composerTextView?.pasteAsText(nil)
+            }
+            return UIMenu(children: suggestedActions + [pasteAsText])
+        }
+
         func textViewDidBeginEditing(_ textView: UITextView) {
             lastAppliedFocus = true
             if !parent.focused {
@@ -380,8 +407,8 @@ struct FeatureComposerTextInput: UIViewRepresentable {
     }
 }
 
-/// Advertises image support to the paste menu and routes image pastes out to
-/// the attachment pipeline. Text-only pastes fall through to UIKit untouched.
+/// Routes images and large text pastes to attachments. Ordinary text keeps
+/// UIKit's native paste behavior.
 final class FeatureComposerUITextView: FeatureInlineSkillTextView {
     private static let bottomEditingInset: CGFloat = 10
     private var lastLaidOutBoundsSize = CGSize.zero
@@ -456,7 +483,23 @@ final class FeatureComposerUITextView: FeatureInlineSkillTextView {
     }
     var onPasteImages: (([NSItemProvider]) -> Void)?
     var onDismissKeyboard: (() -> Void)?
+    var maximumPastedTextBytes: Int?
+    var onPasteTextAttachment: ((String, @escaping @MainActor () -> Bool) -> Void)?
+    var draftOwnerID = ""
+    private var pastedTextRequestID = UUID()
+    var onPasteTextError: ((String) -> Void)?
     private var wantsFirstResponderOnAttach = false
+
+    override var keyCommands: [UIKeyCommand]? {
+        let pasteAsTextCommand = UIKeyCommand(
+            input: "v",
+            modifierFlags: [.command, .shift],
+            action: #selector(pasteAsText(_:))
+        )
+        pasteAsTextCommand.discoverabilityTitle = "Paste as Text"
+        pasteAsTextCommand.wantsPriorityOverSystemBehavior = true
+        return (super.keyCommands ?? []) + [pasteAsTextCommand]
+    }
 
     /// Programmatic focus can arrive before the view joins a window (a host
     /// refocusing right as the composer expands); retry once attached. The
@@ -548,6 +591,9 @@ final class FeatureComposerUITextView: FeatureInlineSkillTextView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(pasteAsText(_:)) {
+            return !isReadOnly && UIPasteboard.general.hasStrings
+        }
         if isReadOnly, action == #selector(paste(_:)) || action == #selector(cut(_:)) {
             return false
         }
@@ -579,18 +625,74 @@ final class FeatureComposerUITextView: FeatureInlineSkillTextView {
     // attached screenshot reads as a bug.
     override func paste(_ sender: Any?) {
         guard !isReadOnly else { return }
-        guard acceptsImages else {
-            super.paste(sender)
+        if acceptsImages {
+            let imageProviders = UIPasteboard.general.itemProviders.filter {
+                $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+            }
+            if !imageProviders.isEmpty {
+                onPasteImages?(imageProviders)
+                return
+            }
+        }
+        if let pastedText = UIPasteboard.general.string, foldPastedText(pastedText) {
             return
         }
-        let imageProviders = UIPasteboard.general.itemProviders.filter {
-            $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+        super.paste(sender)
+    }
+
+    var readClipboardText: () -> String? = { UIPasteboard.general.string }
+
+    @objc func pasteAsText(_ sender: Any?) {
+        guard !isReadOnly, let pastedText = readClipboardText() else { return }
+        if !foldPastedText(pastedText, bypassAutoAttachment: true) {
+            insertText(pastedText)
         }
-        guard !imageProviders.isEmpty else {
-            super.paste(sender)
-            return
+    }
+
+    /// Returning false leaves the paste to UIKit. A rejected fold must not
+    /// replace selected draft text with an empty string.
+    func foldPastedText(_ pastedText: String, bypassAutoAttachment: Bool = false) -> Bool {
+        guard !isReadOnly else { return true }
+        let source = FeatureInlineSkillProjection.plainText(from: attributedText)
+        let selection = FeatureInlineSkillProjection.plainRange(
+            for: selectedRange,
+            in: attributedText
+        )
+        switch FeaturePastedText.disposition(
+            text: pastedText,
+            currentTextLength: source.utf16.count,
+            selection: selection,
+            maximumAttachmentBytes: maximumPastedTextBytes,
+            bypassAutoAttachment: bypassAutoAttachment
+        ) {
+        case .inline:
+            return false
+        case .rejected:
+            onPasteTextError?(
+                "Pasted text is too large for this message. Remove some text or an attachment, then paste again."
+            )
+        case .attachment:
+            guard markedTextRange == nil, let onPasteTextAttachment else {
+                onPasteTextError?("Could not attach pasted text. Your draft has not changed.")
+                return true
+            }
+            let requestID = UUID()
+            pastedTextRequestID = requestID
+            let ownerID = draftOwnerID
+            onPasteTextAttachment(pastedText) { [weak self] in
+                guard let self, self.pastedTextRequestID == requestID,
+                      self.draftOwnerID == ownerID, !self.isReadOnly, self.markedTextRange == nil,
+                      FeatureInlineSkillProjection.plainText(from: self.attributedText) == source,
+                      FeatureInlineSkillProjection.plainRange(for: self.selectedRange, in: self.attributedText) == selection else {
+                    return false
+                }
+                if self.selectedRange.length > 0 { self.insertText("") }
+                self.scrollSelectionIntoView()
+                self.pastedTextRequestID = UUID()
+                return true
+            }
         }
-        onPasteImages?(imageProviders)
+        return true
     }
 }
 

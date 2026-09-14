@@ -610,6 +610,61 @@ public struct FeatureReviewCommentDraft: Sendable, Equatable, Hashable {
         Inspect the surrounding code, make the smallest correct change, and report what changed.
         """
     }
+
+    public func submissionText(contextRecord: ComposerContextRecord) -> String {
+        let reference = ComposerContextReferences.format(contextRecord)
+        // The record has a smaller bound than a message. Keep the full comment
+        // in ordinary text when it does not fit instead of discarding instructions.
+        return body.utf16.count > 16_000
+            ? prompt + "\n\n" + reference
+            : "Address this review comment: " + reference
+    }
+
+    public func contextRecord(lines: [FeatureDiffLine]) -> ComposerContextRecord {
+        let range = line.map { "\($0.side.rawValue) line \($0.line)" } ?? "File"
+        let selectedIndex = line.flatMap { selected in
+            lines.firstIndex {
+                selected.side == .new ? $0.newLine == selected.line : $0.oldLine == selected.line
+            }
+        } ?? 0
+        func formatted(_ index: Int) -> String {
+            let line = lines[index]
+            let prefix = switch line.kind {
+            case .addition: "+"
+            case .deletion: "-"
+            case .context: " "
+            case .hunk: ""
+            }
+            return prefix + line.text
+        }
+        // Build outward from the selected row so a large file never clips away
+        // the code the comment is about. Indices still refer to the full diff.
+        var lower = min(selectedIndex, max(0, lines.count - 1))
+        var upper = min(lines.count, lower + 1)
+        let selectedText = lines.isEmpty ? "" : ComposerContextReferences.boundedPrefix(formatted(lower), maximumUTF16: 32_000)
+        var remaining = 32_000 - selectedText.utf16.count
+        while remaining > 0, lower > 0 || upper < lines.count {
+            var added = false
+            if lower > 0, formatted(lower - 1).utf16.count + 1 <= remaining {
+                lower -= 1
+                remaining -= formatted(lower).utf16.count + 1
+                added = true
+            }
+            if upper < lines.count, formatted(upper).utf16.count + 1 <= remaining {
+                remaining -= formatted(upper).utf16.count + 1
+                upper += 1
+                added = true
+            }
+            if !added { break }
+        }
+        return ComposerContextRecord(label: "\(filePath) \(range)", payload: .reviewComment(.init(
+            sectionId: "working-tree", sectionTitle: "Working changes", filePath: filePath,
+            startIndex: selectedIndex, endIndex: selectedIndex,
+            rangeLabel: range, text: ComposerContextReferences.boundedPrefix(body, maximumUTF16: 16_000),
+            diff: (lower..<upper).map { $0 == selectedIndex ? selectedText : formatted($0) }.joined(separator: "\n"),
+            fenceLanguage: "diff", pullRequest: nil
+        )))
+    }
 }
 
 public enum FeatureReviewChangeKind: String, Sendable, Codable {
