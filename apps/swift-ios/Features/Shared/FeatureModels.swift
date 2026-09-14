@@ -146,6 +146,9 @@ public struct FeatureProject: Identifiable, Sendable, Equatable, Hashable, Codab
     public var createdAt: String?
     public var updatedAt: String?
     public var projectIcon: ProjectIconOverride? = nil
+    public var defaultWorkspaceMode: FeatureWorkspaceMode? = nil
+    public var newWorktreesStartFromOrigin: Bool? = nil
+    public var supportsProjectSettingsOverrides: Bool? = nil
 
     public init(
         id: String,
@@ -1178,6 +1181,11 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
         try container.encode(liveActivitiesEnabled, forKey: .liveActivitiesEnabled)
         try container.encodeIfPresent(defaultSelection, forKey: .defaultSelection)
     }
+}
+
+public struct FeatureProjectPreferences: Sendable {
+    public let environment: ServerSettingsSnapshot
+    public let effective: ServerSettingsSnapshot
 }
 
 public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
