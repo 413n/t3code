@@ -25,6 +25,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let onSettle: (FeatureThread, Bool, @escaping (Bool) -> Void) -> Void
     let onSnooze: (FeatureThread, Date?) -> Void
     let onPin: (FeatureThread, Bool) -> Void
+    let onArrange: () -> Void
     let onDelete: (FeatureThread) -> Void
     let onPullRequestChange: (String, String, HomeThreadPullRequestPresentation?) -> Void
 
@@ -565,6 +566,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             }
 
             if !isArchived {
+                actions.append(accessibilityAction("Arrange threads", systemImage: "line.3.horizontal") { coordinator in
+                    coordinator.parent.onArrange()
+                })
                 if thread.canTogglePin {
                     let isPinned = thread.pinnedAt != nil
                     actions.append(accessibilityAction(
@@ -711,6 +715,12 @@ struct HomeThreadCollectionView: UIViewRepresentable {
 
             var statusActions: [UIMenuElement] = []
             if !isArchived {
+                statusActions.append(UIAction(
+                    title: "Arrange threads",
+                    image: UIImage(systemName: "line.3.horizontal")
+                ) { [weak self] _ in
+                    self?.parent.onArrange()
+                })
                 if thread.canTogglePin {
                     let isPinned = thread.pinnedAt != nil
                     statusActions.append(

@@ -55,6 +55,7 @@ public struct WorkspaceView: View {
     @State private var showingAddProject = false
     @State private var showingEnvironments = false
     @State private var showingSettings = false
+    @State private var showingThreadArrangement = false
     @State private var renamingThread: FeatureThread?
     @State private var deletingThread: FeatureThread?
     @State private var renameTitle = ""
@@ -119,6 +120,9 @@ public struct WorkspaceView: View {
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(model: model)
+        }
+        .sheet(isPresented: $showingThreadArrangement) {
+            ThreadArrangementView(model: model)
         }
         .alert(
             "Rename thread",
@@ -252,6 +256,7 @@ public struct WorkspaceView: View {
                 onPin: { thread, pinned in
                     Task { await model.setPinned(thread.id, pinned: pinned) }
                 },
+                onArrange: { showingThreadArrangement = true },
                 onDelete: { thread in
                     deletingThread = thread
                 },

@@ -82,6 +82,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var latestServerConfig: ServerConfigSnapshot?
     private var serverConfigsByEnvironmentID: [String: ServerConfigSnapshot] = [:]
     private var latestSnapshot: FeatureSnapshot?
+    /// One reorder at a time: a second move planned from the same keys would
+    /// land a conflicting write (React Native holds a pending order for this).
+    private var threadMoveInFlight = false
     private var activeThreadID: String?
     private var activeThreadEnvironmentID: String?
     private var latestDetails: [String: FeatureThreadDetail] = [:]
@@ -1687,8 +1690,131 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func setThreadPinned(id: String, pinned: Bool) async throws {
         let route = try threadRoute(for: id)
-        _ = try await route.client.pin(threadID: route.wireID, pinned: pinned)
+        // Same placement as web and React Native: a fresh pin takes the top of
+        // the arranged run. Servers that predate reordering get the bare pin
+        // (keyless, sorted by creation order below keyed threads).
+        var orderKey: String? = nil
+        if pinned, cachedThread(id: route.uiID)?.supportsPinReorder == true {
+            let firstKey = latestSnapshot?.threads
+                .filter { $0.pinnedAt != nil }
+                .compactMap(\.pinOrderKey)
+                .min()
+            orderKey = ThreadOrderPlanner.orderKeyBetween(before: nil, after: firstKey)
+        }
+        _ = try await route.client.pin(threadID: route.wireID, pinned: pinned, orderKey: orderKey)
         try? await refresh(client: route.client)
+    }
+
+    /// Saves a full-section order. Cross-section moves first clear the source
+    /// lifecycle state. Every key write goes to the thread's owning server.
+    @discardableResult
+    func reorderThread(
+        id: String,
+        section: FeatureThreadOrderSection,
+        orderedIDs: [String]
+    ) async throws -> [FeatureThreadOrderAssignment] {
+        guard !threadMoveInFlight else { return [] }
+        guard let snapshot = latestSnapshot else {
+            throw NativeFeatureClientError.threadNotFound
+        }
+        // Only currently-connected environments are writable; a disconnected
+        // server's rows keep their stale keys as anchors but never receive
+        // writes, so a spread rewrite cannot half-land on a dead client.
+        let connectedEnvironmentIDs = Set(
+            snapshot.environments
+                .filter { $0.isEnabled && environmentConnectionStates[$0.id] == .connected }
+                .map(\.id)
+        )
+        let threadsByID = Dictionary(
+            snapshot.threads.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let now = Date.now
+        let canonical = DailyUXSidebarIndex.orderedSection(snapshot.threads, section: section, now: now)
+        guard let moved = threadsByID[id],
+              ThreadArrangementPlanner.canEnter(moved, section: section, now: now),
+              Set(orderedIDs).count == orderedIDs.count,
+              Set(orderedIDs) == Set(canonical.map(\.id)).union([id]),
+              let assignments = ThreadOrderPlanner.planDrop(
+            ordered: orderedIDs.compactMap { threadsByID[$0] },
+            all: snapshot.threads,
+            section: section,
+            connectedEnvironmentIDs: connectedEnvironmentIDs,
+            movedID: id
+        ) else {
+            return []
+        }
+
+        threadMoveInFlight = true
+        defer { threadMoveInFlight = false }
+
+        var confirmed: [FeatureThreadOrderAssignment] = []
+        var touchedEnvironmentIDs = Set<String>()
+        var firstError: Error?
+        let crossesSection = !canonical.contains(where: { $0.id == id })
+        if crossesSection {
+            do {
+                let route = try threadRoute(for: id)
+                touchedEnvironmentIDs.insert(route.environmentID)
+                for action in ThreadArrangementPlanner.lifecycle(moved, section: section, now: now) {
+                    switch action {
+                    case .pin:
+                        let key = assignments.first(where: { $0.threadID == id })?.orderKey
+                        _ = try await route.client.pin(threadID: route.wireID, pinned: true, orderKey: key)
+                    case .unpin:
+                        _ = try await route.client.pin(threadID: route.wireID, pinned: false)
+                    case .unsettle:
+                        _ = try await route.client.settle(threadID: route.wireID, settled: false)
+                    case .unsnooze:
+                        _ = try await route.client.snooze(threadID: route.wireID, until: nil)
+                    }
+                }
+            } catch {
+                firstError = error
+            }
+        }
+        for assignment in assignments {
+            guard firstError == nil else { break }
+            do {
+                let route = try threadRoute(for: assignment.threadID)
+                // Refresh even when the transport lost a receipt after the
+                // server accepted the write.
+                touchedEnvironmentIDs.insert(route.environmentID)
+                switch section {
+                case .pinned:
+                    _ = try await route.client.reorderPinnedThread(
+                        threadID: route.wireID,
+                        orderKey: assignment.orderKey
+                    )
+                case .active:
+                    _ = try await route.client.reorderActiveThread(
+                        threadID: route.wireID,
+                        orderKey: assignment.orderKey
+                    )
+                }
+                confirmed.append(assignment)
+            } catch {
+                // Confirmed writes stand: a later environment rejecting its
+                // write leaves the earlier arrangement in place.
+                firstError = error
+                break
+            }
+        }
+        for environmentID in touchedEnvironmentIDs {
+            if let client = environmentClients[environmentID] {
+                try? await refresh(client: client)
+            }
+        }
+        if let firstError {
+            guard confirmed.isEmpty else {
+                throw FeatureThreadMovePartialError(
+                    confirmed: confirmed,
+                    underlying: firstError
+                )
+            }
+            throw firstError
+        }
+        return confirmed
     }
 
     func setRuntimeMode(id: String, mode: FeatureRuntimeMode) async throws {
@@ -5256,6 +5382,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             supportsSettlement: capabilities?.threadSettlement,
             supportsSnooze: capabilities?.threadSnooze,
             supportsPinning: capabilities?.threadPinning,
+            supportsPinReorder: capabilities?.threadPinReorder,
+            supportsActiveReorder: capabilities?.threadActiveReorder,
             supportsTitleRegeneration: capabilities?.threadTitleRegeneration,
             supportsPullRequestLinking: capabilities?.threadPullRequestLinking,
             isRegeneratingTitle: thread.titleRegeneration != nil,
@@ -5343,6 +5471,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             supportsSettlement: capabilities?.threadSettlement,
             supportsSnooze: capabilities?.threadSnooze,
             supportsPinning: capabilities?.threadPinning,
+            supportsPinReorder: capabilities?.threadPinReorder,
+            supportsActiveReorder: capabilities?.threadActiveReorder,
             supportsTitleRegeneration: capabilities?.threadTitleRegeneration,
             supportsPullRequestLinking: capabilities?.threadPullRequestLinking,
             isRegeneratingTitle: thread.titleRegeneration != nil,
@@ -5652,6 +5782,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             snoozedUntil: loaded.snoozedUntil,
             snoozedAt: loaded.snoozedAt,
             pinnedAt: loaded.pinnedAt,
+            pinOrderKey: loaded.pinOrderKey,
             titleRegeneration: loaded.titleRegeneration,
             deletedAt: loaded.deletedAt,
             messages: prependByID(older.messages, loaded.messages),
@@ -7174,6 +7305,12 @@ enum NativeThreadDetailReducer {
             result = reduceUnsettled(payload: payload, thread: thread)
         case "thread.meta-updated":
             result = reduceMetadata(payload: payload, occurredAt: occurredAt, thread: thread)
+        case "thread.pin-reordered":
+            result = reducePinReordered(
+                payload: payload,
+                occurredAt: occurredAt,
+                thread: thread
+            )
         case "thread.message-sent":
             result = reduceMessage(
                 payload: payload,
@@ -7305,6 +7442,23 @@ enum NativeThreadDetailReducer {
                 updated.activeOrderKey = order
             }
         }
+        return .updated(updated)
+    }
+
+    private static func reducePinReordered(
+        payload: JSONValue,
+        occurredAt: String,
+        thread: OrchestrationThread
+    ) -> NativeThreadDetailReductionResult {
+        guard let orderKey = payload["orderKey"]?.stringValue,
+              !orderKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .refresh
+        }
+        var updated = replacing(
+            thread,
+            updatedAt: payload["updatedAt"]?.stringValue ?? occurredAt
+        )
+        updated.pinOrderKey = orderKey
         return .updated(updated)
     }
 

@@ -69,6 +69,7 @@ public final class FeatureRootModel {
     private(set) var detailRenderUpdates: [String: FeatureDetailRenderUpdate] = [:]
     public private(set) var isLoading = true
     public private(set) var isPerformingAction = false
+    private(set) var isArrangingThreads = false
     /// Approval and question IDs with a response in flight. Views disable
     /// only that request, not every request in every thread.
     public private(set) var resolvingRequestIDs: Set<String> = []
@@ -556,6 +557,97 @@ public final class FeatureRootModel {
                 if pinned {
                     $0.snoozedUntil = nil
                     $0.snoozedAt = nil
+                }
+            }
+        }
+    }
+
+    func arrangementPlan(
+        id: String,
+        destination: ThreadArrangementDestination
+    ) -> ThreadArrangementPlanner.Plan? {
+        guard !isArrangingThreads else { return nil }
+        return ThreadArrangementPlanner.plan(
+            id: id,
+            destination: destination,
+            threads: snapshot.threads,
+            connectedEnvironmentIDs: Set(snapshot.environments.filter {
+                $0.isEnabled && $0.connectionState == .connected
+            }.map(\.id)),
+            now: .now
+        )
+    }
+
+    @discardableResult
+    func arrangeThread(_ id: String, destination: ThreadArrangementDestination) async -> Bool {
+        guard let plan = arrangementPlan(id: id, destination: destination),
+              let previous = snapshot.threads.first(where: { $0.id == id }) else { return false }
+        isArrangingThreads = true
+        defer { isArrangingThreads = false }
+        guard let section = plan.section else { return await setSettled(id, settled: true) }
+        let environment = currentEnvironmentIdentity
+        let succeeded = await reorderThread(id, section: section, orderedIDs: plan.orderedIDs)
+        guard succeeded, currentEnvironmentIdentity == environment else { return false }
+        if ThreadArrangementPlanner.section(of: previous, now: .now).orderSection != section {
+            mutateThread(id: id) {
+                $0.pinnedAt = section == .pinned ? .now : nil
+                $0.snoozedUntil = nil
+                $0.snoozedAt = nil
+                if section == .active { $0.pinOrderKey = nil }
+                if previous.isEffectivelySettled() {
+                    $0.isSettled = false
+                    $0.keepsActive = true
+                    $0.settledAt = nil
+                    $0.unsettledAt = .now
+                    $0.settlementFacts?.settlementOverride = .active
+                }
+            }
+        }
+        return true
+    }
+
+    /// Commits a dropped order: `orderedIDs` is the section's displayed order
+    /// with the dragged row already in its new slot. Returns false when the
+    /// write was rejected or failed so the collection view can snap the row
+    /// back.
+    @discardableResult
+    public func reorderThread(
+        _ id: String,
+        section: FeatureThreadOrderSection,
+        orderedIDs: [String]
+    ) async -> Bool {
+        let environment = currentEnvironmentIdentity
+        do {
+            let assignments = try await client.reorderThread(
+                id: id,
+                section: section,
+                orderedIDs: orderedIDs
+            )
+            applyMoveAssignments(assignments, section: section, environment: environment)
+            return !assignments.isEmpty
+        } catch let partial as FeatureThreadMovePartialError {
+            applyMoveAssignments(partial.confirmed, section: section, environment: environment)
+            await perform { throw partial.underlying }
+            // Confirmed keys are in the model; snapping back renders the true
+            // arrangement instead of holding a full order that never landed.
+            return false
+        } catch {
+            await perform { throw error }
+            return false
+        }
+    }
+
+    private func applyMoveAssignments(
+        _ assignments: [FeatureThreadOrderAssignment],
+        section: FeatureThreadOrderSection,
+        environment: String
+    ) {
+        guard currentEnvironmentIdentity == environment else { return }
+        for assignment in assignments {
+            mutateThread(id: assignment.threadID) {
+                switch section {
+                case .pinned: $0.pinOrderKey = assignment.orderKey
+                case .active: $0.activeOrderKey = assignment.orderKey
                 }
             }
         }

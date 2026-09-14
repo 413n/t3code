@@ -1182,6 +1182,7 @@ struct HomeThreadSwipeActionTests {
             },
             onSnooze: { _, _ in },
             onPin: { _, _ in },
+            onArrange: {},
             onDelete: { _ in },
             onPullRequestChange: { _, _, _ in }
         )
