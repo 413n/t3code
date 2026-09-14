@@ -392,6 +392,7 @@ private struct FeatureSourceTextView: View {
                 .frame(minWidth: proxy.size.width, alignment: .leading)
                 .padding(.vertical, 10)
                 .padding(.trailing, 14)
+                .frame(minHeight: proxy.size.height, alignment: .topLeading)
                 .textSelection(.enabled)
             }
         }
