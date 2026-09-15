@@ -778,7 +778,14 @@ function DeviceIntegrationControls({
             <ScopedSwitch
               settingKeys={["enableDeviceSupport"]}
               checked={enabled}
-              disabled={!canConfigure || projectScope || !loaded || !environmentId || busy || pending !== null}
+              disabled={
+                !canConfigure ||
+                projectScope ||
+                !loaded ||
+                !environmentId ||
+                busy ||
+                pending !== null
+              }
               aria-label="Device hub"
               onCheckedChange={(checked) =>
                 void update("hub", {
@@ -843,7 +850,8 @@ function DeviceIntegrationControls({
               settingKeys={["enableAgentDeviceAccess"]}
               checked={agentAccessEnabled}
               disabled={
-                !canConfigure || connectedEnvironments.length === 0 ||
+                !canConfigure ||
+                connectedEnvironments.length === 0 ||
                 (!projectScope && (!loaded || !anyHubEnabled || busy)) ||
                 pending !== null
               }
