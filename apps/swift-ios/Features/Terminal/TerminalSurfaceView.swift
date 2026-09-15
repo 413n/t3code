@@ -3,6 +3,49 @@ import QuartzCore
 import SwiftUI
 import UIKit
 
+/// Ghostty's worker threads wake the host to drain its bounded app mailbox.
+/// Coalesce wakeups without polling or touching the native app off the main thread.
+private final class GhosttyAppEventLoop: @unchecked Sendable {
+    private let lock = NSLock()
+    private var scheduled = false
+    @MainActor var app: ghostty_app_t?
+
+    @MainActor init() {}
+
+    func wakeup() {
+        lock.lock()
+        guard !scheduled else { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        DispatchQueue.main.async { [self] in
+            lock.lock()
+            scheduled = false
+            lock.unlock()
+            if let app { ghostty_app_tick(app) }
+        }
+    }
+}
+
+private final class GhosttyRetirementFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var delivered = false
+    private let completion: @MainActor () -> Void
+
+    init(completion: @escaping @MainActor () -> Void) { self.completion = completion }
+
+    func complete() {
+        lock.lock()
+        guard !delivered else { lock.unlock(); return }
+        delivered = true
+        lock.unlock()
+        DispatchQueue.main.async { [self] in
+            completion()
+            // The native callback owns a retain until the I/O thread stops.
+            Unmanaged.passUnretained(self).release()
+        }
+    }
+}
+
 struct GhosttyTerminalSurface: UIViewRepresentable {
     @SwiftUI.Environment(\.colorScheme) private var colorScheme
     let terminalKey: String
@@ -753,9 +796,12 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     private var pendingVerticalScrollPoints: CGFloat = 0
     private var hasAutoFocused = false
     private var app: ghostty_app_t?
+    private var eventLoop: GhosttyAppEventLoop?
     private var surface: ghostty_surface_t?
     private var isCreatingSurface = false
     private var surfaceCreationFailed = false
+    private var isTornDown = false
+    private var teardownTask: Task<Void, Never>?
 
     init() {
         super.init(frame: .zero)
@@ -911,7 +957,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func createSurfaceIfPossible() {
-        guard surface == nil, app == nil, !isCreatingSurface, !surfaceCreationFailed else { return }
+        guard !isTornDown, surface == nil, app == nil, !isCreatingSurface, !surfaceCreationFailed else { return }
         guard terminalViewport.bounds.width > 0, terminalViewport.bounds.height > 0 else { return }
         guard GhosttyRuntime.ensureInitialized() else {
             surfaceCreationFailed = true
@@ -921,10 +967,14 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         isCreatingSurface = true
         defer { isCreatingSurface = false }
 
+        let eventLoop = GhosttyAppEventLoop()
         var runtimeConfig = ghostty_runtime_config_s(
-            userdata: Unmanaged.passUnretained(self).toOpaque(),
+            userdata: Unmanaged.passUnretained(eventLoop).toOpaque(),
             supports_selection_clipboard: false,
-            wakeup_cb: { _ in },
+            wakeup_cb: { userdata in
+                guard let userdata else { return }
+                Unmanaged<GhosttyAppEventLoop>.fromOpaque(userdata).takeUnretainedValue().wakeup()
+            },
             action_cb: { _, _, _ in false },
             read_clipboard_cb: { _, _, _, _, _, _ in GHOSTTY_CLIPBOARD_READ_UNSUPPORTED },
             confirm_read_clipboard_cb: { _, _, _, _ in },
@@ -961,6 +1011,8 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         }
 
         app = createdApp
+        eventLoop.app = createdApp
+        self.eventLoop = eventLoop
         surface = createdSurface
         let ghosttyColorScheme =
             isDarkMode
@@ -1016,25 +1068,63 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         createSurfaceIfPossible()
     }
 
-    func tearDown() {
+    @discardableResult
+    func tearDown() -> Task<Void, Never>? {
+        guard !isTornDown else { return teardownTask }
+        isTornDown = true
         onInput = nil
         onPaste = nil
         onResize = nil
         onClear = nil
         onFontSizeStep = nil
         onAttachOutput = nil
-        destroySurface()
+        inputField.resignFirstResponder()
+        teardownTask = destroySurface()
+        return teardownTask
     }
 
-    private func destroySurface() {
-        if let surface {
-            ghostty_surface_set_write_callback(surface, nil, nil)
-            ghostty_surface_free(surface)
-        }
-        if let app { ghostty_app_free(app) }
+    @discardableResult
+    private func destroySurface() -> Task<Void, Never>? {
+        let surface = self.surface
+        let app = self.app
+        let eventLoop = self.eventLoop
+        guard surface != nil || app != nil else { return nil }
+        self.surface = nil
+        self.app = nil
+        self.eventLoop = nil
+        // Remove the renderer's display callbacks from the view before a
+        // dismissal layout or keyboard callback can try to use it again.
         terminalViewport.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        surface = nil
-        app = nil
+        if let surface {
+            ghostty_surface_set_focus(surface, false)
+            ghostty_surface_set_occlusion(surface, false)
+        }
+        return Task { @MainActor [self] in
+            if let surface {
+                await withCheckedContinuation { continuation in
+                    let fence = GhosttyRetirementFence {
+                        eventLoop?.app = nil
+                        ghostty_surface_free(surface)
+                        if let app { ghostty_app_free(app) }
+                        continuation.resume()
+                    }
+                    // Callback changes and writes use the same FIFO as feed_data.
+                    // A write to this replacement callback proves all earlier output
+                    // was parsed. Swallow it here: it must never reach the remote PTY.
+                    // Keep ticking the app while waiting, or its bounded mailbox can
+                    // block the I/O thread that surface_free needs to join.
+                    ghostty_surface_set_write_callback(surface, { userdata, _, _ in
+                        guard let userdata else { return }
+                        Unmanaged<GhosttyRetirementFence>.fromOpaque(userdata).takeUnretainedValue().complete()
+                    }, Unmanaged.passRetained(fence).toOpaque())
+                    " ".withCString { ghostty_surface_text(surface, $0, 1) }
+                }
+            } else {
+                eventLoop?.app = nil
+                if let app { ghostty_app_free(app) }
+            }
+            withExtendedLifetime((self, eventLoop)) {}
+        }
     }
 
     /// Feeds the surface whatever `newBuffer` adds on top of what it already
@@ -1141,7 +1231,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func requestKeyboardFocus() {
-        guard window != nil, isRunning else { return }
+        guard !isTornDown, window != nil, isRunning else { return }
         inputField.becomeFirstResponder()
         if let surface { ghostty_surface_set_focus(surface, true) }
         if let app { ghostty_app_keyboard_changed(app) }
