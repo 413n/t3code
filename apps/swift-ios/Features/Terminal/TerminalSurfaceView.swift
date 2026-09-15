@@ -975,7 +975,14 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
                 guard let userdata else { return }
                 Unmanaged<GhosttyAppEventLoop>.fromOpaque(userdata).takeUnretainedValue().wakeup()
             },
-            action_cb: { _, _, _ in false },
+            action_cb: { _, target, action in
+                // App ticks deliver render requests after queued output is parsed.
+                guard action.tag == GHOSTTY_ACTION_RENDER,
+                      target.tag == GHOSTTY_TARGET_SURFACE,
+                      let surface = target.target.surface else { return false }
+                ghostty_surface_draw(surface)
+                return true
+            },
             read_clipboard_cb: { _, _, _, _, _, _ in GHOSTTY_CLIPBOARD_READ_UNSUPPORTED },
             confirm_read_clipboard_cb: { _, _, _, _ in },
             write_clipboard_cb: { _, _, _, _, _ in },
