@@ -2043,12 +2043,12 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                         || collectionView.isDecelerating
                     let stillFollowing = (collectionView as? BottomAnchoredTranscriptCollectionView)?
                         .maintainsBottomAnchor == true
-                    if shouldFollowBottom, stillFollowing, !userIsScrolling {
+                    if stillFollowing, !userIsScrolling {
                         self.scrollToBottom(
                             collectionView,
                             animated: !isInitialLoad && lastIDChanged
                         )
-                    } else if let prependAnchor {
+                    } else if !userIsScrolling, !stillFollowing, let prependAnchor {
                         self.restore(prependAnchor, in: collectionView, dataSource: dataSource)
                     }
                 }
