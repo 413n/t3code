@@ -1961,7 +1961,10 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let prependedMessages = !threadChanged
                 && newIDs.count > previousIDs.count
                 && Array(newIDs.suffix(previousIDs.count)) == previousIDs
+            // Self-sizing cells can grow before the next layout restores the
+            // bottom offset. Keep following until an actual drag releases it.
             let shouldFollowBottom = isInitialLoad || wasNearBottom
+                || (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor == true
             let prependAnchor = !shouldFollowBottom
                 && (prependedMessages || (loadEarlierChanged && !canLoadEarlier))
                 ? visibleAnchor(in: collectionView, dataSource: dataSource)
@@ -1973,7 +1976,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             }
             orderedIDs = newIDs
             (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor =
-                isInitialLoad || wasNearBottom
+                shouldFollowBottom
 
             var snapshot: NSDiffableDataSourceSnapshot<Section, String>
             if threadChanged || loadEarlierChanged {
@@ -2032,12 +2035,15 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
                 DispatchQueue.main.async {
+                    guard self.currentThreadID == threadID else { return }
                     // A streaming delta lands every ~80 ms. Never fight a
                     // finger that is on the list.
                     let userIsScrolling = collectionView.isTracking
                         || collectionView.isDragging
                         || collectionView.isDecelerating
-                    if shouldFollowBottom, !userIsScrolling {
+                    let stillFollowing = (collectionView as? BottomAnchoredTranscriptCollectionView)?
+                        .maintainsBottomAnchor == true
+                    if shouldFollowBottom, stillFollowing, !userIsScrolling {
                         self.scrollToBottom(
                             collectionView,
                             animated: !isInitialLoad && lastIDChanged
@@ -2366,6 +2372,10 @@ struct TranscriptViewportGeometry: Equatable {
         max(-topInset, contentHeight - viewportHeight + bottomInset)
     }
 
+    func showsScrollToBottom(at offset: CGFloat) -> Bool {
+        viewportHeight > 0 && bottomOffset - offset >= 120
+    }
+
     func restoredBottomOffset(
         after previous: Self?,
         maintainsBottomAnchor: Bool,
@@ -2627,27 +2637,97 @@ private struct ThreadBackSwipeGestureView: UIViewRepresentable {
 /// Self-sizing hosted Markdown can change the transcript height after a snapshot finishes,
 /// while presenting the keyboard changes the viewport without changing the content at all.
 /// Preserve the visual bottom only while the reader is already following the latest turn.
-private final class BottomAnchoredTranscriptCollectionView: UICollectionView {
+final class BottomAnchoredTranscriptCollectionView: UICollectionView {
     var maintainsBottomAnchor = false
 
     private var lastLaidOutGeometry: TranscriptViewportGeometry?
     private var isRestoringBottomAnchor = false
+    private var needsInitialBottomPosition = true
+    private let bottomButton = UIButton(type: .system)
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
+    override init(frame: CGRect, collectionViewLayout layout: UICollectionViewLayout) {
+        super.init(frame: frame, collectionViewLayout: layout)
+        var configuration = UIButton.Configuration.filled()
+        configuration.image = UIImage(systemName: "arrow.down")
+        configuration.preferredSymbolConfigurationForImage = .init(pointSize: 17, weight: .semibold)
+        configuration.baseForegroundColor = T3Colors.uiTextPrimary
+        configuration.baseBackgroundColor = T3Colors.uiSurfaceRaised
+        configuration.cornerStyle = .capsule
+        bottomButton.configuration = configuration
+        bottomButton.accessibilityLabel = "Scroll to bottom"
+        bottomButton.accessibilityIdentifier = "thread-scroll-to-bottom"
+        bottomButton.isHidden = true
+        bottomButton.addTarget(self, action: #selector(jumpToBottom), for: .touchUpInside)
+        addSubview(bottomButton)
+    }
 
-        let geometry = TranscriptViewportGeometry(
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            needsInitialBottomPosition = true
+            maintainsBottomAnchor = true
+            setNeedsLayout()
+        }
+    }
+
+    @objc private func jumpToBottom() {
+        layoutIfNeeded()
+        maintainsBottomAnchor = true
+        let geometry = viewportGeometry
+        // Jump directly in long threads instead of rendering every intervening
+        // message. Keep keyboard focus and follow subsequent streamed output.
+        setContentOffset(CGPoint(x: contentOffset.x, y: geometry.bottomOffset), animated: false)
+        updateBottomButton(geometry)
+    }
+
+    private var viewportGeometry: TranscriptViewportGeometry {
+        TranscriptViewportGeometry(
             contentHeight: contentSize.height,
             viewportHeight: bounds.height,
             topInset: adjustedContentInset.top,
             bottomInset: adjustedContentInset.bottom
         )
-        defer { lastLaidOutGeometry = geometry }
+    }
+
+    private func updateBottomButton(_ geometry: TranscriptViewportGeometry) {
+        bottomButton.isHidden = needsInitialBottomPosition || bounds.height < 64
+            || !geometry.showsScrollToBottom(at: contentOffset.y)
+        bottomButton.frame = CGRect(
+            x: bounds.midX - 22, y: bounds.maxY - adjustedContentInset.bottom - 54,
+            width: 44, height: 44
+        )
+        bringSubviewToFront(bottomButton)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+
+        let geometry = viewportGeometry
+        defer {
+            lastLaidOutGeometry = geometry
+            updateBottomButton(geometry)
+        }
+
+        let isInteracting = isTracking || isDragging || isDecelerating || isRestoringBottomAnchor
+        if needsInitialBottomPosition, isInteracting {
+            needsInitialBottomPosition = false
+        }
+        if needsInitialBottomPosition, window != nil, bounds.height > 0, contentSize.height > 0 {
+            needsInitialBottomPosition = false
+            maintainsBottomAnchor = true
+            isRestoringBottomAnchor = true
+            contentOffset = CGPoint(x: contentOffset.x, y: geometry.bottomOffset)
+            isRestoringBottomAnchor = false
+            return
+        }
 
         guard let bottomY = geometry.restoredBottomOffset(
             after: lastLaidOutGeometry,
             maintainsBottomAnchor: maintainsBottomAnchor,
-            isInteracting: isDragging || isDecelerating || isRestoringBottomAnchor
+            isInteracting: isInteracting
         ) else {
             return
         }

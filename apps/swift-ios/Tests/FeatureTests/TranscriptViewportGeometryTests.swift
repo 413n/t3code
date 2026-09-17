@@ -5,6 +5,61 @@ import UIKit
 
 @Suite("Transcript viewport anchoring")
 struct TranscriptViewportGeometryTests {
+    @Test func bottomButtonUsesTheVisibleViewportIncludingKeyboardInsets() {
+        let geometry = TranscriptViewportGeometry(contentHeight: 1_200, viewportHeight: 400, topInset: 20, bottomInset: 100)
+        #expect(geometry.showsScrollToBottom(at: 780))
+        #expect(!geometry.showsScrollToBottom(at: 781))
+        #expect(!geometry.showsScrollToBottom(at: 900))
+        let short = TranscriptViewportGeometry(contentHeight: 100, viewportHeight: 400, topInset: 20, bottomInset: 0)
+        #expect(!short.showsScrollToBottom(at: -20))
+    }
+
+    @Test @MainActor
+    func transcriptOpensAtBottomAndButtonRestoresFollowing() throws {
+        let layout = FixedTranscriptLayout()
+        let view = BottomAnchoredTranscriptCollectionView(frame: .zero, collectionViewLayout: layout)
+        let dataSource = FixedTranscriptDataSource()
+        defer { withExtendedLifetime(dataSource) {} }
+        view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "message")
+        view.dataSource = dataSource
+        view.contentInsetAdjustmentBehavior = .never
+        let controller = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 800))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        controller.view.addSubview(view)
+        view.layoutIfNeeded()
+        // The first snapshot can arrive before the destination has its final size.
+        layout.height = 3_000
+        view.reloadData()
+        layout.invalidateLayout()
+        view.frame = CGRect(x: 0, y: 0, width: 390, height: 600)
+        view.layoutIfNeeded()
+        #expect(view.contentOffset.y == 2_400)
+        let button = try #require(view.subviews.compactMap { $0 as? UIButton }.first)
+        #expect(button.isHidden)
+
+        view.maintainsBottomAnchor = false
+        view.contentOffset.y = 500
+        view.layoutIfNeeded()
+        #expect(!button.isHidden)
+        #expect(view.bounds.contains(button.frame))
+        button.sendActions(for: .touchUpInside)
+        #expect(view.contentOffset.y == 2_400)
+        #expect(view.maintainsBottomAnchor)
+        #expect(button.isHidden)
+
+        layout.height = 3_200
+        layout.invalidateLayout()
+        view.layoutIfNeeded()
+        #expect(view.contentOffset.y == 2_600)
+        view.frame.size.height = 350
+        view.layoutIfNeeded()
+        #expect(view.contentOffset.y == 2_850)
+        #expect(button.isHidden)
+    }
+
     @Test
     func firstLoadedTranscriptAnchorsToLatestMessage() {
         let empty = TranscriptViewportGeometry(
@@ -223,5 +278,27 @@ struct TranscriptViewportGeometryTests {
         window.isHidden = true
 
         #expect(ThreadBackSwipeGesture.shouldReceiveTouch(in: host, host: host))
+    }
+}
+
+@MainActor
+private final class FixedTranscriptLayout: UICollectionViewLayout {
+    var height: CGFloat = 0
+    override var collectionViewContentSize: CGSize { CGSize(width: 390, height: height) }
+    override func layoutAttributesForItem(at indexPath: IndexPath) -> UICollectionViewLayoutAttributes? {
+        let attributes = UICollectionViewLayoutAttributes(forCellWith: indexPath)
+        attributes.frame = CGRect(x: 0, y: 0, width: 390, height: height)
+        return attributes
+    }
+    override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
+        [layoutAttributesForItem(at: IndexPath(item: 0, section: 0))!]
+    }
+}
+
+@MainActor
+private final class FixedTranscriptDataSource: NSObject, UICollectionViewDataSource {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int { 1 }
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        collectionView.dequeueReusableCell(withReuseIdentifier: "message", for: indexPath)
     }
 }
