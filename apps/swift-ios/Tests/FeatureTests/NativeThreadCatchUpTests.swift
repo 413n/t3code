@@ -23,22 +23,27 @@ final class NativeThreadCatchUpTests: XCTestCase {
                     streaming: index < 499
                 )
             }
-            for start in stride(from: 0, to: values.count, by: batchSize) {
-                try await stream.socket.chunk(
-                    id: stream.id, values: Array(values[start..<min(start + batchSize, values.count)])
-                )
-            }
             var publications = 0
             var latest: FeatureThreadDetail?
-            catchUp: while let event = await events.next(isolation: #isolation) {
-                switch event {
-                case let .detail(detail), let .detailDelta(detail, _):
-                    guard detail.thread.id == fixture.firstID else { continue }
-                    latest = detail
-                    publications += 1
-                case .threadSync(fixture.firstID, .live):
-                    if latest?.messages.first?.text == expected { break catchUp }
-                default: continue
+            var expectedPrefix = ""
+            for start in stride(from: 0, to: values.count, by: batchSize) {
+                let end = min(start + batchSize, values.count)
+                try await stream.socket.chunk(
+                    id: stream.id, values: Array(values[start..<end])
+                )
+                expectedPrefix += (start..<end).map { "\($0)," }.joined()
+                // This checks replay batching, not overload recovery. Wait for
+                // applied progress instead of overflowing the bounded stream.
+                catchUp: while let event = await events.next(isolation: #isolation) {
+                    switch event {
+                    case let .detail(detail), let .detailDelta(detail, _):
+                        guard detail.thread.id == fixture.firstID else { continue }
+                        latest = detail
+                        publications += 1
+                    case .threadSync(fixture.firstID, .live):
+                        if latest?.messages.first?.text == expectedPrefix { break catchUp }
+                    default: continue
+                    }
                 }
             }
             XCTAssertEqual(latest?.messages.map(\.text), [expected])
