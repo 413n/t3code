@@ -50,6 +50,11 @@ export function HomeHeader(props: HomeHeaderProps) {
           // reapply cannot clobber options owned by NativeHeaderToolbar.
           ...(NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED
             ? {
+                headerSearchBarOptions: {
+                  ref: searchBarRef,
+                  autoCapitalize: "none" as const,
+                  onCancelButtonPress: () => props.onSearchQueryChange(""),
+                },
                 unstable_headerToolbarItems: () => [
                   createNativeMailSearchToolbarItem({
                     composeButtonId: "home-new-task",
