@@ -23,6 +23,8 @@ import {
 import { use, useCallback, useEffect, useRef, type ComponentProps } from "react";
 import { View } from "react-native";
 import { Split, type SplitHostCommands } from "react-native-screens";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { scopedThreadKey } from "../lib/scopedEntities";
 
 import { useAdaptiveWorkspaceLayout } from "../features/layout/AdaptiveWorkspaceLayout";
 import { WorkspaceEmptyDetail } from "../features/layout/WorkspaceEmptyDetail";
@@ -51,6 +53,7 @@ const MODAL_FLOWS = new Set(["SettingsSheet", "NewTaskSheet"]);
 function ColumnScreen(props: {
   readonly descriptor: Descriptor;
   readonly primary?: boolean;
+  readonly selectedThreadKey?: string | null;
   readonly onDismiss: (routeKey: string) => void;
   readonly navigation: ViewProps["navigation"];
 }) {
@@ -83,7 +86,9 @@ function ColumnScreen(props: {
             primary={props.primary}
           />
           <ColumnContent>
-            <NativePrimaryColumnContext value={props.primary ?? false}>
+            <NativePrimaryColumnContext
+              value={props.primary ? { selectedThreadKey: props.selectedThreadKey ?? null } : null}
+            >
               {descriptor.render()}
             </NativePrimaryColumnContext>
           </ColumnContent>
@@ -100,6 +105,18 @@ function WorkspaceColumns(
   const inspector = use(NativeWorkspaceInspectorContext);
   const hostRef = useRef<SplitHostCommands>(null);
   const activeDetailKey = props.detail.at(-1)?.key;
+  const threadParams = props.detail.findLast((route) => route.name === "Thread")?.params;
+  const selectedThreadKey =
+    threadParams &&
+    "environmentId" in threadParams &&
+    "threadId" in threadParams &&
+    typeof threadParams.environmentId === "string" &&
+    typeof threadParams.threadId === "string"
+      ? scopedThreadKey(
+          EnvironmentId.make(threadParams.environmentId),
+          ThreadId.make(threadParams.threadId),
+        )
+      : null;
   const handleNativeDismiss = useCallback(
     (key: string) => {
       const state = props.navigation.getState();
@@ -145,6 +162,7 @@ function WorkspaceColumns(
           <ColumnScreen
             descriptor={primary}
             primary
+            selectedThreadKey={selectedThreadKey}
             onDismiss={handleNativeDismiss}
             navigation={props.navigation}
           />
