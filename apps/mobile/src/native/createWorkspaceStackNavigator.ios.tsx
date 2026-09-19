@@ -20,7 +20,7 @@ import {
   type NativeStackNavigatorProps,
   type NativeStackTypeBag,
 } from "@react-navigation/native-stack";
-import { use, useCallback, useEffect, useRef, type ComponentProps } from "react";
+import { use, useCallback, useEffect, useMemo, useRef, type ComponentProps } from "react";
 import { View } from "react-native";
 import { Split, type SplitHostCommands } from "react-native-screens";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -58,6 +58,10 @@ function ColumnScreen(props: {
   readonly navigation: ViewProps["navigation"];
 }) {
   const { descriptor } = props;
+  const primaryColumn = useMemo(
+    () => (props.primary ? { selectedThreadKey: props.selectedThreadKey ?? null } : null),
+    [props.primary, props.selectedThreadKey],
+  );
   const key = descriptor.route.key;
   return (
     <Split.Screen
@@ -86,9 +90,7 @@ function ColumnScreen(props: {
             primary={props.primary}
           />
           <ColumnContent>
-            <NativePrimaryColumnContext
-              value={props.primary ? { selectedThreadKey: props.selectedThreadKey ?? null } : null}
-            >
+            <NativePrimaryColumnContext value={primaryColumn}>
               {descriptor.render()}
             </NativePrimaryColumnContext>
           </ColumnContent>
