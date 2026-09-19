@@ -1,4 +1,10 @@
-import { AuthTerminalReadScope, AuthTerminalOperateScope, DEFAULT_TERMINAL_ID, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  AuthTerminalReadScope,
+  AuthTerminalOperateScope,
+  DEFAULT_TERMINAL_ID,
+  EnvironmentId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { type KnownTerminalSession } from "@t3tools/client-runtime/state/terminal";
 import { SymbolView } from "../../components/AppSymbol";
 import { ScreenHeader } from "../../components/ScreenHeader";
@@ -88,6 +94,7 @@ import { useTerminalLifecycle } from "./useTerminalLifecycle";
 function TerminalHeader(props: {
   readonly subtitle: string;
   readonly isEnvironmentReady: boolean;
+  readonly canOperateTerminal: boolean;
   readonly fontSize: number;
   readonly terminalId: string;
   readonly sessions: ReadonlyArray<TerminalMenuSession>;
@@ -154,6 +161,7 @@ function TerminalHeader(props: {
                   })),
                   {
                     id: "terminal-new",
+                    disabled: !props.canOperateTerminal,
                     title: "Open new terminal",
                     icon: "plus",
                     subtitle: `Start another shell in ${basename(props.workspaceRoot) ?? "this workspace"}`,
@@ -1107,9 +1115,10 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
   }, []);
 
   const handleShowKeyboard = useCallback(() => {
+    if (!canOperateTerminal) return;
     setIsAccessoryDismissed(false);
     setKeyboardFocusRequest((current) => current + 1);
-  }, []);
+  }, [canOperateTerminal]);
   const handleRetryEnvironment = useCallback(() => {
     if (routeEnvironmentId !== null) {
       void retryEnvironment(routeEnvironmentId);
@@ -1163,6 +1172,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
         />
       ) : null}
       <TerminalHeader
+        canOperateTerminal={canOperateTerminal}
         subtitle={headerSubtitle}
         isEnvironmentReady={isEnvironmentReady}
         fontSize={fontSize}
@@ -1209,35 +1219,36 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
               resourceName="terminal"
               onRetry={handleRetryEnvironment}
             />
-        ) : terminalSession.data === null && terminalSession.error === null ? (
-          <EmptyState
-            title="Checking terminal access"
-            detail="Waiting for this connection's permissions."
-          />
-        ) : !canReadTerminal && !canOperateTerminal ? (
-          <EmptyState
-            title={
-              terminalSession.error
-                ? "Could not check terminal access"
-                : "Terminal access unavailable"
-            }
-            detail={
-              terminalSession.error ?? "This connection does not have permission to view terminals."
-            }
-          />
-        ) : !canOperateTerminal && !hasTerminalTarget && sessionsPending ? (
-          <EmptyState title="Loading terminals" detail="Reading existing terminal sessions." />
-        ) : !canOperateTerminal && !hasTerminalTarget && sessionsError !== null ? (
-          <EmptyState title="Could not load terminals" detail={sessionsError} />
-        ) : !canOperateTerminal && !hasTerminalTarget ? (
-          <EmptyState
-            title="No terminal sessions"
-            detail="Existing terminals will appear here when another client opens one."
-          />
-        ) : !canOperateTerminal && terminal.error !== null ? (
-          <EmptyState title="Terminal unavailable" detail={terminal.error} />
-        ) : (
-          <>
+          ) : terminalSession.data === null && terminalSession.error === null ? (
+            <EmptyState
+              title="Checking terminal access"
+              detail="Waiting for this connection's permissions."
+            />
+          ) : !canReadTerminal && !canOperateTerminal ? (
+            <EmptyState
+              title={
+                terminalSession.error
+                  ? "Could not check terminal access"
+                  : "Terminal access unavailable"
+              }
+              detail={
+                terminalSession.error ??
+                "This connection does not have permission to view terminals."
+              }
+            />
+          ) : !canOperateTerminal && !hasTerminalTarget && sessionsPending ? (
+            <EmptyState title="Loading terminals" detail="Reading existing terminal sessions." />
+          ) : !canOperateTerminal && !hasTerminalTarget && sessionsError !== null ? (
+            <EmptyState title="Could not load terminals" detail={sessionsError} />
+          ) : !canOperateTerminal && !hasTerminalTarget ? (
+            <EmptyState
+              title="No terminal sessions"
+              detail="Existing terminals will appear here when another client opens one."
+            />
+          ) : !canOperateTerminal && terminal.error !== null ? (
+            <EmptyState title="Terminal unavailable" detail={terminal.error} />
+          ) : (
+            <>
               <View
                 style={{
                   flex: 1,
