@@ -21,7 +21,7 @@ import {
   type NativeStackNavigatorProps,
   type NativeStackTypeBag,
 } from "@react-navigation/native-stack";
-import { useCallback, useRef, useState, type ComponentProps } from "react";
+import { useCallback, useState, type ComponentProps } from "react";
 import { View } from "react-native";
 import { Stack } from "react-native-screens";
 import { V5StackHeader } from "./V5StackHeader.ios";
@@ -52,13 +52,22 @@ export function modalEnvelopeOptions(options: NativeStackNavigationOptions) {
 /** Keep outgoing screens until UIKit completes its pop, as required by v5. */
 export function V5CardStackView(props: V5StackViewProps) {
   const { preventedRoutes } = usePreventRemoveContext();
-  const [retained, setRetained] = useState(props.state.routes);
-  const [observedRoutes, setObservedRoutes] = useState(props.state.routes);
-  const retainedDescriptors = useRef(props.descriptors);
-  retainedDescriptors.current = { ...retainedDescriptors.current, ...props.descriptors };
-  if (observedRoutes !== props.state.routes) {
-    setObservedRoutes(props.state.routes);
-    setRetained(reconcileStackScreens(retained, props.state.routes));
+  const [screens, setScreens] = useState({
+    routes: props.state.routes,
+    descriptors: props.descriptors,
+    observedRoutes: props.state.routes,
+    observedDescriptors: props.descriptors,
+  });
+  if (
+    screens.observedRoutes !== props.state.routes ||
+    screens.observedDescriptors !== props.descriptors
+  ) {
+    setScreens({
+      routes: reconcileStackScreens(screens.routes, props.state.routes),
+      descriptors: { ...screens.descriptors, ...props.descriptors },
+      observedRoutes: props.state.routes,
+      observedDescriptors: props.descriptors,
+    });
   }
   // Keep the real descriptor through dismissal. describe(route, true) creates
   // a placeholder whose navigation rejects setOptions and dispatches.
@@ -74,8 +83,15 @@ export function V5CardStackView(props: V5StackViewProps) {
   const removeDismissed = useCallback(
     (key: string) => {
       if (!props.navigation.getState().routes.some((route) => route.key === key)) {
-        delete retainedDescriptors.current[key];
-        setRetained((current) => current.filter((route) => route.key !== key));
+        setScreens((current) => {
+          const descriptors = { ...current.descriptors };
+          delete descriptors[key];
+          return {
+            ...current,
+            routes: current.routes.filter((route) => route.key !== key),
+            descriptors,
+          };
+        });
       }
     },
     [props.navigation],
@@ -83,8 +99,8 @@ export function V5CardStackView(props: V5StackViewProps) {
   return (
     <View className="flex-1 bg-screen">
       <Stack.Host>
-        {retained.map((route, index) => {
-          const descriptor = props.descriptors[route.key] ?? retainedDescriptors.current[route.key];
+        {screens.routes.map((route, index) => {
+          const descriptor = props.descriptors[route.key] ?? screens.descriptors[route.key];
           if (!descriptor) return null;
           const attached = props.state.routes.some((current) => current.key === route.key);
           return (
