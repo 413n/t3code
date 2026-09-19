@@ -170,15 +170,19 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
  }
  
  - (void)rebuild
-@@ -61,6 +67,7 @@
+@@ -60,7 +66,10 @@
+   }
  
    UIViewController *controller = [self requireScreenController];
- 
+-
++  // The system search placement item needs its controller before items are built.
++  [self applyConfigPropertiesForController:controller];
++
 +  [_toolbarBarButtonItems removeAllObjects];
    [_leadingBarButtonItems removeAllObjects];
    [_trailingBarButtonItems removeAllObjects];
    [_barButtonItemsByItemId removeAllObjects];
-@@ -75,6 +82,9 @@
+@@ -75,6 +84,9 @@
        id<RNSHeaderItemDataProviding> item = (id<RNSHeaderItemDataProviding>)child;
  
        switch (item.placement) {
@@ -188,7 +192,7 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
          case RNSHeaderItemPlacementLeading:
            [_leadingBarButtonItems addObject:[self buildBarButtonItemForItem:item]];
            break;
-@@ -104,6 +114,9 @@
+@@ -104,6 +116,9 @@
        id<RNSHeaderItemSpacerDataProviding> spacer = (id<RNSHeaderItemSpacerDataProviding>)child;
        UIBarButtonItem *barButtonItem = [RNSHeaderContentFactory spacerForHeaderSpacerItem:spacer];
        switch (spacer.placement) {
@@ -198,7 +202,15 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
          case RNSHeaderItemSpacerPlacementLeading:
            [_leadingBarButtonItems addObject:barButtonItem];
            break;
-@@ -172,6 +185,13 @@
+@@ -114,7 +129,6 @@
+     }
+   }
+ 
+-  [self applyConfigPropertiesForController:controller];
+   [self applyItemsWithTitleView:titleView
+                    subtitleView:subtitleView
+               largeSubtitleView:largeSubtitleView
+@@ -172,6 +186,13 @@
    UIViewController *controller = [self requireScreenController];
  
    switch (targetItem.placement) {
@@ -212,7 +224,7 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
      case RNSHeaderItemPlacementLeading: {
        UIBarButtonItem *newBarButtonItem = [self buildBarButtonItemForItem:targetItem];
  
-@@ -302,6 +322,7 @@
+@@ -302,6 +323,7 @@
    _eventsDelegate = nil;
    _imageLoader = nil;
  
@@ -220,7 +232,7 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
    [_leadingBarButtonItems removeAllObjects];
    [_trailingBarButtonItems removeAllObjects];
    [_barButtonItemsByItemId removeAllObjects];
-@@ -310,6 +331,7 @@
+@@ -310,6 +332,7 @@
    UIViewController *controller = [self requireScreenController];
    UINavigationItem *navItem = controller.navigationItem;
  
@@ -228,7 +240,7 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
    navItem.title = nil;
    navItem.titleView = nil;
    navItem.standardAppearance = nil;
-@@ -422,6 +444,21 @@
+@@ -422,6 +445,21 @@
    UINavigationItem *navItem = controller.navigationItem;
  
    navItem.title = _configDataProvider.title;
@@ -250,7 +262,7 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
    navItem.standardAppearance = _configDataProvider.standardAppearance;
    navItem.scrollEdgeAppearance = _configDataProvider.scrollEdgeAppearance;
  
-@@ -491,6 +528,7 @@
+@@ -491,6 +529,7 @@
    [navItem setLeftBarButtonItems:[_leadingBarButtonItems copy] animated:YES];
    [navItem setRightBarButtonItems:[_trailingBarButtonItems copy] animated:YES];
  
@@ -258,6 +270,66 @@ diff --git a/ios/header/RNSHeaderCoordinator.mm b/ios/header/RNSHeaderCoordinato
    navItem.titleView = titleView;
  
  #if RNS_IPHONE_OS_VERSION_AVAILABLE(26_0)
+@@ -536,10 +575,20 @@
+ 
+ - (UIBarButtonItem *)buildBarButtonItemForItem:(id<RNSHeaderItemDataProviding>)item
+ {
+-  UIBarButtonItem *barButtonItem = [RNSHeaderContentFactory barButtonItemForHeaderItem:item
+-                                                               withFrameChangeDelegate:_frameChangeDelegate
+-                                                              withHeaderEventsDelegate:_eventsDelegate
+-                                                                       withImageLoader:_imageLoader];
++  UIBarButtonItem *barButtonItem = nil;
++#if !TARGET_OS_TV && RNS_IPHONE_OS_VERSION_AVAILABLE(26_0)
++  if (@available(iOS 26.0, *)) {
++    if (item.searchBarPlacement) {
++      barButtonItem = [self requireScreenController].navigationItem.searchBarPlacementBarButtonItem;
++    }
++  }
++#endif
++  if (barButtonItem == nil) {
++    barButtonItem = [RNSHeaderContentFactory barButtonItemForHeaderItem:item
++                                                withFrameChangeDelegate:_frameChangeDelegate
++                                               withHeaderEventsDelegate:_eventsDelegate
++                                                        withImageLoader:_imageLoader];
++  }
+ 
+ #if RNS_IPHONE_OS_VERSION_AVAILABLE(26_0)
+   if (@available(iOS 26.0, *)) {
+diff --git a/ios/header/RNSHeaderItemComponentView.mm b/ios/header/RNSHeaderItemComponentView.mm
+--- a/ios/header/RNSHeaderItemComponentView.mm
++++ b/ios/header/RNSHeaderItemComponentView.mm
+@@ -92,6 +92,11 @@
+ 
+ #pragma mark - RNSHeaderItemDataProviding
+ 
++- (BOOL)searchBarPlacement
++{
++  return std::static_pointer_cast<const react::RNSHeaderItemIOSProps>(_props)->searchBarPlacement;
++}
++
+ - (nullable UIView *)customView
+ {
+   return self.subviews.count > 0 ? self : nil;
+@@ -178,7 +183,7 @@
+   const auto &newItemProps = *std::static_pointer_cast<const react::RNSHeaderItemIOSProps>(props);
+   const auto &oldItemProps = *std::static_pointer_cast<const react::RNSHeaderItemIOSProps>(_props);
+ 
+-  BOOL needsUpdate = NO;
++  BOOL needsUpdate = oldItemProps.searchBarPlacement != newItemProps.searchBarPlacement;
+   BOOL menuDidChange = NO;
+ 
+   if (oldItemProps.itemId != newItemProps.itemId) {
+diff --git a/ios/header/RNSHeaderItemDataProviding.h b/ios/header/RNSHeaderItemDataProviding.h
+--- a/ios/header/RNSHeaderItemDataProviding.h
++++ b/ios/header/RNSHeaderItemDataProviding.h
+@@ -17,6 +17,7 @@
+ @property (nonatomic, readonly, nullable) RNSHeaderIconData *icon;
+ @property (nonatomic, readonly, nullable) RNSHeaderMenuData *menu;
+ @property (nonatomic, readonly, nullable) UIView *customView;
++@property (nonatomic, readonly) BOOL searchBarPlacement;
+ @property (nonatomic, readonly) BOOL respondsToOnPress;
+ @property (nonatomic, readonly) BOOL hidesSharedBackground;
+ 
 diff --git a/ios/header/RNSHeaderItemPlacement.h b/ios/header/RNSHeaderItemPlacement.h
 --- a/ios/header/RNSHeaderItemPlacement.h
 +++ b/ios/header/RNSHeaderItemPlacement.h
@@ -556,15 +628,16 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.tsx b/src/compone
 diff --git a/src/components/stack/header/StackHeaderConfig.ios.types.ts b/src/components/stack/header/StackHeaderConfig.ios.types.ts
 --- a/src/components/stack/header/StackHeaderConfig.ios.types.ts
 +++ b/src/components/stack/header/StackHeaderConfig.ios.types.ts
-@@ -61,6 +61,7 @@
- }
- 
- export interface StackHeaderBaseItemIOS {
-+  axisBehavior?: 'automatic' | 'horizontalOnly' | 'verticalPreferred' | undefined;
+@@ -148,6 +148,8 @@
+    * @platform iOS
+    */
+   type: 'item';
++  /** Uses UINavigationItem's system search placement item on iOS 26+. */
++  searchBarPlacement?: boolean | undefined;
    /**
-    * @summary A unique identifier within the screen header.
+    * @summary Callback invoked when the header item is pressed.
     *
-@@ -425,6 +426,7 @@
+@@ -425,6 +427,7 @@
  }
  
  export interface StackHeaderConfigPropsIOS {
@@ -599,6 +672,14 @@ diff --git a/src/components/stack/header/ios/StackHeaderItem.ios.types.ts b/src/
    | 'leading'
    | 'trailing'
    | 'title'
+@@ -11,6 +12,7 @@
+ 
+ export type StackHeaderItemProps = {
+   placement: StackHeaderItemPlacement;
++  searchBarPlacement?: boolean | undefined;
+   itemId?: string | undefined;
+   identifier?: string | undefined;
+   hidesSharedBackground?: boolean | undefined;
 diff --git a/src/components/stack/header/ios/StackHeaderItemSpacer.ios.types.ts b/src/components/stack/header/ios/StackHeaderItemSpacer.ios.types.ts
 --- a/src/components/stack/header/ios/StackHeaderItemSpacer.ios.types.ts
 +++ b/src/components/stack/header/ios/StackHeaderItemSpacer.ios.types.ts
@@ -647,6 +728,14 @@ diff --git a/src/fabric/header/HeaderItemIOSNativeComponent.ts b/src/fabric/head
    | 'leading'
    | 'trailing'
    | 'title'
+@@ -69,6 +70,7 @@
+ 
+ export interface NativeProps extends ViewProps {
+   placement?: CT.WithDefault<Placement, 'trailing'>;
++  searchBarPlacement?: CT.WithDefault<boolean, false>;
+   itemId?: string | undefined;
+   identifier?: string | undefined;
+   hidesSharedBackground?: CT.WithDefault<boolean, false>;
 diff --git a/src/fabric/header/HeaderItemSpacerIOSNativeComponent.ts b/src/fabric/header/HeaderItemSpacerIOSNativeComponent.ts
 --- a/src/fabric/header/HeaderItemSpacerIOSNativeComponent.ts
 +++ b/src/fabric/header/HeaderItemSpacerIOSNativeComponent.ts

@@ -4,7 +4,7 @@ import type {
   NativeStackNavigationOptions,
 } from "@react-navigation/native-stack";
 import { isValidElement, useRef } from "react";
-import { StyleSheet } from "react-native";
+import { Platform, StyleSheet } from "react-native";
 import {
   SearchBar,
   Stack,
@@ -146,13 +146,13 @@ export function V5StackHeader(props: {
   const mailSearch = toolbar.find(
     (item): item is HeaderBarButtonMailSearchToolbarItem => item.type === "mailSearchToolbar",
   );
-  const bottom = convertItems(
-    toolbar.filter(
-      (item): item is NativeStackHeaderItem =>
-        item.type !== "mailSearchToolbar" && item.type !== "searchBarPlacement",
-    ),
-    "toolbar",
-  );
+  const bottomSearch = Boolean(mailSearch) && !Platform.isPad;
+  const bottom = toolbar.flatMap<HeaderItem>((item, index) => {
+    if (item.type === "mailSearchToolbar") return [];
+    if (item.type === "searchBarPlacement")
+      return [{ type: "item", id: `toolbar-search:${index}`, searchBarPlacement: true }];
+    return convertItems([item], `toolbar:${index}`);
+  });
   if (mailSearch) {
     if (mailSearch.filterMenu)
       bottom.push({
@@ -164,6 +164,13 @@ export function V5StackHeader(props: {
         },
         menu: convertMenu(mailSearch.filterMenu, "filter-menu"),
       });
+    if (bottomSearch) {
+      if (bottom.length)
+        bottom.push({ type: "spacer", id: "before-search", sizing: "fixed", width: 8 });
+      bottom.push({ type: "item", id: "home-search", searchBarPlacement: true });
+      if (mailSearch.onComposePress)
+        bottom.push({ type: "spacer", id: "after-search", sizing: "fixed", width: 8 });
+    }
     if (mailSearch.onComposePress)
       bottom.push({
         type: "item",
@@ -201,7 +208,7 @@ export function V5StackHeader(props: {
             hideNavigationBar={false}
             hideWhenScrolling={false}
             allowToolbarIntegration
-            placement="automatic"
+            placement={bottomSearch ? "integrated" : (searchOptions?.placement ?? "automatic")}
             placeholder={mailSearch?.placeholder ?? searchOptions?.placeholder ?? "Search"}
             onChangeText={(event) => {
               mailSearch?.onSearchTextChange?.(event.nativeEvent.text);
