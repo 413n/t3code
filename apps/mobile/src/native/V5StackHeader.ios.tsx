@@ -146,7 +146,7 @@ export function V5StackHeader(props: {
   const mailSearch = toolbar.find(
     (item): item is HeaderBarButtonMailSearchToolbarItem => item.type === "mailSearchToolbar",
   );
-  const bottomSearch = Boolean(mailSearch) && !Platform.isPad;
+  const bottomSearch = Boolean(mailSearch) && Platform.OS === "ios" && !Platform.isPad;
   const bottom = toolbar.flatMap<HeaderItem>((item, index) => {
     if (item.type === "mailSearchToolbar") return [];
     if (item.type === "searchBarPlacement")
