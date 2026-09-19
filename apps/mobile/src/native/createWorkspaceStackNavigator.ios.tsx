@@ -208,25 +208,18 @@ function WorkspaceStackView(props: ViewProps) {
     const presentation = props.descriptors[route.key]?.options.presentation;
     return MODAL_FLOWS.has(route.name) || (presentation !== undefined && presentation !== "card");
   });
-  // Linking can restore a detail-only history. Obtain Home's real descriptor
-  // without inserting a synthetic route into the router's durable state.
-  const primaryRoute = projection.primary ?? { key: `${props.state.key}:home`, name: "Home" };
-  const primaryDescriptor =
-    props.descriptors[primaryRoute.key] ?? props.describe(primaryRoute, true);
-  const descriptors = { ...props.descriptors, [primaryRoute.key]: primaryDescriptor };
+  // Linking normally restores Home via initialRouteName. A detail-only history
+  // must stay a single stack: placeholder descriptors cannot own an interactive
+  // sidebar because React Navigation rejects their actions and setOptions.
+  const primaryRoute = projection.primary;
+  if (!primaryRoute) return <V5StackView {...props} />;
+  const primaryDescriptor = props.descriptors[primaryRoute.key]!;
   const baseRoute = { key: `${props.state.key}:workspace`, name: "Workspace" };
   const baseDescriptor: Descriptor = {
     ...primaryDescriptor,
     route: baseRoute,
     options: { headerShown: false },
-    render: () => (
-      <WorkspaceColumns
-        {...props}
-        descriptors={descriptors}
-        primary={primaryRoute}
-        detail={projection.detail}
-      />
-    ),
+    render: () => <WorkspaceColumns {...props} primary={primaryRoute} detail={projection.detail} />,
   };
   const overlays = partitionStackPresentations(projection.overlays, (route) => {
     const presentation = props.descriptors[route.key]?.options.presentation;
