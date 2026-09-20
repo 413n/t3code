@@ -996,7 +996,7 @@ export function HomeScreen(props: HomeScreenProps) {
             onTouchStart={(event) => trackListTouches(event, true)}
             onTouchEnd={(event) => trackListTouches(event, false)}
             onTouchCancel={(event) => trackListTouches(event, false)}
-            renderScrollComponent={renderHomeScrollView}
+            renderScrollComponent={Platform.OS === "ios" ? renderHomeScrollView : undefined}
             data={threadListV2Items}
             renderItem={renderV2Item}
             keyExtractor={v2KeyExtractor}
