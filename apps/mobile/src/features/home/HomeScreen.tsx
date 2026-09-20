@@ -35,6 +35,7 @@ import type { WorkspaceEnvironment, WorkspaceState } from "../../state/workspace
 import type { SavedRemoteConnection } from "../../lib/connection";
 import { scopedProjectKey, scopedThreadKey } from "../../lib/scopedEntities";
 import { NativePrimaryColumnContext } from "../../native/v5-workspace-context";
+import { nativeHeaderScrollEdgeEffects } from "../../native/scrollEdgeEffects";
 import { useNativeColumnLayoutMetrics } from "../layout/native-layout-metrics";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { useThreadSearch } from "../../state/queries";
@@ -231,9 +232,11 @@ function HomeScrollView(props: ComponentProps<typeof ScrollView>) {
   return (
     <ScrollViewMarker
       style={{ flex: 1 }}
-      // With v5's custom title slot, automatic fades only the status area.
-      // UIKit's soft effect also protects the title and header buttons.
-      scrollEdgeEffects={{ top: "soft", bottom: "hidden", left: "hidden", right: "hidden" }}
+      scrollEdgeEffects={{
+        ...nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version),
+        // Retain the existing sidebar fade on iOS 26; iOS 27 uses the native bar material.
+        top: Number.parseInt(String(Platform.Version), 10) >= 27 ? "automatic" : "soft",
+      }}
     >
       <ScrollView
         {...props}

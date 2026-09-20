@@ -149,6 +149,11 @@ const GLASS_HEADER_OPTIONS: AppScreenOptions = {
   headerStyle: NATIVE_LIQUID_GLASS_SUPPORTED ? { backgroundColor: "transparent" } : undefined,
   headerTitleStyle: { fontSize: 18, fontWeight: "800" },
   headerTransparent: NATIVE_LIQUID_GLASS_SUPPORTED,
+  // v5's custom title does not extend iOS 27's automatic scroll-edge protection.
+  headerBlurEffect:
+    Platform.OS === "ios" && Number.parseInt(String(Platform.Version), 10) >= 27
+      ? "systemChromeMaterial"
+      : undefined,
   scrollEdgeEffects: NATIVE_LIQUID_GLASS_SUPPORTED ? HEADER_SCROLL_EDGE_EFFECTS : undefined,
   unstable_navigationItemStyle: NATIVE_LIQUID_GLASS_SUPPORTED ? "editor" : undefined,
 };
