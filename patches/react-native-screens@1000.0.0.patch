@@ -575,9 +575,10 @@ diff --git a/package.json b/package.json
      "src/",
      "common/",
 diff --git a/src/components/stack/header/StackHeaderConfig.ios.tsx b/src/components/stack/header/StackHeaderConfig.ios.tsx
+index e4d94a4085e..b90439374ec 100644
 --- a/src/components/stack/header/StackHeaderConfig.ios.tsx
 +++ b/src/components/stack/header/StackHeaderConfig.ios.tsx
-@@ -45,9 +45,10 @@
+@@ -45,9 +45,10 @@ function StackHeaderConfig(
  ) {
    // android props are safely dropped
    // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -589,7 +590,7 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.tsx b/src/compone
      leadingItems,
      trailingItems,
      titleItem,
-@@ -114,9 +115,10 @@
+@@ -114,9 +115,10 @@ function StackHeaderConfig(
          ...(trailingItems ?? [])
            .filter(it => it && it.type === 'item')
            .map(it => it.menu),
@@ -601,7 +602,7 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.tsx b/src/compone
    );
  
    const handleMenuItemPress = useCallback(
-@@ -172,12 +174,14 @@
+@@ -172,12 +174,14 @@ function StackHeaderConfig(
        style={styles.config}
        onMenuItemPress={handleMenuItemPress}
        onMenuSelectionChange={handleSelectionChange}>
@@ -616,7 +617,25 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.tsx b/src/compone
      </StackHeaderConfigIOSNativeComponent>
    );
  }
-@@ -223,7 +227,7 @@
+@@ -188,6 +192,8 @@ function mapAppearanceToNativeProp(
+   if (!appearance) return undefined;
+ 
+   const {
++    backgroundColor,
++    shadowColor,
+     titleFontColor,
+     titleFontWeight,
+     largeTitleFontColor,
+@@ -198,6 +204,8 @@ function mapAppearanceToNativeProp(
+ 
+   return {
+     ...appearance,
++    backgroundColor: processColor(backgroundColor),
++    shadowColor: processColor(shadowColor),
+     titleFontColor: processColor(titleFontColor),
+     titleFontWeight:
+       titleFontWeight !== undefined ? String(titleFontWeight) : undefined,
+@@ -223,7 +231,7 @@ function makeItemViewFromItem(
    if ('type' in item && item.type === 'spacer') {
      const { id, ...rest } = item;
  
@@ -626,9 +645,10 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.tsx b/src/compone
          `[Stack] Invalid placement for spacer: "${placement}", defaulting to "trailing"`,
        );
 diff --git a/src/components/stack/header/StackHeaderConfig.ios.types.ts b/src/components/stack/header/StackHeaderConfig.ios.types.ts
+index cdcba4e8d6b..21380057c7f 100644
 --- a/src/components/stack/header/StackHeaderConfig.ios.types.ts
 +++ b/src/components/stack/header/StackHeaderConfig.ios.types.ts
-@@ -148,6 +148,8 @@
+@@ -148,6 +148,8 @@ export interface StackHeaderInlineItemIOS
     * @platform iOS
     */
    type: 'item';
@@ -637,7 +657,17 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.types.ts b/src/co
    /**
     * @summary Callback invoked when the header item is pressed.
     *
-@@ -425,6 +427,7 @@
+@@ -312,6 +314,9 @@ export type StackHeaderBackButtonDisplayModeIOS =
+   | 'minimal';
+ 
+ export interface StackHeaderAppearanceIOS {
++  /** Explicit clear color removes the bar material; other colors use an opaque background. */
++  backgroundColor?: TextStyle['color'] | undefined;
++  shadowColor?: TextStyle['color'] | undefined;
+   /**
+    * @summary Specifies the font family used for the title of the header.
+    *
+@@ -425,6 +430,7 @@ export interface StackHeaderAppearanceIOS {
  }
  
  export interface StackHeaderConfigPropsIOS {
@@ -707,9 +737,19 @@ diff --git a/src/components/stack/header/ios/StackHeaderMenu.ios.types.ts b/src/
     * @summary Unique identifier of the menu item.
     *
 diff --git a/src/fabric/header/HeaderConfigIOSNativeComponent.ts b/src/fabric/header/HeaderConfigIOSNativeComponent.ts
+index 3ee33816f65..e27b5060517 100644
 --- a/src/fabric/header/HeaderConfigIOSNativeComponent.ts
 +++ b/src/fabric/header/HeaderConfigIOSNativeComponent.ts
-@@ -43,6 +43,7 @@
+@@ -16,6 +16,8 @@ import { UnsafeMixed } from '../codegenUtils';
+ type BackButtonDisplayMode = 'default' | 'generic' | 'minimal';
+ 
+ export type HeaderAppearance = {
++  backgroundColor?: ProcessedColorValue | null | undefined;
++  shadowColor?: ProcessedColorValue | null | undefined;
+   titleFontFamily?: string | undefined;
+   titleFontSize?: CT.Float | undefined;
+   titleFontWeight?: string | undefined;
+@@ -43,6 +45,7 @@ export type MenuSelectionChangeEvent = Readonly<{
  }>;
  
  export interface NativeProps extends ViewProps {
@@ -1179,3 +1219,45 @@ diff --git a/src/legacy/types.ts b/src/legacy/types.ts
    | HeaderBarButtonItemSpacing;
  
  /**
+diff --git a/ios/header/RNSHeaderAppearanceMapper.mm b/ios/header/RNSHeaderAppearanceMapper.mm
+index 7bac022f033..91fb7e517d5 100644
+--- a/ios/header/RNSHeaderAppearanceMapper.mm
++++ b/ios/header/RNSHeaderAppearanceMapper.mm
+@@ -13,6 +13,7 @@ + (nullable UINavigationBarAppearance *)appearanceFromDictionary:(nullable NSDic
+   }
+ 
+   UINavigationBarAppearance *appearance = [UINavigationBarAppearance new];
++  [self applyBackgroundFromDictionary:appearanceDict toAppearance:appearance];
+   [self applyTextAttributesFromDictionary:appearanceDict toAppearance:appearance];
+   return appearance;
+ }
+@@ -31,10 +32,29 @@ + (nullable UINavigationBarAppearance *)scrollEdgeAppearanceFromDictionary:(null
+   // not suddenly bring back the default bar background at the scroll edge.
+   [appearance configureWithTransparentBackground];
+ 
++  [self applyBackgroundFromDictionary:appearanceDict toAppearance:appearance];
+   [self applyTextAttributesFromDictionary:appearanceDict toAppearance:appearance];
+   return appearance;
+ }
+ 
+++ (void)applyBackgroundFromDictionary:(nullable NSDictionary *)appearanceDict
++                        toAppearance:(nonnull UINavigationBarAppearance *)appearance
++{
++  UIColor *backgroundColor = [RCTConvert UIColor:appearanceDict[@"backgroundColor"]];
++  if (backgroundColor != nil) {
++    // Explicit transparent headers must also remove UIKit's default bar material.
++    if (CGColorGetAlpha(backgroundColor.CGColor) == 0) {
++      [appearance configureWithTransparentBackground];
++    } else {
++      [appearance configureWithOpaqueBackground];
++    }
++    appearance.backgroundColor = backgroundColor;
++  }
++  if (appearanceDict[@"shadowColor"] != nil) {
++    appearance.shadowColor = [RCTConvert UIColor:appearanceDict[@"shadowColor"]];
++  }
++}
++
+ + (void)applyTextAttributesFromDictionary:(nullable NSDictionary *)appearanceDict
+                              toAppearance:(nonnull UINavigationBarAppearance *)appearance
+ {

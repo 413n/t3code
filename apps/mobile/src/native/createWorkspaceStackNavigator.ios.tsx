@@ -89,7 +89,7 @@ function ColumnScreen(props: {
             canGoBack={!props.primary}
             primary={props.primary}
           />
-          <ColumnContent>
+          <ColumnContent primary={props.primary}>
             <NativePrimaryColumnContext value={primaryColumn}>
               {descriptor.render()}
             </NativePrimaryColumnContext>

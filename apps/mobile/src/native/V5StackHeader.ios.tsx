@@ -5,6 +5,7 @@ import type {
 } from "@react-navigation/native-stack";
 import { isValidElement, useRef } from "react";
 import { Platform, StyleSheet } from "react-native";
+import { useMobileNavigationTheme } from "../lib/useMobileNavigationTheme";
 import {
   SearchBar,
   Stack,
@@ -132,6 +133,7 @@ export function V5StackHeader(props: {
   readonly primary?: boolean;
 }) {
   const { options } = props;
+  const theme = useMobileNavigationTheme();
   const searchRef = useRef<SearchBarCommands>(null);
   const itemProps = { tintColor: options.headerTintColor, canGoBack: props.canGoBack };
   const leading = convertItems(options.unstable_headerLeftItems?.(itemProps) ?? [], "leading");
@@ -192,6 +194,19 @@ export function V5StackHeader(props: {
       : undefined;
   const searchOptions = options.headerSearchBarOptions;
   const titleStyle = StyleSheet.flatten(options.headerTitleStyle);
+  const headerStyle = StyleSheet.flatten(options.headerStyle);
+  const appearance = {
+    backgroundColor:
+      headerStyle?.backgroundColor ??
+      (options.headerTransparent ? "transparent" : theme.colors.card),
+    shadowColor: options.headerShadowVisible === false ? "transparent" : undefined,
+    titleFontSize: titleStyle?.fontSize,
+    titleFontFamily: titleStyle?.fontFamily,
+    titleFontWeight: titleStyle?.fontWeight,
+    titleFontColor: titleStyle?.color,
+    subtitleFontSize: options.headerSubtitleStyle?.fontSize,
+    subtitleFontColor: options.headerSubtitleStyle?.color,
+  };
   return (
     <Stack.HeaderConfig
       hidden={options.headerShown === false}
@@ -228,14 +243,8 @@ export function V5StackHeader(props: {
         backButtonDisplayMode: options.headerBackButtonDisplayMode ?? "minimal",
         backButtonMenuEnabled: options.headerBackButtonMenuEnabled ?? true,
         backButtonTitle: options.headerBackTitle,
-        standardAppearance: {
-          titleFontSize: titleStyle?.fontSize,
-          titleFontFamily: titleStyle?.fontFamily,
-          titleFontWeight: titleStyle?.fontWeight,
-          titleFontColor: titleStyle?.color,
-          subtitleFontSize: options.headerSubtitleStyle?.fontSize,
-          subtitleFontColor: options.headerSubtitleStyle?.color,
-        },
+        standardAppearance: appearance,
+        scrollEdgeAppearance: appearance,
       }}
     />
   );
