@@ -645,17 +645,10 @@ index e4d94a4085e..b90439374ec 100644
          `[Stack] Invalid placement for spacer: "${placement}", defaulting to "trailing"`,
        );
 diff --git a/src/components/stack/header/StackHeaderConfig.ios.types.ts b/src/components/stack/header/StackHeaderConfig.ios.types.ts
+index cdcba4e8d6b..21380057c7f 100644
 --- a/src/components/stack/header/StackHeaderConfig.ios.types.ts
 +++ b/src/components/stack/header/StackHeaderConfig.ios.types.ts
-@@ -1,6 +1,6 @@
- import type { ReactElement } from 'react';
- import type { TextStyle } from 'react-native';
--import type { PlatformIconIOS } from '../../shared/types';
-+import type { BlurEffect, PlatformIconIOS } from '../../shared/types';
- import type { StackHeaderMenuIOS } from './ios/StackHeaderMenu.ios.types';
- 
- /**
-@@ -148,6 +148,8 @@
+@@ -148,6 +148,8 @@ export interface StackHeaderInlineItemIOS
     * @platform iOS
     */
    type: 'item';
@@ -664,19 +657,17 @@ diff --git a/src/components/stack/header/StackHeaderConfig.ios.types.ts b/src/co
    /**
     * @summary Callback invoked when the header item is pressed.
     *
-@@ -312,6 +314,11 @@
+@@ -312,6 +314,9 @@ export type StackHeaderBackButtonDisplayModeIOS =
    | 'minimal';
  
  export interface StackHeaderAppearanceIOS {
 +  /** Explicit clear color removes the bar material; other colors use an opaque background. */
 +  backgroundColor?: TextStyle['color'] | undefined;
-+  /** Native bar material, applied after backgroundColor. Use `none` to clear it. */
-+  backgroundBlurEffect?: BlurEffect | undefined;
 +  shadowColor?: TextStyle['color'] | undefined;
    /**
     * @summary Specifies the font family used for the title of the header.
     *
-@@ -425,6 +432,7 @@
+@@ -425,6 +430,7 @@ export interface StackHeaderAppearanceIOS {
  }
  
  export interface StackHeaderConfigPropsIOS {
@@ -746,19 +737,19 @@ diff --git a/src/components/stack/header/ios/StackHeaderMenu.ios.types.ts b/src/
     * @summary Unique identifier of the menu item.
     *
 diff --git a/src/fabric/header/HeaderConfigIOSNativeComponent.ts b/src/fabric/header/HeaderConfigIOSNativeComponent.ts
+index 3ee33816f65..e27b5060517 100644
 --- a/src/fabric/header/HeaderConfigIOSNativeComponent.ts
 +++ b/src/fabric/header/HeaderConfigIOSNativeComponent.ts
-@@ -16,6 +16,9 @@
+@@ -16,6 +16,8 @@ import { UnsafeMixed } from '../codegenUtils';
  type BackButtonDisplayMode = 'default' | 'generic' | 'minimal';
  
  export type HeaderAppearance = {
 +  backgroundColor?: ProcessedColorValue | null | undefined;
-+  backgroundBlurEffect?: string | undefined;
 +  shadowColor?: ProcessedColorValue | null | undefined;
    titleFontFamily?: string | undefined;
    titleFontSize?: CT.Float | undefined;
    titleFontWeight?: string | undefined;
-@@ -43,6 +46,7 @@
+@@ -43,6 +45,7 @@ export type MenuSelectionChangeEvent = Readonly<{
  }>;
  
  export interface NativeProps extends ViewProps {
@@ -1229,16 +1220,10 @@ diff --git a/src/legacy/types.ts b/src/legacy/types.ts
  
  /**
 diff --git a/ios/header/RNSHeaderAppearanceMapper.mm b/ios/header/RNSHeaderAppearanceMapper.mm
+index 7bac022f033..91fb7e517d5 100644
 --- a/ios/header/RNSHeaderAppearanceMapper.mm
 +++ b/ios/header/RNSHeaderAppearanceMapper.mm
-@@ -1,5 +1,6 @@
- #import "RNSHeaderAppearanceMapper.h"
- #import "RNSDefines.h"
-+#import "RNSConversions.h"
- 
- #import <React/RCTConvert.h>
- #import <React/RCTFont.h>
-@@ -13,6 +14,7 @@
+@@ -13,6 +13,7 @@ + (nullable UINavigationBarAppearance *)appearanceFromDictionary:(nullable NSDic
    }
  
    UINavigationBarAppearance *appearance = [UINavigationBarAppearance new];
@@ -1246,15 +1231,15 @@ diff --git a/ios/header/RNSHeaderAppearanceMapper.mm b/ios/header/RNSHeaderAppea
    [self applyTextAttributesFromDictionary:appearanceDict toAppearance:appearance];
    return appearance;
  }
-@@ -31,8 +33,32 @@
+@@ -31,10 +32,29 @@ + (nullable UINavigationBarAppearance *)scrollEdgeAppearanceFromDictionary:(null
    // not suddenly bring back the default bar background at the scroll edge.
    [appearance configureWithTransparentBackground];
  
 +  [self applyBackgroundFromDictionary:appearanceDict toAppearance:appearance];
    [self applyTextAttributesFromDictionary:appearanceDict toAppearance:appearance];
    return appearance;
-+}
-+
+ }
+ 
 ++ (void)applyBackgroundFromDictionary:(nullable NSDictionary *)appearanceDict
 +                        toAppearance:(nonnull UINavigationBarAppearance *)appearance
 +{
@@ -1268,14 +1253,38 @@ diff --git a/ios/header/RNSHeaderAppearanceMapper.mm b/ios/header/RNSHeaderAppea
 +    }
 +    appearance.backgroundColor = backgroundColor;
 +  }
-+  NSString *blurEffect = appearanceDict[@"backgroundBlurEffect"];
-+  if (blurEffect != nil) {
-+    // Apply after the color preset so an explicit material can accompany a clear tint.
-+    appearance.backgroundEffect = rnscreens::conversion::RNSUIBlurEffectFromString(blurEffect);
-+  }
 +  if (appearanceDict[@"shadowColor"] != nil) {
 +    appearance.shadowColor = [RCTConvert UIColor:appearanceDict[@"shadowColor"]];
 +  }
- }
- 
++}
++
  + (void)applyTextAttributesFromDictionary:(nullable NSDictionary *)appearanceDict
+                              toAppearance:(nonnull UINavigationBarAppearance *)appearance
+ {
+diff --git a/ios/header/RNSHeaderContentFactory.mm b/ios/header/RNSHeaderContentFactory.mm
+--- a/ios/header/RNSHeaderContentFactory.mm
++++ b/ios/header/RNSHeaderContentFactory.mm
+@@ -82,6 +82,23 @@
+   wrapperView.translatesAutoresizingMaskIntoConstraints = NO;
+   [wrapperView addSubview:contentView];
+ 
++#if RNS_IPHONE_OS_VERSION_AVAILABLE(26_0)
++  if (@available(iOS 26.0, *)) {
++    if (item.placement == RNSHeaderItemPlacementTitle || item.placement == RNSHeaderItemPlacementSubtitle ||
++        item.placement == RNSHeaderItemPlacementLargeSubtitle) {
++      // UIKit shapes automatic scroll-edge effects around native labels, but does
++      // not recognize Fabric text views. Supply the custom title's geometry without
++      // drawing additional text or changing the Fabric children's mount indices.
++      UILabel *titleScrollEdgeEffectGuide = [UILabel new];
++      titleScrollEdgeEffectGuide.accessibilityElementsHidden = YES;
++      titleScrollEdgeEffectGuide.userInteractionEnabled = NO;
++      titleScrollEdgeEffectGuide.frame = wrapperView.bounds;
++      titleScrollEdgeEffectGuide.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++      [wrapperView addSubview:titleScrollEdgeEffectGuide];
++    }
++  }
++#endif
++
+   [NSLayoutConstraint activateConstraints:@[
+     [contentView.leadingAnchor constraintEqualToAnchor:wrapperView.leadingAnchor],
+     [contentView.trailingAnchor constraintEqualToAnchor:wrapperView.trailingAnchor],

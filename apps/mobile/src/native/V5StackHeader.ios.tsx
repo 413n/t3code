@@ -199,7 +199,6 @@ export function V5StackHeader(props: {
     backgroundColor:
       headerStyle?.backgroundColor ??
       (options.headerTransparent ? "transparent" : theme.colors.card),
-    backgroundBlurEffect: options.headerBlurEffect,
     shadowColor: options.headerShadowVisible === false ? "transparent" : undefined,
     titleFontSize: titleStyle?.fontSize,
     titleFontFamily: titleStyle?.fontFamily,
