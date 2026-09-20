@@ -207,7 +207,7 @@ export function V5StackHeader(props: {
             ref={searchOptions?.ref ?? searchRef}
             hideNavigationBar={false}
             hideWhenScrolling={false}
-            allowToolbarIntegration
+            allowToolbarIntegration={searchOptions?.allowToolbarIntegration ?? true}
             placement={bottomSearch ? "integrated" : (searchOptions?.placement ?? "automatic")}
             placeholder={mailSearch?.placeholder ?? searchOptions?.placeholder ?? "Search"}
             onChangeText={(event) => {
