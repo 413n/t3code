@@ -224,7 +224,7 @@ private struct StaticDPoPAuthorizer: ManagedEnvironmentAuthorizing {
 
     func refreshCredential(
         for environment: Environment,
-        replacing _: EnvironmentCredential
+        replacing _: EnvironmentCredential?
     ) async throws -> EnvironmentCredential {
         .managedDPoP(
             accessToken: "refreshed-token",

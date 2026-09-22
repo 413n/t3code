@@ -10,7 +10,7 @@ public protocol CredentialStore: Sendable {
     ) async throws -> EnvironmentCredential?
     func replaceCredential(
         _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential?,
         for environmentID: String
     ) async throws -> Bool
     func removeCredential(for environmentID: String) async throws
@@ -101,7 +101,7 @@ public actor KeychainCredentialStore: CredentialStore {
 
     public func replaceCredential(
         _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential?,
         for environmentID: String
     ) throws -> Bool {
         try Self.keychainLock.withLock {
@@ -222,7 +222,7 @@ public actor InMemoryCredentialStore: CredentialStore {
 
     public func replaceCredential(
         _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential?,
         for environmentID: String
     ) -> Bool {
         guard credentials[environmentID] == expected else { return false }

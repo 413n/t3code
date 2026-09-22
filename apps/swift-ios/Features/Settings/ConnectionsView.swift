@@ -524,6 +524,12 @@ private struct ConnectionDetailView: View {
                         ).title
                     )
                     LabeledContent("Connection", value: environment.source.title)
+                    if environment.source == .t3Connect,
+                       let detail = environment.connectionDetail {
+                        Text(detail)
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.danger)
+                    }
                     if environment.connectionState == .needsPairing,
                        environment.source == .direct {
                         Text(environment.connectionDetail ?? "The saved pairing was rejected.")

@@ -35,7 +35,7 @@ public protocol ManagedEnvironmentAuthorizing: Sendable {
 
     func refreshCredential(
         for environment: Environment,
-        replacing credential: EnvironmentCredential
+        replacing credential: EnvironmentCredential?
     ) async throws -> EnvironmentCredential
 }
 
@@ -414,12 +414,11 @@ public actor EnvironmentAPI {
         isUnauthorizedResponse: (@Sendable (Result) -> Bool)? = nil,
         as type: Result.Type
     ) async throws -> Result {
-        guard let credential = try await credentials.credential(for: environment.id) else {
-            throw HTTPError.missingCredential
-        }
+        let credential = try await credentials.credential(for: environment.id)
 
         switch environment.kind {
         case .bearer, .local:
+            guard let credential else { throw HTTPError.missingCredential }
             guard credential.authorizationMethod == .bearer else {
                 throw HTTPError.incompatibleCredential
             }
@@ -440,15 +439,22 @@ public actor EnvironmentAPI {
             return try await send(request, as: type)
 
         case .managedDPoP:
-            guard credential.authorizationMethod == .dpop,
-                  credential.managedEnvironmentID == environment.id else {
-                throw HTTPError.incompatibleCredential
-            }
             guard let managedAuthorization else {
                 throw HTTPError.managedAuthorizationUnavailable
             }
 
-            var current = credential
+            // Device-only Keychain entries do not transfer to a new iPhone.
+            // The restored catalog can still use the signed-in relay account.
+            var current: EnvironmentCredential
+            if let credential,
+               credential.authorizationMethod == .dpop,
+               credential.managedEnvironmentID == environment.id {
+                current = credential
+            } else {
+                current = try await refreshManagedCredential(
+                    credential, environment: environment, using: managedAuthorization
+                )
+            }
             let bindingRequiresRefresh = try await managedAuthorization
                 .credentialRequiresRefresh(current, environment: environment)
             if current.expiresAt?.timeIntervalSinceNow ?? 0 <= Self.managedRefreshMargin
@@ -537,7 +543,7 @@ public actor EnvironmentAPI {
     }
 
     private func refreshManagedCredential(
-        _ credential: EnvironmentCredential,
+        _ credential: EnvironmentCredential?,
         environment: Environment,
         using managedAuthorization: any ManagedEnvironmentAuthorizing
     ) async throws -> EnvironmentCredential {
@@ -575,7 +581,7 @@ public actor EnvironmentAPI {
     }
 
     private func newestUsableManagedCredential(
-        replacing credential: EnvironmentCredential,
+        replacing credential: EnvironmentCredential?,
         environment: Environment,
         using managedAuthorization: any ManagedEnvironmentAuthorizing
     ) async throws -> EnvironmentCredential? {

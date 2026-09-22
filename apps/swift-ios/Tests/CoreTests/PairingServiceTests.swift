@@ -206,7 +206,7 @@ private actor InterleavedCredentialStore: CredentialStore {
 
     func replaceCredential(
         _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential?,
         for environmentID: String
     ) -> Bool {
         guard storedCredential == expected else { return false }

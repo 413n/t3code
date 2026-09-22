@@ -329,9 +329,12 @@ public actor T3ConnectRuntimeAuthorization: ManagedEnvironmentAuthorizing {
 
     public func refreshCredential(
         for environment: Environment,
-        replacing credential: EnvironmentCredential
+        replacing credential: EnvironmentCredential?
     ) async throws -> EnvironmentCredential {
-        _ = try Self.authorization(environment: environment, credential: credential)
+        guard environment.kind == .managedDPoP,
+              Self.managedEndpoint(for: environment) != nil else {
+            throw HTTPError.incompatibleCredential
+        }
         if let refresh = refreshTasks[environment.id] {
             return try await refresh.task.value
         }

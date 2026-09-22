@@ -3,6 +3,50 @@ import XCTest
 @testable import T3Code
 
 final class T3ConnectRuntimeTests: XCTestCase {
+    func testRestoredEnvironmentRecoversWithoutDeviceOnlyCredential() async throws {
+        let fixture = try await refreshFixture(savedThumbprint: nil, expiresAt: .distantFuture)
+        await fixture.credentials.removeCredential(for: fixture.environment.id)
+
+        async let first = fixture.api.session(for: fixture.environment)
+        async let second = fixture.secondAPI.session(for: fixture.environment)
+        let sessions = try await (first, second)
+        XCTAssertTrue(sessions.0.authenticated && sessions.1.authenticated)
+        let calls = await fixture.bootstrap.calls
+        XCTAssertEqual(calls, 1)
+        let saved = await fixture.credentials.credential(for: fixture.environment.id)
+        XCTAssertEqual(saved?.accessToken, "fresh-environment-token")
+        let requests = await fixture.transport.requests
+        XCTAssertEqual(requests.filter { $0.url?.path == "/oauth/token" }.count, 1)
+    }
+
+    func testManagedEnvironmentReplacesIncompatibleSavedCredential() async throws {
+        let fixture = try await refreshFixture(savedThumbprint: nil, expiresAt: .distantFuture)
+        await fixture.credentials.setCredential(
+            EnvironmentCredential(accessToken: "old-bearer"), for: fixture.environment.id
+        )
+        let session = try await fixture.api.session(for: fixture.environment)
+        XCTAssertTrue(session.authenticated)
+        let saved = await fixture.credentials.credential(for: fixture.environment.id)
+        XCTAssertEqual(saved?.authorizationMethod, .dpop)
+        let requests = await fixture.transport.requests
+        XCTAssertFalse(requests.contains {
+            $0.value(forHTTPHeaderField: "Authorization") == "Bearer old-bearer"
+        })
+    }
+
+    func testMissingDirectCredentialNeverUsesRelayRecovery() async throws {
+        let fixture = try await refreshFixture(savedThumbprint: nil, expiresAt: .distantFuture)
+        await fixture.credentials.removeCredential(for: fixture.environment.id)
+        var direct = fixture.environment
+        direct.kind = .bearer
+        do {
+            _ = try await fixture.api.session(for: direct)
+            XCTFail("Direct connection must require pairing")
+        } catch HTTPError.missingCredential {}
+        let calls = await fixture.bootstrap.calls
+        XCTAssertEqual(calls, 0)
+    }
+
     func testLegacyCredentialsRemainBearerAndManagedMetadataIsRedacted() async throws {
         let legacy = Data(#"{"accessToken":"legacy-secret","scopes":["read"]}"#.utf8)
         let decoded = try JSONDecoder.t3.decode(EnvironmentCredential.self, from: legacy)
@@ -1304,7 +1348,7 @@ private actor ManagedPersistenceCredentialStore: CredentialStore {
 
     func replaceCredential(
         _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential?,
         for environmentID: String
     ) -> Bool {
         guard storedCredential == expected else { return false }

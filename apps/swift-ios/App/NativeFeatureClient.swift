@@ -254,7 +254,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             scheduleArchivedRefresh(client: activeClient, environment: environment)
         }
         if activeLoad?.credentialRejected == true {
-            markActiveEnvironmentNeedsPairing()
+            markActiveEnvironmentNeedsPairing(detail: activeLoad?.failureDetail)
         }
         let snapshot = makeSnapshot(
             environments: environments,
@@ -3826,7 +3826,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     if error.isRejectedAuthorization,
                        let self,
                        self.isCurrentSession(client: activeClient, generation: generation) {
-                        self.markActiveEnvironmentNeedsPairing()
+                        self.markActiveEnvironmentNeedsPairing(detail: error.localizedDescription)
                         return
                     }
                     // The independent HTTP fallback below keeps the workspace
@@ -3896,7 +3896,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             return
                         }
                         if error.isRejectedAuthorization {
-                            self.markActiveEnvironmentNeedsPairing()
+                            self.markActiveEnvironmentNeedsPairing(detail: error.localizedDescription)
                             return
                         }
                         self.emitConnection(
@@ -4800,7 +4800,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             client: pair.client,
                             shell: nil,
                             config: nil,
-                            credentialRejected: error.isRejectedAuthorization
+                            credentialRejected: error.isRejectedAuthorization,
+                            failureDetail: error.localizedDescription
                         )
                     }
 
@@ -4884,13 +4885,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 }
                 environmentConnectionStates[load.environment.id] = .connected
                 environmentConnectionDetails[load.environment.id] = nil
-            } else if load.credentialRejected {
+            } else if load.credentialRejected && load.environment.kind != .managedDPoP {
                 environmentConnectionStates[load.environment.id] = .needsPairing
                 environmentConnectionDetails[load.environment.id] = Self.needsPairingDetail
             } else {
                 environmentConnectionStates[load.environment.id] = .disconnected
                 environmentConnectionDetails[load.environment.id] =
-                    "That server is currently unreachable."
+                    load.failureDetail ?? "That server is currently unreachable."
             }
         }
         rebuildEntityIndexes(savedEnvironments)
@@ -4901,7 +4902,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     /// A rejected credential cannot recover on its own. Stop the live
     /// subscription and the HTTP fallback so the app is not minting tickets
     /// and polling a 401 every few seconds until the user pairs again.
-    private func markActiveEnvironmentNeedsPairing() {
+    private func markActiveEnvironmentNeedsPairing(detail: String?) {
         pollingTask?.cancel()
         fallbackPollingTask?.cancel()
         configurationTask?.cancel()
@@ -4909,7 +4910,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         fallbackPollingTask = nil
         configurationTask = nil
         lastShellEventAt = nil
-        emitConnection(.needsPairing, detail: Self.needsPairingDetail)
+        if activeEnvironment?.kind == .managedDPoP {
+            emitConnection(.disconnected, detail: detail)
+        } else {
+            emitConnection(.needsPairing, detail: Self.needsPairingDetail)
+        }
         if let client {
             Task { await client.disconnect() }
         }
@@ -8318,6 +8323,7 @@ private struct EnvironmentShellLoad: Sendable {
     let config: ServerConfigSnapshot?
     /// The server answered and refused the saved credential.
     var credentialRejected = false
+    var failureDetail: String?
 }
 
 private struct EntityWireOwner: Hashable {

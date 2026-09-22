@@ -500,7 +500,7 @@ private actor RemovalOrderCredentialStore: CredentialStore {
 
     func replaceCredential(
         _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential?,
         for environmentID: String
     ) -> Bool {
         guard environmentID == self.environmentID,
