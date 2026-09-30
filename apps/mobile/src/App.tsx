@@ -23,7 +23,7 @@ import { OverlayPortalHost } from "./components/OverlayPortal";
 import { shouldHandleAppLink } from "./lib/appLinking";
 import { useMobileNavigationTheme } from "./lib/useMobileNavigationTheme";
 import { SubscriptionUsageCoordinator } from "./widgets/SubscriptionUsageCoordinator";
-import { NativeLayoutMetricsProvider } from "./features/layout/native-layout-metrics";
+import { NativeLayoutMetricsProvider } from "./native/native-layout-metrics";
 
 import "../global.css";
 
