@@ -211,28 +211,27 @@ export function V5StackHeader(props: {
     <Stack.HeaderConfig
       hidden={options.headerShown === false}
       transparent={options.headerTransparent}
-      editorStyle={options.unstable_navigationItemStyle === "editor"}
       title={title}
       subtitle={options.unstable_headerSubtitle ?? options.headerSubtitle}
       backButtonHidden={options.headerBackVisible === false}
-      searchBar={
-        mailSearch || searchOptions ? (
-          <SearchBar
-            {...searchOptions}
-            ref={searchOptions?.ref ?? searchRef}
-            hideNavigationBar={false}
-            hideWhenScrolling={false}
-            allowToolbarIntegration={searchOptions?.allowToolbarIntegration ?? true}
-            placement={bottomSearch ? "integrated" : (searchOptions?.placement ?? "automatic")}
-            placeholder={mailSearch?.placeholder ?? searchOptions?.placeholder ?? "Search"}
-            onChangeText={(event) => {
-              mailSearch?.onSearchTextChange?.(event.nativeEvent.text);
-              searchOptions?.onChangeText?.(event);
-            }}
-          />
-        ) : undefined
-      }
       ios={{
+        navigationItemStyle: options.unstable_navigationItemStyle,
+        searchBar:
+          mailSearch || searchOptions ? (
+            <SearchBar
+              {...searchOptions}
+              ref={searchOptions?.ref ?? searchRef}
+              hideNavigationBar={false}
+              hideWhenScrolling={false}
+              allowToolbarIntegration={searchOptions?.allowToolbarIntegration ?? true}
+              placement={bottomSearch ? "integrated" : (searchOptions?.placement ?? "automatic")}
+              placeholder={mailSearch?.placeholder ?? searchOptions?.placeholder ?? "Search"}
+              onChangeText={(event) => {
+                mailSearch?.onSearchTextChange?.(event.nativeEvent.text);
+                searchOptions?.onChangeText?.(event);
+              }}
+            />
+          ) : undefined,
         toolbarItems: bottom,
         leadingItems: leading,
         trailingItems: trailing,

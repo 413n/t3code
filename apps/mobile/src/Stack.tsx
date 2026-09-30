@@ -1,5 +1,5 @@
 import { createV5StackNavigator as createNativeStackNavigator } from "./native/createV5StackNavigator";
-import { createWorkspaceStackNavigator } from "./native/createWorkspaceStackNavigator";
+import { createWorkspaceStackNavigator } from "./features/layout/createWorkspaceStackNavigator";
 import {
   createPathConfigForStaticNavigation,
   getPathFromState,

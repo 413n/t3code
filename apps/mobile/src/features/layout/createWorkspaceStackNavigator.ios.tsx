@@ -24,24 +24,28 @@ import { use, useCallback, useEffect, useMemo, useRef, type ComponentProps } fro
 import { View } from "react-native";
 import { Split, type SplitHostCommands } from "react-native-screens";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { scopedThreadKey } from "../lib/scopedEntities";
+import { scopedThreadKey } from "../../lib/scopedEntities";
 
-import { useAdaptiveWorkspaceLayout } from "../features/layout/AdaptiveWorkspaceLayout";
-import { WorkspaceEmptyDetail } from "../features/layout/WorkspaceEmptyDetail";
-import { NativeColumnContent as ColumnContent } from "./NativeColumnContent.ios";
-import { modalEnvelopeOptions, V5CardStackView, V5StackView } from "./createV5StackNavigator.ios";
-import { NATIVE_WORKSPACE_COLUMNS_SUPPORTED } from "./NativeWorkspaceColumns";
-import { V5StackHeader } from "./V5StackHeader.ios";
+import { useAdaptiveWorkspaceLayout } from "./AdaptiveWorkspaceLayout";
+import { WorkspaceEmptyDetail } from "./WorkspaceEmptyDetail";
+import { NativeColumnContent as ColumnContent } from "../../native/NativeColumnContent.ios";
+import {
+  modalEnvelopeOptions,
+  V5CardStackView,
+  V5StackView,
+} from "../../native/createV5StackNavigator.ios";
+import { NATIVE_WORKSPACE_COLUMNS_SUPPORTED } from "../../native/NativeWorkspaceColumns";
+import { V5StackHeader } from "../../native/V5StackHeader.ios";
 import {
   nativeWorkspacePopCount,
   projectWorkspaceStack,
   partitionStackPresentations,
-} from "./workspace-stack-projection";
+} from "../../native/workspace-stack-projection";
 import {
   NativePrimaryColumnContext,
   NativeWorkspaceInspectorContext,
   NativeWorkspaceModeContext,
-} from "./v5-workspace-context";
+} from "../../native/v5-workspace-context";
 
 type ViewProps = ComponentProps<typeof NativeStackView>;
 type Descriptor = ViewProps["descriptors"][string];

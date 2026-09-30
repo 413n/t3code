@@ -1,6 +1,6 @@
 import { createContext, use, useState, type ReactNode } from "react";
-import type { NativeLayoutMetrics } from "../../lib/reserved-regions";
-import { NativeLayoutObserver } from "../../native/NativeLayoutObserver";
+import type { NativeLayoutMetrics } from "../lib/reserved-regions";
+import { NativeLayoutObserver } from "./NativeLayoutObserver";
 
 const NativeLayoutContext = createContext<NativeLayoutMetrics | null>(null);
 // Column reservations come from UIKit's layout, outside the resizing navigator.
