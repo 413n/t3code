@@ -1114,6 +1114,7 @@ export default function DiffPanel({
                           },
                         }
                       : {})}
+                    onRevealSearchMatch={toggleDiffFileCollapsed}
                     renderHeaderPrefix={(fileDiff, fileKey) => {
                       const unavailable = fileDiff.cacheKey?.endsWith(":pending") === true;
                       const collapsed = unavailable || collapsedDiffFileKeys.has(fileKey);

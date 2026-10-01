@@ -1519,6 +1519,8 @@ function PullRequestCodeTab({
             renderHeaderPrefix={renderHeaderPrefix}
             renderHeaderMetadata={renderHeaderMetadata}
             renderAnnotation={renderAnnotation}
+            // Find only asks this for a folded file, so toggling it is unfolding it.
+            onRevealSearchMatch={(item) => toggleFile(item.id)}
             unsafeCSSExtra={REPLACE_FILE_COUNTS_CSS}
           />
         </div>
