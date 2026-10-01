@@ -51,9 +51,6 @@ type ViewProps = ComponentProps<typeof NativeStackView>;
 type Descriptor = ViewProps["descriptors"][string];
 type Route = ViewProps["state"]["routes"][number];
 
-// These remain modal flows even when the adaptive app presents them as cards.
-const MODAL_FLOWS = new Set(["SettingsSheet", "NewTaskSheet"]);
-
 function ColumnScreen(props: {
   readonly descriptor: Descriptor;
   readonly primary?: boolean;
@@ -230,7 +227,7 @@ function WorkspaceColumns(
 function WorkspaceStackView(props: ViewProps) {
   const projection = projectWorkspaceStack(props.state, (route) => {
     const presentation = props.descriptors[route.key]?.options.presentation;
-    return MODAL_FLOWS.has(route.name) || (presentation !== undefined && presentation !== "card");
+    return presentation !== undefined && presentation !== "card";
   });
   // Linking normally restores Home via initialRouteName. A detail-only history
   // must stay a single stack: placeholder descriptors cannot own an interactive
@@ -247,7 +244,7 @@ function WorkspaceStackView(props: ViewProps) {
   };
   const overlays = partitionStackPresentations(projection.overlays, (route) => {
     const presentation = props.descriptors[route.key]?.options.presentation;
-    return MODAL_FLOWS.has(route.name) || (presentation !== undefined && presentation !== "card");
+    return presentation !== undefined && presentation !== "card";
   });
   const routes = [baseRoute, ...overlays.map((group) => group[0]!)];
   return (

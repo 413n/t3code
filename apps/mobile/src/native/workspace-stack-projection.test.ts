@@ -29,6 +29,23 @@ function history(
 }
 
 describe("workspace router projection", () => {
+  it("keeps workspace flows beside Home and restores them after a modal closes", () => {
+    const draft = { key: "draft", name: "NewTaskSheet" };
+    const modal = { key: "connect", name: "ConnectOnboarding" };
+    const routes = [home, thread, draft, settings, legal];
+    const isOverlay = (route: { name: string }) => route.name === "ConnectOnboarding";
+    expect(projectWorkspaceStack(history([...routes, modal]), isOverlay)).toEqual({
+      primary: home,
+      detail: [thread, draft, settings, legal],
+      overlays: [modal],
+    });
+    expect(projectWorkspaceStack(history(routes), isOverlay)).toEqual({
+      primary: home,
+      detail: [thread, draft, settings, legal],
+      overlays: [],
+    });
+  });
+
   it("keeps the thread and file history in the detail column when a modal is opened", () => {
     const state = history([home, thread, files, settings, legal]);
     const projection = projectWorkspaceStack(state, (route) => route.name === "SettingsSheet");
