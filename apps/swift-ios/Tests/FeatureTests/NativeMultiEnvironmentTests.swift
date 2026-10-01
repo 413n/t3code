@@ -32,7 +32,7 @@ final class NativeMultiEnvironmentTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         _ = try await fixture.client.initialSnapshot()
         try await fixture.client.updateServerPreferences(environmentID: "two", change: .storageCleanup(["logsAfterDays": .number(14)]))
-        try await fixture.client.updateServerPreferences(environmentID: "two", change: .worktreeSubmodules(.none))
+        try await fixture.client.updateServerPreferences(environmentID: "two", change: .worktreeSubmodules(WorktreeSubmodules.none))
         let hosts = await server.updatedHosts()
         XCTAssertEqual(hosts, ["two.example", "two.example"])
         await fixture.client.disconnect()

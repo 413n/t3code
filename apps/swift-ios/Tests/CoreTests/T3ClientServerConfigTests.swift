@@ -267,6 +267,7 @@ final class T3ClientServerConfigTests: XCTestCase {
         XCTAssertEqual(refreshed.threadSnapshotPagination, true)
         XCTAssertEqual(refreshed.threadResumeCompletionMarker, true)
         XCTAssertEqual(refreshed.environment?.environmentId, "environment-1")
+        XCTAssertEqual(refreshed.scratchWorkspaceRoot, "/tmp/scratch")
         guard case let .snapshot(emitted)? = try await iterator.next() else {
             return XCTFail("Expected the refreshed config.")
         }
@@ -589,6 +590,7 @@ private actor ServerConfigTestConnection: WebSocketConnection {
             ]),
             "threadSnapshotPagination": .bool(true),
             "threadResumeCompletionMarker": .bool(true),
+            "scratchWorkspaceRoot": .string("/tmp/scratch"),
             "environment": .object([
                 "environmentId": .string("environment-1"),
                 "label": .string("Studio"),

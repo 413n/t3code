@@ -2,6 +2,16 @@ import XCTest
 @testable import T3Code
 
 final class ProjectSettingsContractTests: XCTestCase {
+    func testNullSubmoduleSettingSupportsConfigurationAndReset() throws {
+        let current = try JSONValue.object(["worktreeSubmodules": .null]).decode(ServerSettingsSnapshot.self)
+        XCTAssertTrue(current.supportsWorktreeSubmodules)
+        XCTAssertNil(current.worktreeSubmodules)
+        let older = try JSONValue.object([:]).decode(ServerSettingsSnapshot.self)
+        XCTAssertFalse(older.supportsWorktreeSubmodules)
+        XCTAssertEqual(ServerSettingsChange.worktreeSubmodules(nil).jsonValue, .object(["worktreeSubmodules": .null]))
+        XCTAssertEqual(ServerSettingsChange.worktreeSubmodules(WorktreeSubmodules.none).jsonValue,
+            .object(["worktreeSubmodules": .string("none")]))
+    }
     func testSubmodulesAndCleanupKeepTheirProjectScope() throws {
         var settings = ServerSettingsSnapshot()
         settings.worktreeSubmodules = .recursive

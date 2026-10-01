@@ -2756,7 +2756,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         setServerConfig(config, environmentID: environmentID)
         switch change {
         case .worktreeSubmodules:
-            guard config.settings?.worktreeSubmodules != nil else { throw FeatureCapabilityUnavailable("Submodule settings") }
+            guard config.settings?.supportsWorktreeSubmodules == true else { throw FeatureCapabilityUnavailable("Submodule settings") }
         case .storageCleanup, .worktreeCleanup:
             guard config.settings?.storageCleanup != nil else { throw FeatureCapabilityUnavailable("Storage cleanup settings") }
         case .responseStreamingMode:
@@ -2818,16 +2818,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
             throw CancellationError()
         }
-        let previous = serverConfigsByEnvironmentID[environmentID]
-        let config = ServerConfigSnapshot(
-            providers: previous?.providers ?? [],
-            settings: settings,
-            threadSnapshotPagination: previous?.threadSnapshotPagination,
-            threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
-            environment: previous?.environment,
-            usageLimitSources: previous?.usageLimitSources ?? [],
-            scratchWorkspaceRoot: previous?.scratchWorkspaceRoot
-        )
+        var config = serverConfigsByEnvironmentID[environmentID] ?? ServerConfigSnapshot(providers: [])
+        config.settings = settings
         setServerConfig(config, environmentID: environmentID)
         if environmentID == activeEnvironment?.id {
             latestServerConfig = config
@@ -3983,49 +3975,23 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         let previous = self.serverConfigsByEnvironmentID[
                             activeClient.environment.id
                         ]
-                        let config = ServerConfigSnapshot(
-                            providers: providers,
-                            settings: previous?.settings,
-                            threadSnapshotPagination: previous?.threadSnapshotPagination,
-                            threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
-                            environment: previous?.environment
-                                ?? self.latestServerConfig?.environment,
-                            usageLimitSources: previous?.usageLimitSources
-                                ?? self.latestServerConfig?.usageLimitSources ?? []
-                        )
+                        var config = previous ?? self.latestServerConfig ?? ServerConfigSnapshot(providers: [])
+                        config.providers = providers
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
                     case let .settingsUpdated(settings):
                         let previous = self.serverConfigsByEnvironmentID[
                             activeClient.environment.id
                         ]
-                        let providers = previous?.providers
-                            ?? self.latestServerConfig?.providers ?? []
-                        let config = ServerConfigSnapshot(
-                            providers: providers,
-                            settings: settings,
-                            threadSnapshotPagination: previous?.threadSnapshotPagination
-                                ?? self.latestServerConfig?.threadSnapshotPagination,
-                            threadResumeCompletionMarker: previous?.threadResumeCompletionMarker
-                                ?? self.latestServerConfig?.threadResumeCompletionMarker,
-                            environment: previous?.environment
-                                ?? self.latestServerConfig?.environment,
-                            usageLimitSources: previous?.usageLimitSources
-                                ?? self.latestServerConfig?.usageLimitSources ?? []
-                        )
+                        var config = previous ?? self.latestServerConfig ?? ServerConfigSnapshot(providers: [])
+                        config.settings = settings
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
                     case let .usageLimitSourcesUpdated(sources):
                         guard let previous = self.serverConfigsByEnvironmentID[activeClient.environment.id]
                             ?? self.latestServerConfig else { continue }
-                        let config = ServerConfigSnapshot(
-                            providers: previous.providers,
-                            settings: previous.settings,
-                            threadSnapshotPagination: previous.threadSnapshotPagination,
-                            threadResumeCompletionMarker: previous.threadResumeCompletionMarker,
-                            environment: previous.environment,
-                            usageLimitSources: sources
-                        )
+                        var config = previous
+                        config.usageLimitSources = sources
                         self.latestServerConfig = config
                         self.setServerConfig(config, environmentID: activeClient.environment.id)
                         // Limits have their own subscription. A quota update

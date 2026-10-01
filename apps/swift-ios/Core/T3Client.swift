@@ -193,14 +193,8 @@ public actor T3Client {
         )
         guard generation == serverConfigGeneration else { throw CancellationError() }
         let latest = serverConfigCache ?? current
-        let config = ServerConfigSnapshot(
-            providers: result.providers,
-            settings: latest.settings,
-            threadSnapshotPagination: latest.threadSnapshotPagination,
-            threadResumeCompletionMarker: latest.threadResumeCompletionMarker,
-            environment: latest.environment,
-            usageLimitSources: latest.usageLimitSources
-        )
+        var config = latest
+        config.providers = result.providers
         cacheServerConfig(config)
         serverConfigListeners.values.forEach { $0.yield(.snapshot(config)) }
         return config
@@ -494,26 +488,14 @@ public actor T3Client {
             cacheServerConfig(config)
             emittedEvent = .snapshot(config)
         case let .providerStatuses(providers):
-            if let current = serverConfigCache {
-                cacheServerConfig(.init(
-                    providers: providers,
-                    settings: current.settings,
-                    threadSnapshotPagination: current.threadSnapshotPagination,
-                    threadResumeCompletionMarker: current.threadResumeCompletionMarker,
-                    environment: current.environment,
-                    usageLimitSources: current.usageLimitSources
-                ))
+            if var current = serverConfigCache {
+                current.providers = providers
+                cacheServerConfig(current)
             }
         case let .settingsUpdated(settings):
-            if let current = serverConfigCache {
-                cacheServerConfig(.init(
-                    providers: current.providers,
-                    settings: settings,
-                    threadSnapshotPagination: current.threadSnapshotPagination,
-                    threadResumeCompletionMarker: current.threadResumeCompletionMarker,
-                    environment: current.environment,
-                    usageLimitSources: current.usageLimitSources
-                ))
+            if var current = serverConfigCache {
+                current.settings = settings
+                cacheServerConfig(current)
             }
         case let .usageLimitSourcesUpdated(sources):
             guard var current = serverConfigCache,

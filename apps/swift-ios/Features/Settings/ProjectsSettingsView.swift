@@ -132,13 +132,14 @@ struct ProjectPreferencesView: View {
                         .newWorktreesStartFromOrigin, value: effective.newWorktreesStartFromOrigin
                     ))
                 }
-                if settings?.worktreeSubmodules != nil {
+                if settings?.supportsWorktreeSubmodules == true {
                     projectSetting(.worktreeSubmodules) {
                         Picker("Submodules", selection: Binding(
-                            get: { effective.worktreeSubmodules ?? .recursive },
-                            set: { save(.worktreeSubmodules, value: .string($0.rawValue)) }
+                            get: { effective.worktreeSubmodules?.rawValue ?? "" },
+                            set: { save(.worktreeSubmodules, value: $0.isEmpty ? nil : .string($0)) }
                         )) {
-                            ForEach(WorktreeSubmodules.allCases, id: \.self) { Text($0.label).tag($0) }
+                            Text("Project configuration").tag("")
+                            ForEach(WorktreeSubmodules.allCases, id: \.self) { Text($0.label).tag($0.rawValue) }
                         }
                     }
                 }

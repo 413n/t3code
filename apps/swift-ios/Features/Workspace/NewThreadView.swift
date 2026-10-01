@@ -302,12 +302,12 @@ public struct NewThreadView: View {
                 Text("What should we build")
 
                 HStack(spacing: 0) {
-                    Text("in")
+                    Text(selectedProject?.isScratch == true ? "without" : "in")
 
                     Button {
                         presentPicker(.project)
                     } label: {
-                        Text(selectedProjectGroup?.name ?? selectedProject?.name ?? "a project")
+                        Text(selectedProject?.isScratch == true ? "a project" : selectedProjectGroup?.name ?? selectedProject?.name ?? "a project")
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .foregroundStyle(T3Colors.textPrimary)

@@ -169,6 +169,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public var storageCleanup: [String: JSONValue]? = nil
     public var worktreeCleanup: JSONValue? = nil
     public var worktreeSubmodules: WorktreeSubmodules? = nil
+    public var supportsWorktreeSubmodules = false
     /// Missing on servers that do not support the current streaming setting.
     public var responseStreamingMode: ResponseStreamingMode? = nil
     public var projectSettingsOverrides: [String: [String: JSONValue]] = [:]
@@ -236,6 +237,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         storageCleanup = try container.decodeIfPresent([String: JSONValue].self, forKey: .storageCleanup)
         worktreeCleanup = try container.decodeIfPresent(JSONValue.self, forKey: .worktreeCleanup)
         worktreeSubmodules = try? container.decodeIfPresent(WorktreeSubmodules.self, forKey: .worktreeSubmodules)
+        supportsWorktreeSubmodules = container.contains(.worktreeSubmodules)
         defaultAutoPull = try container.decodeIfPresent(Bool.self, forKey: .defaultAutoPull) ?? false
         responseStreamingMode = try container.decodeIfPresent(ResponseStreamingMode.self, forKey: .responseStreamingMode)
         projectSettingsOverrides = try container.decodeIfPresent([String: [String: JSONValue]].self, forKey: .projectSettingsOverrides) ?? [:]
@@ -282,7 +284,7 @@ public enum ServerSettingsChange: Equatable, Sendable {
     case sharedPreferences(JSONValue)
     case worktreeCleanup(JSONValue)
     case storageCleanup([String: JSONValue])
-    case worktreeSubmodules(WorktreeSubmodules)
+    case worktreeSubmodules(WorktreeSubmodules?)
     case responseStreamingMode(ResponseStreamingMode)
     case projectSettingsOverrides(projectID: String, entry: [String: JSONValue]?)
 
@@ -296,7 +298,7 @@ public enum ServerSettingsChange: Equatable, Sendable {
         case let .sharedPreferences(value): value
         case let .worktreeCleanup(value): .object(["worktreeCleanup": value])
         case let .storageCleanup(value): .object(["storageCleanup": .object(value)])
-        case let .worktreeSubmodules(value): .object(["worktreeSubmodules": .string(value.rawValue)])
+        case let .worktreeSubmodules(value): .object(["worktreeSubmodules": value.map { .string($0.rawValue) } ?? .null])
         case let .responseStreamingMode(value): .object(["responseStreamingMode": .string(value.rawValue)])
         case let .projectSettingsOverrides(projectID, entry):
             .object(["projectSettingsOverrides": .object([projectID: entry.map(JSONValue.object) ?? .null])])
@@ -310,8 +312,8 @@ public enum ServerSettingsChange: Equatable, Sendable {
 
 /// Narrow decode view of the much larger `ServerConfig` RPC result.
 public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
-    public let providers: [ServerProviderSnapshot]
-    public let settings: ServerSettingsSnapshot?
+    public var providers: [ServerProviderSnapshot]
+    public var settings: ServerSettingsSnapshot?
     public var scratchWorkspaceRoot: String? = nil
     public let threadSnapshotPagination: Bool?
     public let threadResumeCompletionMarker: Bool?

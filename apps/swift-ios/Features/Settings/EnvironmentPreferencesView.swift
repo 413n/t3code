@@ -38,12 +38,14 @@ struct EnvironmentPreferencesView: View {
                         }
                     }
                 }
-                if let submodules = settings.worktreeSubmodules {
+                if settings.supportsWorktreeSubmodules {
                     Section("Worktrees") {
                         Picker("Submodules", selection: Binding(
-                            get: { submodules }, set: { save(.worktreeSubmodules($0)) }
+                            get: { settings.worktreeSubmodules?.rawValue ?? "" },
+                            set: { save(.worktreeSubmodules(WorktreeSubmodules(rawValue: $0))) }
                         )) {
-                            ForEach(WorktreeSubmodules.allCases, id: \.self) { Text($0.label).tag($0) }
+                            Text("Project configuration").tag("")
+                            ForEach(WorktreeSubmodules.allCases, id: \.self) { Text($0.label).tag($0.rawValue) }
                         }
                     }
                 }
