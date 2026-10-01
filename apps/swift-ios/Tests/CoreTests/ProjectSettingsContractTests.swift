@@ -2,6 +2,19 @@ import XCTest
 @testable import T3Code
 
 final class ProjectSettingsContractTests: XCTestCase {
+    func testSubmodulesAndCleanupKeepTheirProjectScope() throws {
+        var settings = ServerSettingsSnapshot()
+        settings.worktreeSubmodules = .recursive
+        settings.projectSettingsOverrides = ["project": [
+            "worktreeSubmodules": .string("none"), "worktreeCleanup": .object(["mode": .string("off")]),
+        ]]
+        XCTAssertEqual(settings.resolvingProject(id: "project").worktreeSubmodules, WorktreeSubmodules.none)
+        XCTAssertEqual(settings.resolvingProject(id: "other").worktreeSubmodules, .recursive)
+        XCTAssertEqual(settings.resolvingProject(id: "project").worktreeCleanup?["mode"], .string("off"))
+        let patch = ServerSettingsChange.storageCleanup(["logsAfterDays": .number(14)]).jsonValue
+        XCTAssertEqual(patch, .object(["storageCleanup": .object(["logsAfterDays": .number(14)])]))
+    }
+
     func testMissingNullAndExplicitValuesHaveDifferentMeanings() throws {
         let model = ModelSelection(instanceId: "codex", model: "default-model")
         var settings = ServerSettingsSnapshot()

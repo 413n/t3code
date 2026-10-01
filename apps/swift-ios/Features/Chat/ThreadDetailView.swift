@@ -531,6 +531,12 @@ public struct ThreadDetailView: View {
                         )
                     }
                 }
+                if currentThread.supportsAutoSettleOptOut == true {
+                    Toggle("Auto-settle", isOn: Binding(
+                        get: { currentThread.autoSettleDisabledAt == nil },
+                        set: { enabled in Task { await model.setAutoSettle(thread.id, enabled: enabled) } }
+                    ))
+                }
                 let isSettled = model.isEffectivelySettled(currentThread)
                 if (isSettled || currentThread.canSettleNow()), !currentThread.isArchived {
                     Button {

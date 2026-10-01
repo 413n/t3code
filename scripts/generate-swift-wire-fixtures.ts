@@ -50,6 +50,7 @@ const threadShell = {
     url: "https://example.com/fixture/repository/pull/42",
   },
   activeOrderKey: "nm",
+  autoSettleDisabledAt: timestamp,
   latestTurn: null,
   createdAt: timestamp,
   updatedAt: timestamp,
@@ -118,6 +119,19 @@ const shellSnapshot = encodeShellSnapshot(decodeShellSnapshot(shellSnapshotInput
 const threadDetail = encodeThreadDetail(decodeThreadDetail(threadDetailInput));
 const serializeFixture = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 const fixtures = new Map<string, string>([
+  [
+    "auto-settle-command.json",
+    serializeFixture(
+      Schema.encodeSync(ClientOrchestrationCommand)(
+        Schema.decodeUnknownSync(ClientOrchestrationCommand)({
+          type: "thread.auto-settle.set",
+          commandId: "command-fixture",
+          threadId: threadShell.id,
+          enabled: false,
+        }),
+      ),
+    ),
+  ],
   [
     "question-attachment-command.json",
     serializeFixture(

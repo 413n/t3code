@@ -584,6 +584,9 @@ extension UsageProviderKind {
         case .codex: T3Colors.textPrimary
         case .claude: Self.claudeColor
         case .grok: T3Colors.textSecondary
+        case .cursor: .blue
+        case .opencode: .purple
+        case .antigravity: .green
         }
     }
 }

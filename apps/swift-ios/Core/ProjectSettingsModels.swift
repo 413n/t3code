@@ -1,5 +1,19 @@
 import Foundation
 
+public enum WorktreeSubmodules: String, Codable, CaseIterable, Sendable {
+    case recursive
+    case topLevel = "top-level"
+    case none
+
+    var label: String {
+        switch self {
+        case .recursive: "All nested submodules"
+        case .topLevel: "Top-level only"
+        case .none: "Do not initialize"
+        }
+    }
+}
+
 public enum ResponseStreamingMode: String, Codable, CaseIterable, Sendable {
     case turn, paragraph, token
 
@@ -16,7 +30,7 @@ public enum ResponseStreamingMode: String, Codable, CaseIterable, Sendable {
 public enum ServerProjectSettingKey: String, Sendable {
     case defaultModelSelection, defaultThreadEnvMode, newWorktreesStartFromOrigin
     case defaultAutoPull, sidebarAutoSettleOnMerge, sidebarAutoSettleAfterDays
-    case continueThreadsAfterServerUpdate, responseStreamingMode
+    case continueThreadsAfterServerUpdate, responseStreamingMode, worktreeSubmodules, worktreeCleanup
 }
 
 public struct ServerProjectSettingChange: Sendable {
@@ -37,6 +51,17 @@ public struct ServerProjectSettingChange: Sendable {
 }
 
 public extension ServerSettingsSnapshot {
+    var storageCleanupRules: [String: JSONValue] {
+        var result = storageCleanup ?? [:]
+        if worktreeCleanup?["mode"]?.stringValue == "off" {
+            result["worktreeAfterDays"] = .null
+            for key in ["worktreeOnMerge", "worktreeOnDelete", "worktreeUnchanged"] { result[key] = .bool(false) }
+        } else if case let .object(rules) = worktreeCleanup?["rules"] {
+            result.merge(rules) { _, next in next }
+        }
+        return result
+    }
+
     /// The aggregate fields apply only until the server folds them into settings.
     /// After that, removing an override must not restore a stale aggregate value.
     func resolvingProject(
@@ -68,6 +93,10 @@ public extension ServerSettingsSnapshot {
         }
         if let value = entry["newWorktreesStartFromOrigin"]?.boolValue {
             resolved.newWorktreesStartFromOrigin = value
+        }
+        if let value = entry["worktreeCleanup"] { resolved.worktreeCleanup = value }
+        if let value = entry["worktreeSubmodules"]?.stringValue.flatMap(WorktreeSubmodules.init(rawValue:)) {
+            resolved.worktreeSubmodules = value
         }
         if let value = entry["defaultAutoPull"]?.boolValue { resolved.defaultAutoPull = value }
         if let value = entry["sidebarAutoSettleOnMerge"]?.boolValue { resolved.sidebarAutoSettleOnMerge = value }

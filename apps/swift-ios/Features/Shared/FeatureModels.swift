@@ -49,6 +49,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
     public var connectionState: FeatureConnection.State?
     public var connectionDetail: String?
     public var machineIcon: String? = nil
+    public var supportsScratch: Bool? = nil
     public var canCustomizeIcon: Bool? = nil
 
     public var systemImage: String {
@@ -92,6 +93,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         case connectionState
         case connectionDetail
         case machineIcon
+        case supportsScratch
         case canCustomizeIcon
     }
 
@@ -109,6 +111,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         )
         connectionDetail = try container.decodeIfPresent(String.self, forKey: .connectionDetail)
         machineIcon = try container.decodeIfPresent(String.self, forKey: .machineIcon)
+        supportsScratch = try container.decodeIfPresent(Bool.self, forKey: .supportsScratch)
         canCustomizeIcon = try container.decodeIfPresent(Bool.self, forKey: .canCustomizeIcon)
     }
 }
@@ -146,6 +149,7 @@ public struct FeatureProject: Identifiable, Sendable, Equatable, Hashable, Codab
     public var createdAt: String?
     public var updatedAt: String?
     public var projectIcon: ProjectIconOverride? = nil
+    public var isScratch: Bool? = nil
     public var defaultWorkspaceMode: FeatureWorkspaceMode? = nil
     public var newWorktreesStartFromOrigin: Bool? = nil
     public var supportsProjectSettingsOverrides: Bool? = nil
@@ -290,6 +294,8 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var keepsActive: Bool
     public var settledAt: Date?
     public var unsettledAt: Date?
+    public var supportsAutoSettleOptOut: Bool? = nil
+    public var autoSettleDisabledAt: String?
     public var activeOrderKey: String?
     public var lastActivityAt: Date?
     public var snoozedUntil: Date?
@@ -343,12 +349,14 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         settledAt: Date? = nil,
         unsettledAt: Date? = nil,
         activeOrderKey: String? = nil,
+        autoSettleDisabledAt: String? = nil,
         lastActivityAt: Date? = nil,
         snoozedUntil: Date? = nil,
         snoozedAt: Date? = nil,
         pinnedAt: Date? = nil,
         pinOrderKey: String? = nil,
         supportsSettlement: Bool? = nil,
+        supportsAutoSettleOptOut: Bool? = nil,
         supportsSnooze: Bool? = nil,
         supportsPinning: Bool? = nil,
         supportsPinReorder: Bool? = nil,
@@ -390,12 +398,14 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.settledAt = settledAt
         self.unsettledAt = unsettledAt
         self.activeOrderKey = activeOrderKey
+        self.autoSettleDisabledAt = autoSettleDisabledAt
         self.lastActivityAt = lastActivityAt
         self.snoozedUntil = snoozedUntil
         self.snoozedAt = snoozedAt
         self.pinnedAt = pinnedAt
         self.pinOrderKey = pinOrderKey
         self.supportsSettlement = supportsSettlement
+        self.supportsAutoSettleOptOut = supportsAutoSettleOptOut
         self.supportsSnooze = supportsSnooze
         self.supportsPinning = supportsPinning
         self.supportsPinReorder = supportsPinReorder
@@ -1045,6 +1055,17 @@ public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Coda
     public var skills: [FeatureProviderSkill]?
     public var workspaceSnapshots: [FeatureProviderWorkspace]? = nil
     public var setup: ProviderSetupCapabilities? = nil
+    public var versionAdvisory: ProviderVersionAdvisory? = nil
+    public var compatibilityAdvisory: ProviderCompatibilityAdvisory? = nil
+    public var updateState: ProviderUpdateState? = nil
+
+    public var canUpdate: Bool {
+        isInstalled == true && versionAdvisory?.status == "behind_latest"
+            && versionAdvisory?.canUpdate == true && versionAdvisory?.latestVersion != nil
+            && !["broken", "unsupported"].contains(compatibilityAdvisory?.latestVersionStatus ?? "")
+            && updateState?.isRunning != true
+    }
+
     public var isEnabled: Bool? = nil
     public var isInstalled: Bool? = nil
     public var authStatus: String? = nil

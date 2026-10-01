@@ -45,6 +45,13 @@ public struct ServerProviderResetCredits: Codable, Equatable, Sendable {
 }
 
 public struct ServerProviderUsageLimits: Codable, Equatable, Sendable {
+    public struct ExternalUsage: Codable, Equatable, Sendable {
+        public let label: String
+        public let url: String
+    }
+    public var credentialFingerprint: String? = nil
+    public var externalUsage: ExternalUsage? = nil
+
     public struct Unavailable: Codable, Equatable, Sendable {
         public enum Reason: String, Codable, CaseIterable, Sendable {
             case unsupported
@@ -69,20 +76,26 @@ public struct ServerProviderUsageLimits: Codable, Equatable, Sendable {
         checkedAt: String,
         windows: [ServerProviderUsageWindow],
         resetCredits: ServerProviderResetCredits? = nil,
-        unavailable: Unavailable? = nil
+        unavailable: Unavailable? = nil,
+        credentialFingerprint: String? = nil,
+        externalUsage: ExternalUsage? = nil
     ) {
         self.checkedAt = checkedAt
         self.windows = windows
         self.resetCredits = resetCredits
         self.unavailable = unavailable
+        self.credentialFingerprint = credentialFingerprint
+        self.externalUsage = externalUsage
     }
 
     private enum CodingKeys: String, CodingKey {
-        case checkedAt, windows, resetCredits, unavailable
+        case checkedAt, windows, resetCredits, unavailable, credentialFingerprint, externalUsage
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        credentialFingerprint = try container.decodeIfPresent(String.self, forKey: .credentialFingerprint)
+        externalUsage = try? container.decodeIfPresent(ExternalUsage.self, forKey: .externalUsage)
         checkedAt = try container.decode(String.self, forKey: .checkedAt)
         _windows = try container.decode(ForwardCompatibleArray<ServerProviderUsageWindow>.self, forKey: .windows)
         resetCredits = try container.decodeIfPresent(ServerProviderResetCredits.self, forKey: .resetCredits)

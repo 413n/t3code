@@ -92,7 +92,7 @@ public struct NewThreadView: View {
                             .accessibilityElement(children: .combine)
                     }
 
-                    workspaceControls
+                    if selectedProject?.isScratch != true { workspaceControls }
 
                     FeatureComposerView(
                         text: $prompt,
@@ -234,6 +234,7 @@ public struct NewThreadView: View {
                     selectionID: selectedProjectGroup?.id,
                     retryState: unreachableRetry,
                     onRetry: retryUnreachableEnvironments,
+                    onScratch: startScratch,
                     onSelect: { group in
                         if selectProjectGroup(group) {
                             activePicker = nil
@@ -466,6 +467,15 @@ public struct NewThreadView: View {
                     .accessibilityHint("Refresh environment status")
                     .accessibilityIdentifier("new-task-unreachable-retry")
                 }
+                Menu("Start without a project") {
+                    ForEach(scratchEnvironments) { environment in
+                        Button(environment.name) { startScratch(environment.id) }
+                    }
+                }
+                .disabled(scratchEnvironments.isEmpty || isSubmitting)
+                if let submissionValidationError {
+                    Text(submissionValidationError).foregroundStyle(T3Colors.danger)
+                }
                 Button("Add project") {
                     dismiss()
                     Task { @MainActor in
@@ -609,6 +619,26 @@ public struct NewThreadView: View {
         .foregroundStyle(T3Colors.textSecondary)
         .frame(minHeight: 44)
         .contentShape(Rectangle())
+    }
+
+    private var scratchEnvironments: [FeatureEnvironment] {
+        model.snapshot.environments.filter { $0.isEnabled && $0.connectionState == .connected && $0.supportsScratch == true }
+    }
+
+    private func startScratch(_ environmentID: String) {
+        guard !isSubmitting else { return }
+        isSubmitting = true
+        Task {
+            defer { isSubmitting = false }
+            do {
+                let id = try await model.client.ensureScratchProject(environmentID: environmentID)
+                await model.reloadAfterConnection()
+                if selectProject(id) { activePicker = nil }
+                workspaceMode = .local
+            } catch {
+                submissionValidationError = "Could not prepare a scratch workspace. Check this connection and try again."
+            }
+        }
     }
 
     private var creationProjects: [FeatureProject] {
@@ -775,7 +805,7 @@ public struct NewThreadView: View {
         guard attachments.isEmpty || imagesAllowed else {
             return "This model does not support images."
         }
-        guard workspaceMode != .worktree || selectedBranch != nil else {
+        guard selectedProject?.isScratch == true || workspaceMode != .worktree || selectedBranch != nil else {
             if branchesLoading { return "Branches are loading." }
             return branchLoadFailed ? "Could not load branches." : "Choose a base branch."
         }
@@ -836,9 +866,9 @@ public struct NewThreadView: View {
             selection: concreteSelection,
             runtimeMode: .fullAccess,
             interactionMode: .standard,
-            workspaceMode: workspaceMode,
-            branch: selectedBranch?.name,
-            worktreePath: workspaceMode == .local
+            workspaceMode: project.isScratch == true ? .local : workspaceMode,
+            branch: project.isScratch == true ? nil : selectedBranch?.name,
+            worktreePath: project.isScratch != true && workspaceMode == .local
                 ? NewTaskWorkspaceDefaults.normalizedWorktreePath(
                     for: selectedBranch,
                     projectPath: project.path
@@ -1054,6 +1084,10 @@ public struct NewThreadView: View {
 
     @MainActor
     private func loadBranches(refresh: Bool = false) async {
+        if selectedProject?.isScratch == true {
+            branches = []; selectedBranch = nil; branchesLoading = false; branchLoadFailed = false
+            return
+        }
         let requestedProjectID = projectID
         guard !requestedProjectID.isEmpty else { return }
 
@@ -1491,6 +1525,7 @@ private struct NewTaskProjectPicker: View {
     let selectionID: String?
     let retryState: NewTaskRetryState
     let onRetry: () -> Void
+    let onScratch: (String) -> Void
     let onSelect: (DailyUXProjectGroup) -> Void
 
     @State private var query = ""
@@ -1503,6 +1538,14 @@ private struct NewTaskProjectPicker: View {
                 unavailableEnvironments: unreachableEnvironments
             )
             List {
+                let available = environments.filter { $0.isEnabled && $0.connectionState == .connected && $0.supportsScratch == true }
+                if !available.isEmpty && query.isEmpty {
+                    Section("Without a project") {
+                        ForEach(available) { environment in
+                            Button("Scratch on \(environment.name)") { onScratch(environment.id); dismiss() }
+                        }
+                    }
+                }
                 switch presentation.projectContent {
                 case .noProjects:
                     projectUnavailableRow("No projects", systemImage: "folder")

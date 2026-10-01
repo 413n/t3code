@@ -14,11 +14,27 @@ selected computer. Other connected computers are not refreshed.
 Open **Settings > Providers**, or **Providers** in the model picker, to manage a provider on its
 computer. Supported providers offer runtime installation and sign-in. Antigravity can be enabled
 here. Runtime files and credentials stay on that computer. API keys and enterprise authentication
-settings must be configured on the computer.
+settings can be entered here when the provider offers a credential form. Other settings must be configured on the computer.
+
+Open **Software updates** in an environment’s connection details to check its T3 Code version.
+Updates stay on that computer’s release channel. The app asks before restarting it. Provider
+updates are available in **Settings > Providers** when the server supports them.
 
 The composer uses the skills and slash commands for the selected project or worktree. Skills that
 require direct user invocation insert a slash command. Agent-only skills do not appear in the slash
 menu.
+
+## New tasks and thread preferences
+
+To start without a repository, open the new-task project picker and choose **Scratch** on a
+connected computer. This option requires a current server. Scratch tasks use a local workspace.
+
+Use **Auto-settle** in a thread's menu to keep that thread active until you settle it yourself.
+The choice is saved on its computer and applies to every client.
+
+Environment and project preferences include submodule initialization and automatic storage
+cleanup. Cleanup preferences apply only to the selected computer or project. A project can
+inherit its computer's rules, use custom rules, or disable worktree cleanup.
 
 ## Icons and usage
 
@@ -44,8 +60,8 @@ the text is ready. Saved drafts load without waiting for the thread to catch up.
 
 ## Attachments and sharing
 
-One message can contain up to eight photos, videos, or files. Images can be up to 10 MB. Other
-files can be up to 50 MB, or the lower limit reported by the connected server. Older servers accept
+Current servers accept up to 100 photos, videos, or files per message. Each image can be up to
+10 MiB, with at most 80 MiB of images in one message. Other files can be up to 50 MiB, or the lower limit reported by the connected server. Older servers accept
 images only.
 
 Attachments start uploading while you compose. **Preparing** means the attachment is waiting to
@@ -68,7 +84,7 @@ speech model download.
 Tap Stop to finish recording. T3 Code inserts editable text into the draft and never
 sends it automatically.
 
-Starting voice input keeps an open keyboard in place. Editing pauses until voice input finishes
+The screen stays awake while recording. Starting voice input keeps an open keyboard in place. Editing pauses until voice input finishes
 or is canceled.
 
 ## Codex content

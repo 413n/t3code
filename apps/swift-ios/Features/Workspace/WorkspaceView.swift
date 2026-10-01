@@ -270,6 +270,9 @@ public struct WorkspaceView: View {
                 onSnooze: { thread, until in
                     Task { await model.setSnoozed(thread.id, until: until) }
                 },
+                onAutoSettle: { thread, enabled in
+                    Task { await model.setAutoSettle(thread.id, enabled: enabled) }
+                },
                 onPin: { thread, pinned in
                     Task { await model.setPinned(thread.id, pinned: pinned) }
                 },

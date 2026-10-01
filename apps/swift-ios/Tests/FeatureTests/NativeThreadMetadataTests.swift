@@ -5,6 +5,26 @@ import Testing
 @MainActor
 @Suite("Native thread metadata")
 struct NativeThreadMetadataTests {
+    @Test func autoSettleOptOutSurvivesSettlementAndCanBeEnabledAgain() throws {
+        let disabled = NativeThreadDetailReducer.apply(event(type: "thread.auto-settle-set",
+            payload: ["autoSettleDisabledAt": .string("2026-09-30T20:00:00Z")]), to: thread())
+        guard case let .updated(withOptOut) = disabled.result else {
+            Issue.record("Expected an auto-settle update"); return
+        }
+        let settled = NativeThreadDetailReducer.apply(event(type: "thread.settled",
+            payload: ["settledAt": .string("2026-09-30T21:00:00Z"), "reason": .string("user")]), to: withOptOut)
+        guard case let .updated(parked) = settled.result else {
+            Issue.record("Expected settlement"); return
+        }
+        #expect(parked.autoSettleDisabledAt == withOptOut.autoSettleDisabledAt)
+        let enabled = NativeThreadDetailReducer.apply(event(type: "thread.auto-settle-set",
+            payload: ["autoSettleDisabledAt": .null]), to: parked)
+        guard case let .updated(restored) = enabled.result else {
+            Issue.record("Expected an auto-settle update"); return
+        }
+        #expect(restored.autoSettleDisabledAt == nil)
+    }
+
     @Test
     func multiplePRLinksUpdateWithoutReloadAndHideDismissedStackMembers() throws {
         let link = ThreadPullRequestLink(host: "github.com", repository: "test/repo", number: 2,

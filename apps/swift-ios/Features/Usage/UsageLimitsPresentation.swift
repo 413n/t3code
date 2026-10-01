@@ -135,7 +135,7 @@ enum UsageLimitsPresentation {
                 ? "This account has no subscription limits."
                 : "Could not read limits.")
         }
-        return limits.windows.isEmpty ? "No limits reported." : nil
+        return limits.windows.isEmpty && limits.externalUsage == nil ? "No limits reported." : nil
     }
 
     static func visibleWindows(_ limits: ServerProviderUsageLimits) -> [ServerProviderUsageWindow] {

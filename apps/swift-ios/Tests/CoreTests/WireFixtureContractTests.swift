@@ -3,6 +3,15 @@ import XCTest
 @testable import T3Code
 
 final class WireFixtureContractTests: XCTestCase {
+    func testPerThreadAutoSettleMatchesServerContract() throws {
+        XCTAssertEqual(
+            OrchestrationCommands.autoSettle(threadID: "thread-fixture", enabled: false, commandID: "command-fixture"),
+            try decodeFixture("auto-settle-command", as: JSONValue.self)
+        )
+        let shell = try decodeFixture("shell-snapshot", as: OrchestrationShellSnapshot.self)
+        XCTAssertEqual(shell.threads.first?.autoSettleDisabledAt, "2026-08-07T12:00:00.000Z")
+    }
+
     func testQuestionAttachmentAnswerMatchesTheServerContract() throws {
         let image = try UploadChatAttachment(data: Data([1, 2]), name: "screenshot.png", mimeType: "image/png")
         XCTAssertEqual(

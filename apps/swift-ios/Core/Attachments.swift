@@ -25,6 +25,7 @@ public enum FileAttachmentError: LocalizedError, Equatable, Sendable {
     case invalidFileURL
     case unsupported
     case tooMany(maximum: Int)
+    case imageBudgetExceeded
 
     public var errorDescription: String? {
         switch self {
@@ -35,6 +36,7 @@ public enum FileAttachmentError: LocalizedError, Equatable, Sendable {
         case .invalidMIMEType: "The file needs a valid MIME type."
         case .invalidFileURL: "The attachment file is no longer available."
         case .unsupported: "This environment does not support file attachments."
+        case .imageBudgetExceeded: "Images can total up to 80 MiB per message or question response."
         case let .tooMany(maximum): "You can attach up to \(maximum) files per message."
         }
     }
@@ -53,6 +55,20 @@ public struct UploadedAttachmentReference: Codable, Equatable, Sendable {
 /// A validated turn attachment. Images can remain inline for older servers.
 /// Generic files require the upload capability. Clipboard text can stay in memory.
 public struct UploadChatAttachment: Equatable, Sendable {
+    public static let maximumCount = 100
+    public static let maximumTotalImageBytes = 80 * 1024 * 1024
+
+    public static func validateBatch(_ attachments: [UploadChatAttachment]) throws {
+        guard attachments.count <= maximumCount else { throw FileAttachmentError.tooMany(maximum: maximumCount) }
+        var imageBytes = 0
+        for attachment in attachments where attachment.type == "image" || attachment.mimeType.hasPrefix("image/") {
+            guard attachment.sizeBytes <= maximumTotalImageBytes - imageBytes else {
+                throw FileAttachmentError.imageBudgetExceeded
+            }
+            imageBytes += attachment.sizeBytes
+        }
+    }
+
     public static let maximumBytes = 10 * 1024 * 1024
     public static let maximumFileBytes = 50 * 1024 * 1024
 

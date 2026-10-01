@@ -132,6 +132,48 @@ struct ProjectPreferencesView: View {
                         .newWorktreesStartFromOrigin, value: effective.newWorktreesStartFromOrigin
                     ))
                 }
+                if settings?.worktreeSubmodules != nil {
+                    projectSetting(.worktreeSubmodules) {
+                        Picker("Submodules", selection: Binding(
+                            get: { effective.worktreeSubmodules ?? .recursive },
+                            set: { save(.worktreeSubmodules, value: .string($0.rawValue)) }
+                        )) {
+                            ForEach(WorktreeSubmodules.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
+                    }
+                }
+                if settings?.storageCleanup != nil {
+                    projectSetting(.worktreeCleanup) {
+                        let cleanup = settings?.projectSettingsOverrides[wireID]?["worktreeCleanup"]
+                        Picker("Worktree cleanup", selection: Binding(
+                            get: { cleanup?["mode"]?.stringValue ?? "inherit" },
+                            set: { mode in
+                                if mode == "inherit" { save(.worktreeCleanup, value: nil) }
+                                else if mode == "off" { save(.worktreeCleanup, value: .object(["mode": .string("off")])) }
+                                else {
+                                    save(.worktreeCleanup, value: .object([
+                                        "mode": .string("custom"),
+                                        "rules": .object([
+                                            "worktreeAfterDays": .null, "worktreeOnMerge": .bool(false),
+                                            "worktreeOnDelete": .bool(false), "worktreeUnchanged": .bool(false),
+                                        ]),
+                                    ]))
+                                }
+                            }
+                        )) {
+                            Text("Use environment setting").tag("inherit")
+                            Text("Disabled").tag("off")
+                            Text("Custom").tag("custom")
+                        }
+                        if cleanup?["mode"]?.stringValue == "custom", case let .object(rules) = cleanup?["rules"] {
+                            StorageCleanupControls(rules: rules, includesLogs: false) { key, value in
+                                var updated = rules
+                                updated[key] = value
+                                save(.worktreeCleanup, value: .object(["mode": .string("custom"), "rules": .object(updated)]))
+                            }
+                        }
+                    }
+                }
                 projectSetting(.defaultAutoPull) {
                     Toggle("Pull before new threads", isOn: booleanBinding(.defaultAutoPull, value: effective.defaultAutoPull))
                 }
@@ -246,6 +288,39 @@ struct ProjectPreferencesView: View {
                 )
                 await load()
             } catch { errorMessage = "Could not save project settings. Check this connection and try again." }
+        }
+    }
+}
+
+struct StorageCleanupControls: View {
+    let rules: [String: JSONValue]
+    let includesLogs: Bool
+    let save: (String, JSONValue) -> Void
+
+    var body: some View {
+        retention("Inactive worktrees", key: "worktreeAfterDays")
+        Toggle("Remove worktrees after merge", isOn: boolean("worktreeOnMerge"))
+        Toggle("Remove worktrees after thread deletion", isOn: boolean("worktreeOnDelete"))
+        Toggle("Include unchanged worktrees", isOn: boolean("worktreeUnchanged"))
+        if includesLogs {
+            retention("Browser artifacts", key: "browserArtifactsAfterDays")
+            retention("Logs", key: "logsAfterDays")
+        }
+    }
+
+    private func boolean(_ key: String) -> Binding<Bool> {
+        Binding(get: { rules[key]?.boolValue ?? false }, set: { save(key, .bool($0)) })
+    }
+
+    private func retention(_ title: String, key: String) -> some View {
+        let current = (try? rules[key]?.decode(Int.self)) ?? 0
+        return Picker(title, selection: Binding(
+            get: { current }, set: { save(key, $0 == 0 ? .null : .number(Double($0))) }
+        )) {
+            Text("Never").tag(0)
+            ForEach(Array(Set([1, 3, 7, 14, 30, 90, 365] + (current > 0 ? [current] : []))).sorted(), id: \.self) { days in
+                Text(days == 1 ? "After 1 day" : "After \(days) days").tag(days)
+            }
         }
     }
 }

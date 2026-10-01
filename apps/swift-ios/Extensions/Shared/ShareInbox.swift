@@ -94,9 +94,9 @@ enum T3IncomingShareStoreError: LocalizedError {
 enum T3IncomingShareStore {
     static let inboxRelativePath = "Library/Application Support/T3Code/IncomingShares"
     static let manifestFileName = "manifest.json"
-    static let maximumImageCount = 8
+    static let maximumImageCount = 100
     static let maximumImageBytes = 10 * 1_024 * 1_024
-    static let maximumAttachmentCount = 8
+    static let maximumAttachmentCount = 100
     static let maximumFileBytes = 50 * 1_024 * 1_024
 
     static func write(

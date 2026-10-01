@@ -7,7 +7,7 @@ import UIKit
 enum FeatureImageAttachmentLimits {
     /// Shared by every attachment entry point (picker, camera, files, and
     /// paste), so their in-flight reservations count against the same cap.
-    static let maximumCount = 8
+    static let maximumCount = 100
 }
 
 struct FeatureAttachmentPreparationState: Equatable {

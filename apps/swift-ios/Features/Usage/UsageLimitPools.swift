@@ -106,7 +106,9 @@ enum UsageLimitPooling {
                 checkedAt: winner.limits.checkedAt,
                 windows: winner.limits.windows,
                 resetCredits: credits[key]?.limits.resetCredits,
-                unavailable: winner.limits.unavailable
+                unavailable: winner.limits.unavailable,
+                credentialFingerprint: winner.limits.credentialFingerprint,
+                externalUsage: winner.limits.externalUsage
             )
             collected[key] = previous
         }
@@ -117,6 +119,7 @@ enum UsageLimitPooling {
                       UsageLimitsPresentation.limitsNotice(limits) == nil else { continue }
                 merge(UsageLimitAccount(
                     id: accountKey(driver: provider.driver, email: provider.auth.email)
+                        ?? limits.credentialFingerprint.map { "credential:\(provider.driver):\($0)" }
                         ?? "native:\(environment.id):\(provider.instanceId)",
                     driver: provider.driver,
                     displayName: provider.displayName.flatMap(nonEmpty),
@@ -139,6 +142,7 @@ enum UsageLimitPooling {
                     guard UsageLimitsPresentation.limitsNotice(account.usageLimits) == nil else { continue }
                     merge(UsageLimitAccount(
                         id: accountKey(driver: account.driver, email: account.email)
+                            ?? account.usageLimits.credentialFingerprint.map { "credential:\(account.driver):\($0)" }
                             ?? "hub:\(source.id):\(account.id)",
                         driver: account.driver,
                         displayName: account.email == nil

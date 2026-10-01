@@ -1,8 +1,51 @@
 import Foundation
 
+public struct ProviderVersionAdvisory: Codable, Equatable, Hashable, Sendable {
+    public let status: String
+    public let currentVersion: String?
+    public let latestVersion: String?
+    public let canUpdate: Bool?
+    public let message: String?
+}
+public struct ProviderCompatibilityAdvisory: Codable, Equatable, Hashable, Sendable {
+    public let status: String
+    public let latestVersionStatus: String?
+    public let message: String?
+    public let recommendedVersion: String?
+}
+public struct ProviderUpdateState: Codable, Equatable, Hashable, Sendable {
+    public let status: String
+    public let message: String?
+    public var isRunning: Bool { status == "running" || status == "queued" }
+}
+
 public struct ProviderSetupCapabilities: Codable, Equatable, Hashable, Sendable {
     public let canAuthenticate: Bool
     public let canInstall: Bool
+}
+
+public struct ProviderAuthMethod: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let type: String
+    public let accountEmail: String?
+}
+
+public struct ProviderAuthInteraction: Codable, Equatable, Sendable {
+    public struct Field: Codable, Identifiable, Equatable, Sendable {
+        public let name: String
+        public let label: String
+        public let secret: Bool
+        public var id: String { name }
+    }
+    public let type: String
+    public let id: String
+    public let url: String?
+    public let requiresConsent: Bool?
+    public let acceptsCallback: Bool?
+    public let userCode: String?
+    public let output: String?
+    public let fields: [Field]?
 }
 
 public struct ProviderAuthState: Codable, Equatable, Sendable {
@@ -10,6 +53,9 @@ public struct ProviderAuthState: Codable, Equatable, Sendable {
     public let phase: String
     public let flowId: String?
     public let authorizationUrl: String?
+    public var methods: [ProviderAuthMethod]? = nil
+    public var interaction: ProviderAuthInteraction? = nil
+    public var credentialOwner: String? = nil
     public let expiresAt: String?
     public let message: String?
 
@@ -37,6 +83,8 @@ public enum ProviderSetupEvent: Sendable {
 
 public enum ProviderSetupAction: Sendable {
     case signIn
+    case signInMethod(String)
+    case respond(flowID: String, interactionID: String, response: JSONValue)
     case completeSignIn(flowID: String, callbackURL: String)
     case cancelSignIn(flowID: String)
     case signOut
@@ -46,7 +94,8 @@ public enum ProviderSetupAction: Sendable {
 
     var method: String {
         switch self {
-        case .signIn: "provider.auth.start"
+        case .signIn, .signInMethod: "provider.auth.start"
+        case .respond: "provider.auth.respond"
         case .completeSignIn: "provider.auth.complete"
         case .cancelSignIn: "provider.auth.cancel"
         case .signOut: "provider.auth.logout"
@@ -59,6 +108,15 @@ public enum ProviderSetupAction: Sendable {
     func payload(instanceID: String) -> JSONValue {
         var fields: [String: JSONValue] = ["instanceId": .string(instanceID)]
         switch self {
+        case .signIn:
+            fields["callbackMode"] = .string("client")
+        case let .signInMethod(methodID):
+            fields["methodId"] = .string(methodID)
+            fields["callbackMode"] = .string("client")
+        case let .respond(flowID, interactionID, response):
+            fields["flowId"] = .string(flowID)
+            fields["interactionId"] = .string(interactionID)
+            fields["response"] = response
         case let .completeSignIn(flowID, callbackURL):
             fields["flowId"] = .string(flowID)
             fields["callbackUrl"] = .string(callbackURL)

@@ -236,9 +236,15 @@ public actor T3Client {
         let _: JSONValue = try await rpc.request("server.updateSettings", payload: .object(["patch": patch]), as: JSONValue.self)
     }
 
+    public func updateProvider(instanceID: String, driver: String) async throws {
+        let _: JSONValue = try await rpc.request("server.updateProvider", payload: .object([
+            "provider": .string(driver), "instanceId": .string(instanceID),
+        ]), responseDeadline: .none, as: JSONValue.self)
+    }
+
     public func providerSetup(instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent {
         switch action {
-        case .signIn, .completeSignIn, .cancelSignIn, .signOut:
+        case .signIn, .signInMethod, .respond, .completeSignIn, .cancelSignIn, .signOut:
             return .auth(try await rpc.request(action.method, payload: action.payload(instanceID: instanceID), as: ProviderAuthState.self))
         case .install, .cancelInstall, .remove:
             return .install(try await rpc.request(action.method, payload: action.payload(instanceID: instanceID), as: ProviderInstallState.self))
@@ -790,6 +796,29 @@ public actor T3Client {
         )
     }
 
+    public func updateEnvironment(targetVersion: String, continueRunningThreads: Bool) async throws {
+        struct Result: Decodable, Sendable {
+            let method: String
+            let desktopUpdateToken: String?
+        }
+        let result = try await rpc.request("server.updateServer", payload: .object([
+            "targetVersion": .string(targetVersion), "continueRunningThreads": .bool(continueRunningThreads),
+        ]), responseDeadline: .none, as: Result.self)
+        if result.method == "desktop-app", let token = result.desktopUpdateToken {
+            do {
+                let _: JSONValue = try await rpc.request("server.commitDesktopUpdate",
+                    payload: .object(["requestId": .string(token)]), as: JSONValue.self)
+            } catch RPCError.disconnected {
+                // A successful desktop handoff can close the socket before its reply.
+            }
+        }
+    }
+
+    public func ensureScratchProject() async throws -> String {
+        struct Result: Decodable, Sendable { let projectId: String }
+        return try await rpc.request("projects.ensureScratch", payload: .object([:]), as: Result.self).projectId
+    }
+
     @discardableResult
     public func createProject(
         projectID: String = UUID().uuidString,
@@ -859,7 +888,7 @@ public actor T3Client {
         attachmentsByQuestionID: [String: [UploadChatAttachment]] = [:]
     ) async throws -> DispatchResult {
         let count = attachmentsByQuestionID.values.reduce(0) { $0 + $1.count }
-        guard count <= 8 else { throw FileAttachmentError.tooMany(maximum: 8) }
+        try UploadChatAttachment.validateBatch(attachmentsByQuestionID.values.flatMap { $0 })
         var prepared: [String: [JSONValue]] = [:]
         if count > 0 {
             let config = try await serverConfig()
@@ -1117,7 +1146,7 @@ public actor T3Client {
         _ attachments: [UploadChatImageAttachment]
     ) async throws -> [JSONValue]? {
         guard !attachments.isEmpty else { return nil }
-        guard attachments.count <= 8 else { throw FileAttachmentError.tooMany(maximum: 8) }
+        try UploadChatAttachment.validateBatch(attachments)
 
         let capabilities = latestServerEnvironment?.capabilities
             ?? environment.descriptor?.capabilities
@@ -2350,6 +2379,13 @@ public enum OrchestrationCommands {
             "threadId": .string(threadID),
             "requestId": .string(requestID),
             "createdAt": .string(createdAt),
+        ])
+    }
+
+    public static func autoSettle(threadID: String, enabled: Bool, commandID: String = UUID().uuidString) -> JSONValue {
+        .object([
+            "type": .string("thread.auto-settle.set"), "commandId": .string(commandID),
+            "threadId": .string(threadID), "enabled": .bool(enabled),
         ])
     }
 

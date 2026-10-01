@@ -1064,12 +1064,12 @@ struct FeatureComposerView: View {
             attachmentCount: attachments.count,
             pendingCount: attachmentPreparation.pendingItemCount
         ) else {
-            imageIntakeErrorMessage = "You can attach up to eight images."
+            imageIntakeErrorMessage = "You can attach up to 100 files."
             return
         }
         if plan.droppedCount > 0 {
             imageIntakeErrorMessage =
-                "Some images were not attached because the eight-image limit was reached."
+                "Some images were not attached because the 100-attachment limit was reached."
         }
 
         let accepted = Array(providers.prefix(plan.acceptedCount))

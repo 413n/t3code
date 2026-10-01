@@ -500,6 +500,14 @@ public final class FeatureRootModel {
     }
 
     @discardableResult
+    public func setAutoSettle(_ id: String, enabled: Bool) async -> Bool {
+        await perform {
+            try await client.setThreadAutoSettle(id: id, enabled: enabled)
+            mutateThread(id: id) { $0.autoSettleDisabledAt = enabled ? nil : Date().ISO8601Format() }
+        }
+    }
+
+    @discardableResult
     public func setSettled(_ id: String, settled: Bool) async -> Bool {
         guard let previous = snapshot.threads.first(where: { $0.id == id }) else {
             return false

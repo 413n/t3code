@@ -191,8 +191,8 @@ struct FeatureContextClipboardTests {
         await #expect(throws: ComposerContextClipboardError.contextLimit) {
             try await importer.importContent(clipboard, attachmentCount: 0, contextCount: 200, imagesAllowed: true, maximumFileBytes: 1_000)
         }
-        await #expect(throws: FileAttachmentError.tooMany(maximum: 8)) {
-            try await importer.importContent(clipboard, attachmentCount: 8, contextCount: 0, imagesAllowed: true, maximumFileBytes: 1_000)
+        await #expect(throws: FileAttachmentError.tooMany(maximum: 100)) {
+            try await importer.importContent(clipboard, attachmentCount: 100, contextCount: 0, imagesAllowed: true, maximumFileBytes: 1_000)
         }
         await #expect(throws: FileAttachmentError.unsupported) {
             try await importer.importContent(clipboard, attachmentCount: 0, contextCount: 0, imagesAllowed: true, maximumFileBytes: nil)
@@ -235,7 +235,7 @@ struct FeatureContextClipboardTests {
         }
     }
 
-    @Test(arguments: [1, 8])
+    @Test(arguments: [1, 100])
     func attachmentEditsDuringDraftReadRestoreContextTogetherOrKeepTheSavedDraft(liveAttachmentCount: Int) async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -265,7 +265,7 @@ struct FeatureContextClipboardTests {
         resumeRead.continuation.yield(())
         resumeRead.continuation.finish()
 
-        if liveAttachmentCount == 8 {
+        if liveAttachmentCount == 100 {
             await #expect(throws: FeatureComposerDraftRestoration.RestorationError.self) { try await restoration.value }
             #expect(live == edited)
             #expect(try await store.draft(for: key) == saved)

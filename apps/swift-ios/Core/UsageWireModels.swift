@@ -1,6 +1,6 @@
 import Foundation
 
-public let usageContractVersion = 5
+public let usageContractVersion = 6
 public let minimumCompatibleUsageContractVersion = 3
 
 /// Version 3 supports daily totals. Hourly windows require version 4 or later.
@@ -16,12 +16,18 @@ public enum UsageProviderKind: String, Codable, CaseIterable, Sendable {
     case codex
     case claude
     case grok
+    case cursor
+    case opencode
+    case antigravity
 
     public var displayName: String {
         switch self {
         case .codex: "Codex"
         case .claude: "Claude Code"
         case .grok: "Grok Build"
+        case .cursor: "Cursor"
+        case .opencode: "OpenCode"
+        case .antigravity: "Antigravity"
         }
     }
 }
@@ -75,6 +81,7 @@ public struct UsageBucket: Codable, Equatable, Sendable {
     public let hourStart: String?
     public let provider: UsageProviderKind
     public let model: String
+    public var sourcePath: String? = nil
     public let totals: UsageTokenTotals
     public let costUsd: Double
     public let cacheSavingsUsd: Double
@@ -153,8 +160,8 @@ public struct UsageSummary: Codable, Equatable, Sendable {
     public let timeZone: String
     public let sinceDay: String
     public let untilDay: String
-    public let buckets: [UsageBucket]
-    public let sources: [UsageSource]
+    @ForwardCompatibleArray public var buckets: [UsageBucket]
+    @ForwardCompatibleArray public var sources: [UsageSource]
     public let pricing: UsagePricing
     public let scanDurationMs: Int
 }

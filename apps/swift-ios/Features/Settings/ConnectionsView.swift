@@ -540,6 +540,9 @@ private struct ConnectionDetailView: View {
                 }
 
                 Section("Server") {
+                    NavigationLink("Software updates") {
+                        EnvironmentUpdatesView(model: model, environmentID: environmentID)
+                    }
                     Text(environment.endpoint)
                         .textSelection(.enabled)
                     LabeledContent("Projects", value: "\(projectCount)")

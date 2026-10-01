@@ -4,6 +4,42 @@ import Testing
 
 @Suite("Usage reporting")
 struct UsageModelsTests {
+    @Test func unknownUsageProvidersDoNotHideKnownUsage() throws {
+        let original = summary(provider: .cursor, costUsd: 4)
+        guard case var .object(fields) = try JSONValue.encode(original) else { Issue.record("Invalid usage fixture"); return }
+        guard case let .array(buckets) = fields["buckets"], case let .array(sources) = fields["sources"],
+              case var .object(unknownBucket) = buckets.first,
+              case var .object(unknownSource) = sources.first,
+              case var .object(fingerprint) = unknownSource["fingerprint"] else {
+            Issue.record("Invalid usage fixture"); return
+        }
+        unknownBucket["provider"] = .string("future-provider")
+        fingerprint["provider"] = .string("future-provider")
+        unknownSource["fingerprint"] = .object(fingerprint)
+        fields["buckets"] = .array(buckets + [.object(unknownBucket)])
+        fields["sources"] = .array(sources + [.object(unknownSource)])
+        let decoded = try JSONValue.object(fields).decode(UsageSummary.self)
+        #expect(decoded.buckets.count == 1)
+        #expect(decoded.sources.count == 1)
+        let merged = UsageMerger.merge([.init(environmentID: "env", label: "Computer", summary: decoded)])
+        #expect(merged.costUsd == 4)
+        #expect(merged.providers.first?.provider == .cursor)
+    }
+
+    @Test func attributedBucketsOnlyIncludeTheOwnedSource() {
+        var first = summary(provider: .opencode, costUsd: 5)
+        first.buckets[0].sourcePath = first.sources[0].fingerprint.resolvedHomePath
+        var second = first
+        var extra = first.buckets[0]
+        extra.sourcePath = "/other/home"
+        second.buckets.append(extra)
+        let merged = UsageMerger.merge([
+            .init(environmentID: "a", label: "A", summary: first),
+            .init(environmentID: "b", label: "B", summary: second),
+        ])
+        #expect(merged.costUsd == 5)
+    }
+
     @Test
     func missingRatesStayUnpricedWhileProviderReportedZeroStaysZero() throws {
         let environments = [
@@ -466,7 +502,8 @@ struct UsageModelsTests {
         #expect(merged.models.contains { $0.provider == .grok })
         #expect(merged.staleEnvironments.isEmpty)
         #expect(!isCompatibleUsageContractVersion(2))
-        #expect(!isCompatibleUsageContractVersion(6))
+        #expect(isCompatibleUsageContractVersion(6))
+        #expect(!isCompatibleUsageContractVersion(7))
     }
 
     @Test

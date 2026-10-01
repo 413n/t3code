@@ -128,7 +128,7 @@ struct T3ShareExtensionView: View {
     private var message: String {
         switch phase {
         case .ready:
-            "Text, links, and up to eight files will be waiting in the native composer."
+            "Text, links, and up to 100 files will be waiting in the native composer."
         case .saving:
             "Keeping a durable copy so nothing gets lost."
         case let .saved(imageCount):

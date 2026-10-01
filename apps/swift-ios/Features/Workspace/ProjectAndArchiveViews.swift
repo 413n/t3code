@@ -135,7 +135,7 @@ public struct AddProjectView: View {
 
     private var environments: [FeatureEnvironment] {
         model.snapshot.environments
-            .filter(\.isEnabled)
+            .filter { $0.isEnabled && $0.connectionState == .connected }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 

@@ -29,6 +29,24 @@ struct EnvironmentPreferencesView: View {
                 Text("Enable both environments to share PR data through the same GitHub account. Write access permits PR changes. Credentials stay on each environment.")
             }
             if let settings {
+                if settings.storageCleanup != nil {
+                    Section("Automatic storage cleanup") {
+                        StorageCleanupControls(rules: settings.storageCleanupRules, includesLogs: true) { key, value in
+                            if key.hasPrefix("worktree") {
+                                save(.worktreeCleanup(.object(["mode": .string("custom"), "rules": .object([key: value])])))
+                            } else { save(.storageCleanup([key: value])) }
+                        }
+                    }
+                }
+                if let submodules = settings.worktreeSubmodules {
+                    Section("Worktrees") {
+                        Picker("Submodules", selection: Binding(
+                            get: { submodules }, set: { save(.worktreeSubmodules($0)) }
+                        )) {
+                            ForEach(WorktreeSubmodules.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
+                    }
+                }
                 if let streamingMode = settings.responseStreamingMode {
                     Section {
                         ResponseStreamingPicker(title: "Streaming", selection: Binding(

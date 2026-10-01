@@ -266,7 +266,7 @@ struct PlatformIncomingShareTests {
             fileURL: directory.appendingPathComponent("drafts.json")
         )
         let existing = FeatureComposerDraft(
-            attachments: (0..<7).map { Self.attachment(id: UUID(), value: UInt8($0)) }
+            attachments: (0..<99).map { Self.attachment(id: UUID(), value: UInt8($0)) }
         )
         let envelope = Self.envelope(
             images: [

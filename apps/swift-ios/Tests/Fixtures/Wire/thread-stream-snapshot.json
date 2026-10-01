@@ -37,6 +37,7 @@
       "snoozedAt": null,
       "pinnedAt": null,
       "activeOrderKey": "nm",
+      "autoSettleDisabledAt": "2026-08-07T12:00:00.000Z",
       "titleRegeneration": null,
       "deletedAt": null,
       "messages": [

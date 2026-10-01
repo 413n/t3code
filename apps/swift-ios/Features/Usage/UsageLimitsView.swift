@@ -387,6 +387,10 @@ private struct UsageLimitsAccountView: View {
                     .font(T3Typography.supporting)
                     .foregroundStyle(T3Colors.textSecondary)
             }
+            if let external = limits.externalUsage,
+               let url = URL(string: external.url), url.scheme == "https" {
+                Link(external.label, destination: url)
+            }
             ForEach(UsageLimitsPresentation.visibleWindows(limits)) { window in
                 UsageLimitWindowView(window: window, driver: driver, now: now)
             }

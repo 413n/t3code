@@ -136,6 +136,9 @@ public struct ServerProviderSnapshot: Codable, Identifiable, Equatable, Sendable
     public let skills: [ServerProviderSkillSnapshot]?
     public var workspaceSnapshots: [ServerProviderWorkspaceSnapshot]? = nil
     public var setup: ProviderSetupCapabilities? = nil
+    public var versionAdvisory: ProviderVersionAdvisory? = nil
+    public var compatibilityAdvisory: ProviderCompatibilityAdvisory? = nil
+    public var updateState: ProviderUpdateState? = nil
     public var usageLimits: ServerProviderUsageLimits? = nil
     public var supportsConversationRollback: Bool? = nil
 }
@@ -163,6 +166,9 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public var sidebarAutoSettleAfterDays: Double?
     public var continueThreadsAfterServerUpdate: Bool
     public var defaultAutoPull = false
+    public var storageCleanup: [String: JSONValue]? = nil
+    public var worktreeCleanup: JSONValue? = nil
+    public var worktreeSubmodules: WorktreeSubmodules? = nil
     /// Missing on servers that do not support the current streaming setting.
     public var responseStreamingMode: ResponseStreamingMode? = nil
     public var projectSettingsOverrides: [String: [String: JSONValue]] = [:]
@@ -218,6 +224,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         case continueThreadsAfterServerUpdate
         case environmentIcon
         case sourceControlWritingStyle
+        case worktreeSubmodules, storageCleanup, worktreeCleanup
         case defaultAutoPull, responseStreamingMode, projectSettingsOverrides, projectSettingsFolded
     }
 
@@ -226,6 +233,9 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         defaultModelSelection = try container.decodeIfPresent(ModelSelection.self, forKey: .defaultModelSelection)
         environmentIcon = try container.decodeIfPresent(String.self, forKey: .environmentIcon)
         sourceControlWritingStyle = try container.decodeIfPresent(JSONValue.self, forKey: .sourceControlWritingStyle)
+        storageCleanup = try container.decodeIfPresent([String: JSONValue].self, forKey: .storageCleanup)
+        worktreeCleanup = try container.decodeIfPresent(JSONValue.self, forKey: .worktreeCleanup)
+        worktreeSubmodules = try? container.decodeIfPresent(WorktreeSubmodules.self, forKey: .worktreeSubmodules)
         defaultAutoPull = try container.decodeIfPresent(Bool.self, forKey: .defaultAutoPull) ?? false
         responseStreamingMode = try container.decodeIfPresent(ResponseStreamingMode.self, forKey: .responseStreamingMode)
         projectSettingsOverrides = try container.decodeIfPresent([String: [String: JSONValue]].self, forKey: .projectSettingsOverrides) ?? [:]
@@ -270,6 +280,9 @@ public enum ServerSettingsChange: Equatable, Sendable {
     case continueThreadsAfterServerUpdate(Bool)
     case environmentIcon(String?)
     case sharedPreferences(JSONValue)
+    case worktreeCleanup(JSONValue)
+    case storageCleanup([String: JSONValue])
+    case worktreeSubmodules(WorktreeSubmodules)
     case responseStreamingMode(ResponseStreamingMode)
     case projectSettingsOverrides(projectID: String, entry: [String: JSONValue]?)
 
@@ -281,6 +294,9 @@ public enum ServerSettingsChange: Equatable, Sendable {
             .object(["continueThreadsAfterServerUpdate": .bool(value)])
         case let .environmentIcon(value): .object(["environmentIcon": value.map(JSONValue.string) ?? .null])
         case let .sharedPreferences(value): value
+        case let .worktreeCleanup(value): .object(["worktreeCleanup": value])
+        case let .storageCleanup(value): .object(["storageCleanup": .object(value)])
+        case let .worktreeSubmodules(value): .object(["worktreeSubmodules": .string(value.rawValue)])
         case let .responseStreamingMode(value): .object(["responseStreamingMode": .string(value.rawValue)])
         case let .projectSettingsOverrides(projectID, entry):
             .object(["projectSettingsOverrides": .object([projectID: entry.map(JSONValue.object) ?? .null])])
@@ -296,6 +312,7 @@ public enum ServerSettingsChange: Equatable, Sendable {
 public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
     public let providers: [ServerProviderSnapshot]
     public let settings: ServerSettingsSnapshot?
+    public var scratchWorkspaceRoot: String? = nil
     public let threadSnapshotPagination: Bool?
     public let threadResumeCompletionMarker: Bool?
     public let environment: EnvironmentDescriptor?
@@ -307,7 +324,8 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
         threadSnapshotPagination: Bool? = nil,
         threadResumeCompletionMarker: Bool? = nil,
         environment: EnvironmentDescriptor? = nil,
-        usageLimitSources: [UsageLimitSourceSnapshot] = []
+        usageLimitSources: [UsageLimitSourceSnapshot] = [],
+        scratchWorkspaceRoot: String? = nil
     ) {
         self.providers = providers
         self.settings = settings
@@ -315,15 +333,17 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
         self.threadResumeCompletionMarker = threadResumeCompletionMarker
         self.environment = environment
         self.usageLimitSources = usageLimitSources
+        self.scratchWorkspaceRoot = scratchWorkspaceRoot
     }
 
     private enum CodingKeys: String, CodingKey {
         case providers, settings, threadSnapshotPagination, threadResumeCompletionMarker, environment
-        case usageLimitSources
+        case usageLimitSources, scratchWorkspaceRoot
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        scratchWorkspaceRoot = try container.decodeIfPresent(String.self, forKey: .scratchWorkspaceRoot)
         providers = try container.decode(
             [LossyDecodableElement<ServerProviderSnapshot>].self,
             forKey: .providers

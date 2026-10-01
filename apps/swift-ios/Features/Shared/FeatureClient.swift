@@ -22,6 +22,9 @@ public protocol FeatureClient: AnyObject {
     func disconnect() async
 
     func addProject(path: String) async throws
+    func ensureScratchProject(environmentID: String) async throws -> String
+    func environmentDescriptor(environmentID: String) async throws -> EnvironmentDescriptor
+    func updateEnvironment(environmentID: String, targetVersion: String) async throws
     func createThread(projectID: String, title: String?, selection: FeatureSelection?) async throws -> FeatureThread
     /// Creates the thread and sends its first turn as one idempotent command.
     /// `identity` lets a retry after an ambiguous network failure reuse the
@@ -51,6 +54,7 @@ public protocol FeatureClient: AnyObject {
     func regenerateThreadTitle(id: String) async throws
     func setThreadArchived(id: String, archived: Bool) async throws
     func setThreadSettled(id: String, settled: Bool) async throws
+    func setThreadAutoSettle(id: String, enabled: Bool) async throws
     func setThreadSnoozed(id: String, until: Date?) async throws
     func setThreadPinned(id: String, pinned: Bool) async throws
     /// Commits a drag reorder: `orderedIDs` is the thread's displayed section
@@ -108,6 +112,7 @@ public protocol FeatureClient: AnyObject {
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
     func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async throws -> [FeatureProvider]
     func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent
+    func updateProvider(environmentID: String, instanceID: String) async throws
     func providerSetupEvents(environmentID: String, instanceID: String) -> AsyncThrowingStream<ProviderSetupEvent, Error>
     func setProviderEnabled(environmentID: String, instanceID: String, enabled: Bool) async throws
     func updateAutomaticSettlement(
@@ -304,6 +309,7 @@ public extension FeatureClient {
         throw FeatureCapabilityUnavailable("Provider settings")
     }
 
+    func updateProvider(environmentID: String, instanceID: String) async throws { throw FeatureCapabilityUnavailable("Provider updates") }
     func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent {
         throw FeatureCapabilityUnavailable("Provider setup")
     }
@@ -441,6 +447,12 @@ public extension FeatureClient {
         throw FeatureCapabilityUnavailable("Question dismissal")
     }
     func setThreadSettled(id: String, settled: Bool) async throws {}
+    func environmentDescriptor(environmentID: String) async throws -> EnvironmentDescriptor { throw FeatureCapabilityUnavailable("Environment updates") }
+    func updateEnvironment(environmentID: String, targetVersion: String) async throws { throw FeatureCapabilityUnavailable("Environment updates") }
+    func ensureScratchProject(environmentID: String) async throws -> String {
+        throw FeatureCapabilityUnavailable("Scratch threads")
+    }
+    func setThreadAutoSettle(id: String, enabled: Bool) async throws { throw FeatureCapabilityUnavailable("Per-thread automatic settlement") }
     func setThreadSnoozed(id: String, until: Date?) async throws {}
     func setThreadPinned(id: String, pinned: Bool) async throws {}
     func reorderThread(

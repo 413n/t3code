@@ -418,7 +418,13 @@ enum UsageMerger {
             UsageSourceFingerprint: (environmentID: String, status: UsageSourceStatus)
         ] = [:]
         var duplicates: [String] = []
-        let ordered = environments.sorted { $0.0.environmentID < $1.0.environmentID }
+        let dated: [(environment: FeatureEnvironmentUsage, summary: UsageSummary, readAt: Date)] = environments.map {
+            (environment: $0.0, summary: $0.1, readAt: UsageFormat.isoDate($0.1.readAt) ?? .distantPast)
+        }
+        let ordered = dated.sorted { left, right in
+            if left.readAt != right.readAt { return left.readAt > right.readAt }
+            return left.environment.environmentID < right.environment.environmentID
+        }.map { ($0.environment, $0.summary) }
 
         for (environment, summary) in ordered {
             for source in summary.sources where source.status != .missing {
@@ -451,15 +457,22 @@ enum UsageMerger {
         ownerByFingerprint: [UsageSourceFingerprint: String]
     ) -> OwnedContribution {
         var providers: Set<UsageProviderKind> = []
+        var pathsByProvider: [UsageProviderKind: Set<String>] = [:]
         var sessions = 0
         for source in summary.sources where source.status != .missing {
             if ownerByFingerprint[source.fingerprint] == environment.environmentID {
                 providers.insert(source.fingerprint.provider)
+                pathsByProvider[source.fingerprint.provider, default: []].insert(source.fingerprint.resolvedHomePath)
                 sessions += source.distinctSessions
             }
         }
         return OwnedContribution(
-            buckets: summary.buckets.filter { providers.contains($0.provider) },
+            buckets: summary.buckets.filter { bucket in
+                if let path = bucket.sourcePath {
+                    return pathsByProvider[bucket.provider]?.contains(path) == true
+                }
+                return providers.contains(bucket.provider)
+            },
             sessions: sessions
         )
     }

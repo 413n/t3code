@@ -24,6 +24,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let onArchive: (FeatureThread, Bool) -> Void
     let onSettle: (FeatureThread, Bool, @escaping (Bool) -> Void) -> Void
     let onSnooze: (FeatureThread, Date?) -> Void
+    var onAutoSettle: (FeatureThread, Bool) -> Void = { _, _ in }
     let onPin: (FeatureThread, Bool) -> Void
     let onArrange: () -> Void
     let onDelete: (FeatureThread) -> Void
@@ -579,6 +580,14 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                     })
                 }
 
+                if thread.supportsAutoSettleOptOut == true {
+                    actions.append(accessibilityAction(
+                        thread.autoSettleDisabledAt == nil ? "Disable auto-settle" : "Enable auto-settle",
+                        systemImage: "clock.arrow.circlepath"
+                    ) { coordinator in
+                        coordinator.parent.onAutoSettle(thread, thread.autoSettleDisabledAt != nil)
+                    })
+                }
                 let isSettled = thread.isEffectivelySettled()
                 if isSettled || thread.canSettleNow() {
                     actions.append(accessibilityAction(

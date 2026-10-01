@@ -108,6 +108,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public let fileAttachments: FileAttachments?
         public let pullRequests: Bool?
         public let threadSettlement: Bool?
+        public var threadAutoSettleOptOut: Bool? = nil
         public let threadAutoSettlement: Bool?
         public var threadRestartContinuation: Bool? = nil
         public let threadSnooze: Bool?
@@ -118,6 +119,8 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public let threadPullRequestLinking: Bool?
         public var threadPullRequests: Bool? = nil
         public var pullRequestStackActions: Bool? = nil
+        public var desktopAppUpdate: Bool? = nil
+        public var serverUpdateThreadContinuation: Bool? = nil
         public let serverSelfUpdate: String?
         public let serverSelfUpdateProgress: Bool?
         public var environmentIcon: Bool? = nil
@@ -133,6 +136,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case fileAttachments
             case pullRequests
             case threadSettlement
+            case threadAutoSettleOptOut
             case threadAutoSettlement
             case threadRestartContinuation
             case threadSnooze
@@ -143,6 +147,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case threadPullRequestLinking
             case threadPullRequests
             case pullRequestStackActions
+            case desktopAppUpdate, serverUpdateThreadContinuation
             case serverSelfUpdate
             case serverSelfUpdateProgress
             case environmentIcon
@@ -169,6 +174,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             )
             pullRequests = try container.decodeIfPresent(Bool.self, forKey: .pullRequests)
             threadSettlement = try container.decodeIfPresent(Bool.self, forKey: .threadSettlement)
+            threadAutoSettleOptOut = try container.decodeIfPresent(Bool.self, forKey: .threadAutoSettleOptOut)
             threadAutoSettlement = try container.decodeIfPresent(
                 Bool.self,
                 forKey: .threadAutoSettlement
@@ -194,6 +200,8 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             )
             threadPullRequests = try container.decodeIfPresent(Bool.self, forKey: .threadPullRequests)
             pullRequestStackActions = try container.decodeIfPresent(Bool.self, forKey: .pullRequestStackActions)
+            desktopAppUpdate = try container.decodeIfPresent(Bool.self, forKey: .desktopAppUpdate)
+            serverUpdateThreadContinuation = try container.decodeIfPresent(Bool.self, forKey: .serverUpdateThreadContinuation)
             serverSelfUpdate = try container.decodeIfPresent(String.self, forKey: .serverSelfUpdate)
             serverSelfUpdateProgress = try container.decodeIfPresent(
                 Bool.self,
@@ -502,6 +510,7 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let settledAt: String?
     public var unsettledAt: String? = nil
     public var activeOrderKey: String? = nil
+    public var autoSettleDisabledAt: String? = nil
     public let snoozedUntil: String?
     public let snoozedAt: String?
     public let pinnedAt: String?
@@ -584,6 +593,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     public let settledAt: String?
     public var unsettledAt: String? = nil
     public var activeOrderKey: String? = nil
+    public var autoSettleDisabledAt: String? = nil
     public let snoozedUntil: String?
     public let snoozedAt: String?
     public let pinnedAt: String?

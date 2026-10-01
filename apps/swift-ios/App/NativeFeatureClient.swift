@@ -1094,6 +1094,35 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         try await addProject(environmentID: environmentID, path: path)
     }
 
+    func environmentDescriptor(environmentID: String) async throws -> EnvironmentDescriptor {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        guard let descriptor = try await client.serverConfig().environment ?? client.environment.descriptor else {
+            throw FeatureCapabilityUnavailable("Environment updates")
+        }
+        return descriptor
+    }
+
+    func updateEnvironment(environmentID: String, targetVersion: String) async throws {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        try await requireScope("orchestration:operate", client: client)
+        let config = try await client.serverConfig()
+        guard let capabilities = config.environment?.capabilities,
+              capabilities.serverSelfUpdate != nil,
+              capabilities.serverSelfUpdate != "desktop-managed" || capabilities.desktopAppUpdate == true else {
+            throw FeatureCapabilityUnavailable("Environment updates")
+        }
+        try await client.updateEnvironment(targetVersion: targetVersion,
+            continueRunningThreads: capabilities.serverUpdateThreadContinuation == true
+                && config.settings?.continueThreadsAfterServerUpdate == true)
+    }
+
+    func ensureScratchProject(environmentID: String) async throws -> String {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let projectID = try await client.ensureScratchProject()
+        try await refresh(client: client)
+        return FeatureScopedID.project(environmentID: environmentID, wireID: projectID)
+    }
+
     func addProject(environmentID: String, path: String) async throws {
         let client = try await projectCreationClient(environmentID: environmentID)
         try await createProject(client: client, path: path)
@@ -1790,6 +1819,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func setThreadSettled(id: String, settled: Bool) async throws {
         let route = try threadRoute(for: id)
         _ = try await route.client.settle(threadID: route.wireID, settled: settled)
+        try? await refresh(client: route.client)
+    }
+
+    func setThreadAutoSettle(id: String, enabled: Bool) async throws {
+        let route = try threadRoute(for: id)
+        _ = try await route.client.dispatch(OrchestrationCommands.autoSettle(threadID: route.wireID, enabled: enabled))
         try? await refresh(client: route.client)
     }
 
@@ -2518,6 +2553,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         try await client.setProviderEnabled(instanceID: instanceID, driver: provider.driver, enabled: enabled)
     }
 
+    func updateProvider(environmentID: String, instanceID: String) async throws {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let config = try await client.serverConfig()
+        guard let provider = config.providers.first(where: { $0.instanceId == instanceID }),
+              provider.versionAdvisory?.canUpdate == true else {
+            throw FeatureCapabilityUnavailable("Provider updates")
+        }
+        try await client.updateProvider(instanceID: instanceID, driver: provider.driver)
+        try await refresh(client: client)
+    }
+
     func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent {
         let client = try await projectCreationClient(environmentID: environmentID)
         try await requireScope("orchestration:operate", client: client)
@@ -2709,6 +2755,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         setServerConfig(config, environmentID: environmentID)
         switch change {
+        case .worktreeSubmodules:
+            guard config.settings?.worktreeSubmodules != nil else { throw FeatureCapabilityUnavailable("Submodule settings") }
+        case .storageCleanup, .worktreeCleanup:
+            guard config.settings?.storageCleanup != nil else { throw FeatureCapabilityUnavailable("Storage cleanup settings") }
         case .responseStreamingMode:
             guard config.settings?.responseStreamingMode != nil else {
                 throw FeatureCapabilityUnavailable("Response streaming preferences")
@@ -2736,7 +2786,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         ) else { throw FeatureCapabilityUnavailable("Restart continuation") }
         _ = try await saveServerPreferences(client: client, environmentID: environmentID, change: supportedChange)
         switch supportedChange {
-        case .environmentIcon, .projectSettingsOverrides, .responseStreamingMode: return
+        case .environmentIcon, .projectSettingsOverrides, .responseStreamingMode, .worktreeSubmodules, .storageCleanup, .worktreeCleanup: return
         default: break
         }
         await fanOutSharedPreferences(from: environmentID, change: supportedChange)
@@ -2775,7 +2825,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             threadSnapshotPagination: previous?.threadSnapshotPagination,
             threadResumeCompletionMarker: previous?.threadResumeCompletionMarker,
             environment: previous?.environment,
-            usageLimitSources: previous?.usageLimitSources ?? []
+            usageLimitSources: previous?.usageLimitSources ?? [],
+            scratchWorkspaceRoot: previous?.scratchWorkspaceRoot
         )
         setServerConfig(config, environmentID: environmentID)
         if environmentID == activeEnvironment?.id {
@@ -3601,6 +3652,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settledAt: thread.settledAt,
             unsettledAt: thread.unsettledAt,
             activeOrderKey: thread.activeOrderKey,
+            autoSettleDisabledAt: thread.autoSettleDisabledAt,
             snoozedUntil: thread.snoozedUntil,
             snoozedAt: thread.snoozedAt,
             pinnedAt: thread.pinnedAt,
@@ -5250,6 +5302,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let backgroundWorkIsActive = backgroundLiveness == .working
         let capabilities = threadCapabilities(for: environment)
         detail.thread.supportsSettlement = capabilities?.threadSettlement
+        detail.thread.supportsAutoSettleOptOut = capabilities?.threadAutoSettleOptOut
         detail.thread.supportsSnooze = capabilities?.threadSnooze
         detail.thread.supportsPinning = capabilities?.threadPinning
         detail.thread.supportsTitleRegeneration = capabilities?.threadTitleRegeneration
@@ -5589,6 +5642,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 return mapped
             }
             for var project in mappedProjects {
+                project.isScratch = projectConfig?.scratchWorkspaceRoot.map {
+                    URL(fileURLWithPath: $0).standardizedFileURL.path == URL(fileURLWithPath: project.path).standardizedFileURL.path
+                } ?? false
+                if project.isScratch == true { project.defaultWorkspaceMode = .local }
                 project.threadCount = threadCountByProjectID[project.id, default: 0]
                 projects.append(project)
             }
@@ -5693,6 +5750,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         mapped.machineIcon = serverConfigsByEnvironmentID[environment.id]?.settings?.environmentIcon
             ?? environment.descriptor?.platform.machine
+        mapped.supportsScratch = serverConfigsByEnvironmentID[environment.id]?.scratchWorkspaceRoot != nil
         mapped.canCustomizeIcon = serverConfigsByEnvironmentID[environment.id]?.environment?.capabilities.environmentIcon
             ?? environment.descriptor?.capabilities.environmentIcon
         return mapped
@@ -5753,6 +5811,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settledAt: thread.settledAt.flatMap(parseValidDate),
             unsettledAt: thread.unsettledAt.flatMap(parseValidDate),
             activeOrderKey: thread.activeOrderKey,
+            autoSettleDisabledAt: thread.autoSettleDisabledAt,
             lastActivityAt: lastActivityDate(
                 latestUserMessageAt: thread.latestUserMessageAt,
                 latestTurn: thread.latestTurn
@@ -5762,6 +5821,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             pinnedAt: thread.pinnedAt.map(parseDate),
             pinOrderKey: thread.pinOrderKey,
             supportsSettlement: capabilities?.threadSettlement,
+            supportsAutoSettleOptOut: capabilities?.threadAutoSettleOptOut,
             supportsSnooze: capabilities?.threadSnooze,
             supportsPinning: capabilities?.threadPinning,
             supportsPinReorder: capabilities?.threadPinReorder,
@@ -5844,6 +5904,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settledAt: thread.settledAt.flatMap(parseValidDate),
             unsettledAt: thread.unsettledAt.flatMap(parseValidDate),
             activeOrderKey: thread.activeOrderKey,
+            autoSettleDisabledAt: thread.autoSettleDisabledAt,
             lastActivityAt: lastActivityDate(
                 latestUserMessageAt: thread.messages.last(where: { $0.role == "user" })?.createdAt,
                 latestTurn: thread.latestTurn
@@ -5853,6 +5914,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             pinnedAt: thread.pinnedAt.map(parseDate),
             pinOrderKey: thread.pinOrderKey,
             supportsSettlement: capabilities?.threadSettlement,
+            supportsAutoSettleOptOut: capabilities?.threadAutoSettleOptOut,
             supportsSnooze: capabilities?.threadSnooze,
             supportsPinning: capabilities?.threadPinning,
             supportsPinReorder: capabilities?.threadPinReorder,
@@ -6165,6 +6227,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             settledAt: loaded.settledAt,
             unsettledAt: loaded.unsettledAt,
             activeOrderKey: loaded.activeOrderKey,
+            autoSettleDisabledAt: loaded.autoSettleDisabledAt,
             snoozedUntil: loaded.snoozedUntil,
             snoozedAt: loaded.snoozedAt,
             pinnedAt: loaded.pinnedAt,
@@ -6496,13 +6559,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         case "command": return .command
         case "file-read": return .fileRead
         case "file-change": return .fileChange
-        case "mcp-elicitation": return .mcpElicitation
+        case "mcp-elicitation", "permission": return .mcpElicitation
         default: break
         }
         switch payload["requestType"]?.stringValue {
         case "file_read_approval": return .fileRead
         case "file_change_approval", "apply_patch_approval": return .fileChange
-        case "mcp_elicitation_approval": return .mcpElicitation
+        case "mcp_elicitation_approval", "permission_approval": return .mcpElicitation
         default: return .command
         }
     }
@@ -6640,6 +6703,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         thread.settledAt = shell.settledAt.flatMap(parseValidDate)
         thread.unsettledAt = shell.unsettledAt.flatMap(parseValidDate)
         thread.activeOrderKey = shell.activeOrderKey
+        thread.autoSettleDisabledAt = shell.autoSettleDisabledAt
         thread.pinnedAt = shell.pinnedAt.flatMap(parseValidDate)
         thread.pinOrderKey = shell.pinOrderKey
         thread.linkedPullRequest = shell.linkedPullRequest
@@ -6759,6 +6823,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     skills: (provider.skills ?? []).map(Self.mapSkill)
                 )
                 mapped.setup = provider.setup
+                mapped.versionAdvisory = provider.versionAdvisory
+                mapped.compatibilityAdvisory = provider.compatibilityAdvisory
+                mapped.updateState = provider.updateState
                 mapped.accentColor = ProviderInstanceDisplay.accentColor(provider.accentColor)
                 mapped.isEnabled = provider.enabled
                 mapped.isInstalled = provider.installed
@@ -7189,7 +7256,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private func makeUploadAttachments(
         _ attachments: [FeatureUploadAttachment]
     ) async throws -> [UploadChatAttachment] {
-        guard attachments.count <= 8 else {
+        guard attachments.count <= UploadChatAttachment.maximumCount else {
             throw NativeFeatureClientError.tooManyAttachments
         }
         let uploads = try await Task.detached(priority: .userInitiated) {
@@ -7228,6 +7295,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             }
         }.value
         try Task.checkCancellation()
+        try UploadChatAttachment.validateBatch(uploads)
         return uploads
     }
 
@@ -7728,6 +7796,10 @@ enum NativeThreadDetailReducer {
             result = reduceUnsettled(payload: payload, thread: thread)
         case "thread.meta-updated":
             result = reduceMetadata(payload: payload, occurredAt: occurredAt, thread: thread)
+        case "thread.auto-settle-set":
+            var updated = replacing(thread, updatedAt: payload["updatedAt"]?.stringValue ?? occurredAt)
+            updated.autoSettleDisabledAt = payload["autoSettleDisabledAt"]?.stringValue
+            result = .updated(updated)
         case "thread.pin-reordered":
             result = reducePinReordered(
                 payload: payload,
@@ -8190,6 +8262,7 @@ enum NativeThreadDetailReducer {
             settledAt: settlement == nil ? thread.settledAt : settlement?.settledAt,
             unsettledAt: settlement == nil ? thread.unsettledAt : settlement?.unsettledAt,
             activeOrderKey: thread.activeOrderKey,
+            autoSettleDisabledAt: thread.autoSettleDisabledAt,
             snoozedUntil: thread.snoozedUntil,
             snoozedAt: thread.snoozedAt,
             pinnedAt: thread.pinnedAt,
@@ -8482,7 +8555,7 @@ private enum NativeFeatureClientError: LocalizedError {
         case .deviceSessionNotFound: "That device session is no longer active."
         case .currentDeviceUnknown: "This installation has not registered for device access yet."
         case .missingScope: "This connection does not have permission to manage devices."
-        case .tooManyAttachments: "You can attach up to 8 files per message."
+        case .tooManyAttachments: "You can attach up to 100 files per message."
         case .invalidAutomaticSettlementDays: "Choose a value from 1 to 90 days."
         case .remoteStatusUnavailable:
             "Couldn't check the remote status. Try reloading."

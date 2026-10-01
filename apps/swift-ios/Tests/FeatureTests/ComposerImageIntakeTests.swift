@@ -4,6 +4,19 @@ import Testing
 
 @Suite("Composer image intake")
 struct ComposerImageIntakeTests {
+    @Test func batchLimitsAllowOneHundredFilesButKeepImageBudget() throws {
+        let file = try UploadChatAttachment(data: Data([1]), name: "file.txt", mimeType: "text/plain")
+        try UploadChatAttachment.validateBatch(Array(repeating: file, count: 100))
+        #expect(throws: FileAttachmentError.tooMany(maximum: 100)) {
+            try UploadChatAttachment.validateBatch(Array(repeating: file, count: 101))
+        }
+        let image = try UploadChatAttachment(data: Data(repeating: 1, count: 10 * 1024 * 1024), name: "image.png", mimeType: "image/png")
+        try UploadChatAttachment.validateBatch(Array(repeating: image, count: 8))
+        #expect(throws: FileAttachmentError.imageBudgetExceeded) {
+            try UploadChatAttachment.validateBatch(Array(repeating: image, count: 9))
+        }
+    }
+
     private static func plan(
         providerCount: Int,
         attachmentCount: Int = 0,
@@ -12,7 +25,8 @@ struct ComposerImageIntakeTests {
         FeatureComposerImageIntakePlan.forProviders(
             providerCount: providerCount,
             attachmentCount: attachmentCount,
-            pendingCount: pendingCount
+            pendingCount: pendingCount,
+            maximumCount: 8
         )
     }
 

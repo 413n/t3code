@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import Speech
+import UIKit
 
 @MainActor
 enum FeatureVoiceInputAdapterFactory {
@@ -52,6 +53,7 @@ private final class AppleVoiceInputAdapter: FeatureVoiceInputAdapter {
     private var ownedRecordingURLs = Set<URL>()
     private var previousAudioSessionConfiguration: AppleVoiceAudioSessionConfiguration?
     private var audioSessionWasConfigured = false
+    private var previousIdleTimerDisabled: Bool?
 
     var isSupported: Bool { SpeechTranscriber.isAvailable }
     private(set) var localeIdentifier = Locale.current.identifier
@@ -110,6 +112,8 @@ private final class AppleVoiceInputAdapter: FeatureVoiceInputAdapter {
                 throw AppleVoiceInputError.recordingFailed
             }
             self.recorder = recorder
+            previousIdleTimerDisabled = UIApplication.shared.isIdleTimerDisabled
+            UIApplication.shared.isIdleTimerDisabled = true
         } catch {
             restoreAudioSession()
             throw error
@@ -175,6 +179,10 @@ private final class AppleVoiceInputAdapter: FeatureVoiceInputAdapter {
     }
 
     private func restoreAudioSession() {
+        if let previousIdleTimerDisabled {
+            UIApplication.shared.isIdleTimerDisabled = previousIdleTimerDisabled
+            self.previousIdleTimerDisabled = nil
+        }
         guard let previousAudioSessionConfiguration else { return }
         guard audioSessionWasConfigured else {
             self.previousAudioSessionConfiguration = nil

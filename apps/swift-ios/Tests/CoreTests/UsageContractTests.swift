@@ -7,7 +7,7 @@ final class UsageContractTests: XCTestCase {
         let data = Data(
             #"""
             {
-              "contractVersion": 5,
+              "contractVersion": 6,
               "readAt": "2026-08-09T12:00:00.000Z",
               "timeZone": "America/Los_Angeles",
               "sinceDay": "2026-08-03",

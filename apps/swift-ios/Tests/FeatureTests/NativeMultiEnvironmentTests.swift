@@ -5,6 +5,39 @@ import XCTest
 
 @MainActor
 final class NativeMultiEnvironmentTests: XCTestCase {
+    func testScratchCreationUsesTheSelectedComputer() async throws {
+        let server = MultiEnvironmentConfigurationServer()
+        let fixture = try await Self.makeFixture(
+            webSocketConnector: MultiEnvironmentConfigurationConnector(server: server),
+            rpcConnectionWaitTimeout: .seconds(2)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.client.initialSnapshot()
+        let id = try await fixture.client.ensureScratchProject(environmentID: "two")
+        XCTAssertEqual(id, FeatureScopedID.project(environmentID: "two", wireID: "scratch"))
+        let hosts = await server.scratchHosts()
+        XCTAssertEqual(hosts, ["two.example"])
+        await fixture.client.disconnect()
+    }
+
+    func testStorageCleanupAndSubmodulesOnlyChangeTheSelectedEnvironment() async throws {
+        let server = MultiEnvironmentConfigurationServer(settingsByHost: [
+            "one.example": ["storageCleanup": .object([:]), "worktreeSubmodules": .string("recursive")],
+            "two.example": ["storageCleanup": .object([:]), "worktreeSubmodules": .string("recursive")],
+        ])
+        let fixture = try await Self.makeFixture(
+            webSocketConnector: MultiEnvironmentConfigurationConnector(server: server),
+            rpcConnectionWaitTimeout: .seconds(2)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.client.initialSnapshot()
+        try await fixture.client.updateServerPreferences(environmentID: "two", change: .storageCleanup(["logsAfterDays": .number(14)]))
+        try await fixture.client.updateServerPreferences(environmentID: "two", change: .worktreeSubmodules(.none))
+        let hosts = await server.updatedHosts()
+        XCTAssertEqual(hosts, ["two.example", "two.example"])
+        await fixture.client.disconnect()
+    }
+
     func testFolderBrowsingUsesItsOwningEnvironmentAndWindowsWorktree() async throws {
         let server = MultiEnvironmentConfigurationServer(directoryEntries: [
             "": ProjectEntriesResult(entries: [
@@ -1925,6 +1958,7 @@ private struct UnavailableMultiEnvironmentWebSocketConnector: WebSocketConnectin
 private actor MultiEnvironmentConfigurationServer {
     private var settingsByHost: [String: [String: JSONValue]] = [:]
     private var settingsUpdateHosts: [String] = []
+    private var scratchRequestHosts: [String] = []
     private let restartSupportHosts: Set<String>
     private let directoryEntries: [String: ProjectEntriesResult]
     private let legacyEntries: ProjectEntriesResult?
@@ -1959,6 +1993,7 @@ private actor MultiEnvironmentConfigurationServer {
     }
 
     func updatedHosts() -> [String] { settingsUpdateHosts }
+    func scratchHosts() -> [String] { scratchRequestHosts }
     func settings(host: String) -> [String: JSONValue] { settingsByHost[host] ?? [:] }
     func fileRequests() -> [(host: String, input: JSONValue)] { directoryRequests }
     func pullRequestRequests() -> [(host: String, method: String, input: JSONValue)] { prRequests }
@@ -1998,6 +2033,9 @@ private actor MultiEnvironmentConfigurationServer {
                 legacyEntries ?? directoryEntries[input["directoryPath"]?.stringValue ?? ""]
                     ?? ProjectEntriesResult(entries: [], truncated: false)
             )
+        case "projects.ensureScratch":
+            scratchRequestHosts.append(host)
+            value = .object(["projectId": .string("scratch")])
         case "server.getSettings":
             value = .object(settingsByHost[host] ?? [:])
         case RPCMethod.subscribeServerConfig.rawValue:

@@ -58,6 +58,8 @@ private struct ProviderSetupView: View {
     @State private var auth: ProviderAuthState?
     @State private var install: ProviderInstallState?
     @State private var callbackURL = ""
+    @State private var credentialValues: [String: String] = [:]
+    @State private var terminalInput = ""
     @State private var busy = false
     @State private var errorMessage: String?
     @State private var confirmSignOut = false
@@ -88,6 +90,25 @@ private struct ProviderSetupView: View {
                         ))
                     }
                 }
+                if let advisory = provider.versionAdvisory {
+                    Section("Updates") {
+                        if let version = advisory.currentVersion { LabeledContent("Installed", value: version) }
+                        if let message = provider.compatibilityAdvisory?.message { Text(message).font(.footnote) }
+                        if let state = provider.updateState, state.status != "idle" {
+                            Text(state.message ?? state.status.capitalized)
+                        }
+                        if provider.canUpdate {
+                            Button("Update to \(advisory.latestVersion ?? "latest")") {
+                                Task {
+                                    busy = true
+                                    defer { busy = false }
+                                    do { try await model.client.updateProvider(environmentID: environmentID, instanceID: instanceID) }
+                                    catch { errorMessage = "Could not update this provider. Refresh its status and try again." }
+                                }
+                            }
+                        }
+                    }
+                }
                 if provider.setup?.canInstall == true {
                     Section("Runtime") {
                         if let install, install.isActive {
@@ -114,10 +135,14 @@ private struct ProviderSetupView: View {
                             if provider.authStatus == "authenticated" { Text("Signed in") }
                             Button("Sign out", role: .destructive) { confirmSignOut = true }
                         } else if let auth, auth.isActive {
-                            if let rawURL = auth.authorizationUrl, let url = URL(string: rawURL), url.scheme == "https" {
+                            if let rawURL = auth.interaction?.url ?? auth.authorizationUrl, let url = URL(string: rawURL), url.scheme == "https" {
                                 Button("Open sign-in page") { openURL(url) }
                             }
+                            if let interaction = auth.interaction, let flowID = auth.flowId {
+                                authInteraction(interaction, flowID: flowID)
+                            }
                             if let flowID = auth.flowId {
+                                if auth.interaction?.acceptsCallback == true || (auth.interaction == nil && auth.authorizationUrl != nil) {
                                 TextField("Paste the return URL", text: $callbackURL, axis: .vertical)
                                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                                     .privacySensitive()
@@ -126,11 +151,19 @@ private struct ProviderSetupView: View {
                                     callbackURL = ""
                                     run(.completeSignIn(flowID: flowID, callbackURL: url))
                                 }.disabled(callbackURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                }
                                 Button("Cancel sign-in") { callbackURL = ""; run(.cancelSignIn(flowID: flowID)) }
                             }
                         } else {
-                            Button("Sign in") { run(.signIn) }
+                            if let methods = auth?.methods, !methods.isEmpty {
+                                ForEach(methods) { method in
+                                    Button(method.name) { run(.signInMethod(method.id)) }
+                                }
                                 .disabled(provider.isEnabled == false || provider.isInstalled == false)
+                            } else {
+                                Button("Sign in") { run(.signIn) }
+                                    .disabled(provider.isEnabled == false || provider.isInstalled == false)
+                            }
                         }
                         if auth?.phase != "succeeded", let message = auth?.message { Text(message).font(.footnote) }
                     }
@@ -156,12 +189,56 @@ private struct ProviderSetupView: View {
                 }
             } catch is CancellationError {} catch { errorMessage = "Could not load provider setup. Check this connection and its permissions." }
         }
-        .onDisappear { callbackURL = "" }
+        .onDisappear { callbackURL = ""; credentialValues = [:]; terminalInput = "" }
+        .onChange(of: auth?.interaction?.id) { callbackURL = ""; credentialValues = [:]; terminalInput = "" }
         .confirmationDialog("Sign out on this environment?", isPresented: $confirmSignOut) {
             Button("Sign out", role: .destructive) { run(.signOut) }
         }
         .confirmationDialog("Remove the runtime from this environment?", isPresented: $confirmRemove) {
             Button("Remove runtime", role: .destructive) { run(.remove) }
+        }
+    }
+
+    @ViewBuilder
+    private func authInteraction(_ interaction: ProviderAuthInteraction, flowID: String) -> some View {
+        switch interaction.type {
+        case "deviceCode":
+            if let code = interaction.userCode {
+                LabeledContent("Sign-in code", value: code).textSelection(.enabled)
+            }
+        case "browser":
+            if interaction.requiresConsent == true {
+                Button("Continue sign-in") {
+                    run(.respond(flowID: flowID, interactionID: interaction.id, response: .object([
+                        "type": .string("browser"), "action": .string("accept"),
+                    ])))
+                }
+            }
+        case "credentials":
+            ForEach(interaction.fields ?? []) { field in
+                let value = Binding(get: { credentialValues[field.name] ?? "" }, set: { credentialValues[field.name] = $0 })
+                if field.secret { SecureField(field.label, text: value) }
+                else { TextField(field.label, text: value).textInputAutocapitalization(.never).autocorrectionDisabled() }
+            }
+            Button("Sign in") {
+                let values = credentialValues.mapValues(JSONValue.string)
+                credentialValues = [:]
+                run(.respond(flowID: flowID, interactionID: interaction.id, response: .object([
+                    "type": .string("credentials"), "values": .object(values),
+                ])))
+            }
+        case "terminal":
+            if let output = interaction.output { Text(output).font(.system(.footnote, design: .monospaced)).textSelection(.enabled) }
+            SecureField("Terminal response", text: $terminalInput)
+            Button("Send response") {
+                let data = terminalInput + "\n"
+                terminalInput = ""
+                run(.respond(flowID: flowID, interactionID: interaction.id, response: .object([
+                    "type": .string("terminal"), "data": .string(data),
+                ])))
+            }
+        default:
+            Text("This sign-in method needs a newer app.")
         }
     }
 
