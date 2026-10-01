@@ -50,6 +50,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
     public var connectionDetail: String?
     public var machineIcon: String? = nil
     public var supportsScratch: Bool? = nil
+    public var newProjectsRoot: String? = nil
     public var canCustomizeIcon: Bool? = nil
 
     public var systemImage: String {
@@ -93,7 +94,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         case connectionState
         case connectionDetail
         case machineIcon
-        case supportsScratch
+        case supportsScratch, newProjectsRoot
         case canCustomizeIcon
     }
 
@@ -111,6 +112,7 @@ public struct FeatureEnvironment: Identifiable, Sendable, Equatable, Hashable, C
         )
         connectionDetail = try container.decodeIfPresent(String.self, forKey: .connectionDetail)
         machineIcon = try container.decodeIfPresent(String.self, forKey: .machineIcon)
+        newProjectsRoot = try container.decodeIfPresent(String.self, forKey: .newProjectsRoot)
         supportsScratch = try container.decodeIfPresent(Bool.self, forKey: .supportsScratch)
         canCustomizeIcon = try container.decodeIfPresent(Bool.self, forKey: .canCustomizeIcon)
     }

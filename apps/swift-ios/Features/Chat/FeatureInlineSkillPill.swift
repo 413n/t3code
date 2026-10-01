@@ -327,7 +327,7 @@ enum FeatureInlineSkillPillRenderer {
         )
 
         let format = UIGraphicsImageRendererFormat()
-        format.scale = traits.displayScale > 0 ? traits.displayScale : UIScreen.main.scale
+        format.scale = max(1, traits.displayScale)
         format.opaque = false
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
         let rendered = renderer.image { _ in

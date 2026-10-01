@@ -34,7 +34,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     )
     private static let initialThreadUserTurnLimit = 10
     private static let olderThreadPageUserTurnLimit = 20
-    private static let projectFaviconRefreshInterval: TimeInterval = 15 * 60
     private static let projectFaviconFallbackMarker = "project-favicon-missing"
     private static let sourceControlStatusStreamTimeoutSeconds: TimeInterval = 30
 
@@ -1123,6 +1122,20 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return FeatureScopedID.project(environmentID: environmentID, wireID: projectID)
     }
 
+    func createNewProject(environmentID: String, name: String) async throws -> ProjectCreateNewResult {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let result = try await client.createNewProject(name: name)
+        // The server created the project even if the follow-up refresh fails.
+        try? await refresh(client: client)
+        return result
+    }
+
+    func publishNewProject(environmentID: String, cwd: String, repository: String) async throws {
+        let client = try await projectCreationClient(environmentID: environmentID)
+        try await client.publishNewProject(cwd: cwd, repository: repository)
+        try? await refresh(client: client)
+    }
+
     func addProject(environmentID: String, path: String) async throws {
         let client = try await projectCreationClient(environmentID: environmentID)
         try await createProject(client: client, path: path)
@@ -1198,9 +1211,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             workspaceRoot: workspaceRoot
         )
         let cached = try? await projectFaviconStore.value(for: key)
-        if let cached,
-           Date.now.timeIntervalSince(cached.lastCheckedAt)
-               < Self.projectFaviconRefreshInterval {
+        let updatedAt = shellsByEnvironmentID[environmentID]?.projects.first {
+            FeatureProjectFaviconCacheKey(environmentID: environmentID, workspaceRoot: $0.workspaceRoot) == key
+        }?.updatedAt
+        if let cached, !cached.needsRefresh(projectUpdatedAt: updatedAt.flatMap(parseValidDate)) {
             return cached.data
         }
         if let task = projectFaviconRefreshTasks[key] {
@@ -2326,6 +2340,21 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return snapshot.thread.messages.contains { $0.id == messageID }
     }
 
+    func restartAgentSession(threadID: String) async throws {
+        let route = try threadRoute(for: threadID)
+        guard let thread = shellsByEnvironmentID[route.environmentID]?.threads.first(where: { $0.id == route.wireID }) else {
+            throw NativeFeatureClientError.threadNotFound
+        }
+        let context = try workspaceContext(route: route)
+        if let session = thread.session, session.status != "stopped" {
+            _ = try await route.client.dispatch(OrchestrationCommands.stopSession(threadID: route.wireID))
+        }
+        _ = try await refreshProviderCatalog(environmentID: route.environmentID, cwd: context.cwd,
+            instanceID: thread.session?.providerInstanceId ?? thread.modelSelection.instanceId,
+            refreshModels: false, fresh: true)
+        try? await refresh(client: route.client)
+    }
+
     func cancelTurn(threadID: String) async throws {
         let route = try threadRoute(for: threadID)
         let turnID = shellsByEnvironmentID[route.environmentID]?.threads
@@ -2614,10 +2643,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return try await refreshProviderCatalog(environmentID: environmentID, cwd: cwd, instanceID: instanceID, refreshModels: false)
     }
 
-    private func refreshProviderCatalog(environmentID: String, cwd: String?, instanceID: String? = nil, refreshModels: Bool) async throws -> [FeatureProvider] {
+    private func refreshProviderCatalog(environmentID: String, cwd: String?, instanceID: String? = nil, refreshModels: Bool, fresh: Bool = false) async throws -> [FeatureProvider] {
         let client = try await projectCreationClient(environmentID: environmentID)
         let generation = environmentGeneration
-        let config = try await client.refreshProviders(cwd: cwd, instanceID: instanceID, refreshModels: refreshModels)
+        let config = try await client.refreshProviders(cwd: cwd, instanceID: instanceID, refreshModels: refreshModels, fresh: fresh)
         guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
             throw CancellationError()
         }
@@ -5716,6 +5745,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         mapped.machineIcon = serverConfigsByEnvironmentID[environment.id]?.settings?.environmentIcon
             ?? environment.descriptor?.platform.machine
+        mapped.newProjectsRoot = serverConfigsByEnvironmentID[environment.id]?.newProjectsRoot
         mapped.supportsScratch = serverConfigsByEnvironmentID[environment.id]?.scratchWorkspaceRoot != nil
         mapped.canCustomizeIcon = serverConfigsByEnvironmentID[environment.id]?.environment?.capabilities.environmentIcon
             ?? environment.descriptor?.capabilities.environmentIcon

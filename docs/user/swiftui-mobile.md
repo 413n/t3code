@@ -24,7 +24,16 @@ The composer uses the skills and slash commands for the selected project or work
 require direct user invocation insert a slash command. Agent-only skills do not appear in the slash
 menu.
 
+After changing skills, plugins, or tool permissions, choose **Restart agent session** in the
+thread menu. This stops current work but keeps the conversation. The next message starts a
+fresh provider process and resumes that conversation.
+
 ## New tasks and thread preferences
+
+Choose **Add project > New** and enter a name to create a repository on the selected computer.
+T3 Code creates the folder and first commit, then opens a draft in that project. When GitHub
+is available, you can also choose to publish a private repository. A publishing error keeps
+the local project.
 
 To start without a repository, open the new-task project picker and choose **Scratch** on a
 connected computer. This option requires a current server. Scratch tasks use a local workspace.

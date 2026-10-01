@@ -315,6 +315,7 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
     public var providers: [ServerProviderSnapshot]
     public var settings: ServerSettingsSnapshot?
     public var scratchWorkspaceRoot: String? = nil
+    public var newProjectsRoot: String? = nil
     public let threadSnapshotPagination: Bool?
     public let threadResumeCompletionMarker: Bool?
     public let environment: EnvironmentDescriptor?
@@ -340,11 +341,12 @@ public struct ServerConfigSnapshot: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case providers, settings, threadSnapshotPagination, threadResumeCompletionMarker, environment
-        case usageLimitSources, scratchWorkspaceRoot
+        case usageLimitSources, scratchWorkspaceRoot, newProjectsRoot
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        newProjectsRoot = try container.decodeIfPresent(String.self, forKey: .newProjectsRoot)
         scratchWorkspaceRoot = try container.decodeIfPresent(String.self, forKey: .scratchWorkspaceRoot)
         providers = try container.decode(
             [LossyDecodableElement<ServerProviderSnapshot>].self,

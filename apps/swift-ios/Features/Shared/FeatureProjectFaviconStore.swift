@@ -26,6 +26,11 @@ struct FeatureProjectFaviconCacheValue: Equatable, Sendable {
     let data: Data?
     let revision: String?
     let lastCheckedAt: Date
+
+    func needsRefresh(projectUpdatedAt: Date?, now: Date = .now) -> Bool {
+        if let projectUpdatedAt, projectUpdatedAt > lastCheckedAt { return true }
+        return now.timeIntervalSince(lastCheckedAt) >= 15 * 60
+    }
 }
 
 enum FeatureProjectFaviconStoreError: Error, Equatable {

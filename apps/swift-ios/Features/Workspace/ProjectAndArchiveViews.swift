@@ -9,12 +9,13 @@ public struct AddProjectView: View {
     }
 
     private enum ProjectMode: String, CaseIterable, Identifiable {
+        case newProject
         case folder
         case repository
 
         var id: String { rawValue }
-        var label: String { self == .folder ? "Folder" : "Clone" }
-        var icon: String { self == .folder ? "folder" : "arrow.down.circle" }
+        var label: String { switch self { case .newProject: "New"; case .folder: "Folder"; case .repository: "Clone" } }
+        var icon: String { switch self { case .newProject: "plus"; case .folder: "folder"; case .repository: "arrow.down.circle" } }
     }
 
     private enum Field: Hashable {
@@ -25,9 +26,13 @@ public struct AddProjectView: View {
 
     @SwiftUI.Environment(\.dismiss) private var dismiss
     @Bindable var model: FeatureRootModel
+    private let onNewProjectCreated: @MainActor (String) -> Void
 
     @State private var selectedEnvironmentID: String?
-    @State private var mode = ProjectMode.folder
+    @State private var mode = ProjectMode.newProject
+    @State private var newProjectName = ""
+    @State private var publishesToGitHub = false
+    @State private var createdNewProject: ProjectCreateNewResult?
     @State private var localPath = "~/"
     @State private var source = ProjectRemoteSource.url
     @State private var repositoryInput = ""
@@ -52,8 +57,9 @@ public struct AddProjectView: View {
     @State private var cloneRequestID: UUID?
     @FocusState private var focusedField: Field?
 
-    public init(model: FeatureRootModel) {
+    public init(model: FeatureRootModel, onNewProjectCreated: @escaping @MainActor (String) -> Void = { _ in }) {
         self.model = model
+        self.onNewProjectCreated = onNewProjectCreated
     }
 
     public var body: some View {
@@ -63,13 +69,15 @@ public struct AddProjectView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 22) {
                             if environments.count > 1 {
-                                environmentPicker(environment)
+                                environmentPicker(environment).disabled(createdNewProject != nil)
                             }
-                            modePicker
+                            if createdNewProject == nil { modePicker }
                             if let errorMessage {
                                 errorBanner(errorMessage)
                             }
                             switch mode {
+                            case .newProject:
+                                newProjectForm(environment)
                             case .folder:
                                 localProjectForm(environment)
                             case .repository:
@@ -156,7 +164,7 @@ public struct AddProjectView: View {
     }
 
     private var showsFolderBrowser: Bool {
-        mode == .folder || !needsRepositoryLookup
+        mode != .newProject && (mode == .folder || !needsRepositoryLookup)
     }
 
     private var repositoryName: String {
@@ -167,7 +175,7 @@ public struct AddProjectView: View {
 
     private var modePicker: some View {
         HStack(spacing: 24) {
-            ForEach(ProjectMode.allCases) { candidate in
+            ForEach(ProjectMode.allCases.filter { $0 != .newProject || selectedEnvironment?.newProjectsRoot != nil }) { candidate in
                 Button {
                     focusedField = nil
                     errorMessage = nil
@@ -585,6 +593,8 @@ public struct AddProjectView: View {
     }
 
     private func resetEnvironmentState() {
+        if mode == .newProject && selectedEnvironment?.newProjectsRoot == nil { mode = .folder }
+        publishesToGitHub = false
         browsePath = "~/"
         browseResult = nil
         browseError = nil
@@ -671,6 +681,7 @@ public struct AddProjectView: View {
             browseResult = result
             if updateSelection {
                 switch mode {
+                case .newProject: break
                 case .folder:
                     localPath = selectedDirectory
                 case .repository:
@@ -691,6 +702,66 @@ public struct AddProjectView: View {
                 return
             }
             browseError = "Couldn’t browse that folder. Direct path entry still works."
+        }
+    }
+
+    private func newProjectForm(_ environment: FeatureEnvironment) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let createdNewProject {
+                Text("Created \(createdNewProject.workspaceRoot)")
+                    .font(T3Typography.supporting).textSelection(.enabled)
+                Button("Done") { dismiss() }.buttonStyle(.borderedProminent)
+            } else {
+                TextField("Project name", text: $newProjectName)
+                    .t3ProjectInput()
+                    .accessibilityIdentifier("new-project-name")
+                if let root = environment.newProjectsRoot {
+                    Text("Creates \(ProjectCreationPath.appending(ProjectCreationPath.newProjectFolderName(newProjectName), to: root))")
+                        .font(T3Typography.supporting).foregroundStyle(T3Colors.textSecondary)
+                }
+                if sourceOptions.first(where: { $0.source == .github })?.isReady == true {
+                    Toggle("Create private repository on GitHub", isOn: $publishesToGitHub)
+                }
+                primaryAction(label: "Create project", icon: "plus") {
+                    await createNewProject(environment)
+                }
+                .disabled(newProjectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || newProjectName.utf16.count > 200)
+            }
+        }
+    }
+
+    private func createNewProject(_ environment: FeatureEnvironment) async {
+        guard !isSubmitting, createdNewProject == nil, let projectClient else { return }
+        isSubmitting = true
+        errorMessage = nil
+        defer { isSubmitting = false }
+        do {
+            let result = try await projectClient.createNewProject(environmentID: environment.id,
+                name: newProjectName.trimmingCharacters(in: .whitespacesAndNewlines))
+            createdNewProject = result
+            if let commitError = result.commitError {
+                errorMessage = "The project was created without a first commit. \(commitError)"
+                return
+            }
+            if publishesToGitHub, sourceOptions.first(where: { $0.source == .github })?.isReady == true {
+                let account = discovery?.sourceControlProviders.first { $0.kind == .github }?.auth.account
+                let folder = ProjectCreationPath.lastPathComponent(result.workspaceRoot)
+                let repository = account.map { "\($0)/\(folder)" } ?? folder
+                try await projectClient.publishNewProject(environmentID: environment.id,
+                    cwd: result.workspaceRoot, repository: repository)
+            }
+            await model.reloadAfterConnection()
+            let id = FeatureScopedID.project(environmentID: environment.id, wireID: result.projectId)
+            guard model.snapshot.projects.contains(where: { $0.id == id }) else {
+                errorMessage = "The project was created. It will appear when this connection catches up."
+                return
+            }
+            onNewProjectCreated(id)
+            dismiss()
+        } catch {
+            errorMessage = createdNewProject == nil
+                ? "Could not confirm project creation. Check the project list before trying again."
+                : "The local project was created, but GitHub publishing failed. You can publish it later."
         }
     }
 

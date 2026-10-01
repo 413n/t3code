@@ -5,6 +5,14 @@ import UIKit
 
 @Suite("Project favicon cache")
 struct ProjectFaviconStoreTests {
+    @Test func projectChangesRetryCachedMissesWithoutPolling() {
+        let checked = Date(timeIntervalSince1970: 1_000)
+        let cached = FeatureProjectFaviconCacheValue(data: nil, revision: nil, lastCheckedAt: checked)
+        #expect(!cached.needsRefresh(projectUpdatedAt: checked.addingTimeInterval(-1), now: checked.addingTimeInterval(10)))
+        #expect(cached.needsRefresh(projectUpdatedAt: checked.addingTimeInterval(1), now: checked.addingTimeInterval(10)))
+        #expect(cached.needsRefresh(projectUpdatedAt: nil, now: checked.addingTimeInterval(900)))
+    }
+
     @Test
     func persistsLastKnownIconAcrossStoreInstances() async throws {
         let directory = temporaryDirectory()

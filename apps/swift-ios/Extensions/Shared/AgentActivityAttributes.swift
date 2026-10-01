@@ -65,6 +65,24 @@ struct T3RelayAgentActivityAggregateState: Codable, Hashable, Sendable {
     var updatedAt: String
     var activities: [T3RelayAgentActivityAggregateRow]
 
+    /// iOS marks the activity stale even if the app cannot receive another push.
+    func presented(isStale: Bool) -> Self {
+        guard isStale else { return self }
+        var result = self
+        result.activeCount = 0
+        result.activities = activities.map { row in
+            guard row.phase != .completed && row.phase != .failed else { return row }
+            var stale = row
+            stale.phase = .stale
+            stale.status = "Out of date"
+            return stale
+        }
+        if result.activities.contains(where: { $0.phase == .stale }) || (activities.isEmpty && activeCount > 0) {
+            result.subtitle = "Agent status out of date"
+        }
+        return result
+    }
+
     var attentionFirstActivities: [T3RelayAgentActivityAggregateRow] {
         activities.sorted { left, right in
             let leftPriority = left.phase.presentationPriority

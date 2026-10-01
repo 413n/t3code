@@ -8,9 +8,9 @@ struct T3TaskLiveActivity: Widget {
             T3LiveActivityLockScreenView(context: context)
                 .activityBackgroundTint(Color(uiColor: .systemBackground))
                 .activitySystemActionForegroundColor(Color(uiColor: .label))
-                .widgetURL(T3ActivityPresentation(state: context.state).deepLinkURL)
+                .widgetURL(T3ActivityPresentation(state: context.state, isStale: context.isStale).deepLinkURL)
         } dynamicIsland: { context in
-            let presentation = T3ActivityPresentation(state: context.state)
+            let presentation = T3ActivityPresentation(state: context.state, isStale: context.isStale)
             return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
                     Text("T3")
@@ -64,7 +64,7 @@ private struct T3LiveActivityLockScreenView: View {
     let context: ActivityViewContext<LiveActivityAttributes>
 
     private var presentation: T3ActivityPresentation {
-        T3ActivityPresentation(state: context.state)
+        T3ActivityPresentation(state: context.state, isStale: context.isStale)
     }
 
     var body: some View {
@@ -123,9 +123,11 @@ private struct T3LiveActivityRow: View {
 
 private struct T3ActivityPresentation {
     let aggregate: T3RelayAgentActivityAggregateState?
+    let isStale: Bool
 
-    init(state: LiveActivityAttributes.ContentState) {
-        aggregate = state.aggregate
+    init(state: LiveActivityAttributes.ContentState, isStale: Bool) {
+        self.isStale = isStale
+        aggregate = state.aggregate?.presented(isStale: isStale)
     }
 
     var rows: [T3RelayAgentActivityAggregateRow] {
@@ -145,6 +147,7 @@ private struct T3ActivityPresentation {
             return row.phase == .waitingForApproval ? "Approval" : "Input"
         }
         guard let aggregate else { return "Updating" }
+        if rows.contains(where: { $0.phase == .stale }) || (isStale && rows.isEmpty) { return "Out of date" }
         if aggregate.activeCount > 0 {
             return "\(aggregate.activeCount) active"
         }

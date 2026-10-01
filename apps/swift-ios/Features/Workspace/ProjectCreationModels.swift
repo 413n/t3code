@@ -2,6 +2,8 @@ import Foundation
 
 @MainActor
 protocol FeatureProjectCreationClient: AnyObject {
+    func createNewProject(environmentID: String, name: String) async throws -> ProjectCreateNewResult
+    func publishNewProject(environmentID: String, cwd: String, repository: String) async throws
     func addProject(environmentID: String, path: String) async throws
     func browseProjectFolders(
         environmentID: String,
@@ -18,6 +20,15 @@ protocol FeatureProjectCreationClient: AnyObject {
         remoteURL: String,
         destinationPath: String
     ) async throws -> SourceControlCloneResult
+}
+
+extension FeatureProjectCreationClient {
+    func createNewProject(environmentID: String, name: String) async throws -> ProjectCreateNewResult {
+        throw FeatureCapabilityUnavailable("New projects")
+    }
+    func publishNewProject(environmentID: String, cwd: String, repository: String) async throws {
+        throw FeatureCapabilityUnavailable("Publishing repositories")
+    }
 }
 
 enum ProjectRemoteSource: String, CaseIterable, Hashable, Identifiable {
@@ -112,6 +123,18 @@ enum ProjectRemoteSourceOptions {
 }
 
 enum ProjectCreationPath {
+    static func newProjectFolderName(_ name: String) -> String {
+        let normalized = name.decomposedStringWithCompatibilityMapping
+            .replacingOccurrences(of: #"[\u0300-\u036f]"#, with: "", options: .regularExpression)
+            .lowercased()
+            .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let slug = String(normalized.prefix(64)).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        guard !slug.isEmpty else { return "project" }
+        return slug.range(of: "^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", options: .regularExpression) != nil
+            ? slug + "-project" : slug
+    }
+
     static func normalizedCloneURL(_ input: String) -> String {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         let pattern = #"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]+(?:\.git)?$"#

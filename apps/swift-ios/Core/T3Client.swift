@@ -180,14 +180,15 @@ public actor T3Client {
         )
     }
 
-    public func refreshProviders(cwd: String? = nil, instanceID: String? = nil, refreshModels: Bool = true) async throws -> ServerConfigSnapshot {
+    public func refreshProviders(cwd: String? = nil, instanceID: String? = nil, refreshModels: Bool = true, fresh: Bool = false) async throws -> ServerConfigSnapshot {
         let current = try await serverConfig()
         let generation = serverConfigGeneration
         let result: ServerRefreshProvidersResult = try await rpc.request(
             RPCMethod.serverRefreshProviders.rawValue,
             payload: .object([
                 "refreshModels": .bool(refreshModels),
-            ].merging(cwd.map { ["cwd": .string($0)] } ?? [:]) { _, new in new }
+            ].merging(fresh ? ["fresh": .bool(true)] : [:]) { _, new in new }
+                .merging(cwd.map { ["cwd": .string($0)] } ?? [:]) { _, new in new }
                 .merging(instanceID.map { ["instanceId": .string($0)] } ?? [:]) { _, new in new }),
             as: ServerRefreshProvidersResult.self
         )
@@ -794,6 +795,17 @@ public actor T3Client {
                 // A successful desktop handoff can close the socket before its reply.
             }
         }
+    }
+
+    public func createNewProject(name: String) async throws -> ProjectCreateNewResult {
+        try await rpc.request("projects.createNew", payload: .object(["name": .string(name)]), as: ProjectCreateNewResult.self)
+    }
+
+    public func publishNewProject(cwd: String, repository: String) async throws {
+        let _: JSONValue = try await rpc.request("sourceControl.publishRepository", payload: .object([
+            "cwd": .string(cwd), "provider": .string("github"),
+            "repository": .string(repository), "visibility": .string("private"),
+        ]), responseDeadline: .none, as: JSONValue.self)
     }
 
     public func ensureScratchProject() async throws -> String {
@@ -2362,6 +2374,11 @@ public enum OrchestrationCommands {
             "requestId": .string(requestID),
             "createdAt": .string(createdAt),
         ])
+    }
+
+    public static func stopSession(threadID: String, commandID: String = UUID().uuidString) -> JSONValue {
+        .object(["type": .string("thread.session.stop"), "commandId": .string(commandID),
+                 "threadId": .string(threadID), "createdAt": .string(now())])
     }
 
     public static func autoSettle(threadID: String, enabled: Bool, commandID: String = UUID().uuidString) -> JSONValue {

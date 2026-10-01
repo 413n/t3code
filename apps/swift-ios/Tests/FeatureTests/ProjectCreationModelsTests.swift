@@ -4,6 +4,14 @@ import Testing
 
 @Suite("Native project creation")
 struct ProjectCreationModelsTests {
+    @Test func newProjectNamesMatchServerFolderNames() {
+        #expect(ProjectCreationPath.newProjectFolderName("Café Notes") == "cafe-notes")
+        #expect(ProjectCreationPath.newProjectFolderName("COM1") == "com1-project")
+        #expect(ProjectCreationPath.newProjectFolderName("你好") == "project")
+        #expect(ProjectCreationPath.newProjectFolderName("  My__Project!  ") == "my-project")
+        #expect(ProjectCreationPath.newProjectFolderName(String(repeating: "a", count: 70)).count == 64)
+    }
+
     @Test
     func repositoryNamesCoverHttpsSshAndProviderPaths() {
         #expect(

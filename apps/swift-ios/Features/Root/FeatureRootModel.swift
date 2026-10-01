@@ -500,6 +500,11 @@ public final class FeatureRootModel {
     }
 
     @discardableResult
+    public func restartAgentSession(_ id: String) async -> Bool {
+        await perform { try await client.restartAgentSession(threadID: id) }
+    }
+
+    @discardableResult
     public func setAutoSettle(_ id: String, enabled: Bool) async -> Bool {
         await perform {
             try await client.setThreadAutoSettle(id: id, enabled: enabled)

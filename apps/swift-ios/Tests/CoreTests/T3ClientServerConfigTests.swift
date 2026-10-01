@@ -251,7 +251,7 @@ final class T3ClientServerConfigTests: XCTestCase {
         _ = try await iterator.next()
 
         let refresh = Task {
-            try await client.refreshProviders(cwd: "/repo", instanceID: "codex-old", refreshModels: false)
+            try await client.refreshProviders(cwd: "/repo", instanceID: "codex-old", refreshModels: false, fresh: true)
         }
         await connection.waitForRequestCount(2)
         try await connection.pushUsageLimitSources(ids: ["latest"])
@@ -268,6 +268,7 @@ final class T3ClientServerConfigTests: XCTestCase {
         XCTAssertEqual(refreshed.threadResumeCompletionMarker, true)
         XCTAssertEqual(refreshed.environment?.environmentId, "environment-1")
         XCTAssertEqual(refreshed.scratchWorkspaceRoot, "/tmp/scratch")
+        XCTAssertEqual(refreshed.newProjectsRoot, "/tmp/projects")
         guard case let .snapshot(emitted)? = try await iterator.next() else {
             return XCTFail("Expected the refreshed config.")
         }
@@ -275,6 +276,7 @@ final class T3ClientServerConfigTests: XCTestCase {
         let payloads = await connection.payloads(for: "server.refreshProviders")
         XCTAssertEqual(payloads, [.object([
             "refreshModels": .bool(false),
+            "fresh": .bool(true),
             "cwd": .string("/repo"),
             "instanceId": .string("codex-old"),
         ])])
@@ -591,6 +593,7 @@ private actor ServerConfigTestConnection: WebSocketConnection {
             "threadSnapshotPagination": .bool(true),
             "threadResumeCompletionMarker": .bool(true),
             "scratchWorkspaceRoot": .string("/tmp/scratch"),
+            "newProjectsRoot": .string("/tmp/projects"),
             "environment": .object([
                 "environmentId": .string("environment-1"),
                 "label": .string("Studio"),

@@ -51,9 +51,13 @@ public struct WorkspaceView: View {
     @AppStorage("t3.swiftui.home.settledExpanded") private var isSettledExpanded = true
     @AppStorage("t3.swiftui.home.archiveExpanded") private var isArchiveExpanded = false
     @State private var settledLimit = 10
-    @State private var showingNewTask = false
-    @State private var newTaskInitialProjectID: String?
+    private struct NewTaskPresentation: Identifiable {
+        let id = UUID()
+        let projectID: String?
+    }
+    @State private var newTaskPresentation: NewTaskPresentation?
     @State private var showingAddProject = false
+    @State private var createdProjectID: String?
     @State private var showingEnvironments = false
     @State private var showingSettings = false
     @State private var showingThreadArrangement = false
@@ -93,20 +97,25 @@ public struct WorkspaceView: View {
             detail
         }
         .navigationSplitViewStyle(.balanced)
-        .sheet(isPresented: $showingNewTask) {
+        .sheet(item: $newTaskPresentation) { presentation in
             NewThreadView(
                 model: model,
                 submit: submitNewTask,
                 onCreated: { thread in
                     openThread(thread.id)
-                    showingNewTask = false
+                    newTaskPresentation = nil
                 },
                 onCreateProject: openProjectCreation,
-                initialProjectID: newTaskInitialProjectID
+                initialProjectID: presentation.projectID
             )
         }
-        .sheet(isPresented: $showingAddProject) {
-            AddProjectView(model: model)
+        .sheet(isPresented: $showingAddProject, onDismiss: {
+            if let id = createdProjectID {
+                createdProjectID = nil
+                openNewTaskOrProjectCreation(initialProjectID: id)
+            }
+        }) {
+            AddProjectView(model: model, onNewProjectCreated: { createdProjectID = $0 })
         }
         .sheet(item: $settingsProject) { project in
             ProjectPreferencesSheet(model: model, projectID: project.id)
@@ -615,7 +624,7 @@ public struct WorkspaceView: View {
 
     @MainActor
     private func openProjectCreation() {
-        showingNewTask = false
+        newTaskPresentation = nil
         showingAddProject = true
     }
 
@@ -626,8 +635,7 @@ public struct WorkspaceView: View {
     private func openNewTaskOrProjectCreation(initialProjectID: String?) {
         switch DailyUXCreationContext.newTaskDestination(in: model.snapshot) {
         case .newTask:
-            newTaskInitialProjectID = initialProjectID
-            showingNewTask = true
+            newTaskPresentation = NewTaskPresentation(projectID: initialProjectID)
         case .addProject:
             showingAddProject = true
         }
@@ -667,7 +675,7 @@ public struct WorkspaceView: View {
 
     private func dismissTransientPresentations() {
         settingsProject = nil
-        showingNewTask = false
+        newTaskPresentation = nil
         showingAddProject = false
         showingEnvironments = false
         showingSettings = false
@@ -865,6 +873,7 @@ struct HomeShelfHeader: View {
 }
 
 struct HomeThreadRowContext: Equatable {
+    var projectRevision: String? = nil
     var projectIcon: ProjectIconOverride? = nil
     let projectName: String
     let projectEnvironmentID: String?
@@ -965,6 +974,7 @@ struct HomeThreadRowContext: Equatable {
                 : environment?.connectionState
 
             result[thread.id] = HomeThreadRowContext(
+                projectRevision: project?.updatedAt,
                 projectIcon: project?.projectIcon,
                 projectName: projectGroupNameByID[thread.projectID] ?? project?.name ?? "Project",
                 projectEnvironmentID: project?.environmentID,
@@ -1419,6 +1429,7 @@ struct FeatureThreadRow: View {
     private var projectBadge: some View {
         ProjectBadge(
             name: context.projectName,
+            revision: context.projectRevision,
             icon: context.projectIcon,
             environmentID: context.projectEnvironmentID,
             workspaceRoot: context.projectWorkspaceRoot,
@@ -1463,6 +1474,7 @@ struct FeatureThreadRow: View {
 
 private struct ProjectBadge: View {
     let name: String
+    let revision: String?
     let icon: ProjectIconOverride?
     let environmentID: String?
     let workspaceRoot: String?
@@ -1471,12 +1483,14 @@ private struct ProjectBadge: View {
 
     init(
         name: String,
+        revision: String? = nil,
         icon: ProjectIconOverride? = nil,
         environmentID: String?,
         workspaceRoot: String?,
         client: (any FeatureClient)?
     ) {
         self.name = name
+        self.revision = revision
         self.icon = icon
         self.environmentID = environmentID
         self.workspaceRoot = workspaceRoot
@@ -1517,7 +1531,7 @@ private struct ProjectBadge: View {
         }
             .frame(width: 16, height: 16)
             .accessibilityHidden(true)
-            .task(id: faviconKey) {
+            .task(id: [faviconKey, revision]) {
                 await loadFavicon()
             }
     }

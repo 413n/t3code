@@ -20,6 +20,8 @@ public struct ThreadDetailView: View {
     @State private var selection: FeatureSelection?
     @State private var attachments: [FeatureDraftAttachment] = []
     @State private var isSending = false
+    @State private var confirmsRestart = false
+    @State private var isRestarting = false
     @State private var pendingRewindMessageID: String?
     @State private var isPreparingRewind = false
     @State private var isPreparingInput = false
@@ -198,6 +200,17 @@ public struct ThreadDetailView: View {
 
     public var body: some View {
         threadContent
+        .confirmationDialog("Restart agent session?", isPresented: $confirmsRestart, titleVisibility: .visible) {
+            Button("Restart") {
+                Task {
+                    isRestarting = true
+                    defer { isRestarting = false }
+                    await model.restartAgentSession(thread.id)
+                }
+            }
+        } message: {
+            Text("This stops the current turn and keeps the conversation. Your next message reloads skills, plugins, and tool permissions.")
+        }
         .alert("Message not sent", isPresented: $sendFailed) {
             // Refocusing happens here rather than when the send fails: the
             // alert takes first responder from the composer, so a refocus
@@ -548,6 +561,12 @@ public struct ThreadDetailView: View {
                         )
                     }
                 }
+                Button {
+                    confirmsRestart = true
+                } label: {
+                    Label("Restart agent session", systemImage: "arrow.clockwise")
+                }
+                .disabled(isSending || isRestarting)
                 Button(action: reloadThread) {
                     Label("Reload", systemImage: "arrow.clockwise")
                 }

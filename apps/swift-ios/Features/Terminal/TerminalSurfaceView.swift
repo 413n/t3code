@@ -806,7 +806,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     init() {
         super.init(frame: .zero)
         clipsToBounds = true
-        contentScaleFactor = UIScreen.main.scale
+        contentScaleFactor = traitCollection.displayScale
         accessibilityLabel = "Terminal"
 
         terminalViewport.clipsToBounds = true
@@ -1233,7 +1233,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func updateContentScale() {
-        let scale = window?.screen.scale ?? UIScreen.main.scale
+        let scale = window?.screen.scale ?? traitCollection.displayScale
         if contentScaleFactor != scale { contentScaleFactor = scale }
     }
 

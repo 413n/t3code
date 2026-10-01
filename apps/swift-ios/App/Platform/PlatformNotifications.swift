@@ -196,7 +196,7 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
         content.title = notificationTitle(for: signal.kind)
         content.body = signal.thread.title
         content.sound = .default
-        content.threadIdentifier = signal.thread.id
+        content.threadIdentifier = "\(signal.thread.environmentID ?? "")/\(signal.thread.wireID ?? signal.thread.id)"
         if let url = PlatformRoute.thread(
             environmentID: signal.thread.environmentID,
             threadID: signal.thread.wireID ?? signal.thread.id

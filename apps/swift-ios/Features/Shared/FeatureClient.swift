@@ -88,6 +88,7 @@ public protocol FeatureClient: AnyObject {
         context: OrchestrationMessageContext?
     ) async throws
     func cancelTurn(threadID: String) async throws
+    func restartAgentSession(threadID: String) async throws
     func canRewindConversation(threadID: String, messageID: String) -> Bool
     /// Returns only after provider history is rewound. Attachment bytes are copied first.
     func rewindConversation(
@@ -446,6 +447,7 @@ public extension FeatureClient {
     func dismissUserInput(id: String) async throws {
         throw FeatureCapabilityUnavailable("Question dismissal")
     }
+    func restartAgentSession(threadID: String) async throws { throw FeatureCapabilityUnavailable("Restart agent session") }
     func setThreadSettled(id: String, settled: Bool) async throws {}
     func environmentDescriptor(environmentID: String) async throws -> EnvironmentDescriptor { throw FeatureCapabilityUnavailable("Environment updates") }
     func updateEnvironment(environmentID: String, targetVersion: String) async throws { throw FeatureCapabilityUnavailable("Environment updates") }

@@ -1,5 +1,11 @@
 import Foundation
 
+public struct ProjectCreateNewResult: Codable, Equatable, Sendable {
+    public let projectId: String
+    public let workspaceRoot: String
+    public let commitError: String?
+}
+
 // MARK: - Project files
 
 public enum ProjectEntryKind: String, Codable, Sendable {
