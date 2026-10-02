@@ -12,6 +12,7 @@ import {
   type RunId,
   ThreadId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Subagent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -37,6 +38,9 @@ import { checkpointWorkspace } from "./testkit/ReplayFixtureWorkspace.ts";
 const driver = ProviderDriverKind.make("codex");
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "test-model" };
+const yieldToRuntime = Effect.yieldNow.pipe(
+  Effect.andThen(Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))),
+);
 const capabilities = {
   ...CodexProviderCapabilitiesV2,
   turns: { ...CodexProviderCapabilitiesV2.turns, supportsActiveSteering: true },
@@ -172,11 +176,20 @@ for (const resultRead of [false, true]) {
                     event.payload.id === runId &&
                     event.payload.status === "completed",
                 );
-                const projection = yield* orchestrator.getThreadProjection(threadId);
-                const run = projection.runs.find((candidate) => candidate.id === runId)!;
-                const turn = projection.providerTurns.find(
-                  (candidate) => candidate.runAttemptId === run.activeAttemptId,
-                )!;
+                // startTurn's running turn is ingested on the adapter event fiber.
+                let turn: OrchestrationV2ProviderTurn | undefined;
+                for (let attempt = 0; attempt < 200 && turn === undefined; attempt++) {
+                  const projection = yield* orchestrator.getThreadProjection(threadId);
+                  const run = projection.runs.find((candidate) => candidate.id === runId);
+                  turn = projection.providerTurns.find(
+                    (candidate) =>
+                      candidate.runAttemptId === run?.activeAttemptId &&
+                      candidate.status === "running",
+                  );
+                  if (turn === undefined) yield* yieldToRuntime;
+                }
+                assert.isDefined(turn, `run ${runId} has no running provider turn`);
+                if (turn === undefined) return;
                 yield* Queue.offer(events, {
                   type: "provider_turn.updated",
                   driver,
@@ -196,22 +209,26 @@ for (const resultRead of [false, true]) {
                 yield* worker.drain();
                 yield* Fiber.join(completed);
               });
-            // Subscribes, before the settlement that triggers it, to the wake run
-            // the continuation worker starts; joining it runs that wake's turn.
-            const watchWake = (startedCount: number) =>
+            // The continuation worker runs on its own fiber, so drain the effect
+            // worker and yield to it until nothing new starts. A wake that never
+            // starts then fails the assertion with the stranded cohort state.
+            const nextWake = (startedCount: number) =>
               Effect.gen(function* () {
-                const wake = yield* watch(
-                  (event) =>
-                    event.type === "run.updated" &&
-                    event.payload.ordinal === startedCount + 1 &&
-                    event.payload.status !== "queued",
-                );
-                return Effect.gen(function* () {
-                  yield* Fiber.join(wake);
+                for (let attempt = 0; attempt < 200 && started.length === startedCount; attempt++) {
                   yield* worker.drain();
-                  assert.equal(started.length, startedCount + 1);
-                  return started[startedCount]!;
-                });
+                  if (started.length === startedCount) yield* yieldToRuntime;
+                }
+                const projection = yield* orchestrator.getThreadProjection(threadId);
+                assert.equal(
+                  started.length,
+                  startedCount + 1,
+                  `no wake started: delivery=${JSON.stringify(
+                    projection.runs[0]?.delegatedCompletion?.delivery,
+                  )} tasks=${JSON.stringify(
+                    projection.subagents.map((row) => [row.id, row.completionDelivery?.state]),
+                  )}`,
+                );
+                return started[startedCount]!;
               });
 
             yield* orchestrator.dispatch({
@@ -323,7 +340,7 @@ for (const resultRead of [false, true]) {
               delegatedCompletion: { parentRunId: parent.runId, generation: 1, taskIds: [taskA] },
             });
             // Every retry is rejected while the parent turn still looks running.
-            while (steerCalls < 5) {
+            for (let attempt = 0; attempt < 5; attempt++) {
               yield* worker.drain();
               yield* TestClock.adjust("1 minute");
             }
@@ -339,12 +356,6 @@ for (const resultRead of [false, true]) {
                 observedByRunId: parent.runId,
               });
             }
-            const runWakeB = (wakeB: ProviderAdapterV2TurnInput) =>
-              Effect.gen(function* () {
-                assert.include(wakeB.message.text, String(taskB));
-                assert.notInclude(wakeB.message.text, String(taskA));
-                yield* settle(wakeB.runId, wakeB.runOrdinal);
-              });
             const beforeSettle = yield* orchestrator.getThreadProjection(threadId);
             assert.equal(beforeSettle.runs[0]?.status, "running");
             assert.equal(
@@ -352,19 +363,18 @@ for (const resultRead of [false, true]) {
               steerMessageId,
             );
 
-            const firstWake = yield* watchWake(1);
             yield* settle(parent.runId, parent.runOrdinal);
-            const wakeA = resultRead ? undefined : yield* firstWake;
-            if (wakeA !== undefined) {
+            if (!resultRead) {
+              const wakeA = yield* nextWake(1);
               assert.equal(wakeA.message.messageId, steerMessageId);
               assert.include(wakeA.message.text, String(taskA));
               assert.notInclude(wakeA.message.text, String(taskB));
-              const secondWake = yield* watchWake(2);
               yield* settle(wakeA.runId, wakeA.runOrdinal);
-              yield* runWakeB(yield* secondWake);
-            } else {
-              yield* runWakeB(yield* firstWake);
             }
+            const wakeB = yield* nextWake(resultRead ? 1 : 2);
+            assert.include(wakeB.message.text, String(taskB));
+            assert.notInclude(wakeB.message.text, String(taskA));
+            yield* settle(wakeB.runId, wakeB.runOrdinal);
 
             const final = yield* orchestrator.getThreadProjection(threadId);
             assert.equal(final.runs[0]?.delegatedCompletion?.delivery, null);
