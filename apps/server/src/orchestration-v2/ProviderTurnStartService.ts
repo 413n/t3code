@@ -2,7 +2,6 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   CommandId,
-  isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
@@ -179,146 +178,59 @@ export const layer: Layer.Layer<
     };
 
     /**
-     * Ends the work a run that never reaches its provider still shows. A
+     * Ends the work a run that never reached its provider still shows. A
      * restart supersedes only the root turn, so requests, streaming replies and
      * background work an earlier attempt left open stay with the run, and once
-     * it settles nothing will report on them. Provider-native subagent threads
-     * the run launched end with it; app-owned children run on their own.
+     * it fails nothing will report on them. The run's projection rows feed
+     * RunExecutionService's terminal cascade, the same one a started run uses.
      */
     const inheritedWorkSettlement = Effect.fn(
       "orchestrationV2.providerTurnStart.inheritedWorkSettlement",
-    )(function* (input: {
-      readonly run: OrchestrationV2Run;
-      readonly rootNodeId: OrchestrationV2ExecutionNode["id"];
-      readonly now: DateTime.Utc;
-    }) {
-      const { run, now } = input;
-      const events: Array<OrchestrationV2DomainEvent> = [];
-      const reason = "The run ended before its provider turn started.";
-      const pending: Array<ThreadId> = [run.threadId];
-      const visited = new Set<ThreadId>(pending);
-      const follow = (childThreadId: ThreadId | null) => {
-        if (childThreadId === null || visited.has(childThreadId)) return;
-        visited.add(childThreadId);
-        pending.push(childThreadId);
-      };
+    )(function* (input: { readonly run: OrchestrationV2Run; readonly now: DateTime.Utc }) {
+      const { run } = input;
       // Lifetime links: a subagent row can settle before its child thread does.
       const links = yield* projectionStore.getThreadRecords(
         run.threadId,
         ["subagents", "turnItems"],
         { turnItemRunIds: [run.id], turnItemTypes: ["subagent"] },
       );
-      for (const row of [...links.subagents, ...links.turnItems]) {
-        if (row.runId === run.id && "childThreadId" in row) follow(row.childThreadId);
-      }
+      const pending = [...links.subagents, ...links.turnItems].flatMap((row) =>
+        row.runId === run.id &&
+        "childThreadId" in row &&
+        row.childThreadId !== null &&
+        row.origin === "provider_native"
+          ? [row.childThreadId]
+          : [],
+      );
+      const linkedChildThreadIds = new Set<ThreadId>();
+      const threads = [yield* projectionStore.getRuntimeRecoveryProjection(run.threadId)];
       for (let threadId = pending.shift(); threadId !== undefined; threadId = pending.shift()) {
-        const projection = yield* projectionStore.getRuntimeRecoveryProjection(threadId).pipe(
+        if (threadId === run.threadId || linkedChildThreadIds.has(threadId)) continue;
+        const child = yield* projectionStore.getRuntimeRecoveryProjection(threadId).pipe(
           Effect.map(Option.some),
           Effect.catchTag("ProjectionStoreThreadNotFoundError", () =>
             Effect.succeed(Option.none()),
           ),
         );
-        if (Option.isNone(projection)) continue;
-        const current = projection.value;
-        const isRoot = threadId === run.threadId;
-        if (!isRoot && !isProviderNativeSubagentThread(current.thread)) continue;
-        // A provider-native child has no runs; its rows carry no run id.
-        const owns = (rowRunId: RunId | null) =>
-          rowRunId === run.id || (!isRoot && rowRunId === null);
-        const envelope = Effect.map(idAllocator.allocate.event({ threadId }), (id) => ({
-          id,
-          threadId,
-          providerInstanceId: run.providerInstanceId,
-          occurredAt: now,
-        }));
-        const ownedNodes = current.nodes.filter(
-          (node) =>
-            node.id !== input.rootNodeId &&
-            owns(node.runId) &&
-            isOrchestrationV2WorkActive(node.status),
-        );
-        const ownedNodeIds = new Set(ownedNodes.map((node) => node.id));
-        for (const request of current.runtimeRequests) {
-          if (request.status !== "pending" || !ownedNodeIds.has(request.nodeId)) continue;
-          events.push({
-            ...(yield* envelope),
-            type: "runtime-request.updated",
-            nodeId: request.nodeId,
-            payload: {
-              ...request,
-              status: "cancelled",
-              responseCapability: { type: "not_resumable", reason },
-              resolvedAt: now,
-            },
-          });
-        }
-        for (const node of ownedNodes) {
-          events.push({
-            ...(yield* envelope),
-            type: "node.updated",
-            ...(node.runId === null ? {} : { runId: node.runId }),
-            nodeId: node.id,
-            payload: { ...node, status: "cancelled", completedAt: now },
-          });
-        }
-        for (const subagent of current.subagents) {
-          if (!owns(subagent.runId)) continue;
-          follow(subagent.childThreadId);
-          if (!isOrchestrationV2WorkActive(subagent.status)) continue;
-          events.push({
-            ...(yield* envelope),
-            type: "subagent.updated",
-            ...(subagent.runId === null ? {} : { runId: subagent.runId }),
-            nodeId: subagent.id,
-            driver: subagent.driver,
-            payload: { ...subagent, status: "cancelled", completedAt: now, updatedAt: now },
-          });
-        }
-        for (const providerTurn of current.providerTurns) {
-          const attemptRunId = current.attempts.find(
-            (attempt) => attempt.id === providerTurn.runAttemptId,
-          )?.runId;
-          if (attemptRunId !== run.id || !isOrchestrationV2WorkActive(providerTurn.status)) {
-            continue;
-          }
-          events.push({
-            ...(yield* envelope),
-            type: "provider-turn.updated",
-            runId: run.id,
-            nodeId: providerTurn.nodeId,
-            payload: { ...providerTurn, status: "cancelled", completedAt: now },
-          });
-        }
-        for (const message of current.messages) {
-          if (!message.streaming || !owns(message.runId)) continue;
-          events.push({
-            ...(yield* envelope),
-            type: "message.updated",
-            ...(message.runId === null ? {} : { runId: message.runId }),
-            ...(message.nodeId === null ? {} : { nodeId: message.nodeId }),
-            payload: { ...message, streaming: false, updatedAt: now },
-          });
-        }
-        for (const item of current.turnItems) {
-          if (!owns(item.runId)) continue;
-          if (item.type === "subagent") follow(item.childThreadId);
-          if (!isOrchestrationV2WorkActive(item.status)) continue;
-          events.push({
-            ...(yield* envelope),
-            type: "turn-item.updated",
-            ...(item.runId === null ? {} : { runId: item.runId }),
-            ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
-            payload: {
-              ...item,
-              ...("streaming" in item ? { streaming: false } : {}),
-              status: "cancelled",
-              completedAt: now,
-              updatedAt: now,
-            },
-          });
+        if (Option.isNone(child) || !isProviderNativeSubagentThread(child.value.thread)) continue;
+        linkedChildThreadIds.add(threadId);
+        threads.push(child.value);
+        for (const row of [...child.value.subagents, ...child.value.turnItems]) {
+          if ("childThreadId" in row && row.childThreadId !== null) pending.push(row.childThreadId);
         }
       }
-      return events;
+      const linked = RunExecutionService.openRunOwnedWorkFromProjection({
+        run,
+        threads,
+        linkedChildThreadIds,
+      });
+      return yield* RunExecutionService.cascadeTerminalizeRunOwnedSubagents({
+        run,
+        open: linked,
+        status: "cancelled",
+        completedAt: input.now,
+        allocateEventId: () => idAllocator.allocate.event({ threadId: run.threadId }),
+      });
     });
 
     const makeDeliverySession = (
@@ -511,10 +423,7 @@ export const layer: Layer.Layer<
             expectedStatus: "starting",
             events:
               status === "failed"
-                ? [
-                    ...(yield* inheritedWorkSettlement({ run, rootNodeId: rootNode.id, now })),
-                    ...events,
-                  ]
+                ? [...(yield* inheritedWorkSettlement({ run, now })), ...events]
                 : events,
           });
         },
