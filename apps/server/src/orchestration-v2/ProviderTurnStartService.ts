@@ -215,18 +215,45 @@ export const layer: Layer.Layer<
         if (threadId === run.threadId || linkedChildThreadIds.has(threadId)) continue;
         const child = yield* projectionStore.getRuntimeRecoveryProjection(threadId).pipe(
           Effect.map(Option.some),
-          Effect.catchTag("ProjectionStoreThreadNotFoundError", () =>
-            Effect.succeed(Option.none()),
-          ),
+          Effect.catchTags({
+            ProjectionStoreThreadNotFoundError: () => Effect.succeed(Option.none()),
+          }),
         );
         if (Option.isNone(child) || !isProviderNativeSubagentThread(child.value.thread)) continue;
         linkedChildThreadIds.add(threadId);
         // A child thread has no runs, so the recovery read leaves out its
-        // streaming replies; read them by thread instead.
-        const { messages } = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
-          messageRoles: ["assistant"],
+        // streaming replies and its pending requests' nodes and items; read
+        // them by thread instead.
+        const records = yield* projectionStore.getThreadRecords(
+          threadId,
+          ["messages", "nodes", "turnItems"],
+          {
+            messageRoles: ["assistant"],
+            turnItemTypes: ["approval_request", "user_input_request"],
+            turnItemStatuses: ["pending", "running", "waiting"],
+          },
+        );
+        const requestNodeIds = new Set(
+          child.value.runtimeRequests.flatMap((request) =>
+            request.status === "pending" ? [request.nodeId] : [],
+          ),
+        );
+        const knownNodeIds = new Set(child.value.nodes.map((node) => node.id));
+        const knownItemIds = new Set(child.value.turnItems.map((item) => item.id));
+        threads.push({
+          ...child.value,
+          nodes: [
+            ...child.value.nodes,
+            ...records.nodes.filter(
+              (node) => requestNodeIds.has(node.id) && !knownNodeIds.has(node.id),
+            ),
+          ],
+          turnItems: [
+            ...child.value.turnItems,
+            ...records.turnItems.filter((item) => !knownItemIds.has(item.id)),
+          ],
+          messages: records.messages.filter((message) => message.streaming),
         });
-        threads.push({ ...child.value, messages: messages.filter((message) => message.streaming) });
         pending.push(...(yield* nativeLinks(threadId)));
       }
       const linked = RunExecutionService.openRunOwnedWorkFromProjection({

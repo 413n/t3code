@@ -125,6 +125,8 @@ function openTurnWork(
   const subagentNodeId = NodeId.make(`node:subagent:${input.attemptId}`);
   const childThreadId = providerNativeChildThreadId(input.threadId);
   const grandchildThreadId = providerNativeChildThreadId(childThreadId);
+  const childApprovalNodeId = NodeId.make(`node:child-approval:${input.attemptId}`);
+  const childRequestId = RuntimeRequestId.make(`request:child-approval:${input.attemptId}`);
   const requestId = RuntimeRequestId.make(`request:approval:${input.attemptId}`);
   return [
     {
@@ -233,6 +235,61 @@ function openTurnWork(
         childThreadId,
         prompt: "Explore the repo",
         result: null,
+      },
+    },
+    // The subagent is waiting on an approval in its own thread. Its rows carry
+    // no run id; the child thread has no runs.
+    {
+      type: "node.updated",
+      driver,
+      node: {
+        id: childApprovalNodeId,
+        threadId: childThreadId,
+        runId: null,
+        parentNodeId: null,
+        rootNodeId: childApprovalNodeId,
+        kind: "approval_request",
+        status: "waiting",
+        countsForRun: false,
+        providerThreadId: input.providerThread.id,
+        providerTurnId,
+        nativeItemRef: null,
+        runtimeRequestId: childRequestId,
+        checkpointScopeId: null,
+        startedAt: now,
+        completedAt: null,
+      },
+    },
+    {
+      type: "runtime_request.updated",
+      driver,
+      threadId: childThreadId,
+      runtimeRequest: {
+        id: childRequestId,
+        nodeId: childApprovalNodeId,
+        providerTurnId,
+        nativeRequestRef: null,
+        kind: "command",
+        status: "pending",
+        responseCapability: { type: "live", providerSessionId },
+        createdAt: now,
+        resolvedAt: null,
+      },
+    },
+    {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: TurnItemId.make(`turn-item:child-approval:${input.attemptId}`),
+        threadId: childThreadId,
+        runId: null,
+        nodeId: childApprovalNodeId,
+        ordinal: 3,
+        status: "waiting",
+        type: "approval_request",
+        requestId: childRequestId,
+        requestKind: "command",
       },
     },
     {
@@ -826,6 +883,7 @@ it.live("settles the work a restarted run inherited when its replacement never o
         projection,
         nativeChildItems,
         nativeChildStreaming,
+        nativeChildRequests,
         nativeGrandchildItems,
         delegatedItems,
       } = yield* Effect.gen(function* () {
@@ -990,6 +1048,9 @@ it.live("settles the work a restarted run inherited when its replacement never o
           nativeChildStreaming: (yield* orchestrator.getThreadProjection(
             providerNativeChildThreadId(threadId),
           )).messages.some((message) => message.streaming),
+          nativeChildRequests: (yield* orchestrator.getThreadProjection(
+            providerNativeChildThreadId(threadId),
+          )).runtimeRequests.map((request) => request.status),
           nativeGrandchildItems: openItems(
             yield* orchestrator.getThreadProjection(
               providerNativeChildThreadId(providerNativeChildThreadId(threadId)),
@@ -1025,10 +1086,12 @@ it.live("settles the work a restarted run inherited when its replacement never o
       // The provider-native subagent's own thread ends with the run, and so does
       // the thread of a nested subagent whose row already settled.
       assert.deepEqual(nativeChildItems, [
+        ["approval_request", "cancelled"],
         ["subagent", "completed"],
         ["command_execution", "cancelled"],
       ]);
       assert.isFalse(nativeChildStreaming);
+      assert.deepEqual(nativeChildRequests, ["cancelled"]);
       assert.deepEqual(nativeGrandchildItems, [["command_execution", "cancelled"]]);
       // The delegated task and its thread keep running.
       assert.deepEqual(
