@@ -23,8 +23,11 @@ struct UsagePresentationTests {
         let daySegments = presentation.costSegments.filter { $0.period == day }
         #expect(presentation.costSegments.count == 7 * UsageProviderKind.allCases.count)
         #expect(daySegments.map(\.provider) == UsageProviderKind.allCases)
-        #expect(daySegments.map { ($0.start, $0.end) }.map { [$0.0, $0.1] } == [[0, 2], [2, 5], [5, 5]])
-        #expect(presentation.tokenSegments.filter { $0.period == day }.map(\.end) == [300, 400, 400])
+        let trailingProviderCount = UsageProviderKind.allCases.count - 2
+        #expect(daySegments.map { ($0.start, $0.end) }.map { [$0.0, $0.1] }
+            == [[0, 2], [2, 5]] + Array(repeating: [5, 5], count: trailingProviderCount))
+        #expect(presentation.tokenSegments.filter { $0.period == day }.map(\.end)
+            == [300, 400] + Array(repeating: 400, count: trailingProviderCount))
         #expect(presentation.providersByCost.map(\.provider) == [.claude, .codex])
         #expect(presentation.providersByTokens.map(\.provider) == [.codex, .claude])
         #expect(presentation.periods.map(\.id) == [day])

@@ -25,13 +25,13 @@ struct FeaturePastedTextTests {
             advertisedMaximum: nil, attachmentCount: 0, pendingCount: 0
         ) == nil)
         #expect(FeaturePastedText.maximumAttachmentBytes(
-            advertisedMaximum: 100, attachmentCount: 5, pendingCount: 3
+            advertisedMaximum: 100, attachmentCount: FeatureImageAttachmentLimits.maximumCount - 3, pendingCount: 3
         ) == nil)
         #expect(FeaturePastedText.maximumAttachmentBytes(
             advertisedMaximum: 0, attachmentCount: 0, pendingCount: 0
         ) == nil)
         #expect(FeaturePastedText.maximumAttachmentBytes(
-            advertisedMaximum: 100, attachmentCount: 5, pendingCount: 2
+            advertisedMaximum: 100, attachmentCount: FeatureImageAttachmentLimits.maximumCount - 3, pendingCount: 2
         ) == 100)
         #expect(FeaturePastedText.maximumAttachmentBytes(
             advertisedMaximum: Int.max, attachmentCount: 0, pendingCount: 0
