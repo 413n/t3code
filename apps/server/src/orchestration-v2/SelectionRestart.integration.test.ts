@@ -179,6 +179,8 @@ function openTurnWork(
         runId: input.runId,
         nodeId: input.rootNodeId,
         role: "assistant",
+        createdBy: "agent",
+        creationSource: "provider",
         text: "Working on it",
         attachments: [],
         streaming: true,
@@ -760,8 +762,8 @@ it.live("settles the work a restarted run inherited when its replacement never o
             : [],
         ),
         [
-          ["approval_request", "failed"],
-          ["command_execution", "failed"],
+          ["approval_request", "cancelled"],
+          ["command_execution", "cancelled"],
         ],
       );
     }),
