@@ -38,6 +38,8 @@ import { checkpointWorkspace } from "./testkit/ReplayFixtureWorkspace.ts";
 const driver = ProviderDriverKind.make("codex");
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "test-model" };
+const taskA = NodeId.make("task:a");
+const taskB = NodeId.make("task:b");
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))),
 );
@@ -210,25 +212,36 @@ for (const resultRead of [false, true]) {
                 yield* Fiber.join(completed);
               });
             // The continuation worker runs on its own fiber, so drain the effect
-            // worker and yield to it until nothing new starts. A wake that never
-            // starts then fails the assertion with the stranded cohort state.
-            const nextWake = (startedCount: number) =>
+            // worker and yield to it until a wake starts. When none does, the
+            // assertions show the delivery reservation left behind.
+            const nextWake = (
+              startedCount: number,
+              expected: { readonly taskIds: ReadonlyArray<NodeId> },
+            ) =>
               Effect.gen(function* () {
                 for (let attempt = 0; attempt < 200 && started.length === startedCount; attempt++) {
                   yield* worker.drain();
                   if (started.length === startedCount) yield* yieldToRuntime;
                 }
-                const projection = yield* orchestrator.getThreadProjection(threadId);
-                assert.equal(
-                  started.length,
-                  startedCount + 1,
-                  `no wake started: delivery=${JSON.stringify(
-                    projection.runs[0]?.delegatedCompletion?.delivery,
-                  )} tasks=${JSON.stringify(
-                    projection.subagents.map((row) => [row.id, row.completionDelivery?.state]),
-                  )}`,
-                );
-                return started[startedCount]!;
+                if (started.length === startedCount) {
+                  const projection = yield* orchestrator.getThreadProjection(threadId);
+                  assert.deepEqual(
+                    projection.runs[0]?.delegatedCompletion?.delivery?.taskIds,
+                    expected.taskIds,
+                    "no wake started for the reserved delivery",
+                  );
+                  assert.fail("no wake started for the reserved delivery");
+                }
+                const wake = started[startedCount]!;
+                assert.equal(started.length, startedCount + 1);
+                for (const taskId of [taskA, taskB]) {
+                  if (expected.taskIds.includes(taskId)) {
+                    assert.include(wake.message.text, String(taskId));
+                  } else {
+                    assert.notInclude(wake.message.text, String(taskId));
+                  }
+                }
+                return wake;
               });
 
             yield* orchestrator.dispatch({
@@ -265,8 +278,6 @@ for (const resultRead of [false, true]) {
             const parent = started[0]!;
 
             const steerMessageId = MessageId.make("message:delegated-steer");
-            const taskA = NodeId.make("task:a");
-            const taskB = NodeId.make("task:b");
             const projection = yield* orchestrator.getThreadProjection(threadId);
             const parentRun = projection.runs.find((run) => run.id === parent.runId)!;
             const now = yield* DateTime.now;
@@ -365,15 +376,11 @@ for (const resultRead of [false, true]) {
 
             yield* settle(parent.runId, parent.runOrdinal);
             if (!resultRead) {
-              const wakeA = yield* nextWake(1);
+              const wakeA = yield* nextWake(1, { taskIds: [taskA] });
               assert.equal(wakeA.message.messageId, steerMessageId);
-              assert.include(wakeA.message.text, String(taskA));
-              assert.notInclude(wakeA.message.text, String(taskB));
               yield* settle(wakeA.runId, wakeA.runOrdinal);
             }
-            const wakeB = yield* nextWake(resultRead ? 1 : 2);
-            assert.include(wakeB.message.text, String(taskB));
-            assert.notInclude(wakeB.message.text, String(taskA));
+            const wakeB = yield* nextWake(resultRead ? 1 : 2, { taskIds: [taskB] });
             yield* settle(wakeB.runId, wakeB.runOrdinal);
 
             const final = yield* orchestrator.getThreadProjection(threadId);
