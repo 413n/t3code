@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-10-02T19:45:00Z",
+  "updatedAt": "2026-10-02T20:06:05Z",
   "compatibility": [
     {
       "driver": "codex",
@@ -80,7 +80,7 @@
     },
     {
       "driver": "kiro",
-      "t3CodeRange": ">=0.0.42",
+      "t3CodeRange": ">=0.0.46",
       "recommendedRange": ">=2.27.0",
       "ranges": [{ "range": ">=2.27.0", "status": "supported" }]
     },
