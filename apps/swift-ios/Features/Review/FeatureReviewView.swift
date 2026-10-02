@@ -12,6 +12,7 @@ public struct FeatureReviewView: View {
     @State private var review: FeatureReview?
     @State private var isLoading = true
     @State private var errorMessage: String?
+    @State private var loadGeneration = FeatureAsyncGeneration()
 
     public init(
         client: any FeatureClient,
@@ -60,6 +61,14 @@ public struct FeatureReviewView: View {
 
     private func reviewList(_ review: FeatureReview) -> some View {
         List {
+            if let errorMessage {
+                Section {
+                    FeatureRefreshFailureRow(message: errorMessage) {
+                        Task { await load() }
+                    }
+                }
+            }
+
             Section {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
@@ -112,12 +121,20 @@ public struct FeatureReviewView: View {
     }
 
     private func load() async {
+        let generation = loadGeneration.begin()
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            if loadGeneration.accepts(generation) { isLoading = false }
+        }
         do {
-            review = try await client.loadReview(threadID: threadID)
+            let loaded = try await client.loadReview(threadID: threadID)
+            guard loadGeneration.accepts(generation) else { return }
+            review = loaded
             errorMessage = nil
+        } catch is CancellationError {
+            return
         } catch {
+            guard loadGeneration.accepts(generation) else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -204,8 +221,7 @@ private struct FeatureDiffView: View {
     let file: FeatureReviewFile
     let sendMessage: (FeatureMessageSubmission) async -> Bool
 
-    @State private var renderedLines: [FeatureDiffLine]
-    @State private var isHydrating = false
+    @State private var hydration: FeatureDiffHydration
     @State private var selectedLine: FeatureReviewLineSelection?
     @State private var isCommenting = false
     @State private var comment = ""
@@ -223,15 +239,24 @@ private struct FeatureDiffView: View {
         self.threadID = threadID
         self.file = file
         self.sendMessage = sendMessage
-        _renderedLines = State(initialValue: file.lines)
+        _hydration = State(initialValue: FeatureDiffHydration(lines: file.lines))
     }
 
     var body: some View {
         Group {
-            if renderedLines.isEmpty, isHydrating {
+            if hydration.lines.isEmpty, hydration.isLoading {
                 ProgressView("Loading full diff…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if renderedLines.isEmpty {
+            } else if let hydrationError = hydration.errorMessage, hydration.lines.isEmpty {
+                ContentUnavailableView {
+                    Label("Couldn’t load this diff", systemImage: "exclamationmark.circle")
+                } description: {
+                    Text(hydrationError)
+                } actions: {
+                    Button("Try again") { Task { await hydrate() } }
+                        .buttonStyle(.borderedProminent)
+                }
+            } else if hydration.lines.isEmpty {
                 ContentUnavailableView(
                     file.change == .binary ? "Binary file" : "Diff unavailable",
                     systemImage: file.change == .binary ? "doc.richtext" : "doc.text.magnifyingglass",
@@ -241,7 +266,7 @@ private struct FeatureDiffView: View {
                 GeometryReader { proxy in
                     ScrollView([.horizontal, .vertical]) {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(renderedLines) { line in
+                            ForEach(hydration.lines) { line in
                                 FeatureDiffLineRow(
                                     line: line,
                                     isSelected: selection(for: line) == selectedLine,
@@ -276,6 +301,16 @@ private struct FeatureDiffView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if isCommenting {
                 commentComposer
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let hydrationError = hydration.errorMessage, !hydration.lines.isEmpty {
+                FeatureRefreshFailureRow(message: hydrationError) {
+                    Task { await hydrate() }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(T3Colors.surface)
             }
         }
         .task(id: file.id) { await hydrate() }
@@ -409,20 +444,23 @@ private struct FeatureDiffView: View {
     }
 
     private func hydrate() async {
-        isHydrating = true
-        defer { isHydrating = false }
-        guard let contents = try? await client.loadReviewFileContents(
-            threadID: threadID,
-            file: file
-        ) else {
-            return
+        let attempt = hydration.begin()
+        do {
+            let contents = try await client.loadReviewFileContents(threadID: threadID, file: file)
+            hydration.succeed(
+                attempt,
+                lines: contents.map { FeatureFullDiffHydrator.lines(for: file, contents: $0) }
+            )
+        } catch is CancellationError {
+            hydration.cancel(attempt)
+        } catch {
+            hydration.fail(attempt, message: error.localizedDescription)
         }
-        renderedLines = FeatureFullDiffHydrator.lines(for: file, contents: contents)
     }
 
     private func sendComment() {
         guard !trimmedComment.isEmpty, !isSending else { return }
-        let record = reviewDraft.contextRecord(lines: renderedLines)
+        let record = reviewDraft.contextRecord(lines: hydration.lines)
         let prompt = reviewDraft.submissionText(contextRecord: record)
         isSending = true
         commentError = nil
