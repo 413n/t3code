@@ -2422,6 +2422,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           event.type === "unreadable.execution.started"
         ) {
           busy.add(sessionId);
+          // A session runs one execution at a time, each opening with `started`
+          // on this ordered stream, so the run `unsettled` waits on is over: an
+          // end not seen by now was lost with a dropped stream, and the next
+          // end is this execution's own.
+          const state = threads.get(sessionId);
+          if (state !== undefined) state.unsettled = false;
         } else if (event.type === "unreadable.execution.ended" || executionEnd(event.type)) {
           busy.delete(sessionId);
         }
