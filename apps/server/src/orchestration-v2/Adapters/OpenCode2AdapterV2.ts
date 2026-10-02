@@ -314,6 +314,11 @@ interface Wake {
   readonly after: string | undefined;
   /** The first report it delivered, where fork and rollback cut before its turn. */
   readonly first: string | undefined;
+  /**
+   * Subagent sessions OpenCode announced while it was held: their calls are
+   * in its events, so only its replay names them.
+   */
+  readonly children: Set<string>;
 }
 
 interface OpenBlock {
@@ -2323,6 +2328,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         dropped: false,
         after: delivered.at(-1)?.inboxId,
         first: delivered[0]?.inboxId,
+        children: new Set(),
       };
       state.wakes.push(wake);
       yield* Effect.logInfo("OpenCode started a turn on its own; asking for a continuation.", {
@@ -2442,6 +2448,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         if (owner !== undefined) {
           childOwners.set(event.data.sessionID, owner);
           announced.set(event.data.sessionID, event.data);
+          holderOf(event.data.parentID)?.wakes.at(-1)?.children.add(event.data.sessionID);
         }
         return;
       }
@@ -2747,7 +2754,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }
         // A subagent's session holds reports of its own background subagents.
         for (const session of sessionsOf(state)) {
-          for (const wake of session.wakes.splice(0)) wake.dropped = true;
+          yield* discardWakes(session.wakes.splice(0));
           session.reports.clear();
         }
       }
@@ -3323,6 +3330,34 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     /**
+     * Drops held executions no turn will take. The subagents one started are
+     * named only by its replay, so they are forgotten (their requests no
+     * longer reach the thread) and stopped. A subagent that registered its own
+     * call outside the held execution is the thread's, and is left alone.
+     */
+    const discardWakes = Effect.fnUntraced(function* (wakes: ReadonlyArray<Wake>) {
+      const orphans: Array<string> = [];
+      for (const wake of wakes) {
+        wake.dropped = true;
+        for (const childId of wake.children) {
+          if (!announced.has(childId)) continue;
+          announced.delete(childId);
+          childOwners.delete(childId);
+          orphans.push(childId);
+        }
+      }
+      for (const childId of orphans) {
+        yield* client.session
+          .interrupt({ sessionID: Session.ID.make(childId) })
+          .pipe(
+            Effect.catchTags({ SessionNotFoundError: () => Effect.void }),
+            Effect.timeout(INTERRUPT_TIMEOUT),
+            Effect.ignore({ log: true }),
+          );
+      }
+    });
+
+    /**
      * A user turn that starts while OpenCode runs an execution on its own: the
      * prompt joins that execution, so the turn takes it, and its continuation
      * turn is no longer needed. Executions that already ended stay for theirs.
@@ -3353,7 +3388,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             (held) => held.messageId === turnInput.message.messageId,
           );
           if (index < 0) return yield* finishTurn(state, { status: "completed" });
-          for (const skipped of state.wakes.splice(0, index)) skipped.dropped = true;
+          yield* discardWakes(state.wakes.splice(0, index));
           const wake = state.wakes.shift()!;
           const turn = state.active;
           if (turn !== undefined && wake.after !== undefined) turn.before = wake.after;
@@ -3441,7 +3476,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           }
           // A held wake no turn will take: its execution is stopped, not replayed.
           const running = state.wakes.some((wake) => wake.running);
-          for (const wake of state.wakes.splice(0)) wake.dropped = true;
+          yield* discardWakes(state.wakes.splice(0));
           if (running) {
             state.unsettled = true;
             yield* client.session

@@ -3757,6 +3757,144 @@ describe("OpenCode2 adapter", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("keeps a subagent a stopped background reply started off the next turn", () =>
+    Effect.gen(function* () {
+      const CHILD_B = "ses_f1485c529ffeBBBBBBBBBBBBBB";
+      const SPAWNED = "ses_f1485c529ffeDDDDDDDDDDDDDD";
+      const toolB = { sessionID: SESSION, assistantMessageID: "msg_assistant", id: "call-b" };
+      const spawn = { sessionID: SESSION, assistantMessageID: "msg_reply", id: "call-spawn" };
+      const offers: Array<ProviderContinuationRequest> = [];
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        // The same turn starts a second background subagent, which runs on.
+        event("session.tool.input.started", { ...toolB, name: "subagent" }),
+        event("session.tool.called", {
+          ...toolB,
+          name: "subagent",
+          input: { description: "Sleep", prompt: "sleep", background: true },
+          executed: false,
+        }),
+        event("session.created", { ...childCreated(CHILD_B), sessionID: CHILD_B }),
+        event("session.tool.progress", {
+          ...toolB,
+          metadata: { sessionID: CHILD_B, status: "running" },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        event("session.execution.started", { sessionID: CHILD_B }),
+        // The first subagent's report wakes the parent into a reply T3 holds
+        // for its continuation.
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        event("session.inbox.enqueued", {
+          inboxID: "msg_report",
+          sessionID: SESSION,
+          item: {
+            type: "synthetic",
+            payload: {
+              text: `<subagent sessionID="${CHILD}" state="completed" description="Sleep">\nCHILD_OK\n</subagent>`,
+              description: "Sleep",
+              metadata: {
+                source: "subagent",
+                childID: CHILD,
+                agent: "General",
+                state: "completed",
+              },
+            },
+            delivery: "steer",
+          },
+        }),
+        event("session.execution.started", { sessionID: SESSION }),
+        // The reply starts a background subagent of its own, named only by
+        // the reply's held events.
+        event("session.tool.input.started", { ...spawn, name: "subagent" }),
+        event("session.tool.called", {
+          ...spawn,
+          name: "subagent",
+          input: { description: "Sleep", prompt: "sleep", background: true },
+          executed: false,
+        }),
+        event("session.created", { ...childCreated(SPAWNED), sessionID: SPAWNED }),
+        event("session.tool.progress", {
+          ...spawn,
+          metadata: { sessionID: SPAWNED, status: "running" },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        // The second subagent's text, shown live, marks that the reply has ended.
+        event("session.text.ended", {
+          sessionID: CHILD_B,
+          assistantMessageID: "msg_child_b",
+          ordinal: 0,
+          text: "B_WORKING",
+        }),
+        // The user's Stop stops the second subagent and drops the held reply.
+        out("session.interrupt", { sessionID: CHILD_B }),
+        reply("session.interrupt", { interrupted: true }),
+        // The subagent only the dropped reply named is stopped too; that Stop
+        // fails, so it runs on.
+        out("session.interrupt", { sessionID: SPAWNED }),
+        reply("session.interrupt", {
+          status: 500,
+          body: { _tag: "UnknownError", message: "interrupt failed" },
+        }),
+        // An unrelated prompt runs while that subagent asks for a permission.
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.started", { sessionID: SESSION }),
+        event("permission.asked", { ...shellAsk.data, id: "per_spawned", sessionID: SPAWNED }),
+        event("session.text.ended", {
+          sessionID: SESSION,
+          assistantMessageID: "msg_unrelated",
+          ordinal: 0,
+          text: "UNRELATED",
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]).pipe(
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: (request) => Effect.sync(() => void offers.push(request)),
+          take: Effect.never,
+        }),
+      );
+      const collected: Array<ProviderAdapterV2Event> = [];
+      const replyEnded = yield* Deferred.make<void>();
+      const bothEnded = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.tap((event) =>
+          Effect.gen(function* () {
+            collected.push(event);
+            if (event.type === "turn_item.updated" && event.turnItem.type === "assistant_message") {
+              if (event.turnItem.text === "B_WORKING")
+                yield* Deferred.succeed(replyEnded, undefined);
+            }
+            if (collected.filter((entry) => entry.type === "turn.terminal").length === 2) {
+              yield* Deferred.succeed(bothEnded, undefined);
+            }
+          }),
+        ),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      yield* Deferred.await(replyEnded);
+      assert.lengthOf(offers, 1);
+      // The user stops the thread before the reply's continuation runs.
+      yield* runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId: yield* providerTurnId,
+        requestRuntimeRestart: true,
+      });
+      yield* runtime.startTurn({ ...secondTurn(thread), appThread: withLineage(thread).appThread });
+      yield* Deferred.await(bothEnded);
+      // The unrelated turn shows no request it never made.
+      assert.deepEqual(
+        collected.flatMap((event) =>
+          event.type === "runtime_request.updated"
+            ? [`${event.runtimeRequest.nativeRequestRef?.nativeId}:${event.runtimeRequest.status}`]
+            : [],
+        ),
+        [],
+      );
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("replays only its own background reply into a continuation turn", () =>
     Effect.gen(function* () {
       const CHILD_B = "ses_f1485c529ffeBBBBBBBBBBBBBB";
