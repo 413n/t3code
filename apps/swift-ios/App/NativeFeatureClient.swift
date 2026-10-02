@@ -4689,7 +4689,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 scheduleDetailRefresh(threadID: route.uiID, client: route.client, force: true)
                 return
             }
-            let reduction = NativeThreadDetailReducer.apply(event, to: current)
+            let reduction = NativeThreadDetailReducer.apply(
+                event, to: current, afterSequence: activeThreadSequence ?? 0
+            )
             if reduction.sequence < 0 {
                 threadHistoryEpoch &+= 1
                 detailSnapshotRequiredAfterEpoch = threadHistoryEpoch
@@ -7768,7 +7770,8 @@ struct NativeThreadDetailReduction: Equatable {
 enum NativeThreadDetailReducer {
     static func apply(
         _ event: JSONValue,
-        to thread: OrchestrationThread
+        to thread: OrchestrationThread,
+        afterSequence: Int? = nil
     ) -> NativeThreadDetailReduction {
         guard case let .object(object) = event,
               let type = object["type"]?.stringValue,
@@ -7780,6 +7783,13 @@ enum NativeThreadDetailReducer {
                 sequence: -1,
                 result: .refresh,
                 renderMutation: .full
+            )
+        }
+
+        // Validate ownership and the common envelope before skipping replayed events.
+        if let afterSequence, sequence >= 0, sequence <= afterSequence {
+            return NativeThreadDetailReduction(
+                sequence: sequence, result: .unchanged, renderMutation: .none
             )
         }
 
