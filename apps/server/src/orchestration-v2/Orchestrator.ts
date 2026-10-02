@@ -8892,6 +8892,113 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     });
 
+  /**
+   * A provider can reject every steer retry before its terminal event reaches
+   * the projection, leaving a delegated delivery reserved as a steer on a run
+   * that has since settled. Nothing else offers it again, and it blocks later
+   * siblings. Offer it as a wake; when the run already read every result in
+   * it, release it and reserve the pending siblings instead. A rolled-back
+   * run's deliveries stay discarded.
+   */
+  const recoverSettledDelegatedSteers = (threadId: ThreadId, settledRun: OrchestrationV2Run) =>
+    Effect.gen(function* () {
+      if (settledRun.status === "rolled_back") return;
+      const { messages } = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+        messageRunIds: [settledRun.id],
+        messageRoles: ["user"],
+      });
+      const steers = messages.filter(
+        (message) =>
+          message.delegatedCompletion !== undefined && message.id !== settledRun.userMessageId,
+      );
+      if (steers.length === 0) return;
+      const projection = yield* projectionStore.getThreadRecords(threadId, ["runs", "subagents"]);
+      for (const steer of steers) {
+        const ownership = steer.delegatedCompletion!;
+        const parentRun = projection.runs.find((run) => run.id === ownership.parentRunId);
+        const cohort = parentRun?.delegatedCompletion;
+        const delivery = cohort?.delivery;
+        if (
+          parentRun === undefined ||
+          parentRun.status === "rolled_back" ||
+          cohort?.disposition !== "open" ||
+          delivery == null ||
+          delivery.messageId !== steer.id ||
+          delivery.generation !== ownership.generation
+        ) {
+          continue;
+        }
+        if (delivery.taskIds.length > 0) {
+          yield* offerDelegatedCompletionDelivery(threadId, parentRun.id);
+          continue;
+        }
+        const parentIsLive = hasLiveRun(projection);
+        const pendingTasks =
+          projection.thread.archivedAt === null && projection.thread.deletedAt === null
+            ? projection.subagents.filter(
+                (task) =>
+                  task.origin === "app_owned" &&
+                  task.runId === parentRun.id &&
+                  task.completionDelivery?.state === "pending" &&
+                  isTerminalDelegatedTaskStatus(task.status) &&
+                  (!parentIsLive || task.completionWake === "always"),
+              )
+            : [];
+        const nextDelivery =
+          pendingTasks.length === 0
+            ? null
+            : {
+                generation: cohort.nextGeneration,
+                messageId: yield* mapDelegatedCompletionError(
+                  idAllocator.allocate.message({
+                    threadId,
+                    ordinal:
+                      (yield* mapDelegatedCompletionError(
+                        projectionStore.getMessageCount(threadId),
+                      )) + 1,
+                  }),
+                ),
+                taskIds: pendingTasks.map((task) => task.id),
+              };
+        const now = yield* DateTime.now;
+        yield* writeSystemEvents([
+          ...pendingTasks.map((task) => ({
+            type: "subagent.updated" as const,
+            threadId,
+            runId: parentRun.id,
+            nodeId: task.id,
+            driver: task.driver,
+            providerInstanceId: task.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              ...task,
+              completionDelivery: { state: "claimed" as const, observedByRunId: null },
+              updatedAt: now,
+            },
+          })),
+          {
+            type: "run.updated",
+            threadId,
+            runId: parentRun.id,
+            ...(parentRun.rootNodeId === null ? {} : { nodeId: parentRun.rootNodeId }),
+            providerInstanceId: parentRun.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              ...parentRun,
+              delegatedCompletion: {
+                ...cohort,
+                nextGeneration: cohort.nextGeneration + (nextDelivery === null ? 0 : 1),
+                delivery: nextDelivery,
+              },
+            },
+          },
+        ]);
+        if (nextDelivery !== null) {
+          yield* offerDelegatedCompletionDelivery(threadId, parentRun.id);
+        }
+      }
+    });
+
   const dispatchNotificationAccepted = Effect.fn("orchestrationV2.notificationAccepted")(function* (
     command: Extract<OrchestrationV2Command, { type: "notification.delivery.accept" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -9485,6 +9592,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : undefined,
         ),
       );
+      if (stored.event.type === "run.updated") {
+        yield* threadDispatch.withLock(
+          threadId,
+          recoverSettledDelegatedSteers(threadId, stored.event.payload),
+        );
+      }
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("Failed to react to terminal V2 run", {
