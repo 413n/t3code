@@ -4,6 +4,8 @@ import {
   EventId,
   MessageId,
   type ModelSelection,
+  NodeId,
+  type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
@@ -14,7 +16,9 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   type RunId,
+  RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -86,6 +90,116 @@ interface RestartAdapterState {
   }>;
   readonly closedSessionCount: number;
   readonly failedReplacementOpen: boolean;
+  /** Every replacement open fails, not just the first. */
+  readonly replacementOpenAlwaysFails?: boolean;
+  /** The first turn leaves an approval, a streaming reply and a background command open. */
+  readonly firstTurnLeavesWorkOpen?: boolean;
+}
+
+// Work a turn leaves open when it is superseded: an approval it is waiting on,
+// a reply still streaming, and a background command.
+function openTurnWork(
+  providerSessionId: ProviderSessionId,
+  active: ActiveTurn,
+  now: DateTime.Utc,
+): ReadonlyArray<ProviderAdapterV2Event> {
+  const { input, providerTurnId } = active;
+  const base = {
+    threadId: input.threadId,
+    runId: input.runId,
+    providerThreadId: input.providerThread.id,
+    providerTurnId,
+    nativeItemRef: null,
+    parentItemId: null,
+    title: null,
+    startedAt: now,
+    completedAt: null,
+    updatedAt: now,
+  };
+  const approvalNodeId = NodeId.make(`node:approval:${input.attemptId}`);
+  const requestId = RuntimeRequestId.make(`request:approval:${input.attemptId}`);
+  return [
+    {
+      type: "node.updated",
+      driver,
+      node: {
+        id: approvalNodeId,
+        threadId: input.threadId,
+        runId: input.runId,
+        parentNodeId: input.rootNodeId,
+        rootNodeId: input.rootNodeId,
+        kind: "approval_request",
+        status: "waiting",
+        countsForRun: false,
+        providerThreadId: input.providerThread.id,
+        providerTurnId,
+        nativeItemRef: null,
+        runtimeRequestId: requestId,
+        checkpointScopeId: null,
+        startedAt: now,
+        completedAt: null,
+      },
+    },
+    {
+      type: "runtime_request.updated",
+      driver,
+      threadId: input.threadId,
+      runtimeRequest: {
+        id: requestId,
+        nodeId: approvalNodeId,
+        providerTurnId,
+        nativeRequestRef: null,
+        kind: "command",
+        status: "pending",
+        responseCapability: { type: "live", providerSessionId },
+        createdAt: now,
+        resolvedAt: null,
+      },
+    },
+    {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: TurnItemId.make(`turn-item:approval:${input.attemptId}`),
+        nodeId: approvalNodeId,
+        ordinal: 1,
+        status: "waiting",
+        type: "approval_request",
+        requestId,
+        requestKind: "command",
+      },
+    },
+    {
+      type: "message.updated",
+      driver,
+      message: {
+        id: MessageId.make(`message:reply:${input.attemptId}`),
+        threadId: input.threadId,
+        runId: input.runId,
+        nodeId: input.rootNodeId,
+        role: "assistant",
+        text: "Working on it",
+        attachments: [],
+        streaming: true,
+        createdAt: now,
+        updatedAt: now,
+      },
+    },
+    {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: TurnItemId.make(`turn-item:command:${input.attemptId}`),
+        nodeId: input.rootNodeId,
+        ordinal: 2,
+        status: "running",
+        type: "command_execution",
+        input: "npm run dev",
+      },
+    },
+  ];
 }
 
 function makeRestartAdapter(
@@ -108,7 +222,7 @@ function makeRestartAdapter(
         const failThisOpen = yield* Ref.modify(state, (current) => {
           const shouldFail =
             sessionInput.modelSelection.model === replacementSelection.model &&
-            !current.failedReplacementOpen;
+            (current.replacementOpenAlwaysFails === true || !current.failedReplacementOpen);
           return [
             shouldFail,
             {
@@ -258,6 +372,15 @@ function makeRestartAdapter(
                     completedAt: null,
                   },
                 });
+                if ((yield* Ref.get(state)).firstTurnLeavesWorkOpen === true) {
+                  for (const event of openTurnWork(
+                    sessionInput.providerSessionId,
+                    active,
+                    occurredAt,
+                  )) {
+                    yield* Queue.offer(events, event);
+                  }
+                }
                 return;
               }
               yield* publishTerminal(active, "completed");
@@ -532,6 +655,114 @@ it.live("restarts selection as a new attempt and retries after old-session clean
         projection.providerThreads[0]?.providerSessionId,
         projection.providerSessions.find((session) => session.model === replacementSelection.model)
           ?.id,
+      );
+    }),
+  ),
+);
+
+// A restart only replaces the root turn: the request, reply and command the
+// superseded attempt left open become the restarted run's to settle. When the
+// replacement never starts, failing the run must end them too, or the thread
+// waits on work nothing is running.
+it.live("settles the work a restarted run inherited when its replacement never opens", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = "selection-restart-failed-start";
+      const cwd = yield* checkpointWorkspace(name);
+      const threadId = ThreadId.make(`thread:${name}`);
+      const state = yield* Ref.make<RestartAdapterState>({
+        activeTurn: null,
+        opened: [],
+        started: [],
+        closedSessionCount: 0,
+        failedReplacementOpen: false,
+        replacementOpenAlwaysFails: true,
+        firstTurnLeavesWorkOpen: true,
+      });
+      const registry = ProviderAdapterRegistry.makeSingleLayer(makeRestartAdapter(state));
+
+      const projection = yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const awaitDomainEvent = (matches: (event: OrchestrationV2DomainEvent) => boolean) =>
+          orchestrator.streamDomainEvents.pipe(
+            Stream.filter(matches),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${name}:create`),
+          threadId,
+          projectId: ProjectId.make(`project:${name}`),
+          title: name,
+          modelSelection: initialSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: cwd,
+        });
+        // The command item is the last open work the first turn reports.
+        const workOpen = yield* awaitDomainEvent(
+          (event) =>
+            event.type === "turn-item.updated" && event.payload.type === "command_execution",
+        );
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${name}:first`),
+          threadId,
+          messageId: MessageId.make(`${name}:first`),
+          text: "first",
+          attachments: [],
+          modelSelection: initialSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        yield* Fiber.join(workOpen);
+        const runId = (yield* orchestrator.getThreadProjection(threadId)).runs[0]?.id;
+        if (runId === undefined) return yield* Effect.die("the first run is missing");
+
+        const runFailed = yield* awaitDomainEvent(
+          (event) => event.type === "run.updated" && event.payload.status === "failed",
+        );
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${name}:second`),
+          threadId,
+          messageId: MessageId.make(`${name}:second`),
+          text: "second",
+          attachments: [],
+          modelSelection: replacementSelection,
+          dispatchMode: { type: "restart_active", targetRunId: runId },
+        });
+        yield* Fiber.join(runFailed);
+        return yield* orchestrator.getThreadProjection(threadId);
+      }).pipe(Effect.provide(makeOrchestratorV2ReplayLayerWithRegistry({ name }, registry)));
+
+      assert.deepEqual(
+        projection.runs.map((run) => run.status),
+        ["failed"],
+      );
+      assert.deepEqual(
+        projection.runtimeRequests.map((request) => request.status),
+        ["cancelled"],
+      );
+      assert.isFalse(projection.messages.some((message) => message.streaming));
+      assert.deepEqual(
+        projection.turnItems.flatMap((item) =>
+          item.type === "approval_request" || item.type === "command_execution"
+            ? [[item.type, item.status]]
+            : [],
+        ),
+        [
+          ["approval_request", "failed"],
+          ["command_execution", "failed"],
+        ],
       );
     }),
   ),
