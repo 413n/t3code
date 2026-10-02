@@ -188,20 +188,27 @@ export const layer: Layer.Layer<
       "orchestrationV2.providerTurnStart.inheritedWorkSettlement",
     )(function* (input: { readonly run: OrchestrationV2Run; readonly now: DateTime.Utc }) {
       const { run } = input;
-      // Lifetime links: a subagent row can settle before its child thread does.
-      const links = yield* projectionStore.getThreadRecords(
-        run.threadId,
-        ["subagents", "turnItems"],
-        { turnItemRunIds: [run.id], turnItemTypes: ["subagent"] },
-      );
-      const pending = [...links.subagents, ...links.turnItems].flatMap((row) =>
-        row.runId === run.id &&
-        "childThreadId" in row &&
-        row.childThreadId !== null &&
-        row.origin === "provider_native"
-          ? [row.childThreadId]
-          : [],
-      );
+      // Lifetime links, settled rows included: a subagent row can settle before
+      // its child thread does. App-owned tasks (delegate_task) run on their own.
+      const nativeLinks = (threadId: ThreadId) =>
+        projectionStore
+          .getThreadRecords(threadId, ["subagents", "turnItems"], {
+            turnItemTypes: ["subagent"],
+            ...(threadId === run.threadId ? { turnItemRunIds: [run.id] } : {}),
+          })
+          .pipe(
+            Effect.map((records) =>
+              [...records.subagents, ...records.turnItems].flatMap((row) =>
+                (threadId !== run.threadId || row.runId === run.id) &&
+                "childThreadId" in row &&
+                row.childThreadId !== null &&
+                row.origin === "provider_native"
+                  ? [row.childThreadId]
+                  : [],
+              ),
+            ),
+          );
+      const pending = [...(yield* nativeLinks(run.threadId))];
       const linkedChildThreadIds = new Set<ThreadId>();
       const threads = [yield* projectionStore.getRuntimeRecoveryProjection(run.threadId)];
       for (let threadId = pending.shift(); threadId !== undefined; threadId = pending.shift()) {
@@ -214,10 +221,13 @@ export const layer: Layer.Layer<
         );
         if (Option.isNone(child) || !isProviderNativeSubagentThread(child.value.thread)) continue;
         linkedChildThreadIds.add(threadId);
-        threads.push(child.value);
-        for (const row of [...child.value.subagents, ...child.value.turnItems]) {
-          if ("childThreadId" in row && row.childThreadId !== null) pending.push(row.childThreadId);
-        }
+        // A child thread has no runs, so the recovery read leaves out its
+        // streaming replies; read them by thread instead.
+        const { messages } = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+          messageRoles: ["assistant"],
+        });
+        threads.push({ ...child.value, messages: messages.filter((message) => message.streaming) });
+        pending.push(...(yield* nativeLinks(threadId)));
       }
       const linked = RunExecutionService.openRunOwnedWorkFromProjection({
         run,
@@ -421,6 +431,9 @@ export const layer: Layer.Layer<
             runId,
             activeAttemptId: attempt.id,
             expectedStatus: "starting",
+            // A user answer that lands while the failure is written wins over
+            // cancelling the request it answered.
+            guardPendingUserInputCancellations: true,
             events:
               status === "failed"
                 ? [...(yield* inheritedWorkSettlement({ run, now })), ...events]

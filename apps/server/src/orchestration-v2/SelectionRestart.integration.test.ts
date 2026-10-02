@@ -124,6 +124,7 @@ function openTurnWork(
   const approvalNodeId = NodeId.make(`node:approval:${input.attemptId}`);
   const subagentNodeId = NodeId.make(`node:subagent:${input.attemptId}`);
   const childThreadId = providerNativeChildThreadId(input.threadId);
+  const grandchildThreadId = providerNativeChildThreadId(childThreadId);
   const requestId = RuntimeRequestId.make(`request:approval:${input.attemptId}`);
   return [
     {
@@ -232,6 +233,83 @@ function openTurnWork(
         childThreadId,
         prompt: "Explore the repo",
         result: null,
+      },
+    },
+    {
+      type: "message.updated",
+      driver,
+      message: {
+        id: MessageId.make(`message:child-reply:${input.attemptId}`),
+        threadId: childThreadId,
+        runId: null,
+        nodeId: null,
+        role: "assistant",
+        createdBy: "agent",
+        creationSource: "provider",
+        text: "Looking",
+        attachments: [],
+        streaming: true,
+        createdAt: now,
+        updatedAt: now,
+      },
+    },
+    // The subagent's own subagent already reported done, but its thread is
+    // still running a command.
+    {
+      type: "app_thread.created",
+      driver,
+      appThread: {
+        ...input.appThread,
+        createdBy: "agent",
+        creationSource: "provider",
+        id: grandchildThreadId,
+        title: "Search",
+        activeProviderThreadId: null,
+        lineage: {
+          parentThreadId: childThreadId,
+          relationshipToParent: "subagent",
+          rootThreadId: input.threadId,
+        },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+    },
+    {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: TurnItemId.make(`turn-item:nested-subagent:${input.attemptId}`),
+        threadId: childThreadId,
+        runId: null,
+        nodeId: null,
+        ordinal: 2,
+        status: "completed",
+        completedAt: now,
+        type: "subagent",
+        subagentId: NodeId.make(`node:nested-subagent:${input.attemptId}`),
+        origin: "provider_native",
+        driver,
+        providerInstanceId: input.modelSelection.instanceId,
+        childThreadId: grandchildThreadId,
+        prompt: "Search for TODOs",
+        result: "done",
+      },
+    },
+    {
+      type: "turn_item.updated",
+      driver,
+      turnItem: {
+        ...base,
+        id: TurnItemId.make(`turn-item:grandchild-command:${input.attemptId}`),
+        threadId: grandchildThreadId,
+        runId: null,
+        nodeId: null,
+        ordinal: 1,
+        status: "running",
+        type: "command_execution",
+        input: "rg FIXME",
       },
     },
     {
@@ -744,7 +822,13 @@ it.live("settles the work a restarted run inherited when its replacement never o
       });
       const registry = ProviderAdapterRegistry.makeSingleLayer(makeRestartAdapter(state));
 
-      const { projection, nativeChildItems, delegatedItems } = yield* Effect.gen(function* () {
+      const {
+        projection,
+        nativeChildItems,
+        nativeChildStreaming,
+        nativeGrandchildItems,
+        delegatedItems,
+      } = yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const eventSink = yield* EventSink.EventSinkV2;
         const awaitDomainEvent = (matches: (event: OrchestrationV2DomainEvent) => boolean) =>
@@ -903,6 +987,14 @@ it.live("settles the work a restarted run inherited when its replacement never o
           nativeChildItems: openItems(
             yield* orchestrator.getThreadProjection(providerNativeChildThreadId(threadId)),
           ),
+          nativeChildStreaming: (yield* orchestrator.getThreadProjection(
+            providerNativeChildThreadId(threadId),
+          )).messages.some((message) => message.streaming),
+          nativeGrandchildItems: openItems(
+            yield* orchestrator.getThreadProjection(
+              providerNativeChildThreadId(providerNativeChildThreadId(threadId)),
+            ),
+          ),
           delegatedItems: openItems(yield* orchestrator.getThreadProjection(delegatedThreadId)),
         };
       }).pipe(Effect.provide(makeOrchestratorV2ReplayLayerWithRegistry({ name }, registry)));
@@ -930,8 +1022,14 @@ it.live("settles the work a restarted run inherited when its replacement never o
           ["command_execution", "cancelled"],
         ],
       );
-      // The provider-native subagent's own thread ends with the run.
-      assert.deepEqual(nativeChildItems, [["command_execution", "cancelled"]]);
+      // The provider-native subagent's own thread ends with the run, and so does
+      // the thread of a nested subagent whose row already settled.
+      assert.deepEqual(nativeChildItems, [
+        ["subagent", "completed"],
+        ["command_execution", "cancelled"],
+      ]);
+      assert.isFalse(nativeChildStreaming);
+      assert.deepEqual(nativeGrandchildItems, [["command_execution", "cancelled"]]);
       // The delegated task and its thread keep running.
       assert.deepEqual(
         projection.subagents.flatMap((subagent) =>
