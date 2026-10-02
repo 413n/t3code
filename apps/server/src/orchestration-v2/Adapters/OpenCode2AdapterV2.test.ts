@@ -48,6 +48,10 @@ import * as ProviderContinuationRequests from "../ProviderContinuationRequests.t
 import { OPENCODE_PROVIDER } from "./OpenCodeAdapterV2.ts";
 import { OPENCODE_2_STILL_STOPPING } from "./OpenCode2AdapterV2.ts";
 import { openCode2ReplayRuntime } from "./OpenCode2AdapterV2.testkit.ts";
+import {
+  makeProviderReplayGate,
+  type ProviderReplayGate,
+} from "../testkit/ProviderReplayGate.testkit.ts";
 
 const SESSION = "ses_f148ca2deffeJcwCnRQtb0YFNX";
 const WORK = "/work/opencode2";
@@ -64,12 +68,18 @@ const reply = (operation: string, data: unknown): ProviderReplayEntry => ({
   frame: { type: "sdk.response", operation, data },
 });
 const replyData = (operation: string, data: unknown) => reply(operation, { data });
-const event = (type: string, data: Record<string, unknown>): ProviderReplayEntry => ({
+const event = (
+  type: string,
+  data: Record<string, unknown>,
+  /** Holds the event until a test's replay gate releases this label. */
+  label?: string,
+): ProviderReplayEntry => ({
   type: "emit_inbound",
   frame: {
     type: "sdk.event",
     event: { id: `evt_${type.replaceAll(".", "")}0000`, created: 1, type, data, ...durable },
   },
+  ...(label === undefined ? {} : { label }),
 });
 const durable = { durable: { aggregateID: SESSION, seq: 1, version: 1 } };
 
@@ -313,7 +323,11 @@ const colorForm = {
  */
 const resumed = (
   entries: ReadonlyArray<ProviderReplayEntry>,
-  options?: { readonly external?: boolean; readonly supervised?: boolean },
+  options?: {
+    readonly external?: boolean;
+    readonly supervised?: boolean;
+    readonly replayGate?: ProviderReplayGate;
+  },
 ) =>
   Effect.gen(function* () {
     const runtime = yield* openCode2ReplayRuntime(
@@ -332,7 +346,10 @@ const resumed = (
           : []),
         ...entries,
       ]),
-      options?.external === undefined ? undefined : { external: options.external },
+      {
+        ...(options?.external === undefined ? {} : { external: options.external }),
+        ...(options?.replayGate === undefined ? {} : { replayGate: options.replayGate }),
+      },
     );
     const thread = yield* runtime.resumeThread({
       providerThread: providerThread(yield* DateTime.now),
@@ -3761,104 +3778,149 @@ describe("OpenCode2 adapter", () => {
     Effect.gen(function* () {
       const CHILD_B = "ses_f1485c529ffeBBBBBBBBBBBBBB";
       const SPAWNED = "ses_f1485c529ffeDDDDDDDDDDDDDD";
+      const NESTED = "ses_f1485c529ffeNNNNNNNNNNNNNN";
       const toolB = { sessionID: SESSION, assistantMessageID: "msg_assistant", id: "call-b" };
       const spawn = { sessionID: SESSION, assistantMessageID: "msg_reply", id: "call-spawn" };
       const offers: Array<ProviderContinuationRequest> = [];
-      const { runtime, thread } = yield* resumed([
-        ...backgroundLaunch(CHILD),
-        // The same turn starts a second background subagent, which runs on.
-        event("session.tool.input.started", { ...toolB, name: "subagent" }),
-        event("session.tool.called", {
-          ...toolB,
-          name: "subagent",
-          input: { description: "Sleep", prompt: "sleep", background: true },
-          executed: false,
-        }),
-        event("session.created", { ...childCreated(CHILD_B), sessionID: CHILD_B }),
-        event("session.tool.progress", {
-          ...toolB,
-          metadata: { sessionID: CHILD_B, status: "running" },
-        }),
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        event("session.execution.started", { sessionID: CHILD_B }),
-        // The first subagent's report wakes the parent into a reply T3 holds
-        // for its continuation.
-        event("session.execution.succeeded", { sessionID: CHILD }),
-        event("session.inbox.enqueued", {
-          inboxID: "msg_report",
-          sessionID: SESSION,
-          item: {
-            type: "synthetic",
-            payload: {
-              text: `<subagent sessionID="${CHILD}" state="completed" description="Sleep">\nCHILD_OK\n</subagent>`,
-              description: "Sleep",
-              metadata: {
-                source: "subagent",
-                childID: CHILD,
-                agent: "General",
-                state: "completed",
+      const gate = makeProviderReplayGate(["settled"]);
+      const { runtime, thread } = yield* resumed(
+        [
+          ...backgroundLaunch(CHILD),
+          // The same turn starts a second background subagent, which runs on.
+          event("session.tool.input.started", { ...toolB, name: "subagent" }),
+          event("session.tool.called", {
+            ...toolB,
+            name: "subagent",
+            input: { description: "Sleep", prompt: "sleep", background: true },
+            executed: false,
+          }),
+          event("session.created", { ...childCreated(CHILD_B), sessionID: CHILD_B }),
+          event("session.tool.progress", {
+            ...toolB,
+            metadata: { sessionID: CHILD_B, status: "running" },
+          }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          event("session.execution.started", { sessionID: CHILD_B }),
+          // The first subagent's report wakes the parent into a reply T3 holds
+          // for its continuation.
+          event("session.execution.succeeded", { sessionID: CHILD }),
+          event("session.inbox.enqueued", {
+            inboxID: "msg_report",
+            sessionID: SESSION,
+            item: {
+              type: "synthetic",
+              payload: {
+                text: `<subagent sessionID="${CHILD}" state="completed" description="Sleep">\nCHILD_OK\n</subagent>`,
+                description: "Sleep",
+                metadata: {
+                  source: "subagent",
+                  childID: CHILD,
+                  agent: "General",
+                  state: "completed",
+                },
               },
+              delivery: "steer",
             },
-            delivery: "steer",
-          },
-        }),
-        event("session.execution.started", { sessionID: SESSION }),
-        // The reply starts a background subagent of its own, named only by
-        // the reply's held events.
-        event("session.tool.input.started", { ...spawn, name: "subagent" }),
-        event("session.tool.called", {
-          ...spawn,
-          name: "subagent",
-          input: { description: "Sleep", prompt: "sleep", background: true },
-          executed: false,
-        }),
-        event("session.created", { ...childCreated(SPAWNED), sessionID: SPAWNED }),
-        event("session.tool.progress", {
-          ...spawn,
-          metadata: { sessionID: SPAWNED, status: "running" },
-        }),
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        // The second subagent's text, shown live, marks that the reply has ended.
-        event("session.text.ended", {
-          sessionID: CHILD_B,
-          assistantMessageID: "msg_child_b",
-          ordinal: 0,
-          text: "B_WORKING",
-        }),
-        // The user's Stop stops the second subagent and drops the held reply.
-        out("session.interrupt", { sessionID: CHILD_B }),
-        reply("session.interrupt", { interrupted: true }),
-        event("session.execution.interrupted", { sessionID: CHILD_B }),
-        // The subagent only the dropped reply named is stopped too; that Stop
-        // fails, so it runs on.
-        out("session.interrupt", { sessionID: SPAWNED }),
-        reply("session.interrupt", {
-          status: 500,
-          body: { _tag: "UnknownError", message: "interrupt failed" },
-        }),
-        // An unrelated prompt runs while that subagent asks for a permission,
-        // which no turn shows: it is refused.
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        event("session.execution.started", { sessionID: SESSION }),
-        event("permission.asked", { ...shellAsk.data, id: "per_spawned", sessionID: SPAWNED }),
-        out("permission.reply", {
-          sessionID: SPAWNED,
-          requestID: "per_spawned",
-          decision: "reject",
-        }),
-        reply("permission.reply", null),
-        event("session.text.ended", {
-          sessionID: SESSION,
-          assistantMessageID: "msg_unrelated",
-          ordinal: 0,
-          text: "UNRELATED",
-        }),
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        // The next Stop tries the subagent again, and reaches it.
-        out("session.interrupt", { sessionID: SPAWNED }),
-        reply("session.interrupt", { interrupted: true }),
-      ]).pipe(
+          }),
+          event("session.execution.started", { sessionID: SESSION }),
+          // The reply starts a background subagent of its own, named only by
+          // the reply's held events.
+          event("session.tool.input.started", { ...spawn, name: "subagent" }),
+          event("session.tool.called", {
+            ...spawn,
+            name: "subagent",
+            input: { description: "Sleep", prompt: "sleep", background: true },
+            executed: false,
+          }),
+          event("session.created", { ...childCreated(SPAWNED), sessionID: SPAWNED }),
+          event("session.tool.progress", {
+            ...spawn,
+            metadata: { sessionID: SPAWNED, status: "running" },
+          }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          // The second subagent's text, shown live, marks that the reply has ended.
+          event("session.text.ended", {
+            sessionID: CHILD_B,
+            assistantMessageID: "msg_child_b",
+            ordinal: 0,
+            text: "B_WORKING",
+          }),
+          // The user's Stop stops the second subagent and drops the held reply.
+          out("session.interrupt", { sessionID: CHILD_B }),
+          reply("session.interrupt", { interrupted: true }),
+          event("session.execution.interrupted", { sessionID: CHILD_B }),
+          // The subagent only the dropped reply named is stopped too; that Stop
+          // fails, so it runs on.
+          out("session.interrupt", { sessionID: SPAWNED }),
+          reply("session.interrupt", {
+            status: 500,
+            body: { _tag: "UnknownError", message: "interrupt failed" },
+          }),
+          // An unrelated prompt runs while that subagent, and a subagent it
+          // starts, ask for permissions, which no turn shows: they are refused.
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.started", { sessionID: SESSION }),
+          event("permission.asked", { ...shellAsk.data, id: "per_spawned", sessionID: SPAWNED }),
+          out("permission.reply", {
+            sessionID: SPAWNED,
+            requestID: "per_spawned",
+            decision: "reject",
+          }),
+          reply("permission.reply", null),
+          event("session.created", {
+            ...childCreated(NESTED),
+            sessionID: NESTED,
+            parentID: SPAWNED,
+          }),
+          event("permission.asked", { ...shellAsk.data, id: "per_nested", sessionID: NESTED }),
+          out("permission.reply", {
+            sessionID: NESTED,
+            requestID: "per_nested",
+            decision: "reject",
+          }),
+          reply("permission.reply", null),
+          event("session.text.ended", {
+            sessionID: SESSION,
+            assistantMessageID: "msg_unrelated",
+            ordinal: 0,
+            text: "UNRELATED",
+          }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          // The next Stop tries the subagent again, and the one it started, and reaches both.
+          out("session.interrupt", { sessionID: SPAWNED }),
+          reply("session.interrupt", { interrupted: true }),
+          out("session.interrupt", { sessionID: NESTED }),
+          reply("session.interrupt", { interrupted: true }),
+          // OpenCode reports the stopped subagent to the thread's session and
+          // wakes it; that execution answers no turn, so it is stopped and no
+          // continuation is offered for it.
+          event("session.execution.interrupted", { sessionID: SPAWNED }),
+          event("session.inbox.enqueued", {
+            inboxID: "msg_report_spawned",
+            sessionID: SESSION,
+            item: {
+              type: "synthetic",
+              payload: {
+                text: `<subagent sessionID="${SPAWNED}" state="cancelled" description="Sleep">\n</subagent>`,
+                description: "Sleep",
+                metadata: {
+                  source: "subagent",
+                  childID: SPAWNED,
+                  agent: "General",
+                  state: "cancelled",
+                },
+              },
+              delivery: "steer",
+            },
+          }),
+          event("session.execution.started", { sessionID: SESSION }),
+          out("session.interrupt", { sessionID: SESSION }),
+          reply("session.interrupt", { interrupted: true }),
+          event("session.execution.interrupted", { sessionID: SESSION }, "settled"),
+        ],
+        { replayGate: gate },
+      ).pipe(
         Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
           offer: (request) => Effect.sync(() => void offers.push(request)),
           take: Effect.never,
@@ -3894,8 +3956,8 @@ describe("OpenCode2 adapter", () => {
       });
       yield* runtime.startTurn({ ...secondTurn(thread), appThread: withLineage(thread).appThread });
       yield* Deferred.await(bothEnded);
-      // A later Stop reaches the subagent; once stopped it is not tried again
-      // (the replay fails on any further request).
+      // A later Stop reaches both subagents; once stopped they are not tried
+      // again (the replay fails on any further request).
       for (let stops = 0; stops < 2; stops++) {
         yield* runtime.interruptTurn({
           providerThread: thread,
@@ -3903,6 +3965,10 @@ describe("OpenCode2 adapter", () => {
           requestRuntimeRestart: true,
         });
       }
+      // The stopped subagent's report wakes nothing T3 runs.
+      yield* Effect.promise(() => gate.waitForReached("settled"));
+      gate.release("settled");
+      assert.lengthOf(offers, 1);
       // The unrelated turn shows no request it never made.
       assert.deepEqual(
         collected.flatMap((event) =>

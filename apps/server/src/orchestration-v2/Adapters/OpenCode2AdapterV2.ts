@@ -884,9 +884,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const childOwners = new Map<string, ThreadState>();
     // What OpenCode announced about a subagent's session, until its call names it.
     const announced = new Map<string, EventOf<"session.created">["data"]>();
-    // Subagent sessions a dropped held execution started, by the session that
-    // called them. Nothing names them, so they no longer route to its thread;
-    // they stay here until a Stop of that thread stops them or they are gone.
+    // Subagent sessions a dropped held execution started, and the subagents
+    // they start, by the session the first of them was called from. Nothing
+    // names them, so they no longer route to its thread; they stay here until
+    // a Stop of that thread stops them or they are gone.
     const strays = new Map<string, ThreadState>();
     // Sessions of these threads with an execution running, seen on the stream.
     const busy = new Set<string>();
@@ -2361,6 +2362,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     ) {
       const childId = stringField(payload.metadata, "childID");
       if (stringField(payload.metadata, "source") !== "subagent" || childId === undefined) return;
+      // A stray that reports has ended: no Stop needs to reach it.
+      strays.delete(childId);
       const call = [...state.calls.values()].find(
         (candidate) => candidate.child?.sessionId === childId,
       );
@@ -2457,6 +2460,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
       // A subagent's session: named on its parent's `subagent` call just after.
       if (event.type === "session.created" && event.data.parentID !== undefined) {
+        // A stray's subagent is a stray too: no call of the thread's names it.
+        const strayCaller = strays.get(event.data.parentID);
+        if (strayCaller !== undefined) {
+          strays.set(event.data.sessionID, strayCaller);
+          return;
+        }
         const owner = ownerOf(event.data.parentID);
         if (owner !== undefined) {
           childOwners.set(event.data.sessionID, owner);
@@ -3359,18 +3368,23 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       for (const wake of wakes) {
         wake.dropped = true;
         for (const childId of wake.children) {
-          if (!announced.has(childId)) continue;
+          const info = announced.get(childId);
+          if (info === undefined) continue;
           announced.delete(childId);
           childOwners.delete(childId);
           strays.set(childId, caller);
+          // OpenCode reports its end to the session that called it; that
+          // report answers no turn, so the execution it wakes is stopped.
+          (threads.get(info.parentID ?? "") ?? caller).stoppedChildren.add(childId);
         }
       }
     };
 
     /**
-     * Stops a thread's strays, a few at a time and never under `lock`: one
-     * that does not answer would otherwise hold up every event. A stray is
-     * forgotten once stopped or gone; one still running waits for the next Stop.
+     * Stops a thread's strays one by one, as a Stop stops background
+     * subagents, and never under `lock`: one that does not answer would
+     * otherwise hold up every event. A stray is forgotten once stopped or
+     * gone; one still running waits for the next Stop.
      */
     const stopStrays = (thread: ThreadState) =>
       Effect.forEach(
@@ -3383,7 +3397,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             Effect.tap(() => Effect.sync(() => strays.delete(childId))),
             Effect.ignore({ log: true }),
           ),
-        { concurrency: 4, discard: true },
+        { discard: true },
       );
 
     /**
