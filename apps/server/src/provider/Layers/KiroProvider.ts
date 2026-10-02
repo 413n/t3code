@@ -1,8 +1,9 @@
-import type {
-  KiroSettings,
-  ModelCapabilities,
-  ServerProviderAuth,
-  ServerProviderModel,
+import {
+  type KiroSettings,
+  type ModelCapabilities,
+  ProviderDriverKind,
+  type ServerProviderAuth,
+  type ServerProviderModel,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -26,6 +27,7 @@ import {
   spawnAndCollect,
 } from "../providerSnapshot.ts";
 
+const KIRO_DRIVER_KIND = ProviderDriverKind.make("kiro");
 const KIRO_PRESENTATION = {
   displayName: "Kiro",
   showInteractionModeToggle: false,
@@ -49,6 +51,8 @@ const snapshot = (
   listed?: ReadonlyArray<ServerProviderModel>,
 ) =>
   buildServerProvider({
+    // Gives the snapshot its version advisory; Kiro runs no enrichment pass.
+    driver: KIRO_DRIVER_KIND,
     presentation: KIRO_PRESENTATION,
     enabled: settings.enabled,
     checkedAt,

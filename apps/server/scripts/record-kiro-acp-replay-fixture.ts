@@ -357,7 +357,9 @@ function normalizeEntries(input: {
     ),
     // Kiro's snapshot URIs carry paths URL-encoded once or twice
     // (`?originalPath%3D%252Fhome%252F…`); replace those forms first.
+    // A HOME of "/" (root) or "" would replace every slash, method names included.
     ...[input.workspace, input.home].flatMap((path) => {
+      if (path.length <= 1) return [];
       const once = encodeURIComponent(path);
       const twice = encodeURIComponent(once);
       const placeholder = path === input.workspace ? "<workspace>" : HOME_PLACEHOLDER;
@@ -367,7 +369,7 @@ function normalizeEntries(input: {
       ];
     }),
     [input.workspace, "<workspace>"],
-    [input.home, HOME_PLACEHOLDER],
+    ...(input.home.length <= 1 ? [] : [[input.home, HOME_PLACEHOLDER] as const]),
   ];
   // Kiro's message and backend request ids, numbered in first-seen order.
   const otherIds: Array<string> = [];

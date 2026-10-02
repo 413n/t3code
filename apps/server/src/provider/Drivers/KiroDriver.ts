@@ -126,7 +126,8 @@ export const KiroDriver: ProviderDriver<KiroSettings, KiroDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build Kiro snapshot: ${cause.message ?? String(cause)}`,
+              // The cause keeps the failure; the detail reaches the snapshot, so it stays fixed.
+              detail: "Failed to build Kiro snapshot.",
               cause,
             }),
         ),

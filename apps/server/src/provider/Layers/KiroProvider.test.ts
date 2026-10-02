@@ -90,6 +90,9 @@ describe("KiroProvider", () => {
       });
       assert.equal(snapshot.status, "ready");
       assert.equal(snapshot.auth.status, "authenticated");
+      // The version advisory is what the compatibility check and update UI read.
+      assert.equal(snapshot.versionAdvisory?.currentVersion, "2.27.0");
+      assert.isFalse(snapshot.versionAdvisory?.canUpdate);
     }),
   );
 
