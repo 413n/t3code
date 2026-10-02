@@ -884,6 +884,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const childOwners = new Map<string, ThreadState>();
     // What OpenCode announced about a subagent's session, until its call names it.
     const announced = new Map<string, EventOf<"session.created">["data"]>();
+    // Subagent sessions a dropped held execution started, by the session that
+    // called them. Nothing names them, so they no longer route to its thread;
+    // they stay here until a Stop of that thread stops them or they are gone.
+    const strays = new Map<string, ThreadState>();
     // Sessions of these threads with an execution running, seen on the stream.
     const busy = new Set<string>();
     const pending = new Map<RuntimeRequestId, PendingRequest>();
@@ -2092,6 +2096,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         | { readonly type: "form"; readonly form: NativeForm },
     ) {
       const asking = asked.type === "permission" ? asked.request.sessionID : asked.form.sessionID;
+      // A stray belongs to no turn: its request is refused, which ends its run.
+      if (strays.has(asking)) {
+        return yield* stopStaleRequest(
+          asking,
+          asked.type === "permission"
+            ? { type: "permission", id: asked.request.id }
+            : { type: "form", id: asked.form.id },
+        );
+      }
       const state = ownerOf(asking);
       if (state === undefined) return;
       const target = requestTurn(asking);
@@ -2719,10 +2732,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const background = [...threads.values()].filter(
         (state) => state.subagent === undefined && hasBackground(state),
       );
-      if (running.length === 0 && background.length === 0 && busy.size === 0) return;
+      if (running.length === 0 && background.length === 0 && busy.size === 0 && strays.size === 0)
+        return;
       const active = yield* client.session.active();
       // An execution that ended while the stream was down never said so.
       for (const sessionId of busy) if (!(sessionId in active)) busy.delete(sessionId);
+      // A stray that stopped meanwhile runs nothing to stop.
+      for (const childId of strays.keys()) if (!(childId in active)) strays.delete(childId);
       for (const [sessionId, state] of running) {
         const turn = state.active;
         if (turn === undefined) continue;
@@ -2754,9 +2770,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }
         // A subagent's session holds reports of its own background subagents.
         for (const session of sessionsOf(state)) {
-          yield* discardWakes(session.wakes.splice(0));
+          discardWakes(session, session.wakes.splice(0));
           session.reports.clear();
         }
+      }
+      // Stopped off the lock this reconcile holds; one still running waits for a Stop.
+      for (const thread of new Set([...strays.values()].map(rootOf))) {
+        yield* Effect.forkIn(stopStrays(thread), sessionScope);
       }
       // A request asked while the stream was down was never shown, and the
       // run waits on it; one T3 shows that OpenCode no longer lists was
@@ -3331,31 +3351,40 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
 
     /**
      * Drops held executions no turn will take. The subagents one started are
-     * named only by its replay, so they are forgotten (their requests no
-     * longer reach the thread) and stopped. A subagent that registered its own
+     * named only by its replay, so they stop routing to the thread at once and
+     * become strays for {@link stopStrays}. A subagent that registered its own
      * call outside the held execution is the thread's, and is left alone.
      */
-    const discardWakes = Effect.fnUntraced(function* (wakes: ReadonlyArray<Wake>) {
-      const orphans: Array<string> = [];
+    const discardWakes = (caller: ThreadState, wakes: ReadonlyArray<Wake>) => {
       for (const wake of wakes) {
         wake.dropped = true;
         for (const childId of wake.children) {
           if (!announced.has(childId)) continue;
           announced.delete(childId);
           childOwners.delete(childId);
-          orphans.push(childId);
+          strays.set(childId, caller);
         }
       }
-      for (const childId of orphans) {
-        yield* client.session
-          .interrupt({ sessionID: Session.ID.make(childId) })
-          .pipe(
+    };
+
+    /**
+     * Stops a thread's strays, a few at a time and never under `lock`: one
+     * that does not answer would otherwise hold up every event. A stray is
+     * forgotten once stopped or gone; one still running waits for the next Stop.
+     */
+    const stopStrays = (thread: ThreadState) =>
+      Effect.forEach(
+        [...strays].flatMap(([childId, caller]) => (rootOf(caller) === thread ? [childId] : [])),
+        (childId) =>
+          client.session.interrupt({ sessionID: Session.ID.make(childId) }).pipe(
+            Effect.asVoid,
             Effect.catchTags({ SessionNotFoundError: () => Effect.void }),
             Effect.timeout(INTERRUPT_TIMEOUT),
+            Effect.tap(() => Effect.sync(() => strays.delete(childId))),
             Effect.ignore({ log: true }),
-          );
-      }
-    });
+          ),
+        { concurrency: 4, discard: true },
+      );
 
     /**
      * A user turn that starts while OpenCode runs an execution on its own: the
@@ -3388,7 +3417,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             (held) => held.messageId === turnInput.message.messageId,
           );
           if (index < 0) return yield* finishTurn(state, { status: "completed" });
-          yield* discardWakes(state.wakes.splice(0, index));
+          discardWakes(state, state.wakes.splice(0, index));
+          yield* Effect.forkIn(stopStrays(state), sessionScope);
           const wake = state.wakes.shift()!;
           const turn = state.active;
           if (turn !== undefined && wake.after !== undefined) turn.before = wake.after;
@@ -3476,7 +3506,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           }
           // A held wake no turn will take: its execution is stopped, not replayed.
           const running = state.wakes.some((wake) => wake.running);
-          yield* discardWakes(state.wakes.splice(0));
+          discardWakes(state, state.wakes.splice(0));
           if (running) {
             state.unsettled = true;
             yield* client.session
@@ -3485,6 +3515,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           }
         }),
       );
+      // Subagents of held executions this or an earlier Stop dropped.
+      yield* stopStrays(state);
     });
 
     /**

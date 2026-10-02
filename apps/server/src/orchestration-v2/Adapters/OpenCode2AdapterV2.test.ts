@@ -3828,6 +3828,7 @@ describe("OpenCode2 adapter", () => {
         // The user's Stop stops the second subagent and drops the held reply.
         out("session.interrupt", { sessionID: CHILD_B }),
         reply("session.interrupt", { interrupted: true }),
+        event("session.execution.interrupted", { sessionID: CHILD_B }),
         // The subagent only the dropped reply named is stopped too; that Stop
         // fails, so it runs on.
         out("session.interrupt", { sessionID: SPAWNED }),
@@ -3835,11 +3836,18 @@ describe("OpenCode2 adapter", () => {
           status: 500,
           body: { _tag: "UnknownError", message: "interrupt failed" },
         }),
-        // An unrelated prompt runs while that subagent asks for a permission.
+        // An unrelated prompt runs while that subagent asks for a permission,
+        // which no turn shows: it is refused.
         out("session.prompt", { sessionID: SESSION, text: "<any>" }),
         promptAccepted,
         event("session.execution.started", { sessionID: SESSION }),
         event("permission.asked", { ...shellAsk.data, id: "per_spawned", sessionID: SPAWNED }),
+        out("permission.reply", {
+          sessionID: SPAWNED,
+          requestID: "per_spawned",
+          decision: "reject",
+        }),
+        reply("permission.reply", null),
         event("session.text.ended", {
           sessionID: SESSION,
           assistantMessageID: "msg_unrelated",
@@ -3847,6 +3855,9 @@ describe("OpenCode2 adapter", () => {
           text: "UNRELATED",
         }),
         event("session.execution.succeeded", { sessionID: SESSION }),
+        // The next Stop tries the subagent again, and reaches it.
+        out("session.interrupt", { sessionID: SPAWNED }),
+        reply("session.interrupt", { interrupted: true }),
       ]).pipe(
         Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
           offer: (request) => Effect.sync(() => void offers.push(request)),
@@ -3883,6 +3894,15 @@ describe("OpenCode2 adapter", () => {
       });
       yield* runtime.startTurn({ ...secondTurn(thread), appThread: withLineage(thread).appThread });
       yield* Deferred.await(bothEnded);
+      // A later Stop reaches the subagent; once stopped it is not tried again
+      // (the replay fails on any further request).
+      for (let stops = 0; stops < 2; stops++) {
+        yield* runtime.interruptTurn({
+          providerThread: thread,
+          providerTurnId: yield* providerTurnId,
+          requestRuntimeRestart: true,
+        });
+      }
       // The unrelated turn shows no request it never made.
       assert.deepEqual(
         collected.flatMap((event) =>
@@ -3891,6 +3911,93 @@ describe("OpenCode2 adapter", () => {
             : [],
         ),
         [],
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("ends a continuation while a skipped reply's subagent does not answer its Stop", () =>
+    Effect.gen(function* () {
+      const CHILD_B = "ses_f1485c529ffeBBBBBBBBBBBBBB";
+      const SPAWNED = "ses_f1485c529ffeDDDDDDDDDDDDDD";
+      const toolB = { sessionID: SESSION, assistantMessageID: "msg_assistant", id: "call-b" };
+      const spawn = { sessionID: SESSION, assistantMessageID: "msg_reply_a", id: "call-spawn" };
+      const report = (inboxID: string, child: string) =>
+        event("session.inbox.enqueued", {
+          inboxID,
+          sessionID: SESSION,
+          item: {
+            type: "synthetic",
+            payload: {
+              text: `<subagent sessionID="${child}" state="completed" description="Sleep">\nOK\n</subagent>`,
+              description: "Sleep",
+              metadata: {
+                source: "subagent",
+                childID: child,
+                agent: "General",
+                state: "completed",
+              },
+            },
+            delivery: "steer",
+          },
+        });
+      const offers: Array<ProviderContinuationRequest> = [];
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        event("session.tool.input.started", { ...toolB, name: "subagent" }),
+        event("session.tool.called", {
+          ...toolB,
+          name: "subagent",
+          input: { description: "Sleep", prompt: "sleep", background: true },
+          executed: false,
+        }),
+        event("session.created", { ...childCreated(CHILD_B), sessionID: CHILD_B }),
+        event("session.tool.progress", {
+          ...toolB,
+          metadata: { sessionID: CHILD_B, status: "running" },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        // Reply A starts a subagent of its own, named only by its held events.
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        report("msg_report_a", CHILD),
+        event("session.execution.started", { sessionID: SESSION }),
+        event("session.tool.input.started", { ...spawn, name: "subagent" }),
+        event("session.tool.called", {
+          ...spawn,
+          name: "subagent",
+          input: { description: "Sleep", prompt: "sleep", background: true },
+          executed: false,
+        }),
+        event("session.created", { ...childCreated(SPAWNED), sessionID: SPAWNED }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        event("session.execution.succeeded", { sessionID: CHILD_B }),
+        report("msg_report_b", CHILD_B),
+        event("session.execution.started", { sessionID: SESSION }),
+        event("session.text.ended", {
+          sessionID: SESSION,
+          assistantMessageID: "msg_reply_b",
+          ordinal: 0,
+          text: "REPLY_B",
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        // B's continuation skips reply A and stops its subagent, which never answers.
+        out("session.interrupt", { sessionID: SPAWNED }),
+        reply("session.interrupt", "<hang>"),
+      ]).pipe(
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: (request) => Effect.sync(() => void offers.push(request)),
+          take: Effect.never,
+        }),
+      );
+      const ended = yield* terminals(runtime, 2);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* Effect.gen(function* () {
+        while (offers.length < 2) yield* Effect.yieldNow;
+      }).pipe(Effect.timeout("2 seconds"), Effect.orDie);
+      yield* runtime.startTurn(continuationTurn(thread, offers[1]!, "wake-b"));
+      // B's reply replays and ends its turn while that Stop still waits.
+      assert.deepEqual(
+        [...(yield* Fiber.join(ended))].map((terminal) => terminal.status),
+        ["completed", "completed"],
       );
     }).pipe(Effect.scoped),
   );
