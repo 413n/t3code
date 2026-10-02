@@ -8903,12 +8903,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly parentRun: OrchestrationV2Run;
     readonly cohort: OrchestrationV2DelegatedCompletionCohort;
     readonly accepted?: ReadonlyArray<OrchestrationV2Subagent["id"]>;
+    /** While the parent is live, settled_only results keep waiting. */
+    readonly parentIsLive: boolean;
     readonly now: DateTime.Utc;
   }) =>
     Effect.gen(function* () {
-      const { projection, parentRun, cohort, now } = input;
+      const { projection, parentRun, cohort, parentIsLive, now } = input;
       const threadId = projection.thread.id;
-      const parentIsLive = hasLiveRun(projection);
       const pendingTaskIds =
         projection.thread.archivedAt === null && projection.thread.deletedAt === null
           ? projection.subagents
@@ -9008,6 +9009,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       if (steers.length === 0) return;
       const projection = yield* projectionStore.getThreadRecords(threadId, ["runs", "subagents"]);
+      // A rollback can commit between this terminal event and the thread lock.
+      if (projection.runs.find((run) => run.id === settledRun.id)?.status === "rolled_back") {
+        return;
+      }
       for (const steer of steers) {
         const ownership = steer.delegatedCompletion!;
         const parentRun = projection.runs.find((run) => run.id === ownership.parentRunId);
@@ -9027,10 +9032,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           yield* offerDelegatedCompletionDelivery(threadId, parentRun.id);
           continue;
         }
+        // The receiving run settled, so results pending behind this delivery are
+        // due a wake now, as in finalizeDelegatedCompletionDelivery. A message
+        // promoted from the queue since then must not hold settled_only ones.
         const { events, nextDelivery } = yield* reserveNextDelegatedDelivery({
           projection,
           parentRun,
           cohort,
+          parentIsLive: false,
           now: yield* DateTime.now,
         });
         yield* writeSystemEvents(events);
@@ -9075,6 +9084,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       parentRun,
       cohort,
       accepted: delivery.taskIds,
+      parentIsLive: hasLiveRun(projection),
       now,
     });
     for (const event of reservationEvents) {
