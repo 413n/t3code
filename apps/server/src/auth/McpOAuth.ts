@@ -155,7 +155,11 @@ export type McpOAuthError =
 export class McpOAuthPageError extends Schema.TaggedError<McpOAuthPageError>()(
   "McpOAuthPageError",
   { description: Schema.String },
-) {}
+) {
+  override get message(): string {
+    return this.description;
+  }
+}
 
 /** Problems reported back to the client through its (validated) redirect URI. */
 export class McpOAuthRedirectError extends Schema.TaggedError<McpOAuthRedirectError>()(
@@ -409,7 +413,9 @@ const make = Effect.gen(function* () {
   ) =>
     environmentAuth.authenticateBrowserSession(request).pipe(
       Effect.map((session) =>
-        session.scopes.includes(AuthAccessWriteScope)
+        // Approving manages access, and a session may only hand out scopes it holds.
+        session.scopes.includes(AuthAccessWriteScope) &&
+        EnvironmentAuth.MCP_CLIENT_SCOPES.every((scope) => session.scopes.includes(scope))
           ? { csrfToken: csrfToken(session.sessionId, authorization) }
           : undefined,
       ),

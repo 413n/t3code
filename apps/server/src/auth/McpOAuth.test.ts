@@ -1,7 +1,11 @@
 import * as NodeCrypto from "node:crypto";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentHttpApi } from "@t3tools/contracts";
+import {
+  AuthAdministrativeScopes,
+  type AuthEnvironmentScope,
+  EnvironmentHttpApi,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -13,6 +17,7 @@ import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -55,6 +60,7 @@ const makeLayerRoutes = (capture: (auth: EnvironmentAuth.EnvironmentAuth["Servic
     Layer.provide(NodeServices.layer),
   );
 
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const ORIGIN = "https://box.example.ts.net";
 const REDIRECT = "http://localhost/callback";
 const verifier = "a".repeat(43) + "-verifier-for-tests";
@@ -105,7 +111,7 @@ const register = (handler: Handler, redirect = REDIRECT) =>
     at("/oauth/mcp/register", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+      body: encodeJson({
         client_name: "Claude Code",
         redirect_uris: [redirect],
         grant_types: ["authorization_code", "refresh_token"],
@@ -354,6 +360,50 @@ it.live("denies and refuses codes bound to another client's key or without threa
       const readOnlyResponse = yield* approveWith(readOnly.credential);
       expect(readOnlyResponse.status).toBe(400);
       expect(yield* text(readOnlyResponse)).toContain("cannot control threads");
+    }),
+  ),
+);
+
+it.live("offers one-click only to a browser session that holds the scopes it would grant", () =>
+  withRoutes((handler, auth) =>
+    Effect.gen(function* () {
+      const clientId = yield* registeredClientId(handler);
+      const params = authorizeParams(clientId);
+      // Signs a browser in through the real route and returns its session cookie.
+      const browserCookie = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+        Effect.gen(function* () {
+          const pairing = yield* auth.issuePairingCredential({ scopes });
+          const response = yield* handler(
+            at("/api/auth/browser-session", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: encodeJson({ credential: pairing.credential }),
+            }),
+          );
+          return response.headers.getSetCookie()[0]!.split(";", 1)[0]!;
+        });
+      const page = (cookie: string) =>
+        handler(
+          at(`/oauth/mcp/authorize?${new URLSearchParams(params)}`, { headers: { cookie } }),
+        ).pipe(Effect.flatMap(text));
+
+      const admin = yield* browserCookie([...AuthAdministrativeScopes]);
+      expect(yield* page(admin)).toContain('name="csrf_token"');
+
+      // access:write alone cannot hand an agent thread control it does not hold.
+      const accessOnly = yield* browserCookie(["access:read", "access:write"]);
+      expect(yield* page(accessOnly)).not.toContain('name="csrf_token"');
+      const forged = yield* handler(
+        at("/oauth/mcp/authorize", {
+          ...form({ ...params, decision: "approve", runtime_mode: "auto", csrf_token: "forged" }),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: accessOnly,
+          },
+        }),
+      );
+      expect(forged.status).toBe(400);
+      expect(yield* text(forged)).toContain("Enter a pairing code instead");
     }),
   ),
 );
