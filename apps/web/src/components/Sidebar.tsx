@@ -167,7 +167,7 @@ import { formatRelativeTimeLabel, parseTimestampDate } from "../timestampFormat"
 import type { SidebarThreadSummary } from "../types";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { cn, randomUUID } from "~/lib/utils";
-import { reportTitleRegenerationFailures } from "~/lib/titleRegenerationFailures";
+import { createTitleRegenerationReporter } from "~/lib/titleRegenerationFailures";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { ProjectEnvironmentBadge } from "./ProjectEnvironmentBadge";
 import { buildThreadActionMenuItems } from "./threadActionMenu.logic";
@@ -4161,20 +4161,19 @@ export default function Sidebar() {
         return;
       }
       if (clicked.value === "regenerate-title") {
-        const accepted: Array<{ threadRef: ScopedThreadRef; requestId: CommandId }> = [];
+        const reporter = createTitleRegenerationReporter();
         for (const thread of regeneratableTitleThreads) {
           const requestId = CommandId.make(randomUUID());
+          const stopWatching = reporter.watch(
+            scopeThreadRef(thread.environmentId, thread.id),
+            requestId,
+          );
           const result = await updateThreadMetadata({
             environmentId: thread.environmentId,
             input: { commandId: requestId, threadId: thread.id, regenerateTitle: true },
           });
-          if (result._tag === "Success") {
-            accepted.push({
-              threadRef: scopeThreadRef(thread.environmentId, thread.id),
-              requestId,
-            });
-            continue;
-          }
+          if (result._tag === "Success") continue;
+          stopWatching();
           if (!isAtomCommandInterrupted(result)) {
             const error = squashAtomCommandFailure(result);
             toastManager.add(
@@ -4185,10 +4184,8 @@ export default function Sidebar() {
               }),
             );
           }
-          reportTitleRegenerationFailures(accepted);
           return;
         }
-        reportTitleRegenerationFailures(accepted);
         clearSelection();
         return;
       }
@@ -4432,13 +4429,13 @@ export default function Sidebar() {
           case "regenerate-title": {
             if (isRegeneratingTitle) return;
             const requestId = CommandId.make(randomUUID());
+            const stopWatching = createTitleRegenerationReporter().watch(threadRef, requestId);
             const result = await updateThreadMetadata({
               environmentId: threadRef.environmentId,
               input: { commandId: requestId, threadId: threadRef.threadId, regenerateTitle: true },
             });
-            if (result._tag === "Success") {
-              reportTitleRegenerationFailures([{ threadRef, requestId }]);
-            } else if (!isAtomCommandInterrupted(result)) {
+            if (result._tag === "Failure") stopWatching();
+            if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
               const error = squashAtomCommandFailure(result);
               toastManager.add(
                 stackedThreadToast({

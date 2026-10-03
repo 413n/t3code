@@ -6,17 +6,20 @@ import type { EnvironmentThreadShell } from "./models.ts";
 /**
  * Waits for title regeneration `requestId` to settle on the thread shell in
  * `atom`. Resolves with the server's failure reason, or null once the request
- * finishes without failing, the thread goes away, or `timeoutMs` elapses.
+ * finishes without failing, the thread goes away, `signal` aborts, or
+ * `timeoutMs` elapses.
  *
- * Call it after the regeneration command is accepted. A request that settles
- * before its in-flight marker ever reaches this client still reports its
- * failure, because the failure keeps the request id.
+ * Start it before sending the regeneration command, and abort it if the command
+ * is rejected. A success is only recognized after this client saw the request
+ * in flight, so a watcher started late waits for its timeout. A failure keeps
+ * the request id and is reported either way.
  */
 export function waitForTitleRegenerationFailure(input: {
   readonly registry: AtomRegistry.AtomRegistry;
   readonly atom: Atom.Atom<EnvironmentThreadShell | null>;
   readonly requestId: string;
   readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
 }): Promise<string | null> {
   return new Promise((resolve) => {
     let sawInFlight = false;
@@ -24,13 +27,17 @@ export function waitForTitleRegenerationFailure(input: {
     let timeoutId: ReturnType<typeof globalThis.setTimeout> | undefined;
     let unsubscribe: (() => void) | undefined;
 
+    const abort = () => finish(null);
     const finish = (failure: string | null) => {
       if (settled) return;
       settled = true;
       if (timeoutId !== undefined) globalThis.clearTimeout(timeoutId);
+      input.signal?.removeEventListener("abort", abort);
       unsubscribe?.();
       resolve(failure);
     };
+    if (input.signal?.aborted) return finish(null);
+    input.signal?.addEventListener("abort", abort, { once: true });
     const inspect = (thread: EnvironmentThreadShell | null) => {
       if (thread === null) return finish(null);
       if (thread.titleRegenerationFailure?.requestId === input.requestId) {

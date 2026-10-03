@@ -24,12 +24,24 @@ const failed = scopeThreadShell(environmentId, {
 function setup(initial: EnvironmentThreadShell | null) {
   const atom = Atom.make<EnvironmentThreadShell | null>(initial);
   const registry = AtomRegistry.make();
-  const wait = waitForTitleRegenerationFailure({ registry, atom, requestId, timeoutMs: 60_000 });
-  return { wait, set: (thread: EnvironmentThreadShell | null) => registry.set(atom, thread) };
+  const controller = new AbortController();
+  const wait = waitForTitleRegenerationFailure({
+    registry,
+    atom,
+    requestId,
+    timeoutMs: 60_000,
+    signal: controller.signal,
+  });
+  return {
+    wait,
+    set: (thread: EnvironmentThreadShell | null) => registry.set(atom, thread),
+    abort: () => controller.abort(),
+  };
 }
 
 it("resolves with the server's reason when the request fails", async () => {
-  const { wait, set } = setup(inFlight);
+  const { wait, set } = setup(settled);
+  set(inFlight);
   set(failed);
   await expect(wait).resolves.toBe("refresh_token_reused");
 });
@@ -37,6 +49,13 @@ it("resolves with the server's reason when the request fails", async () => {
 it("reports a failure that settled before the in-flight marker arrived", async () => {
   const { wait } = setup(failed);
   await expect(wait).resolves.toBe("refresh_token_reused");
+});
+
+it("sees a success for a request armed after the watcher started", async () => {
+  const { wait, set } = setup(settled);
+  set(inFlight);
+  set(settled);
+  await expect(wait).resolves.toBeNull();
 });
 
 it("resolves null when the request finishes without failing", async () => {
@@ -60,5 +79,11 @@ it("ignores a failure recorded for another request", async () => {
 it("resolves null when the thread goes away", async () => {
   const { wait, set } = setup(inFlight);
   set(null);
+  await expect(wait).resolves.toBeNull();
+});
+
+it("resolves null when the watcher is aborted after a rejected command", async () => {
+  const { wait, abort } = setup(settled);
+  abort();
   await expect(wait).resolves.toBeNull();
 });

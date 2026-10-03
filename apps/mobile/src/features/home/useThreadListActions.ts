@@ -504,11 +504,26 @@ export function useThreadListActions(): {
       selectionHaptic();
       try {
         const requestId = CommandId.make(uuidv4());
+        // Generation runs in the background after the command is accepted, so
+        // start watching before sending it.
+        const watcher = new AbortController();
+        void waitForTitleRegenerationFailure({
+          registry: appAtomRegistry,
+          atom: environmentThreadShells.threadShellAtom(
+            scopeThreadRef(thread.environmentId, thread.id),
+          ),
+          requestId,
+          timeoutMs: TITLE_REGENERATION_TIMEOUT_MS,
+          signal: watcher.signal,
+        }).then((failure) => {
+          if (failure !== null) Alert.alert("Could not regenerate title", failure);
+        });
         const result = await updateThreadMetadata({
           environmentId: thread.environmentId,
           input: { commandId: requestId, threadId: thread.id, regenerateTitle: true },
         });
         if (result._tag === "Failure") {
+          watcher.abort();
           const error = Cause.squash(result.cause);
           Alert.alert(
             "Could not regenerate title",
@@ -518,17 +533,6 @@ export function useThreadListActions(): {
           );
           return false;
         }
-        // Generation runs in the background after the command is accepted.
-        void waitForTitleRegenerationFailure({
-          registry: appAtomRegistry,
-          atom: environmentThreadShells.threadShellAtom(
-            scopeThreadRef(thread.environmentId, thread.id),
-          ),
-          requestId,
-          timeoutMs: TITLE_REGENERATION_TIMEOUT_MS,
-        }).then((failure) => {
-          if (failure !== null) Alert.alert("Could not regenerate title", failure);
-        });
         return true;
       } finally {
         titleRegenerationInFlightThreadKeys.current.delete(key);

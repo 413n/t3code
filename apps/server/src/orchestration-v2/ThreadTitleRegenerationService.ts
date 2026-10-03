@@ -25,13 +25,18 @@ import { formatThreadTitleContext } from "../textGeneration/ThreadTitleContext.t
 export { formatThreadTitleContext } from "../textGeneration/ThreadTitleContext.ts";
 
 const TITLE_GENERATION_FAILED_MESSAGE = "The thread title could not be generated.";
+// The reason is persisted on the thread and sent with its shell, so CLI output is capped.
+const TITLE_GENERATION_FAILURE_MAX_LENGTH = 500;
 const isTextGenerationError = Schema.is(TextGenerationError);
 
 /** The provider's reason when text generation failed, or a fixed message for anything else. */
 const titleGenerationFailureMessage = (cause: Cause.Cause<unknown>): string => {
   const error = Cause.squash(cause);
   const detail = isTextGenerationError(error) ? error.detail.trim() : "";
-  return detail.length > 0 ? detail : TITLE_GENERATION_FAILED_MESSAGE;
+  if (detail.length === 0) return TITLE_GENERATION_FAILED_MESSAGE;
+  return detail.length > TITLE_GENERATION_FAILURE_MAX_LENGTH
+    ? `${detail.slice(0, TITLE_GENERATION_FAILURE_MAX_LENGTH).trimEnd()}…`
+    : detail;
 };
 
 type TitleOutcome =

@@ -458,6 +458,42 @@ describe("ThreadTitleRegenerationService", () => {
     }),
   );
 
+  it.effect("caps a long provider reason", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness({
+        generateTitle: () =>
+          Effect.fail(
+            new TextGenerationError({
+              operation: "generateThreadTitle",
+              detail: `Codex CLI command failed: ${"x".repeat(2_000)}`,
+            }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const titleRegeneration = yield* ThreadTitleRegeneration.ThreadTitleRegenerationService;
+        const threadId = yield* createThread({
+          command: "command:title:long:create",
+          thread: "thread:title:long",
+        });
+        yield* dispatchUserMessage({
+          command: "command:title:long:message",
+          threadId,
+          text: "Some conversation",
+        });
+        const requestId = yield* armRegeneration({ command: "command:title:long:1", threadId });
+
+        yield* titleRegeneration.execute({ threadId, requestId, kind: { type: "regenerate" } });
+
+        const projection = yield* threads.getThreadProjection(threadId);
+        const message = projection.thread.titleRegenerationFailure?.message ?? "";
+        assert.equal(message.length, 501);
+        assert.isTrue(message.startsWith("Codex CLI command failed: x"));
+        assert.isTrue(message.endsWith("…"));
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
   it.effect("completes without generating when the initial message is unavailable", () =>
     Effect.gen(function* () {
       const harness = makeHarness();

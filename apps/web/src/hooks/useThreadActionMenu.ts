@@ -36,7 +36,7 @@ import {
   selectProjectGroupingSettings,
 } from "../logicalProject";
 import { buildPhysicalToLogicalProjectKeyMap } from "../sidebarProjectGrouping";
-import { reportTitleRegenerationFailures } from "../lib/titleRegenerationFailures";
+import { createTitleRegenerationReporter } from "../lib/titleRegenerationFailures";
 import { randomUUID } from "../lib/utils";
 import { threadRuntimeCanArchive } from "@t3tools/client-runtime/state/models";
 import { useCopyToClipboard } from "./useCopyToClipboard";
@@ -241,14 +241,16 @@ export function useThreadActionMenu(input: {
           case "regenerate-title": {
             if (isRegeneratingTitle) return;
             const requestId = CommandId.make(randomUUID());
+            const stopWatching = createTitleRegenerationReporter().watch(threadRef, requestId);
             const result = await updateThreadMetadata({
               environmentId: threadRef.environmentId,
               input: { commandId: requestId, threadId: threadRef.threadId, regenerateTitle: true },
             });
-            if (result._tag === "Success") {
-              reportTitleRegenerationFailures([{ threadRef, requestId }]);
-            } else if (!isAtomCommandInterrupted(result)) {
-              failureToast("Failed to regenerate thread title", squashAtomCommandFailure(result));
+            if (result._tag === "Failure") {
+              stopWatching();
+              if (!isAtomCommandInterrupted(result)) {
+                failureToast("Failed to regenerate thread title", squashAtomCommandFailure(result));
+              }
             }
             return;
           }

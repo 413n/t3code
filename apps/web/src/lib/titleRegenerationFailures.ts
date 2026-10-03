@@ -9,35 +9,47 @@ const TITLE_REGENERATION_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * Title regeneration runs in the background after its command is accepted.
- * Watches the given requests and shows one toast with the server's reason if
- * any of them fail.
+ * Call `watch` before sending each regeneration command, and call the function
+ * it returns if the command is rejected. Failures share one toast that counts
+ * them, so a bulk regeneration against a broken provider shows one toast.
  */
-export function reportTitleRegenerationFailures(
-  requests: ReadonlyArray<{ readonly threadRef: ScopedThreadRef; readonly requestId: CommandId }>,
-): void {
-  if (requests.length === 0) return;
-  void Promise.all(
-    requests.map(({ threadRef, requestId }) =>
-      waitForTitleRegenerationFailure({
+export function createTitleRegenerationReporter() {
+  let toastId: string | null = null;
+  let failures = 0;
+
+  const show = (reason: string) => {
+    failures += 1;
+    const options = {
+      ...stackedThreadToast({
+        type: "error",
+        title:
+          failures === 1
+            ? "Failed to regenerate thread title"
+            : `Failed to regenerate ${failures} thread titles`,
+        description: reason,
+      }),
+      onClose: () => {
+        toastId = null;
+        failures = 0;
+      },
+    };
+    if (toastId === null) toastId = toastManager.add(options);
+    else toastManager.update(toastId, options);
+  };
+
+  return {
+    watch(threadRef: ScopedThreadRef, requestId: CommandId): () => void {
+      const controller = new AbortController();
+      void waitForTitleRegenerationFailure({
         registry: appAtomRegistry,
         atom: environmentThreadShells.threadShellAtom(threadRef),
         requestId,
         timeoutMs: TITLE_REGENERATION_TIMEOUT_MS,
-      }),
-    ),
-  ).then((failures) => {
-    const reasons = failures.filter((failure) => failure !== null);
-    const [reason] = reasons;
-    if (reason === undefined) return;
-    toastManager.add(
-      stackedThreadToast({
-        type: "error",
-        title:
-          reasons.length === 1
-            ? "Failed to regenerate thread title"
-            : `Failed to regenerate ${reasons.length} thread titles`,
-        description: reason,
-      }),
-    );
-  });
+        signal: controller.signal,
+      }).then((reason) => {
+        if (reason !== null) show(reason);
+      });
+      return () => controller.abort();
+    },
+  };
 }
