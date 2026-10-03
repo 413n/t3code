@@ -487,7 +487,7 @@ describe("ThreadTitleRegenerationService", () => {
 
         const projection = yield* threads.getThreadProjection(threadId);
         const message = projection.thread.titleRegenerationFailure?.message ?? "";
-        assert.equal(message.length, 501);
+        assert.equal(message.length, 500);
         assert.isTrue(message.startsWith("Codex CLI command failed: x"));
         assert.isTrue(message.endsWith("…"));
       }).pipe(Effect.provide(harness.layer));

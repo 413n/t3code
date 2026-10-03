@@ -35,7 +35,7 @@ const titleGenerationFailureMessage = (cause: Cause.Cause<unknown>): string => {
   const detail = isTextGenerationError(error) ? error.detail.trim() : "";
   if (detail.length === 0) return TITLE_GENERATION_FAILED_MESSAGE;
   return detail.length > TITLE_GENERATION_FAILURE_MAX_LENGTH
-    ? `${detail.slice(0, TITLE_GENERATION_FAILURE_MAX_LENGTH).trimEnd()}…`
+    ? `${detail.slice(0, TITLE_GENERATION_FAILURE_MAX_LENGTH - 1).trimEnd()}…`
     : detail;
 };
 
