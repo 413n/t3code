@@ -51,7 +51,7 @@ const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const CODE_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9\-._~]{43,128}$/;
 
-export const MCP_OAUTH_SCOPE = encodeOAuthScope(EnvironmentAuth.MCP_CLIENT_SCOPES);
+const MCP_OAUTH_SCOPE = encodeOAuthScope(EnvironmentAuth.MCP_CLIENT_SCOPES);
 export const decodeRuntimeMode = Schema.decodeUnknownOption(RuntimeMode);
 
 export interface McpOAuthUrls {
@@ -260,7 +260,7 @@ export const redirectForError = (error: McpOAuthRedirectError, issuer: string) =
     iss: issuer,
   });
 
-export const make = Effect.gen(function* () {
+const make = Effect.gen(function* () {
   const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const crypto = yield* Crypto.Crypto;

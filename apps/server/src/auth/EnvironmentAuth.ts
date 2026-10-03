@@ -72,7 +72,7 @@ export interface IssuedBearerSession {
  * runtime-mode ceiling the user approved; the HTTP API and WebSocket reject
  * them so an agent token cannot reach the full RPC surface around that cap.
  */
-export const MCP_CLIENT_SUBJECT = "mcp-client";
+const MCP_CLIENT_SUBJECT = "mcp-client";
 export const MCP_CLIENT_SCOPES = [
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,

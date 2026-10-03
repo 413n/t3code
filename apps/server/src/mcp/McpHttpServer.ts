@@ -60,7 +60,7 @@ import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 
 /** Where an MCP client discovers how to sign in (RFC 9728), at this request's own origin. */
-export const mcpResourceMetadataUrl = (request: HttpServerRequest.HttpServerRequest) =>
+const mcpResourceMetadataUrl = (request: HttpServerRequest.HttpServerRequest) =>
   HttpServerRequest.toURL(request).pipe(
     Option.map((url) => `${url.origin}/.well-known/oauth-protected-resource/mcp`),
   );
