@@ -440,7 +440,7 @@ export class ServerAuthMcpApprovalCodeError extends Schema.TaggedError<ServerAut
 ) {
   override get message(): string {
     return this.reason === "insufficient_scope"
-      ? "That pairing code cannot grant this access. Create one with the standard scopes, or choose Read only."
+      ? "That pairing code cannot grant this access, and it is now used up. Create one with the standard scopes, or choose Read only with a new code."
       : this.reason === "not_a_pairing_code"
         ? "That is not a one-time pairing code."
         : "That pairing code is unknown, expired, or already used.";
