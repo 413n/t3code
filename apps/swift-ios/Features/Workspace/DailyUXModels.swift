@@ -768,8 +768,10 @@ struct DailyUXSidebarIndex {
         now: Date = .now,
         pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation] = [:]
     ) {
+        // Delegate children remain addressable through their parent, but do not
+        // become independent inbox tasks (the same rule as the web sidebar).
         let visible = snapshot.threads.filter { thread in
-            guard !thread.isArchived else { return false }
+            guard !thread.isArchived, !thread.isSubagent else { return false }
             return projectID == nil || thread.projectID == projectID
         }
         let available = visible.filter { !$0.isEffectivelySnoozed(at: now) }
@@ -820,6 +822,7 @@ struct DailyUXSidebarIndex {
         threads
             .filter { thread in
                 !thread.isArchived
+                    && !thread.isSubagent
                     && !thread.isEffectivelySnoozed(at: now)
                     && !(thread.supportsSettlement == true && thread.isEffectivelySettled())
                     && (thread.pinnedAt != nil) == (section == .pinned)

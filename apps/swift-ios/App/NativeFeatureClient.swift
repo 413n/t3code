@@ -3777,6 +3777,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         _ thread: OrchestrationThreadShell
     ) -> OrchestrationThreadShell {
         OrchestrationThreadShell(
+            relationshipToParent: thread.relationshipToParent,
             id: thread.id,
             projectId: thread.projectId,
             title: thread.title,
@@ -5988,6 +5989,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return FeatureThread(
             id: FeatureScopedID.thread(environmentID: environment.id, wireID: thread.id),
             wireID: thread.id,
+            relationshipToParent: thread.relationshipToParent,
             projectID: FeatureScopedID.project(
                 environmentID: environment.id,
                 wireID: thread.projectId
@@ -6080,6 +6082,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return FeatureThread(
             id: FeatureScopedID.thread(environmentID: environment.id, wireID: thread.id),
             wireID: thread.id,
+            relationshipToParent: thread.relationshipToParent,
             projectID: FeatureScopedID.project(
                 environmentID: environment.id,
                 wireID: thread.projectId
@@ -6426,6 +6429,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
         let loadedCheckpointTurns = Set(loaded.checkpoints.map(\.turnId))
         return OrchestrationThread(
+            relationshipToParent: loaded.relationshipToParent,
             id: loaded.id,
             projectId: loaded.projectId,
             title: loaded.title,
@@ -6919,6 +6923,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ) {
         // The shell is the freshest source for the title. A cached detail can
         // still carry the pre-regeneration title after the server renamed it.
+        thread.relationshipToParent = shell.relationshipToParent
         thread.title = shell.title
         thread.isRegeneratingTitle = shell.titleRegeneration != nil
         thread.isSettled = isSettled(shell.settledOverride, settledAt: shell.settledAt)
@@ -8489,6 +8494,7 @@ enum NativeThreadDetailReducer {
         updatedAt: String
     ) -> OrchestrationThread {
         OrchestrationThread(
+            relationshipToParent: thread.relationshipToParent,
             id: thread.id,
             projectId: thread.projectId,
             title: thread.title,

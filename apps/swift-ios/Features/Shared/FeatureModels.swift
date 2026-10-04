@@ -270,6 +270,8 @@ public struct FeatureThreadSettlementFacts: Sendable, Equatable, Hashable, Codab
 }
 
 public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public var relationshipToParent: String? = nil
+    public var isSubagent: Bool { relationshipToParent == "subagent" }
     public let id: String
     /// The environment-local identifier sent over the wire.
     public var wireID: String?
@@ -327,6 +329,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public init(
         id: String,
         wireID: String? = nil,
+        relationshipToParent: String? = nil,
         projectID: String,
         environmentID: String? = nil,
         environmentName: String? = nil,
@@ -376,6 +379,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     ) {
         self.id = id
         self.wireID = wireID
+        self.relationshipToParent = relationshipToParent
         self.projectID = projectID
         self.environmentID = environmentID
         self.environmentName = environmentName

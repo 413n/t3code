@@ -3,6 +3,38 @@ import XCTest
 @testable import T3Code
 
 final class OrchestrationV2PresentationTests: XCTestCase {
+    func testCompletedDelegateKeepsLineageAndTerminalStatusAcrossShellAndDetail() throws {
+        let lineage: JSONValue = .object([
+            "parentThreadId": .string("parent"), "rootThreadId": .string("parent"),
+            "relationshipToParent": .string("subagent"),
+        ])
+        let raw = try V2Fixture.load("v2-shell-snapshot")
+        let original = try XCTUnwrap(raw["threads"]?.v2Array?.first)
+        let child = V2Fixture.patch(original, [
+            "lineage": lineage, "creationSource": .string("mcp"),
+            "status": .string("completed"), "activeRunId": .null,
+            "activityRunStatus": .null, "pendingRuntimeRequest": .null,
+            "pendingBackgroundTasks": .array([]),
+        ])
+        let shell = OrchestrationV2Presentation.shellThread(try OrchestrationV2ThreadShell(json: child))
+        XCTAssertEqual(shell.relationshipToParent, "subagent")
+        XCTAssertEqual(shell.latestTurn?.state, "completed")
+        XCTAssertEqual(shell.session?.status, "ready")
+        XCTAssertEqual(NativeFeatureClient.resolveThreadState(
+            latestTurn: shell.latestTurn, session: shell.session,
+            hasApprovals: false, hasUserInput: false, backgroundLiveness: shell.backgroundLiveness
+        ), .completed)
+        let base = V2Fixture.snapshot()
+        let thread = try XCTUnwrap(base["projection"]?["thread"])
+        let snapshot = V2Fixture.projectionPatch(base, [
+            "thread": V2Fixture.patch(thread, ["lineage": lineage, "creationSource": .string("mcp")]),
+            "runs": .array([V2Fixture.run(status: "completed")]),
+        ])
+        let detail = try OrchestrationV2ThreadState(snapshot: snapshot).normalizedSnapshot()
+        XCTAssertEqual(detail.thread.relationshipToParent, "subagent")
+        XCTAssertEqual(detail.thread.session?.status, "ready")
+    }
+
     func testArchiveEndpointUsesItsThreadsArrayWithoutAnArchivedThreadsKey() throws {
         var archived = try V2Fixture.load("v2-shell-snapshot").v2Object
         archived.removeValue(forKey: "archivedThreads")

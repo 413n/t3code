@@ -5,6 +5,33 @@ import XCTest
 
 @MainActor
 final class NativeMultiEnvironmentTests: XCTestCase {
+    func testDelegateLineageSurvivesNativeMappingAndCachedSnapshots() async throws {
+        let fixture = try await Self.makeFixture(
+            fallbackPollingInitialDelay: .seconds(60), aggregateRefreshInterval: .seconds(60)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let source = multiEnvironmentShell(projectID: "project-two", threadID: "child", title: "Review")
+        var child = try XCTUnwrap(source.threads.first)
+        child.relationshipToParent = "subagent"
+        await fixture.transport.setShell(OrchestrationShellSnapshot(
+            snapshotSequence: source.snapshotSequence, projects: source.projects,
+            threads: [child], updatedAt: source.updatedAt
+        ), host: "two.example")
+        let snapshot = try await fixture.client.initialSnapshot()
+        let mapped = try XCTUnwrap(snapshot.threads.first { $0.wireID == "child" })
+        XCTAssertTrue(mapped.isSubagent)
+        let restored = try JSONDecoder.t3.decode(FeatureSnapshot.self, from: JSONEncoder.t3.encode(snapshot))
+        XCTAssertTrue(try XCTUnwrap(restored.threads.first { $0.id == mapped.id }).isSubagent)
+        let inbox = DailyUXSidebarIndex(snapshot: restored, query: "Review")
+        XCTAssertFalse(inbox.active.contains { $0.id == mapped.id })
+        XCTAssertTrue(inbox.searchResults.isEmpty)
+        // Older persisted snapshots and V1 threads have no lineage.
+        var oldFields = try JSONValue.encode(mapped).v2Object
+        oldFields.removeValue(forKey: "relationshipToParent")
+        XCTAssertFalse(try JSONValue.object(oldFields).decode(FeatureThread.self).isSubagent)
+        await fixture.client.disconnect()
+    }
+
     func testPreferenceChangeRejectsAnAlreadyRunningPassiveRefresh() async throws {
         let fixture = try await Self.makeFixture(
             fallbackPollingInitialDelay: .seconds(60), aggregateRefreshInterval: .seconds(60)

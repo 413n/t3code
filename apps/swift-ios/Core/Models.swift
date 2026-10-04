@@ -522,6 +522,7 @@ public struct ThreadTitleRegeneration: Codable, Equatable, Sendable {
 }
 
 public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendable {
+    public var relationshipToParent: String? = nil
     public let id: String
     public let projectId: String
     public let title: String
@@ -605,6 +606,7 @@ public struct CheckpointSummary: Codable, Equatable, Sendable {
 }
 
 public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
+    public var relationshipToParent: String? = nil
     public let id: String
     public let projectId: String
     public let title: String

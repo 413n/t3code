@@ -7,6 +7,32 @@ struct DailyUXSidebarTests {
     private let now = Date(timeIntervalSince1970: 2_000_000)
 
     @Test
+    func delegateChildrenDoNotEnterInboxSearchOrReorderLists() {
+        let ordinary = thread(id: "ordinary", created: -100, updated: -10)
+        var fork = thread(id: "fork", created: -90, updated: -10)
+        fork.relationshipToParent = "fork"
+        var children = [FeatureThread]()
+        for state in [FeatureThreadState.working, .completed, .waitingForApproval, .failed] {
+            var child = thread(id: "child-\(state)", created: -50, updated: -5, state: state)
+            child.relationshipToParent = "subagent"
+            children.append(child)
+        }
+        let threads = [ordinary, fork] + children
+        let index = DailyUXSidebarIndex(snapshot: FeatureSnapshot(threads: threads), query: "Task", now: now)
+        #expect(Set(index.active.map(\.id)) == ["ordinary", "fork"])
+        #expect(Set(index.searchResults.map(\.id)) == ["ordinary", "fork"])
+        #expect(DailyUXSidebarIndex.orderedSection(threads, section: .active, now: now).count == 2)
+        children[0].pinnedAt = now
+        children[1].isSettled = true
+        children[2].snoozedUntil = now.addingTimeInterval(3600)
+        let otherShelves = makeIndex(children)
+        #expect(otherShelves.pinned.isEmpty)
+        #expect(otherShelves.settled.isEmpty)
+        #expect(otherShelves.snoozed.isEmpty)
+        #expect(DailyUXSidebarIndex.orderedSection(children, section: .pinned, now: now).isEmpty)
+    }
+
+    @Test
     func snoozePresetsUseUsefulLocalClockBoundaries() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try #require(TimeZone(identifier: "America/Los_Angeles"))

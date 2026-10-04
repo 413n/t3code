@@ -79,6 +79,7 @@ public enum OrchestrationV2Presentation {
             )
         }
         return OrchestrationThreadShell(
+            relationshipToParent: t.lineage.relationshipToParent,
             id: t.id, projectId: t.projectId, title: t.title, modelSelection: t.modelSelection,
             runtimeMode: t.runtimeMode, interactionMode: t.interactionMode, branch: t.branch,
             worktreePath: t.worktreePath, linkedPullRequest: t.linkedPullRequest,
@@ -140,6 +141,7 @@ public enum OrchestrationV2Presentation {
         let failure = rootFailure(displayRun, items: p.turnItems)
         let lastError = providerSession?.lastError ?? failure?.message
         let native = OrchestrationThread(
+            relationshipToParent: t.lineage.relationshipToParent,
             id: t.id, projectId: t.projectId, title: t.title, modelSelection: t.modelSelection,
             runtimeMode: t.runtimeMode, interactionMode: t.interactionMode, branch: t.branch,
             worktreePath: t.worktreePath, linkedPullRequest: t.linkedPullRequest,
