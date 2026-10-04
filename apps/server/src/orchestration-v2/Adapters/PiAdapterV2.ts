@@ -2342,7 +2342,9 @@ export function makePiAdapterV2(
               activeProviderRetry: null,
               failure: null,
             };
-            // Set together with the send, with no gap for an interrupt to land in.
+            // Set together with the send and its pending-response entry, with
+            // no gap for an interrupt to land in: a sent turn always has the
+            // entry that settles or fails it.
             let sent = false;
             // Only the install/send/start-event boundary excludes the event
             // pump. Earlier correlated requests must leave the pump free so
@@ -2352,13 +2354,17 @@ export function makePiAdapterV2(
               state.activeTurn = activeTurn;
               if (compactCommand !== null) {
                 yield* connection.send(compactRpcRecord(compactCommand)).pipe(
-                  Effect.tap(() => Effect.sync(() => (sent = true))),
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      pendingCompactResponses.push({
+                        providerTurnId: providerTurn.id,
+                        kind: "turn_start",
+                      });
+                      sent = true;
+                    }),
+                  ),
                   Effect.uninterruptible,
                 );
-                pendingCompactResponses.push({
-                  providerTurnId: providerTurn.id,
-                  kind: "turn_start",
-                });
               } else if (payload !== null) {
                 yield* connection
                   .send({
@@ -2367,13 +2373,17 @@ export function makePiAdapterV2(
                     ...(payload.images.length === 0 ? {} : { images: payload.images }),
                   })
                   .pipe(
-                    Effect.tap(() => Effect.sync(() => (sent = true))),
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        pendingPromptResponses.push({
+                          providerTurnId: providerTurn.id,
+                          kind: "turn_start",
+                        });
+                        sent = true;
+                      }),
+                    ),
                     Effect.uninterruptible,
                   );
-                pendingPromptResponses.push({
-                  providerTurnId: providerTurn.id,
-                  kind: "turn_start",
-                });
               }
               yield* emit({
                 type: "provider_turn.updated",

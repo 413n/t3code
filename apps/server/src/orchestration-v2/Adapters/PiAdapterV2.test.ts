@@ -1298,6 +1298,75 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect("fails a kept turn when Pi rejects the prompt it was interrupted after sending", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const appThread = yield* makeAppThread("default");
+      const runId = RunId.make(`run:${THREAD_ID}:1`);
+      // The install block first reads `runOrdinal` after it sent the prompt.
+      // Interrupting the starting fiber there is a Stop that lands once Pi is
+      // already running the prompt, with no wait to race. Later reads (the
+      // event pump settling the turn) are left alone.
+      let interruptOnRead = true;
+      const turnInput = {
+        appThread,
+        threadId: THREAD_ID,
+        runId,
+        get runOrdinal() {
+          if (interruptOnRead) {
+            interruptOnRead = false;
+            Fiber.getCurrent()?.interruptUnsafe();
+          }
+          return 1;
+        },
+        providerTurnOrdinal: 1,
+        attemptId: RunAttemptId.make(`run-attempt:${runId}:1`),
+        rootNodeId: NodeId.make(`node:${runId}:root`),
+        providerThread,
+        message: {
+          messageId: `message:${THREAD_ID}:1` as never,
+          text: "Hello pi",
+          attachments: [],
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+        },
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      };
+      const starting = yield* runtime.startTurn(turnInput).pipe(Effect.forkChild);
+      const interrupted = yield* Fiber.await(starting);
+      assert.isTrue(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause));
+      yield* fake.takeRequest("prompt");
+      const running = yield* takeEvent(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      const providerTurnId =
+        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
+      assert.isDefined(providerTurnId);
+
+      // The kept turn still has the pending response that settles or fails it.
+      yield* fake.emit({
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "Prompt rejected",
+      });
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(
+        terminal.type === "turn.terminal" &&
+          terminal.status === "failed" &&
+          terminal.providerTurnId === providerTurnId,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("leaves /compacted as an ordinary prompt", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
