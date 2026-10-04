@@ -189,29 +189,27 @@ describe("connection onboarding", () => {
       ]);
     }),
   );
-  for (const { label, scopes } of [
+  it.effect.each([
     { label: "read-only", scopes: ["orchestration:read"] },
     { label: "administrative", scopes: AuthAdministrativeScopes },
-  ] as const) {
-    it.effect(`preserves the ${label} grant when pairing a remote environment`, () =>
-      Effect.gen(function* () {
-        const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
-        const httpLayer = pairingHttpLayer(calls, { grantScopes: scopes });
-        const registration = yield* preparePairingRegistration({
-          host: "remote.example.test",
-          pairingCode: "pairing-token",
-        }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, httpLayer)));
+  ] as const)("preserves the $label grant when pairing a remote environment", ({ scopes }) =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const httpLayer = pairingHttpLayer(calls, { grantScopes: scopes });
+      const registration = yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, httpLayer)));
 
-        const session = yield* fetchRemoteSessionState({
-          httpBaseUrl: registration.profile.httpBaseUrl,
-          bearerToken: registration.credential.token,
-        }).pipe(Effect.provide(httpLayer));
+      const session = yield* fetchRemoteSessionState({
+        httpBaseUrl: registration.profile.httpBaseUrl,
+        bearerToken: registration.credential.token,
+      }).pipe(Effect.provide(httpLayer));
 
-        expect(session.authenticated).toBe(true);
-        expect(session.scopes).toEqual(scopes);
-      }),
-    );
-  }
+      expect(session.authenticated).toBe(true);
+      expect(session.scopes).toEqual(scopes);
+    }),
+  );
 
   it.effect("pairs an outdated server so it can be updated from this client", () =>
     Effect.gen(function* () {

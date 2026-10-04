@@ -384,83 +384,81 @@ describe("RemoteEnvironmentAuthorization", () => {
     }),
   );
 
-  for (const [name, grantScopes] of [
-    ["read-only", ["orchestration:read"]],
-    ["administrative", AuthAdministrativeScopes],
-  ] as const) {
-    it.effect(
-      `inherits ${name} pairing grant scopes for websocket authorization and HTTP renewal`,
-      () =>
-        Effect.gen(function* () {
-          const grantedScope = grantScopes.join(" ");
-          let exchangeCount = 0;
-          const tokenFields = (init: RequestInit) =>
-            new URLSearchParams(
-              init.body instanceof Uint8Array
-                ? new TextDecoder().decode(init.body)
-                : String(init.body),
-            );
-          const exchangeGrant = (init: RequestInit) => {
-            const fields = tokenFields(init);
-            expect(fields.get("scope")).toBeNull();
-            const scope = fields.get("scope") ?? grantedScope;
-            const scopes = scope.split(" ");
-            if (scopes.some((requested) => !grantScopes.some((grant) => grant === requested))) {
-              return authInvalid();
-            }
-            return accessToken(`access-token:${++exchangeCount}:${scopes.join(",")}`, scope);
-          };
-          const harness = yield* makeHarness({
-            responses: [
-              Response.json(DESCRIPTOR),
-              exchangeGrant,
-              websocketTicket("granted-ticket"),
-              Response.json(DESCRIPTOR),
-              exchangeGrant,
-            ],
-          });
-
-          const [authorized, refreshed] = yield* Effect.gen(function* () {
-            const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
-            const first = yield* remote.authorizeDpop({
-              expectedEnvironmentId: ENVIRONMENT_ID,
-            });
-            yield* TestClock.adjust("1 hour");
-            const refreshed = yield* remote.authorizeDpopHttp({
-              expectedEnvironmentId: ENVIRONMENT_ID,
-            });
-            return [first, refreshed] as const;
-          }).pipe(Effect.provide(Layer.merge(harness.layer, TestClock.layer())));
-
-          expect(authorized.socketUrl).toContain("wsTicket=granted-ticket");
-          expect(authorized.httpAuthorization).toMatchObject({
-            _tag: "Dpop",
-            accessToken: `access-token:1:${grantScopes.join(",")}`,
-          });
-          expect(refreshed.httpAuthorization).toMatchObject({
-            _tag: "Dpop",
-            accessToken: `access-token:2:${grantScopes.join(",")}`,
-          });
-          expect((yield* Ref.get(harness.tokens)).get(ENVIRONMENT_ID)).toMatchObject({
-            accessToken: `access-token:2:${grantScopes.join(",")}`,
-            dpopThumbprint: "thumbprint-1",
-          });
-          expect(yield* Ref.get(harness.bootstrapCalls)).toBe(2);
-          const exchanges = harness.fetch.calls.filter(([url]) =>
-            String(url).endsWith("/oauth/token"),
+  it.effect.each([
+    { name: "read-only", grantScopes: ["orchestration:read"] },
+    { name: "administrative", grantScopes: AuthAdministrativeScopes },
+  ] as const)(
+    "inherits $name pairing grant scopes for websocket authorization and HTTP renewal",
+    ({ grantScopes }) =>
+      Effect.gen(function* () {
+        const grantedScope = grantScopes.join(" ");
+        let exchangeCount = 0;
+        const tokenFields = (init: RequestInit) =>
+          new URLSearchParams(
+            init.body instanceof Uint8Array
+              ? new TextDecoder().decode(init.body)
+              : String(init.body),
           );
-          expect(exchanges).toHaveLength(2);
-          for (const [, init] of exchanges) {
-            expect(Object.fromEntries(tokenFields(init))).toMatchObject({
-              subject_token: BOOTSTRAP.credential,
-              client_label: "T3 Code Test",
-              client_device_type: "mobile",
-              client_os: "test",
-            });
+        const exchangeGrant = (init: RequestInit) => {
+          const fields = tokenFields(init);
+          expect(fields.get("scope")).toBeNull();
+          const scope = fields.get("scope") ?? grantedScope;
+          const scopes = scope.split(" ");
+          if (scopes.some((requested) => !grantScopes.some((grant) => grant === requested))) {
+            return authInvalid();
           }
-        }),
-    );
-  }
+          return accessToken(`access-token:${++exchangeCount}:${scopes.join(",")}`, scope);
+        };
+        const harness = yield* makeHarness({
+          responses: [
+            Response.json(DESCRIPTOR),
+            exchangeGrant,
+            websocketTicket("granted-ticket"),
+            Response.json(DESCRIPTOR),
+            exchangeGrant,
+          ],
+        });
+
+        const [authorized, refreshed] = yield* Effect.gen(function* () {
+          const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+          const first = yield* remote.authorizeDpop({
+            expectedEnvironmentId: ENVIRONMENT_ID,
+          });
+          yield* TestClock.adjust("1 hour");
+          const refreshed = yield* remote.authorizeDpopHttp({
+            expectedEnvironmentId: ENVIRONMENT_ID,
+          });
+          return [first, refreshed] as const;
+        }).pipe(Effect.provide(Layer.merge(harness.layer, TestClock.layer())));
+
+        expect(authorized.socketUrl).toContain("wsTicket=granted-ticket");
+        expect(authorized.httpAuthorization).toMatchObject({
+          _tag: "Dpop",
+          accessToken: `access-token:1:${grantScopes.join(",")}`,
+        });
+        expect(refreshed.httpAuthorization).toMatchObject({
+          _tag: "Dpop",
+          accessToken: `access-token:2:${grantScopes.join(",")}`,
+        });
+        expect((yield* Ref.get(harness.tokens)).get(ENVIRONMENT_ID)).toMatchObject({
+          accessToken: `access-token:2:${grantScopes.join(",")}`,
+          dpopThumbprint: "thumbprint-1",
+        });
+        expect(yield* Ref.get(harness.bootstrapCalls)).toBe(2);
+        const exchanges = harness.fetch.calls.filter(([url]) =>
+          String(url).endsWith("/oauth/token"),
+        );
+        expect(exchanges).toHaveLength(2);
+        for (const [, init] of exchanges) {
+          expect(Object.fromEntries(tokenFields(init))).toMatchObject({
+            subject_token: BOOTSTRAP.credential,
+            client_label: "T3 Code Test",
+            client_device_type: "mobile",
+            client_os: "test",
+          });
+        }
+      }),
+  );
 
   it.effect("evicts an auth-invalid cached token and obtains a fresh bootstrap", () =>
     Effect.gen(function* () {

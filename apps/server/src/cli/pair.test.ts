@@ -334,11 +334,12 @@ describe("t3 pair", () => {
 });
 
 describe("auth scope options", () => {
-  for (const [group, action] of [
-    ["pairing", "create"],
-    ["session", "issue"],
-  ] as const) {
-    it.effect(`issues and persists only the selected scopes for auth ${group} ${action}`, () =>
+  it.effect.each([
+    { group: "pairing", action: "create" },
+    { group: "session", action: "issue" },
+  ] as const)(
+    "issues and persists only the selected scopes for auth $group $action",
+    ({ group, action }) =>
       Effect.gen(function* () {
         const baseDir = NodeFS.mkdtempSync(
           NodePath.join(NodeOS.tmpdir(), "t3-cli-auth-scopes-test-"),
@@ -373,31 +374,33 @@ describe("auth scope options", () => {
         assert.lengthOf(listed, 1);
         assert.deepEqual(listed[0]?.scopes, issued.scopes);
       }),
-    );
-  }
+  );
 
-  for (const command of [["pair"], ["auth", "pairing", "create"], ["auth", "session", "issue"]]) {
-    it.effect(`rejects invalid scopes before running ${command.join(" ")}`, () =>
-      Effect.gen(function* () {
-        const error = yield* runCli([
-          ...command,
-          "--scope",
-          "orchestration:read",
-          "--scope",
-          "admin",
-        ]).pipe(Effect.provide(CliRuntimeLayer), Effect.flip);
+  it.effect.each(
+    [["pair"], ["auth", "pairing", "create"], ["auth", "session", "issue"]].map((command) => ({
+      command,
+      label: command.join(" "),
+    })),
+  )("rejects invalid scopes before running $label", ({ command }) =>
+    Effect.gen(function* () {
+      const error = yield* runCli([
+        ...command,
+        "--scope",
+        "orchestration:read",
+        "--scope",
+        "admin",
+      ]).pipe(Effect.provide(CliRuntimeLayer), Effect.flip);
 
-        if (!CliError.isCliError(error) || error._tag !== "ShowHelp") {
-          assert.fail(`Expected ShowHelp, got ${String(error)}`);
-        }
-        assert.deepEqual(error.commandPath, ["t3", ...command]);
-        const scopeError = error.errors[0];
-        if (scopeError?._tag !== "InvalidValue") {
-          assert.fail(`Expected InvalidValue, got ${String(scopeError?._tag)}`);
-        }
-        assert.equal(scopeError.option, "scope");
-        assert.equal(scopeError.value, "admin");
-      }),
-    );
-  }
+      if (!CliError.isCliError(error) || error._tag !== "ShowHelp") {
+        assert.fail(`Expected ShowHelp, got ${String(error)}`);
+      }
+      assert.deepEqual(error.commandPath, ["t3", ...command]);
+      const scopeError = error.errors[0];
+      if (scopeError?._tag !== "InvalidValue") {
+        assert.fail(`Expected InvalidValue, got ${String(scopeError?._tag)}`);
+      }
+      assert.equal(scopeError.option, "scope");
+      assert.equal(scopeError.value, "admin");
+    }),
+  );
 });

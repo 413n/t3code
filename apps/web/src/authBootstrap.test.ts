@@ -669,7 +669,7 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(testWindow.location.hash).toBe("");
   });
 
-  it("exchanges an explicit pair link after caching an authenticated state", async () => {
+  it("exchanges a root URL token after caching an authenticated state", async () => {
     const testApi = await installAuthApi({
       session: () => authenticatedSession(LOOPBACK_AUTH),
       browserSession: () => Effect.succeed(browserSession(["orchestration:read", "access:write"])),
@@ -680,7 +680,7 @@ describe("resolveInitialServerAuthGateState", () => {
     await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
       status: "authenticated",
     });
-    testWindow.location = new URL("http://localhost/pair#token=reusable-token");
+    testWindow.location = new URL("http://localhost/#token=reusable-token");
 
     await Promise.all([resolveInitialServerAuthGateState(), resolveInitialServerAuthGateState()]);
 
@@ -722,7 +722,7 @@ describe("resolveInitialServerAuthGateState", () => {
     const { resolveInitialServerAuthGateState } = await import("./environments/primary");
 
     const initialBootstrap = resolveInitialServerAuthGateState();
-    testWindow.location = new URL("http://localhost/pair#token=reusable-token");
+    testWindow.location = new URL("http://localhost/#token=reusable-token");
     const explicitPairing = resolveInitialServerAuthGateState();
     const laterCaller = resolveInitialServerAuthGateState();
     let laterCallerSettled = false;
