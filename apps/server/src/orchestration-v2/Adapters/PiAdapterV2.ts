@@ -2382,7 +2382,9 @@ export function makePiAdapterV2(
               }
             }).pipe(
               sessionEventPermit.withPermits(1),
-              Effect.tapError(() =>
+              // On interrupt too: a Stop that lands here must not leave the
+              // turn installed, or every later turn is rejected as active.
+              Effect.onError(() =>
                 Effect.sync(() => {
                   if (state.activeTurn === activeTurn) state.activeTurn = null;
                 }),
@@ -2669,8 +2671,9 @@ export function makePiAdapterV2(
             }
             // Pi fork replaces the session file, including for rollback. Persist
             // its new identity before any later request can fail or restart.
+            // An interrupted read leaves the identity just as unknown as a failed one.
             const forkState = yield* request({ type: "get_state" }).pipe(
-              Effect.tapError(() =>
+              Effect.onError(() =>
                 Effect.sync(() => {
                   threadState = null;
                 }),

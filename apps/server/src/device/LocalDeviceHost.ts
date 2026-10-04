@@ -406,7 +406,8 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
         }),
     }).pipe(
       Effect.provideService(HttpClient.HttpClient, httpClient),
-      Effect.tapError(() => stopHub(hub)),
+      // On interrupt too: the hub is not recorded yet, so nothing else stops it.
+      Effect.onError(() => stopHub(hub)),
     );
     yield* recordHub(hub, hubTool);
     yield* Effect.logInfo("Device hub started", { pid: Number(child.pid), port });

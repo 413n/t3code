@@ -294,8 +294,16 @@ function makeProviderAdapter(
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hangSessionScopeClose?: boolean;
     readonly beforeUnload?: Effect.Effect<void>;
+    /** Registers the process's closeCount finalizer before `beforeOpen` runs. */
+    readonly spawnBeforeOpen?: boolean;
   } = {},
 ): ProviderAdapterV2Shape {
+  const countClose = Effect.addFinalizer(() =>
+    Ref.update(state, (current) => ({
+      ...current,
+      closeCount: current.closeCount + 1,
+    })),
+  );
   return {
     instanceId: ProviderInstanceId.make("codex"),
     driver: CODEX_DRIVER,
@@ -303,10 +311,19 @@ function makeProviderAdapter(
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
     openSession: (input) =>
       Effect.gen(function* () {
+        if (options.spawnBeforeOpen === true) {
+          yield* countClose;
+        }
+        if (options.mcpConfigs !== undefined && options.spawnBeforeOpen === true) {
+          yield* Ref.update(options.mcpConfigs, (configs) => [
+            ...configs,
+            McpProviderSession.readMcpProviderSession(input.threadId),
+          ]);
+        }
         if (options.beforeOpen !== undefined) {
           yield* options.beforeOpen(input);
         }
-        if (options.mcpConfigs !== undefined) {
+        if (options.mcpConfigs !== undefined && options.spawnBeforeOpen !== true) {
           yield* Ref.update(options.mcpConfigs, (configs) => [
             ...configs,
             McpProviderSession.readMcpProviderSession(input.threadId),
@@ -328,12 +345,9 @@ function makeProviderAdapter(
             eventQueues,
           };
         });
-        yield* Effect.addFinalizer(() =>
-          Ref.update(state, (current) => ({
-            ...current,
-            closeCount: current.closeCount + 1,
-          })),
-        );
+        if (options.spawnBeforeOpen !== true) {
+          yield* countClose;
+        }
         if (options.hangSessionScopeClose === true) {
           // Registered last so it runs first on scope close, wedging the
           // close before the closeCount finalizer, like a provider process
@@ -410,6 +424,7 @@ function makeTestLayer(input: {
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hangSessionScopeClose?: boolean;
   readonly beforeUnload?: Effect.Effect<void>;
+  readonly spawnBeforeOpen?: boolean;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -432,6 +447,7 @@ function makeTestLayer(input: {
         ? {}
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
+      ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
     }),
   );
   const providerEventIngestorTestLayer = ProviderEventIngestor.layer.pipe(
@@ -889,6 +905,127 @@ it.effect("ProviderSessionManagerV2 opens a duplicate session only once", () =>
         }),
       ),
     );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 cleans up an open interrupted mid-handshake", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const mcpConfigs = yield* Ref.make<
+      ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
+    >([]);
+    const handshakeStarted = yield* Deferred.make<void>();
+    const holdHandshake = yield* Ref.make(true);
+    const effect = Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const registry = yield* McpSessionRegistry.McpSessionRegistry;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-interrupted-open");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+
+      const opening = yield* manager
+        .open({ threadId, providerSessionId, modelSelection, runtimePolicy })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(handshakeStarted);
+      const issued = (yield* Ref.get(mcpConfigs)).at(-1);
+      const token = issued?.authorizationHeader.replace(/^Bearer\s+/, "");
+      assert.isDefined(token);
+      assert.isDefined(yield* registry.resolve(token!));
+
+      // A Stop while the provider is still starting.
+      yield* Fiber.interrupt(opening);
+
+      // The process started for this open is stopped, and the credential minted
+      // for it revoked.
+      assert.equal((yield* Ref.get(state)).closeCount, 1);
+      assert.isUndefined(yield* registry.resolve(token!));
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
+      assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
+
+      // Nothing of the interrupted open is left behind: the next open starts a
+      // fresh process with a fresh credential that a later release revokes,
+      // which a leaked reservation would prevent.
+      yield* Ref.set(holdHandshake, false);
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      const replacement = (yield* Ref.get(mcpConfigs)).at(-1);
+      const replacementToken = replacement?.authorizationHeader.replace(/^Bearer\s+/, "");
+      assert.isDefined(replacementToken);
+      assert.notEqual(replacementToken, token);
+      const projection = yield* projectionStore.getThreadProjection(threadId);
+      assert.equal(projection.providerSessions.at(-1)?.status, "ready");
+
+      yield* manager.close(providerSessionId);
+      assert.isUndefined(yield* registry.resolve(replacementToken!));
+    });
+
+    yield* effect.pipe(
+      Effect.provide(
+        makeTestLayer({
+          state,
+          idleTimeoutMs: 60_000,
+          mcpConfigs,
+          beforeOpen: () =>
+            Ref.get(holdHandshake).pipe(
+              Effect.flatMap((hold) =>
+                hold
+                  ? Deferred.succeed(handshakeStarted, undefined).pipe(Effect.andThen(Effect.never))
+                  : Effect.void,
+              ),
+            ),
+          // The process is spawned before the handshake that is interrupted.
+          spawnBeforeOpen: true,
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 stops a session still opening when its layer shuts down", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const handshakeStarted = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-shutdown-during-open");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+      // Detached, like an open the layer does not own: only the session
+      // scope's parent can stop its process when the layer closes.
+      yield* manager
+        .open({ threadId, providerSessionId, modelSelection, runtimePolicy })
+        .pipe(Effect.forkDetach);
+      yield* Deferred.await(handshakeStarted);
+      assert.equal((yield* Ref.get(state)).closeCount, 0);
+    }).pipe(
+      Effect.provide(
+        makeTestLayer({
+          state,
+          idleTimeoutMs: 60_000,
+          beforeOpen: () =>
+            Deferred.succeed(handshakeStarted, undefined).pipe(Effect.andThen(Effect.never)),
+          spawnBeforeOpen: true,
+        }),
+      ),
+    );
+
+    assert.equal((yield* Ref.get(state)).closeCount, 1);
   }),
 );
 

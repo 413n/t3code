@@ -20,6 +20,7 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1178,6 +1179,57 @@ describe("PiAdapterV2", () => {
       yield* fake.emit({ type: "response", command: "prompt", success: true });
       // The adapter probes get_state (auto-acked idle by the fake), then
       // settles the turn as completed.
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("clears a turn whose start is interrupted while it is installed", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const appThread = yield* makeAppThread("default");
+      const runId = RunId.make(`run:${THREAD_ID}:1`);
+      // The install block reads `runOrdinal` once the turn is installed and its
+      // prompt sent. Interrupting the starting fiber there is a Stop that lands
+      // between installing the turn and returning, with no wait to race.
+      const turnInput = {
+        appThread,
+        threadId: THREAD_ID,
+        runId,
+        get runOrdinal() {
+          Fiber.getCurrent()?.interruptUnsafe();
+          return 1;
+        },
+        providerTurnOrdinal: 1,
+        attemptId: RunAttemptId.make(`run-attempt:${runId}:1`),
+        rootNodeId: NodeId.make(`node:${runId}:root`),
+        providerThread,
+        message: {
+          messageId: `message:${THREAD_ID}:1` as never,
+          text: "Hello pi",
+          attachments: [],
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+        },
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      };
+      const starting = yield* runtime.startTurn(turnInput).pipe(Effect.forkChild);
+      const interrupted = yield* Fiber.await(starting);
+      assert.isTrue(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause));
+      yield* fake.takeRequest("prompt");
+
+      // A turn left installed would reject this one as already active.
+      yield* startTurn(runtime, providerThread, "default", [], "Second turn", undefined, 2);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "agent_settled" });
       const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
       assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),

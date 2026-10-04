@@ -1229,6 +1229,7 @@ export const layerWithOptions = (
         readonly providerInstanceId: ProviderInstanceId;
       }) =>
         Effect.suspend(() => {
+          let attachedHere = false;
           let preparedForCleanup: PreparedMcpCredential | undefined;
           let reservationDropped = false;
           const dropReservation = () => {
@@ -1240,7 +1241,12 @@ export const layerWithOptions = (
           return Effect.gen(function* () {
             const attached = yield* threadAttachment.withLock(
               threadAttachmentKey(input),
-              attachThread(input),
+              // Recorded with no gap for an interrupt: cleanup undoes only an
+              // attach this call made, never one an earlier open made.
+              attachThread(input).pipe(
+                Effect.tap((attached) => Effect.sync(() => (attachedHere = attached))),
+                Effect.uninterruptible,
+              ),
             );
             if (attached) {
               const prepared = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
@@ -1272,21 +1278,25 @@ export const layerWithOptions = (
               }
             }
           }).pipe(
-            Effect.tapError(() =>
-              removeThreadAttachment(input).pipe(
-                // Revoke only a credential this attach freshly minted: a REUSED
-                // credential is by definition held by another live provider
-                // process, and revoking it thread-wide would break that
-                // process's MCP client mid-conversation.
-                Effect.andThen(
-                  Effect.suspend(() => {
-                    dropReservation();
-                    return preparedForCleanup?.issued === true
-                      ? clearMcpSession(input.threadId, preparedForCleanup.mcpCredentialId)
-                      : Effect.void;
-                  }),
-                ),
-              ),
+            // An interrupted attach is undone too, so the next attach writes
+            // the attachment instead of finding the thread already attached.
+            Effect.onError(() =>
+              attachedHere
+                ? removeThreadAttachment(input).pipe(
+                    // Revoke only a credential this attach freshly minted: a REUSED
+                    // credential is by definition held by another live provider
+                    // process, and revoking it thread-wide would break that
+                    // process's MCP client mid-conversation.
+                    Effect.andThen(
+                      Effect.suspend(() => {
+                        dropReservation();
+                        return preparedForCleanup?.issued === true
+                          ? clearMcpSession(input.threadId, preparedForCleanup.mcpCredentialId)
+                          : Effect.void;
+                      }),
+                    ),
+                  )
+                : Effect.void,
             ),
             // The entry's own record (written above while the thread is
             // attached) guards the credential from here on; the reservation
@@ -1661,6 +1671,10 @@ export const layerWithOptions = (
         );
       };
 
+      // Parent of every session scope, forked before the shutdown finalizer is
+      // added: on layer close, shutdown releases the live sessions first, then
+      // this closes any session whose open is still in flight.
+      const sessionScopes = yield* Scope.fork(layerScope);
       const shutdown = Effect.gen(function* () {
         const activeSessions = [...(yield* Ref.get(sessions)).values()];
         yield* Effect.forEach(
@@ -1749,7 +1763,7 @@ export const layerWithOptions = (
                   dropMcpCredentialReservation(input.threadId, mcpCredentialId);
                 }
               });
-              const sessionScope = yield* Scope.make();
+              const sessionScope = yield* Scope.fork(sessionScopes);
               const runtime = yield* adapter
                 .openSession({
                   threadId: input.threadId,
@@ -1771,7 +1785,9 @@ export const layerWithOptions = (
                 })
                 .pipe(
                   Effect.provideService(Scope.Scope, sessionScope),
-                  Effect.tapError(() =>
+                  // Any failure, including a Stop that interrupts a slow
+                  // handshake, stops the provider process this open started.
+                  Effect.onError(() =>
                     Scope.close(sessionScope, Exit.void).pipe(
                       Effect.ignore,
                       Effect.andThen(dropReservation),
@@ -1785,7 +1801,6 @@ export const layerWithOptions = (
                       ),
                     ),
                   ),
-                  Effect.onInterrupt(() => dropReservation),
                   Effect.mapError(
                     (cause) =>
                       new ProviderSessionOpenError({
@@ -1838,12 +1853,22 @@ export const layerWithOptions = (
                   payload: runtime.providerSession,
                 }),
               ).pipe(
-                Effect.tapError(() =>
-                  releaseEntry({
-                    providerSessionId: input.providerSessionId,
-                    reason: "runtime_error",
-                    detail: "Failed to persist the provider-session attachment.",
-                  }).pipe(logReleaseFailure(input.providerSessionId)),
+                // Released on interrupt too: this entry has no event pump or
+                // idle timer yet, so nothing else would ever release it.
+                Effect.onError((cause) =>
+                  releaseEntry(
+                    Cause.hasInterruptsOnly(cause)
+                      ? {
+                          providerSessionId: input.providerSessionId,
+                          reason: "manual_shutdown",
+                          detail: "The provider session start was interrupted.",
+                        }
+                      : {
+                          providerSessionId: input.providerSessionId,
+                          reason: "runtime_error",
+                          detail: "Failed to persist the provider-session attachment.",
+                        },
+                  ).pipe(logReleaseFailure(input.providerSessionId)),
                 ),
               );
               yield* startEventPump(entry);
