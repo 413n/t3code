@@ -17,6 +17,7 @@ import * as ServerConfig from "../../config.ts";
 import * as ResourceAttribution from "../../resourceTelemetry/ResourceAttribution.ts";
 import { ServerLoggerLive } from "../../serverLogger.ts";
 import * as BrowserTraceCollector from "../BrowserTraceCollector.ts";
+import * as DefectReporter from "../DefectReporter.ts";
 
 export const ObservabilityLive = Layer.unwrap(
   Effect.gen(function* () {
@@ -95,7 +96,13 @@ export const ObservabilityLive = Layer.unwrap(
 
     return otelWarningsLayer.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(ServerLoggerLive, traceReferencesLayer, tracerLayer, metricsLayer),
+        Layer.mergeAll(
+          ServerLoggerLive,
+          traceReferencesLayer,
+          tracerLayer,
+          metricsLayer,
+          DefectReporter.layer,
+        ),
       ),
       Layer.provide(
         OtelEnvironment.layerResourceAttributes(config.otelEnvironment.resourceAttributes),
