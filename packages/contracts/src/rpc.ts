@@ -1684,14 +1684,15 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 });
 
 /**
- * Checks the connection's scopes against the scope each RPC declares, before
- * the handler runs. Every RPC in `WsRpcGroup` carries it, so a handler cannot
- * be added without authorization.
+ * Wraps every WebSocket RPC on the server. It checks the connection's scopes
+ * against the scope the RPC declares before the handler runs, and records the
+ * call's span and metrics, including for calls it rejects. Every RPC in
+ * `WsRpcGroup` carries it, so a handler cannot be added without authorization
+ * or telemetry.
  */
-export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthorization>()(
-  "t3/contracts/RpcScopeAuthorization",
-  { error: EnvironmentAuthorizationError },
-) {}
+export class WsRpcGuard extends RpcMiddleware.Service<WsRpcGuard>()("t3/contracts/WsRpcGuard", {
+  error: EnvironmentAuthorizationError,
+}) {}
 
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
@@ -1867,4 +1868,4 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeArchivedShellRpc,
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
-).middleware(RpcScopeAuthorization);
+).middleware(WsRpcGuard);

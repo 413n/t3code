@@ -24,14 +24,15 @@ message) are fine next to the service; the capability itself is the method.
 ```ts
 // ws.ts: a thin handler
 [WS_METHODS.projectsCreateNew]: (input) =>
-  observeRpcEffect(
-    WS_METHODS.projectsCreateNew,
-    projectFolders.createNamedProject(input).pipe(
-      Effect.mapError((cause) => new ProjectCreateNewError({ cause })),
-    ),
-    { "rpc.aggregate": "orchestration" },
-  ),
+  projectFolders
+    .createNamedProject(input)
+    .pipe(Effect.mapError((cause) => new ProjectCreateNewError({ cause }))),
 ```
+
+Handlers don't add their own spans or request metrics. The `WsRpcGroup` middleware
+([`RpcAuthorization.ts`](../../apps/server/src/auth/RpcAuthorization.ts)) authorizes and instruments
+every call. A handler with per-call context, such as a thread id, adds it with
+`Effect.annotateCurrentSpan`.
 
 ## Shape of a service module
 

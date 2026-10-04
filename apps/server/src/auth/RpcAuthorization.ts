@@ -10,13 +10,15 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   type AuthEnvironmentScope,
   EnvironmentAuthorizationError,
-  RpcScopeAuthorization,
   WS_METHODS,
   WsRpcGroup,
+  WsRpcGuard,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+
+import { instrumentRpc } from "../observability/RpcInstrumentation.ts";
 
 type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
 
@@ -222,13 +224,17 @@ export const rpcAuthorizationError = (requiredScope: AuthEnvironmentScope) =>
     requiredScope,
   });
 
-/** Authorizes every RPC on one connection against that connection's session scopes. */
-export const rpcScopeAuthorizationLayer = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
-  Layer.succeed(RpcScopeAuthorization)((effect, { rpc }) => {
+/**
+ * Guards every RPC on one connection: authorizes it against that connection's session scopes and
+ * instruments it. A rejected call still gets its span and a failed request metric.
+ */
+export const wsRpcGuardLayer = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+  Layer.succeed(WsRpcGuard)((effect, { rpc }) => {
     const requiredScope = requiredScopeForRpcMethod(rpc._tag);
-    return scopes.includes(requiredScope)
-      ? effect
-      : Effect.fail(rpcAuthorizationError(requiredScope));
+    return instrumentRpc(
+      rpc,
+      scopes.includes(requiredScope) ? effect : Effect.fail(rpcAuthorizationError(requiredScope)),
+    );
   });
 
 /** Retrying can install or restart tools even though ordinary listing is readable. */
