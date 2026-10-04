@@ -25,7 +25,6 @@ import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AcpRegistryOperationError,
   CommandId,
-  authScopeRequiredResponse,
   authScopeResponse,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,

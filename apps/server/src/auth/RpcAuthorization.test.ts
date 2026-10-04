@@ -238,7 +238,7 @@ describe("RPC scope middleware", () => {
         yield* client[WS_METHODS.serverRetryResourceTelemetry]({}).pipe(Effect.flip),
       ).toMatchObject({
         _tag: "EnvironmentAuthorizationError",
-        requiredScope: missing,
+        requiredPermission: missing,
       });
       expect(handled).toEqual([]);
     }).pipe(Effect.scoped),
@@ -282,7 +282,7 @@ describe("settings mutation authorization", () => {
           patch: { defaultRuntimeMode: "full-access" },
           providerInstanceMutation,
         }).pipe(Effect.flip),
-      ).toMatchObject({ requiredScope: AuthSettingsWriteScope });
+      ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
       expect(handled).toBe(1);
     }).pipe(Effect.scoped),
   );
@@ -308,7 +308,7 @@ describe("settings mutation authorization", () => {
           patch: {},
           providerInstanceMutation,
         }).pipe(Effect.flip),
-      ).toMatchObject({ requiredScope: AuthProvidersManageScope });
+      ).toMatchObject({ requiredPermission: AuthProvidersManageScope });
       expect(handled).toBe(false);
     }).pipe(Effect.scoped),
   );
@@ -346,7 +346,7 @@ it.effect("requires task permission before attaching a prepared worktree to a th
         mode: "worktree",
         threadId: ThreadId.make("thread"),
       }).pipe(Effect.flip),
-    ).toMatchObject({ requiredScope: AuthOrchestrationOperateScope });
+    ).toMatchObject({ requiredPermission: AuthOrchestrationOperateScope });
     expect(handled).toBe(false);
   }).pipe(Effect.scoped),
 );
@@ -385,7 +385,10 @@ it.effect("separates host file URLs from readable attachment URLs", () =>
     ] as const) {
       expect(
         yield* client[WS_METHODS.assetsCreateUrl]({ resource }).pipe(Effect.flip),
-      ).toMatchObject({ requiredScope: AuthFilesystemReadScope });
+      ).toMatchObject({
+        requiredScope: AuthOrchestrationReadScope,
+        requiredPermission: AuthFilesystemReadScope,
+      });
     }
     expect(handled).toBe(1);
   }).pipe(Effect.scoped),
