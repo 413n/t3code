@@ -1217,6 +1217,7 @@ function ImportStep({
   const canImport = selected.every((candidate) =>
     writableEnvironments.has(candidate.environmentId),
   );
+  const [importError, setImportError] = useState("");
   const visibleImportError = !canImport
     ? IMPORT_PERMISSION_MESSAGE
     : importError === IMPORT_PERMISSION_MESSAGE

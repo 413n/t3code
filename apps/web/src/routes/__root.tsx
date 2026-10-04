@@ -48,7 +48,6 @@ import {
   ToastProvider,
   toastManager,
 } from "../components/ui/toast";
-import { resolveAndPersistPreferredEditor } from "../editorPreferences";
 import { isElectron } from "../env";
 import { cn } from "../lib/utils";
 import { applyAppearanceFontVariables } from "~/appearanceFonts";
