@@ -12,7 +12,7 @@ import * as ErrorReporter from "effect/ErrorReporter";
  * 400, and that second report must not be logged. Ignored errors, such as the
  * response HttpEffect attaches to every failed request, are skipped.
  */
-export const make = (): ErrorReporter.ErrorReporter => {
+const make = (): ErrorReporter.ErrorReporter => {
   const seen = new WeakSet<object>();
   return {
     [ErrorReporter.TypeId]: ErrorReporter.TypeId,
