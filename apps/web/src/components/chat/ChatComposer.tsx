@@ -4147,7 +4147,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       dispatchMode?: ComposerDispatchMode,
       submissionIntent?: ComposerSubmissionIntent,
     ) => {
-      if (noProviderAvailable || isSendDisabled || !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) {
+      if (
+        noProviderAvailable ||
+        isSendDisabled ||
+        !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
+      ) {
         event?.preventDefault();
         return;
       }
