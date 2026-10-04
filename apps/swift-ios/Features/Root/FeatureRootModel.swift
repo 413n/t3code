@@ -819,6 +819,10 @@ public final class FeatureRootModel {
 
     public func sendMessage(_ submission: FeatureMessageSubmission) async -> Bool {
         guard !rewindingThreadIDs.contains(submission.threadID) else { return false }
+        guard details[submission.threadID]?.execution?.isReadOnly != true else {
+            errorMessage = "This conversation is read-only."
+            return false
+        }
         activeSubmissionCounts[submission.threadID, default: 0] += 1
         defer {
             let remaining = (activeSubmissionCounts[submission.threadID] ?? 1) - 1
@@ -842,7 +846,8 @@ public final class FeatureRootModel {
             runtimeMode: thread.runtimeMode,
             interactionMode: thread.interactionMode,
             attachments: uploads,
-            context: submission.context
+            context: submission.context,
+            delivery: submission.delivery
         )
         guard await enqueue(queued) else { return false }
 
@@ -884,7 +889,8 @@ public final class FeatureRootModel {
                 runtimeMode: queued.runtimeMode,
                 attachments: uploads,
                 identity: identity,
-                context: submission.context
+                context: submission.context,
+                delivery: queued.delivery
             )
             if !(await completeQueuedSubmission(queued)) {
                 scheduleOutboxRetry()
@@ -1469,7 +1475,7 @@ public final class FeatureRootModel {
         var incoming = retainingLocalAttachmentPreviews(in: incoming)
         incoming.thread = retainingPendingSettlement(in: incoming.thread)
         let id = incoming.thread.id
-        acknowledgeDeliveredMessages(incoming.messages)
+        acknowledgeDeliveredMessages(incoming)
         let prepared = addingPendingMessages(to: incoming)
         let next = details[id].map { current in
             FeatureThreadDetail(
@@ -1480,7 +1486,8 @@ public final class FeatureRootModel {
                 page: prepared.page,
                 activeSubagentCount: prepared.activeSubagentCount,
                 backgroundWorkIsActive: prepared.backgroundWorkIsActive,
-                isCompacting: prepared.isCompacting == true
+                isCompacting: prepared.isCompacting == true,
+                execution: prepared.execution
             )
         } ?? prepared
         guard details[id] != next else { return }
@@ -1496,8 +1503,11 @@ public final class FeatureRootModel {
         var incoming = retainingLocalAttachmentPreviews(in: incoming)
         incoming.thread = retainingPendingSettlement(in: incoming.thread)
         let id = incoming.thread.id
-        acknowledgeDeliveredMessages(incoming.messages)
+        acknowledgeDeliveredMessages(incoming)
         let next = addingPendingMessages(to: incoming)
+        let queuedIDs = Set(incoming.execution?.queuedEntries.map(\.messageID) ?? [])
+        let removedOptimisticMessage = !queuedIDs.isEmpty
+            && details[id]?.messages.contains { queuedIDs.contains($0.id) } == true
         details[id] = next
         markDetailRecentlyUsed(id)
         bumpDetailLoadRevision(id: id)
@@ -1506,7 +1516,7 @@ public final class FeatureRootModel {
             changedMessages: delta.changedMessages + next.messages.dropFirst(incoming.messages.count),
             appendedMessageIDs: delta.appendedMessageIDs + appended
         )
-        bumpDetailRevision(id: id, change: .delta(pendingDelta))
+        bumpDetailRevision(id: id, change: removedOptimisticMessage ? .full : .delta(pendingDelta))
     }
 
     private func retainingPendingSettlement(in thread: FeatureThread) -> FeatureThread {
@@ -1755,8 +1765,13 @@ public final class FeatureRootModel {
             .filter { $0.threadID == incoming.thread.id }
             .sorted { $0.identity.createdAt < $1.identity.createdAt }
         guard !queued.isEmpty else { return incoming }
+        let acceptedQueueIDs = Set(incoming.execution?.queuedEntries.map(\.messageID) ?? [])
         var result = incoming
-        let existing = Set(result.messages.map(\.id))
+        // Accepted V2 queue messages stay in the queue until their run starts.
+        if !acceptedQueueIDs.isEmpty {
+            result.messages.removeAll { acceptedQueueIDs.contains($0.id) }
+        }
+        let existing = Set(result.messages.map(\.id)).union(acceptedQueueIDs)
         result.messages.append(contentsOf: queued.lazy
             .filter { !existing.contains($0.identity.messageID) }
             .map(queuedMessage(for:)))
@@ -1795,18 +1810,18 @@ public final class FeatureRootModel {
         return result
     }
 
-    private func acknowledgeDeliveredMessages(_ messages: [FeatureMessage]) {
+    private func acknowledgeDeliveredMessages(_ detail: FeatureThreadDetail) {
         // Runs on every detail publish; skip the full message-ID scan in the
         // common case where nothing is waiting in the outbox.
         guard !pendingSubmissionsByID.isEmpty else { return }
         // Local optimistic rows reuse the final message ID but are not proof
-        // that the server accepted the turn. Only authoritative, non-queued
-        // rows can retire a durable outbox entry.
-        let messageIDs = Set(messages.lazy
+        // that the server accepted the turn. V2 queued entries are authoritative
+        // receipts even though their messages are absent from the transcript.
+        let messageIDs = Set(detail.messages.lazy
             .filter { $0.state != .queued }
-            .map(\.id))
+            .map(\.id)).union(detail.execution?.queuedEntries.map(\.messageID) ?? [])
         let delivered = pendingSubmissionsByID.values.filter {
-            messageIDs.contains($0.identity.messageID)
+            $0.threadID == detail.thread.id && messageIDs.contains($0.identity.messageID)
         }
         for submission in delivered {
             scheduleQueuedSubmissionCompletion(submission)
@@ -1845,6 +1860,14 @@ public final class FeatureRootModel {
     }
 
     private func markQueuedMessageDelivered(_ submission: FeatureQueuedSubmission) {
+        if details[submission.threadID]?.execution?.queuedEntries.contains(where: {
+            $0.messageID == submission.identity.messageID
+        }) == true {
+            mutateDetail(id: submission.threadID) {
+                $0.messages.removeAll { $0.id == submission.identity.messageID }
+            }
+            return
+        }
         guard var message = details[submission.threadID]?.messages.first(where: {
             $0.id == submission.identity.messageID
         }), message.state != .complete else { return }
@@ -2043,7 +2066,8 @@ public final class FeatureRootModel {
                             runtimeMode: submission.runtimeMode,
                             attachments: submission.uploads,
                             identity: submission.identity,
-                            context: submission.context
+                            context: submission.context,
+                            delivery: submission.delivery
                         )
                         guard !Task.isCancelled,
                               outboxGeneration == generation else { return false }

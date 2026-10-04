@@ -508,6 +508,10 @@ private struct ConnectionDetailView: View {
     @State private var showingRemoval = false
     @State private var isUpdatingAutomaticSettlement = false
     @State private var showingPairAgain = false
+    @State private var orchestrationPreference: OrchestrationProtocolPreference?
+    @State private var detectedProtocolVersion: Int?
+    @State private var isUpdatingOrchestration = false
+    @State private var orchestrationErrorMessage: String?
 
     var body: some View {
         List {
@@ -553,6 +557,24 @@ private struct ConnectionDetailView: View {
                     }
                 }
 
+                Section("Orchestration") {
+                    Picker("Protocol", selection: orchestrationPreferenceBinding) {
+                        Text("Auto (Recommended)").tag(OrchestrationProtocolPreference.auto)
+                        Text("V1").tag(OrchestrationProtocolPreference.v1)
+                        Text("V2").tag(OrchestrationProtocolPreference.v2)
+                    }
+                    .disabled(orchestrationPreference == nil || isUpdatingOrchestration)
+                    LabeledContent(
+                        "Server protocol",
+                        value: detectedProtocolVersion.map { "V\($0)" } ?? "Not available"
+                    )
+                    if let orchestrationErrorMessage {
+                        Text(orchestrationErrorMessage)
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.danger)
+                    }
+                }
+
                 if let automaticSettlement {
                     Section("Automatic settlement") {
                         Toggle("When a pull request merges", isOn: mergeBinding)
@@ -588,6 +610,9 @@ private struct ConnectionDetailView: View {
         .background(T3Colors.background)
         .navigationTitle(environment?.name ?? "Connection")
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: environment?.connectionState) {
+            await loadOrchestrationSettings()
+        }
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Done") { dismiss() }
@@ -623,6 +648,75 @@ private struct ConnectionDetailView: View {
 
     private var projectCount: Int {
         model.snapshot.projects.count { $0.environmentID == environmentID }
+    }
+
+    private var orchestrationPreferenceBinding: Binding<OrchestrationProtocolPreference> {
+        Binding(
+            get: { orchestrationPreference ?? .auto },
+            set: { preference in
+                guard orchestrationPreference != nil,
+                      preference != orchestrationPreference,
+                      !isUpdatingOrchestration else { return }
+                orchestrationPreference = preference
+                isUpdatingOrchestration = true
+                Task {
+                    defer { isUpdatingOrchestration = false }
+                    orchestrationErrorMessage = nil
+                    do {
+                        try await model.client.setOrchestrationPreference(
+                            environmentID: environmentID,
+                            preference: preference
+                        )
+                    } catch {
+                        orchestrationErrorMessage = error.localizedDescription
+                        // A reconnect may fail after the preference was saved.
+                        // Read the saved value instead of assuming a rollback.
+                        orchestrationPreference = try? await model.client.orchestrationPreference(
+                            environmentID: environmentID
+                        )
+                    }
+                    await model.reloadAfterConnection()
+                    await loadDetectedProtocol()
+                }
+            }
+        )
+    }
+
+    private func loadOrchestrationSettings() async {
+        guard !isUpdatingOrchestration else { return }
+        do {
+            let preference = try await model.client.orchestrationPreference(
+                environmentID: environmentID
+            )
+            try Task.checkCancellation()
+            orchestrationPreference = preference
+            orchestrationErrorMessage = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            orchestrationErrorMessage = error.localizedDescription
+        }
+        await loadDetectedProtocol()
+    }
+
+    private func loadDetectedProtocol() async {
+        do {
+            let descriptor = try await model.client.environmentDescriptor(environmentID: environmentID)
+            try Task.checkCancellation()
+            detectedProtocolVersion = descriptor.orchestrationProtocolVersion ?? 1
+            _ = try OrchestrationProtocolSelection(
+                descriptor: descriptor,
+                preference: orchestrationPreference ?? .auto
+            )
+        } catch {
+            guard !Task.isCancelled else { return }
+            // Keep a detected incompatible version visible while showing its error.
+            if !(error is OrchestrationProtocolError) {
+                detectedProtocolVersion = nil
+            }
+            if orchestrationErrorMessage == nil {
+                orchestrationErrorMessage = error.localizedDescription
+            }
+        }
     }
 
     private var automaticSettlement: FeatureAutomaticSettlementSettings? {

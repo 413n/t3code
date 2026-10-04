@@ -60,8 +60,8 @@ final class T3ConnectNativeCapabilityTests: XCTestCase {
 
         let requests = await transport.requests
         XCTAssertEqual(
-            Array(requests.prefix(3).map(\.url?.path)),
-            ["/.well-known/t3/environment", "/oauth/token", "/api/orchestration/shell"]
+            Array(requests.prefix(4).map(\.url?.path)),
+            ["/.well-known/t3/environment", "/oauth/token", "/.well-known/t3/environment", "/api/orchestration/shell"]
         )
         let shellRequest = try XCTUnwrap(
             requests.first(where: { $0.url?.path == "/api/orchestration/shell" })

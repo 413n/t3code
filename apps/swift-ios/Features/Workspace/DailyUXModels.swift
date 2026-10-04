@@ -115,25 +115,73 @@ public struct NewTaskRequest: Sendable, Equatable {
     }
 }
 
+public enum FeatureMessageDelivery: String, Sendable, Equatable, Codable, CaseIterable {
+    case auto, queue, steer, restart
+}
+
+/// Optional adapter support for explicit follow-up delivery. Existing clients keep auto delivery.
+@MainActor
+public protocol FeatureMessageDeliveryManaging {
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?,
+        delivery: FeatureMessageDelivery
+    ) async throws
+}
+
+public extension FeatureClient {
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?,
+        delivery: FeatureMessageDelivery
+    ) async throws {
+        if let client = self as? any FeatureMessageDeliveryManaging {
+            try await client.sendMessage(
+                threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
+                attachments: attachments, identity: identity, context: context, delivery: delivery
+            )
+        } else {
+            guard delivery == .auto else { throw FeatureCapabilityUnavailable("Message delivery options") }
+            try await sendMessage(
+                threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
+                attachments: attachments, identity: identity, context: context
+            )
+        }
+    }
+}
+
 public struct FeatureMessageSubmission: Sendable, Equatable {
     public var context: OrchestrationMessageContext?
     public var threadID: String
     public var text: String
     public var selection: FeatureSelection?
     public var attachments: [FeatureDraftAttachment]
+    public var delivery: FeatureMessageDelivery
 
     public init(
         threadID: String,
         text: String,
         selection: FeatureSelection?,
         attachments: [FeatureDraftAttachment] = [],
-        context: OrchestrationMessageContext? = nil
+        context: OrchestrationMessageContext? = nil,
+        delivery: FeatureMessageDelivery = .auto
     ) {
         self.threadID = threadID
         self.text = text
         self.selection = selection
         self.attachments = attachments
         self.context = context
+        self.delivery = delivery
     }
 }
 

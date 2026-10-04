@@ -25,7 +25,8 @@ private struct T3ConnectManagedCleanupError: LocalizedError {
 @MainActor
 final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     FeatureProjectCreationClient, FeatureWorkspaceAssetResolving, FeatureAttachmentAssetResolving,
-    FeatureFeedbackSubmitting, FeatureContextAttachmentResolving, T3ConnectCapable
+    FeatureFeedbackSubmitting, FeatureContextAttachmentResolving, T3ConnectCapable, FeatureThreadQueueManaging,
+    FeatureMessageDeliveryManaging
 {
     private static let maximumRetainedThreadDetails = 6
     private static let t3ConnectLogger = Logger(
@@ -64,6 +65,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var client: T3Client?
     private var latestShell: OrchestrationShellSnapshot?
     private var environmentClients: [String: T3Client] = [:]
+    private var orchestrationVersions: [String: Int] = [:]
+    private var orchestrationPreferenceGenerations: [String: Int] = [:]
     private var shellsByEnvironmentID: [String: OrchestrationShellSnapshot] = [:]
     private var shellProjectionCache: [String: NativeShellProjection] = [:]
     private var indexedShellMembership: [NativeShellMembership]?
@@ -226,6 +229,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func initialSnapshot() async throws -> FeatureSnapshot {
+        let preferenceGenerations = orchestrationPreferenceGenerations
         let environments = try await runtime.environments()
         guard let activeClient = try await runtime.activeClient() else {
             await clearActiveEnvironment()
@@ -240,7 +244,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
         await adoptEnvironment(environment, client: activeClient)
         let generation = environmentGeneration
-        let loads = await loadEnvironmentShells(environments.filter(\.isEnabled))
+        let loads = await loadEnvironmentShells(environments.filter(\.isEnabled), preferenceGenerations: preferenceGenerations)
         guard isCurrentSession(client: activeClient, generation: generation) else {
             throw CancellationError()
         }
@@ -300,13 +304,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func backgroundSnapshot() async throws -> FeatureSnapshot {
+        let preferenceGenerations = orchestrationPreferenceGenerations
         let environments = try await runtime.environments()
         guard let activeClient = try await runtime.activeClient() else {
             return disconnectedSnapshot(environments: environments)
         }
         let environment = activeClient.environment
         let generation = environmentGeneration
-        let loads = await loadEnvironmentShells(environments.filter(\.isEnabled))
+        let loads = await loadEnvironmentShells(environments.filter(\.isEnabled), preferenceGenerations: preferenceGenerations)
         guard let currentClient = try await runtime.activeClient(),
               currentClient === activeClient,
               generation == environmentGeneration else {
@@ -384,7 +389,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             throw T3ConnectRelayError.environmentMismatch
         }
 
-        let environment = Environment(
+        let previousPreference = try await runtime.environments()
+            .first { $0.id == descriptor.environmentId }?.orchestrationProtocolPreference ?? .auto
+        _ = try OrchestrationProtocolSelection(descriptor: descriptor, preference: previousPreference)
+        var environment = Environment(
             id: descriptor.environmentId,
             label: descriptor.label,
             httpBaseURL: httpBaseURL,
@@ -392,6 +400,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             kind: .managedDPoP,
             descriptor: descriptor
         )
+        environment.orchestrationProtocolPreference = previousPreference
         let savedCredential = EnvironmentCredential.managedDPoP(
             accessToken: authorization.accessToken,
             expiresAt: authorization.expiresAt,
@@ -478,6 +487,72 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             providerCatalogCache[id] = nil
             archivedThreadsByEnvironmentID[id] = nil
             archivedShellThreadsByEnvironmentID[id] = nil
+        }
+    }
+
+    func orchestrationPreference(environmentID: String) async throws -> OrchestrationProtocolPreference {
+        guard let environment = try await runtime.environments().first(where: { $0.id == environmentID }) else {
+            throw RPCError.remote("This environment is no longer saved.")
+        }
+        return environment.orchestrationProtocolPreference
+    }
+
+    func updateThreadQueue(threadID: String, action: FeatureThreadQueueAction) async throws {
+        let route = try threadRoute(for: threadID)
+        guard try await route.client.orchestrationVersion() == .v2 else {
+            throw FeatureCapabilityUnavailable("Queue controls")
+        }
+        var command: [String: JSONValue] = [
+            "commandId": .string(UUID().uuidString), "threadId": .string(route.wireID),
+        ]
+        switch action {
+        case let .cancel(runID):
+            command["type"] = .string("queued-run.cancel")
+            command["runId"] = .string(runID)
+        case let .reorder(runID, beforeRunID):
+            command["type"] = .string("queued-run.reorder")
+            command["runId"] = .string(runID)
+            command["beforeRunId"] = beforeRunID.map(JSONValue.string) ?? .null
+        case let .promoteToSteer(queuedRunID, targetRunID):
+            command["type"] = .string("queued-message.promote-to-steer")
+            command["queuedRunId"] = .string(queuedRunID)
+            command["targetRunId"] = .string(targetRunID)
+        case .resume:
+            command["type"] = .string("queue.resume")
+        case let .edit(runID, text):
+            command["type"] = .string("queued-run.edit")
+            command["runId"] = .string(runID)
+            command["text"] = .string(text)
+        case let .interrupt(runID, holdQueue):
+            command["type"] = .string("run.interrupt")
+            command["runId"] = .string(runID)
+            command["holdQueue"] = .bool(holdQueue)
+        }
+        _ = try await route.client.dispatch(.object(command))
+        await refreshThreadUnlessLive(id: route.uiID, client: route.client)
+    }
+
+    func setOrchestrationPreference(
+        environmentID: String, preference: OrchestrationProtocolPreference
+    ) async throws {
+        _ = try await runtime.environmentStore.setOrchestrationProtocolPreference(
+            id: environmentID, preference: preference
+        )
+        orchestrationPreferenceGenerations[environmentID, default: 0] &+= 1
+        if activeEnvironment?.id == environmentID { await clearActiveEnvironment() }
+        if let oldClient = environmentClients.removeValue(forKey: environmentID) {
+            await oldClient.disconnect()
+        }
+        shellsByEnvironmentID[environmentID] = nil
+        shellProjectionCache[environmentID] = nil
+        serverConfigsByEnvironmentID[environmentID] = nil
+        archivedThreadsByEnvironmentID[environmentID] = nil
+        archivedShellThreadsByEnvironmentID[environmentID] = nil
+        let threadIDs = threadEnvironmentIDs.filter { $0.value == environmentID }.map(\.key)
+        for id in threadIDs {
+            threadResumeStates[id] = nil
+            latestDetails[id] = nil
+            detailRenderCaches[id] = nil
         }
     }
 
@@ -1094,11 +1169,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     func environmentDescriptor(environmentID: String) async throws -> EnvironmentDescriptor {
-        let client = try await projectCreationClient(environmentID: environmentID)
-        guard let descriptor = try await client.serverConfig().environment ?? client.environment.descriptor else {
-            throw FeatureCapabilityUnavailable("Environment updates")
+        guard let environment = try await runtime.environments().first(where: { $0.id == environmentID }) else {
+            throw RPCError.remote("This environment is no longer saved.")
         }
-        return descriptor
+        // Discovery must still work when a forced protocol choice blocks RPC.
+        return try await runtime.descriptor(at: environment.httpBaseURL)
     }
 
     func updateEnvironment(environmentID: String, targetVersion: String) async throws {
@@ -2041,7 +2116,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 snapshotSequence: shell.snapshotSequence,
                 projects: shell.projects,
                 threads: shell.threads.filter { $0.id != route.wireID },
-                updatedAt: shell.updatedAt
+                updatedAt: shell.updatedAt,
+                orchestrationProtocolVersion: shell.orchestrationProtocolVersion
             )
         }
         provisionalThreadRoutes[route.uiID] = nil
@@ -2183,6 +2259,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 return latestDetails[route.uiID]
             }
 
+            if snapshot.orchestrationProtocolVersion == 2 {
+                consumeDetailStreamItem(.projection(snapshot), route: route,
+                                        subscriptionEpoch: epoch, synchronizeLegacy: false)
+                flushDetailPublish(route)
+                return latestDetails[route.uiID]
+            }
+
             if let watermark = snapshot.page?.threadSequence,
                watermark > (activeThreadSequence ?? 0) {
                 pendingOlderThreadPage = PendingOlderThreadPage(
@@ -2228,6 +2311,22 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         identity: FeatureSubmissionIdentity,
         context: OrchestrationMessageContext? = nil
     ) async throws {
+        try await sendMessage(
+            threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
+            attachments: attachments, identity: identity, context: context, delivery: .auto
+        )
+    }
+
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext? = nil,
+        delivery: FeatureMessageDelivery
+    ) async throws {
         try await sendMessageResolved(
             threadID: threadID,
             text: text,
@@ -2235,7 +2334,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             runtimeMode: runtimeMode,
             attachments: attachments,
             submissionIdentity: identity,
-            context: context
+            context: context,
+            delivery: delivery
         )
     }
 
@@ -2246,7 +2346,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         runtimeMode requestedRuntimeMode: FeatureRuntimeMode?,
         attachments: [FeatureUploadAttachment],
         submissionIdentity: FeatureSubmissionIdentity?,
-        context: OrchestrationMessageContext? = nil
+        context: OrchestrationMessageContext? = nil,
+        delivery: FeatureMessageDelivery = .auto
     ) async throws {
         let route = try threadRoute(for: threadID)
         let client = route.client
@@ -2263,13 +2364,20 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             requestedRuntimeMode ?? mapRuntimeMode(shellThread.runtimeMode)
         )
         let interactionMode = InteractionMode.default
+        let coreDelivery: OrchestrationV2Commands.Delivery = switch delivery {
+        case .auto: .auto
+        case .queue: .queue
+        case .steer: .steer
+        case .restart: .restart
+        }
         let signature = TurnSubmissionSignature(
             text: text,
             model: model,
             runtimeMode: runtimeMode,
             interactionMode: interactionMode,
             attachments: attachments,
-            context: context
+            context: context,
+            delivery: delivery
         )
         let pending: PendingTurnSubmission
         let explicitIdentity = submissionIdentity.map { commandIdentity($0) }
@@ -2300,7 +2408,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 context: context,
                 commandID: pending.identity.commandID,
                 messageID: pending.identity.messageID,
-                createdAt: pending.identity.createdAt
+                createdAt: pending.identity.createdAt,
+                delivery: coreDelivery
             )
         } catch {
             guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
@@ -2337,7 +2446,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         guard let snapshot = try? await client.threadSnapshot(id: threadID) else {
             return false
         }
-        return snapshot.thread.messages.contains { $0.id == messageID }
+        if snapshot.thread.messages.contains(where: { $0.id == messageID }) { return true }
+        // V2 holds accepted queue messages outside the shared transcript until they start.
+        if case let .array(messages)? = snapshot.thread.orchestrationV2Control?["messages"] {
+            return messages.contains { $0["id"]?.stringValue == messageID }
+        }
+        return false
     }
 
     func restartAgentSession(threadID: String) async throws {
@@ -2374,7 +2488,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
               }),
               provider.supportsConversationRollback != false,
               provider.driver != "cursor", provider.driver != "grok" else { return false }
-        return NativeConversationRewind.turnCount(before: messageID, in: thread) != nil
+        return NativeConversationRewind.canRewind(before: messageID, in: thread)
     }
 
     func rewindConversation(
@@ -2384,7 +2498,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let route = try threadRoute(for: threadID)
         let generation = environmentGeneration
         // The visible page can omit checkpoints. Validate against the whole thread.
-        let snapshot = try await route.client.threadSnapshot(id: route.wireID)
+        let snapshot = try await route.client.fullThreadSnapshot(id: route.wireID)
         guard let provider = serverConfigsByEnvironmentID[route.environmentID]?.providers.first(where: {
             $0.instanceId == (snapshot.thread.session?.providerInstanceId ?? snapshot.thread.modelSelection.instanceId)
         }), provider.supportsConversationRollback != false,
@@ -2393,10 +2507,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         guard snapshot.thread.session?.status != "running",
               snapshot.thread.session?.status != "starting",
-              let turnCount = NativeConversationRewind.turnCount(before: messageID, in: snapshot.thread),
               let original = snapshot.thread.messages.first(where: { $0.id == messageID }) else {
             throw FeatureConversationRewindError(message: "Wait for this turn to finish before rewinding.")
         }
+        let target = try NativeConversationRewind.target(before: messageID, in: snapshot.thread)
         let message = mapMessage(original, environmentID: route.environmentID)
         let fileStore = ManagedAttachmentFileStore()
         var attachments: [FeatureDraftAttachment] = []
@@ -2465,10 +2579,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         do {
             let accepted: DispatchResult
+            let command = target.command(threadID: route.wireID)
             do {
-                accepted = try await route.client.dispatch(OrchestrationCommands.revertConversation(
-                    threadID: route.wireID, turnCount: turnCount
-                ))
+                accepted = try await route.client.dispatch(command)
             } catch let error as RPCError {
                 if case .remote = error {
                     throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
@@ -2479,29 +2592,37 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
                 }
                 throw error
+            } catch let error as OrchestrationV2Commands.AdapterError {
+                throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
+            } catch let error as OrchestrationV2Commands.RollbackError {
+                throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
             }
             let receiptSequence = try await NativeConversationRewind.waitForCompletion(
                 batches: buffered.stream,
                 threadID: route.wireID,
                 messageID: messageID,
-                turnCount: turnCount,
+                turnCount: target.turnCount,
                 afterSequence: accepted.sequence,
                 previousFailureIDs: Set(snapshot.thread.activities.filter {
                     $0.kind == "checkpoint.revert.failed"
-                }.map(\.id))
+                }.map(\.id)),
+                rollbackRequestID: command["commandId"]?.stringValue,
+                rollbackRunID: target.runID
             )
-            let current = try await route.client.threadSnapshot(id: route.wireID)
+            let current = try await route.client.fullThreadSnapshot(id: route.wireID)
             guard current.snapshotSequence >= receiptSequence,
-                  NativeConversationRewind.isComplete(current.thread, messageID: messageID, turnCount: turnCount) else {
+                  NativeConversationRewind.isComplete(current.thread, messageID: messageID,
+                    turnCount: target.turnCount, rollbackRunID: target.runID) else {
                 throw FeatureConversationRewindError(message: "Could not confirm the final rewind state. The prompt remains saved for recovery.")
             }
         } catch {
             if (error as? FeatureConversationRewindError)?.didNotRevert == true { throw error }
             // A lost socket does not mean rollback failed. An HTTP read can
             // confirm completion without submitting the destructive command again.
-            guard let current = try? await route.client.threadSnapshot(id: route.wireID),
+            guard let current = try? await route.client.fullThreadSnapshot(id: route.wireID),
                   current.snapshotSequence > snapshot.snapshotSequence,
-                  NativeConversationRewind.isComplete(current.thread, messageID: messageID, turnCount: turnCount) else {
+                  NativeConversationRewind.isComplete(current.thread, messageID: messageID,
+                    turnCount: target.turnCount, rollbackRunID: target.runID) else {
                 throw error
             }
         }
@@ -3634,7 +3755,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     snapshotSequence: shell.snapshotSequence,
                     projects: shell.projects,
                     threads: shell.threads.filter { $0.id != route.wireID },
-                    updatedAt: shell.updatedAt
+                    updatedAt: shell.updatedAt,
+                    orchestrationProtocolVersion: shell.orchestrationProtocolVersion
                 )
             } else if let previouslyArchivedShell {
                 var threads = shell.threads.filter { $0.id != route.wireID }
@@ -3643,7 +3765,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     snapshotSequence: shell.snapshotSequence,
                     projects: shell.projects,
                     threads: threads,
-                    updatedAt: shell.updatedAt
+                    updatedAt: shell.updatedAt,
+                    orchestrationProtocolVersion: shell.orchestrationProtocolVersion
                 )
             }
         }
@@ -3847,7 +3970,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         return
                     }
                     let sequence = self?.latestShell?.snapshotSequence
-                    let events = await activeClient.shellEventBatches(after: sequence, reconnect: false)
+                    let events = await activeClient.shellEventBatches(
+                        after: sequence,
+                        protocolVersion: self?.latestShell?.orchestrationProtocolVersion ?? 1,
+                        reconnect: false
+                    )
                     // Re-bind self per event instead of holding it strongly across
                     // the indefinite stream, so the client can deinit mid-stream.
                     for try await batch in events {
@@ -3874,7 +4001,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                                     generation: generation,
                                     refreshActiveThread: true
                                 )
-                            case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved:
+                            case .projectUpserted, .projectRemoved, .threadUpserted, .threadRemoved, .repositoryIdentitiesUpdated:
                                 deltas.append(item)
                             case .refreshRequired:
                                 await self.consume(deltas: deltas, client: activeClient, generation: generation)
@@ -4077,6 +4204,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     return
                 }
                 let environments: [Environment]
+                let preferenceGenerations = self.orchestrationPreferenceGenerations
                 do {
                     environments = try await loadEnvironments(self.runtime)
                 } catch is CancellationError where Task.isCancelled {
@@ -4115,7 +4243,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     nextInterval = fastInterval
                     continue
                 }
-                let loads = await self.loadEnvironmentShells(refreshableEnvironments)
+                let loads = await self.loadEnvironmentShells(refreshableEnvironments, preferenceGenerations: preferenceGenerations)
                 guard !Task.isCancelled,
                       self.aggregateRefreshID == refreshID,
                       self.isCurrentSession(
@@ -4185,6 +4313,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         generation: Int,
         refreshActiveThread: Bool
     ) async {
+        guard isCurrentSession(client: client, generation: generation) else { return }
+        adoptOrchestrationProtocol(shell, environmentID: client.environment.id)
         guard !Task.isCancelled,
               isCurrentSession(client: client, generation: generation),
               shell.snapshotSequence >= (latestShell?.snapshotSequence ?? .min) else {
@@ -4209,6 +4339,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         client: T3Client,
         generation: Int
     ) async {
+        guard isCurrentSession(client: client, generation: generation) else { return }
+        adoptOrchestrationProtocol(shell, environmentID: client.environment.id)
         guard isCurrentSession(client: client, generation: generation),
               shell.snapshotSequence >= (latestShell?.snapshotSequence ?? .min) else {
             return
@@ -4249,12 +4381,18 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         var shouldRefreshArchived = false
 
         for delta in deltas {
+            if case let .repositoryIdentitiesUpdated(updates, resolvedRoots) = delta {
+                projects = OrchestrationV2Presentation.mergingRepositoryIdentities(
+                    projects, updates: updates, resolvedRoots: resolvedRoots
+                )
+                continue
+            }
             let nextSequence: Int
             switch delta {
             case let .projectUpserted(value, _), let .projectRemoved(value, _),
                  let .threadUpserted(value, _), let .threadRemoved(value, _):
                 nextSequence = value
-            case .snapshot, .synchronized, .refreshRequired:
+            case .snapshot, .synchronized, .refreshRequired, .repositoryIdentitiesUpdated:
                 continue
             }
 
@@ -4305,17 +4443,18 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     threadHistoryEpoch &+= 1
                     pendingOlderThreadPage = nil
                 }
-            case .snapshot, .synchronized, .refreshRequired:
+            case .snapshot, .synchronized, .refreshRequired, .repositoryIdentitiesUpdated:
                 continue
             }
         }
-        guard sequence > current.snapshotSequence else { return }
+        guard sequence > current.snapshotSequence || projects != current.projects else { return }
 
         let shell = OrchestrationShellSnapshot(
             snapshotSequence: sequence,
             projects: projects,
             threads: threads,
-            updatedAt: current.updatedAt
+            updatedAt: current.updatedAt,
+            orchestrationProtocolVersion: current.orchestrationProtocolVersion
         )
         latestShell = shell
         // Keep the source cache current during the coalesced UI publish. A
@@ -4625,7 +4764,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let needsIndividualUpdates = items.count == 1 || activeRawThread == nil
             || pendingOlderThreadPage != nil || items.contains { item in
                 switch item {
-                case .snapshot: true
+                case .snapshot, .projection: true
                 case let .event(event):
                     event["type"]?.stringValue == "thread.reverted"
                         || event["type"]?.stringValue == "thread.deleted"
@@ -4651,6 +4790,39 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         synchronizeLegacy: Bool
     ) {
         switch item {
+        case let .projection(snapshot):
+            let previous = activeRawThread
+            if let revision = snapshot.thread.orchestrationV2Revision,
+               let displayed = previous?.orchestrationV2Revision, revision < displayed { return }
+            let changedProtocol = previous != nil && previous?.orchestrationV2Control == nil
+            guard changedProtocol || snapshot.snapshotSequence >= (activeThreadSequence ?? 0) else { return }
+            if changedProtocol {
+                threadHistoryEpoch &+= 1
+                pendingOlderThreadPage = nil
+                detailRenderCaches[route.uiID] = nil
+            }
+            beginWarmReplayIfNeeded(route)
+            resetDetailRefresh()
+            detailSnapshotRequiredAfterEpoch = nil
+            activeThreadSequence = snapshot.snapshotSequence
+            activeRawThread = snapshot.thread
+            activeThreadPage = featurePage(snapshot.page)
+            if let previous, !changedProtocol,
+               Set(previous.messages.map(\.id)).isSubset(of: Set(snapshot.thread.messages.map(\.id))),
+               Set(previous.activities.map(\.id)).isSubset(of: Set(snapshot.thread.activities.map(\.id))) {
+                let messages = Dictionary(previous.messages.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+                let activities = Dictionary(previous.activities.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+                for message in snapshot.thread.messages where messages[message.id] != message {
+                    scheduleRawDetailPublish(route: route, mutation: .message(message))
+                }
+                for activity in snapshot.thread.activities where activities[activity.id] != activity {
+                    scheduleRawDetailPublish(route: route, mutation: .activity(activity))
+                }
+                scheduleRawDetailPublish(route: route, mutation: .metadata)
+            } else {
+                scheduleRawDetailPublish(route: route, mutation: .full)
+            }
+            if detailCompletionReceived { markDetailSynchronized(route) }
         case .synchronized:
             detailCompletionReceived = true
             guard activeRawThread != nil else { return }
@@ -4821,7 +4993,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     }
 
     private func loadEnvironmentShells(
-        _ environments: [Environment]
+        _ environments: [Environment], preferenceGenerations: [String: Int]
     ) async -> [EnvironmentShellLoad] {
         let activeEnvironmentID = activeEnvironment?.id
         let environmentsWithCachedConfig = Set(serverConfigsByEnvironmentID.keys)
@@ -4830,6 +5002,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         var clients: [(environment: Environment, client: T3Client)] = []
         clients.reserveCapacity(environments.count)
         for environment in environments {
+            guard preferenceGenerations[environment.id, default: 0]
+                    == orchestrationPreferenceGenerations[environment.id, default: 0] else { continue }
             clients.append(
                 (environment, await runtime.client(for: environment))
             )
@@ -4850,7 +5024,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             shell: nil,
                             config: nil,
                             credentialRejected: error.isRejectedAuthorization,
-                            failureDetail: error.localizedDescription
+                            failureDetail: error.localizedDescription,
+                            preferenceGeneration: preferenceGenerations[pair.environment.id, default: 0]
                         )
                     }
 
@@ -4877,7 +5052,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         environment: pair.environment,
                         client: pair.client,
                         shell: shell,
-                        config: config
+                        config: config,
+                        preferenceGeneration: preferenceGenerations[pair.environment.id, default: 0]
                     )
                 }
             }
@@ -4920,6 +5096,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
 
         for load in loads {
+            guard load.preferenceGeneration == orchestrationPreferenceGenerations[load.environment.id, default: 0] else {
+                continue
+            }
             environmentClients[load.environment.id] = load.client
             if let config = load.config {
                 setServerConfig(config, environmentID: load.environment.id)
@@ -4928,6 +5107,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 }
             }
             if let shell = load.shell {
+                adoptOrchestrationProtocol(shell, environmentID: load.environment.id)
                 if shell.snapshotSequence
                     >= (shellsByEnvironmentID[load.environment.id]?.snapshotSequence ?? .min) {
                     shellsByEnvironmentID[load.environment.id] = shell
@@ -4973,6 +5153,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         _ candidate: OrchestrationShellSnapshot,
         for environment: Environment
     ) -> OrchestrationShellSnapshot {
+        adoptOrchestrationProtocol(candidate, environmentID: environment.id)
         let latest: OrchestrationShellSnapshot
         if let cached = shellsByEnvironmentID[environment.id],
            cached.snapshotSequence > candidate.snapshotSequence {
@@ -4985,6 +5166,37 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             latestShell = latest
         }
         return latest
+    }
+
+    /// Server upgrades start a different event sequence. Discard versioned
+    /// state before comparing cursors, while preserving credentials and drafts.
+    private func adoptOrchestrationProtocol(_ shell: OrchestrationShellSnapshot, environmentID: String) {
+        let version = shell.orchestrationProtocolVersion ?? 1
+        let previous = orchestrationVersions.updateValue(version, forKey: environmentID)
+        guard let previous, previous != version else { return }
+        shellsByEnvironmentID[environmentID] = nil
+        shellProjectionCache[environmentID] = nil
+        archivedThreadsByEnvironmentID[environmentID] = nil
+        archivedShellThreadsByEnvironmentID[environmentID] = nil
+        serverConfigsByEnvironmentID[environmentID] = nil
+        if activeEnvironment?.id == environmentID { latestShell = nil }
+        for id in threadEnvironmentIDs.keys where threadEnvironmentIDs[id] == environmentID {
+            threadResumeStates[id] = nil
+            detailRenderCaches[id] = nil
+            latestDetails[id] = nil
+        }
+        if activeThreadEnvironmentID == environmentID, let id = activeThreadID,
+           let route = try? threadRoute(for: id) {
+            resetDetailRefresh()
+            resetDetailStream()
+            activeRawThread = nil
+            activeThreadSequence = nil
+            activeThreadPage = nil
+            threadHistoryEpoch &+= 1
+            pendingOlderThreadPage = nil
+            continuation.yield(.threadSync(id: id, state: .catchingUp))
+            startDetailStream(route)
+        }
     }
 
     private func rebuildEntityIndexes(_ environments: [Environment]) {
@@ -5098,6 +5310,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         guard isKnownClient(client, environmentID: environment.id, generation: generation) else {
             throw CancellationError()
         }
+        adoptOrchestrationProtocol(shell, environmentID: environment.id)
         guard shell.snapshotSequence
             >= (shellsByEnvironmentID[environment.id]?.snapshotSequence ?? .min) else {
             return
@@ -5464,7 +5677,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             }
             if NativeActivityNotice.accepts(activity) {
                 changedIDs.insert("activity-\(activity.id)")
-            } else if NativeWorkLogAccumulator.accepts(activity) {
+            }
+            if NativeWorkLogAccumulator.accepts(activity) {
                 changedIDs.insert("work-log-\(activity.turnId ?? "unscoped")")
             }
         }
@@ -5500,7 +5714,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             page: incoming.page,
             activeSubagentCount: incoming.activeSubagentCount,
             backgroundWorkIsActive: incoming.backgroundWorkIsActive,
-            isCompacting: incoming.isCompacting == true
+            isCompacting: incoming.isCompacting == true,
+            execution: incoming.execution
         )
     }
 
@@ -5973,7 +6188,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             }
             let sessionIsLive = thread.session?.status == "starting"
                 || thread.session?.status == "running"
-            let activityMessages = (notices + collapsedWorkLogs(
+            let answers = thread.activities.flatMap {
+                NativeQuestionAnswerHistory.messages($0, createdAt: parseDate($0.createdAt))
+            }
+            let activityMessages = (notices + answers + collapsedWorkLogs(
                 thread.activities,
                 sessionIsLive: sessionIsLive
             ))
@@ -6048,7 +6266,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 sessionStatus: thread.session?.status,
                 latestTurnState: thread.latestTurn?.state,
                 latestTurnRequestedAt: (thread.latestTurn?.requestedAt).flatMap(parseValidDate)
-            )
+            ),
+            execution: thread.orchestrationV2Control.flatMap { try? FeatureThreadExecution(projection: $0) }
         )
     }
 
@@ -6169,7 +6388,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             page: activeThreadPage,
             activeSubagentCount: currentDetail.activeSubagentCount,
             backgroundWorkIsActive: currentDetail.backgroundWorkIsActive,
-            isCompacting: currentDetail.isCompacting == true
+            isCompacting: currentDetail.isCompacting == true,
+            execution: currentDetail.execution
         )
         publish(detail, threadID: route.uiID, renderCacheIsSource: true)
         return detail
@@ -6295,10 +6515,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         for answer in NativeQuestionAnswerHistory.messages(activity, createdAt: parseDate(activity.createdAt)) {
             upsertMergedMessage(answer, cache: cache)
         }
-        guard NativeWorkLogAccumulator.accepts(activity),
-              cache.workLogActivityIDs.insert(activity.id).inserted else {
-            return
-        }
+        guard NativeWorkLogAccumulator.accepts(activity) else { return }
+        let isNewActivity = cache.workLogActivityIDs.insert(activity.id).inserted
+        // V2 updates the same durable tool record in place.
+        guard isNewActivity || activity.kind == "tool.updated" else { return }
         let groupID = activity.turnId ?? "unscoped"
         var accumulator = cache.workLogsByGroupID[groupID] ?? NativeWorkLogAccumulator()
         accumulator.append(
@@ -6307,7 +6527,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             createdAt: parseDate(activity.createdAt)
         )
         cache.workLogsByGroupID[groupID] = accumulator
-        guard accumulator.hasContent else { return }
+        guard accumulator.hasContent else {
+            cache.mergedMessages.removeAll { $0.id == "work-log-\(groupID)" }
+            rebuildMergedIndexes(cache)
+            return
+        }
         let message = accumulator.message(groupID: groupID)
         upsertMergedMessage(message, cache: cache)
     }
@@ -6465,6 +6689,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             text: message.text,
             createdAt: parseDate(message.createdAt),
             state: message.streaming ? .streaming : .complete,
+            toolName: message.role == "reasoning" ? "Thinking" : nil,
             attachments: (message.attachments ?? []).map {
                 FeatureMessageAttachment(
                     id: $0.id,
@@ -7622,6 +7847,8 @@ struct NativeWorkLogAccumulator {
 
     private(set) var count = 0
     private var visibleLines: [String] = []
+    private var visibleLineKeys: [String] = []
+    private var completedKeys: Set<String> = []
     private var createdAt = Date.distantPast
     private var activeEntries: [String: String] = [:]
     private var activeOrder: [String] = []
@@ -7666,10 +7893,23 @@ struct NativeWorkLogAccumulator {
             activeEntries[key] = nil
             activePresentations[key] = nil
             activeOrder.removeAll { $0 == key }
-            guard activity.tone != "error" else { return }
-            count += 1
-            visibleLines.append("• \(preview ?? activity.summary)")
+            guard activity.tone != "error" else {
+                if completedKeys.remove(activity.id) != nil { count -= 1 }
+                if let index = visibleLineKeys.firstIndex(of: activity.id) {
+                    visibleLineKeys.remove(at: index)
+                    visibleLines.remove(at: index)
+                }
+                return
+            }
+            if completedKeys.insert(activity.id).inserted { count += 1 }
+            if let index = visibleLineKeys.firstIndex(of: activity.id) {
+                visibleLines[index] = "• \(preview ?? activity.summary)"
+            } else {
+                visibleLineKeys.append(activity.id)
+                visibleLines.append("• \(preview ?? activity.summary)")
+            }
             if visibleLines.count > 40 {
+                visibleLineKeys.removeFirst(visibleLines.count - 40)
                 visibleLines.removeFirst(visibleLines.count - 40)
             }
         }
@@ -8403,6 +8643,7 @@ private struct EnvironmentShellLoad: Sendable {
     /// The server answered and refused the saved credential.
     var credentialRejected = false
     var failureDetail: String?
+    var preferenceGeneration = 0
 }
 
 private struct EntityWireOwner: Hashable {
@@ -8518,6 +8759,7 @@ private struct TurnSubmissionSignature: Equatable {
     let interactionMode: InteractionMode
     let attachments: [FeatureUploadAttachment]
     var context: OrchestrationMessageContext? = nil
+    var delivery: FeatureMessageDelivery = .auto
 }
 
 private struct PendingTurnSubmission {

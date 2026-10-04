@@ -165,6 +165,7 @@ public struct FeatureQueuedSubmission: Identifiable, Sendable, Equatable, Codabl
     public var interactionMode: FeatureInteractionMode
     public var attachments: [FeatureQueuedAttachment]
     public var creation: FeatureQueuedCreation?
+    public var delivery: FeatureMessageDelivery
 
     public init(
         id: String? = nil,
@@ -177,7 +178,8 @@ public struct FeatureQueuedSubmission: Identifiable, Sendable, Equatable, Codabl
         interactionMode: FeatureInteractionMode,
         attachments: [FeatureUploadAttachment],
         creation: FeatureQueuedCreation? = nil,
-        context: OrchestrationMessageContext? = nil
+        context: OrchestrationMessageContext? = nil,
+        delivery: FeatureMessageDelivery = .auto
     ) {
         self.id = id ?? identity.messageID
         self.environmentID = environmentID
@@ -190,6 +192,28 @@ public struct FeatureQueuedSubmission: Identifiable, Sendable, Equatable, Codabl
         self.attachments = attachments.map(FeatureQueuedAttachment.init)
         self.creation = creation
         self.context = context
+        self.delivery = delivery
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, environmentID, identity, threadID, text, selection, runtimeMode, interactionMode
+        case attachments, creation, context, delivery
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        environmentID = try values.decode(String.self, forKey: .environmentID)
+        identity = try values.decode(FeatureSubmissionIdentity.self, forKey: .identity)
+        threadID = try values.decode(String.self, forKey: .threadID)
+        text = try values.decode(String.self, forKey: .text)
+        selection = try values.decodeIfPresent(FeatureSelection.self, forKey: .selection)
+        runtimeMode = try values.decode(FeatureRuntimeMode.self, forKey: .runtimeMode)
+        interactionMode = try values.decode(FeatureInteractionMode.self, forKey: .interactionMode)
+        attachments = try values.decode([FeatureQueuedAttachment].self, forKey: .attachments)
+        creation = try values.decodeIfPresent(FeatureQueuedCreation.self, forKey: .creation)
+        context = try values.decodeIfPresent(OrchestrationMessageContext.self, forKey: .context)
+        delivery = try values.decodeIfPresent(FeatureMessageDelivery.self, forKey: .delivery) ?? .auto
     }
 
     public var uploads: [FeatureUploadAttachment] {

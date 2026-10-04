@@ -44,6 +44,9 @@ public struct ThreadDetailView: View {
     @State private var pullRequestError: String?
     @State private var linkedMediaPreview: FeatureLinkedMediaPreview?
     @State private var linkedMediaPreviewError: String?
+    @State private var showsThreadQueue = false
+    @State private var isUpdatingQueue = false
+    @State private var queueActionError: String?
     // Plain state, not `FocusState`: the composer's UIKit text view owns
     // focus and mirrors it through this binding, because SwiftUI drops
     // writes to a `FocusState` no `.focused()` view registers with.
@@ -200,6 +203,26 @@ public struct ThreadDetailView: View {
 
     public var body: some View {
         threadContent
+        .sheet(isPresented: $showsThreadQueue) {
+            NavigationStack {
+                if let execution = detail?.execution {
+                    FeatureThreadQueueView(
+                        execution: execution,
+                        controlsAvailable: queueControlsAvailable && execution.canManageQueue,
+                        isUpdating: isUpdatingQueue,
+                        error: queueActionError,
+                        performAction: updateThreadQueue
+                    )
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showsThreadQueue = false }
+                        }
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+            .presentationDetents([.large])
+        }
         .confirmationDialog("Restart agent session?", isPresented: $confirmsRestart, titleVisibility: .visible) {
             Button("Restart") {
                 Task {
@@ -567,6 +590,17 @@ public struct ThreadDetailView: View {
                     Label("Restart agent session", systemImage: "arrow.clockwise")
                 }
                 .disabled(isSending || isRestarting)
+                if let execution = detail?.execution {
+                    if !execution.queuedEntries.isEmpty || execution.isQueueHeld {
+                        Button { showsThreadQueue = true } label: {
+                            Label("Queued messages", systemImage: "text.line.first.and.arrowtriangle.forward")
+                        }
+                    }
+                    if execution.interruptibleRun != nil {
+                        Button("Stop and pause queue", systemImage: "stop.fill", action: stopThreadWork)
+                            .disabled(!queueControlsAvailable || isUpdatingQueue || !execution.canInterrupt)
+                    }
+                }
                 Button(action: reloadThread) {
                     Label("Reload", systemImage: "arrow.clockwise")
                 }
@@ -720,6 +754,89 @@ public struct ThreadDetailView: View {
         return model.snapshot.environments.first { $0.id == environmentID }?.connectionState
     }
 
+    private var queueControlsAvailable: Bool {
+        model.client is any FeatureThreadQueueManaging
+            && threadConnectionState == .connected && refreshPresentation == nil
+            && !isSending && !isRewinding && !isRestarting
+    }
+
+    private var messageDeliveries: [FeatureMessageDelivery] {
+        guard model.client is any FeatureMessageDeliveryManaging,
+              let execution = detail?.execution,
+              execution.canManageQueue, execution.activeRun != nil else { return [] }
+        var deliveries: [FeatureMessageDelivery] = [.queue]
+        if execution.canSteer { deliveries.append(.steer) }
+        if execution.canRestart { deliveries.append(.restart) }
+        return deliveries
+    }
+
+    @MainActor
+    private func updateThreadQueue(_ action: FeatureThreadQueueAction) async -> Bool {
+        guard !isUpdatingQueue, queueControlsAvailable,
+              let client = model.client as? any FeatureThreadQueueManaging,
+              let execution = detail?.execution else { return false }
+        guard execution.allows(action) else {
+            queueActionError = "The queue changed. Check the current messages and try again."
+            return false
+        }
+        isUpdatingQueue = true
+        queueActionError = nil
+        defer { isUpdatingQueue = false }
+        do {
+            try await client.updateThreadQueue(threadID: thread.id, action: action)
+            // The existing live detail subscription supplies the new state.
+            return true
+        } catch {
+            queueActionError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func stopThreadWork() {
+        if let execution = detail?.execution {
+            guard let run = execution.interruptibleRun, execution.canInterrupt else { return }
+            Task { _ = await updateThreadQueue(.interrupt(runID: run.id, holdQueue: true)) }
+        } else {
+            Task { await model.cancelTurn(threadID: thread.id) }
+        }
+    }
+
+    @ViewBuilder
+    private var threadQueueControls: some View {
+        if let execution = detail?.execution {
+            if !execution.queuedEntries.isEmpty || execution.isQueueHeld {
+                Button { showsThreadQueue = true } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                        Text("\(execution.queuedEntries.count) queued")
+                        if execution.isQueueHeld { Text("Paused") }
+                        Spacer()
+                        Image(systemName: "chevron.up")
+                    }
+                    .font(T3Typography.control)
+                    .foregroundStyle(Color.white)
+                    .frame(minHeight: T3Metrics.minimumTapTarget)
+                    .padding(.horizontal, 18)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(Color.black)
+                .accessibilityIdentifier("thread-queue-open")
+            }
+            if let queueActionError {
+                HStack {
+                    Text(queueActionError)
+                        .foregroundStyle(T3Colors.danger)
+                    Spacer(minLength: 4)
+                    Button("Dismiss") { self.queueActionError = nil }
+                        .frame(minHeight: T3Metrics.minimumTapTarget)
+                }
+                .font(T3Typography.supporting)
+                .padding(.horizontal, 18)
+            }
+        }
+    }
+
     private var refreshPresentation: ThreadRefreshPresentation? {
         ThreadRefreshPresentation.resolve(
             loadState: model.detailLoadStates[thread.id],
@@ -833,6 +950,7 @@ public struct ThreadDetailView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
                 refreshStatus
+                threadQueueControls
                 if isRewinding {
                     Text("Rewinding conversation")
                         .font(T3Typography.supporting)
@@ -857,58 +975,66 @@ public struct ThreadDetailView: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 8)
                 }
-                FeatureComposerView(
-                    text: $draft,
-                    selection: $selection,
-                    attachments: attachmentBinding,
-                    draftOwnerID: "thread:\(currentThread.id)",
-                    environmentID: currentThread.environmentID,
-                    draftStorageKey: draftKey,
-                    environmentIsConnected: threadConnectionState == .connected,
-                    attachmentUploads: model.attachmentUploads,
-                    attachmentPreferences: currentThread.environmentID.flatMap {
-                        model.snapshot.preferencesByEnvironment?[$0]
-                    } ?? FeatureEnvironmentPreferences(),
-                    providers: threadProviders,
-                    threadSelection: currentSelection,
-                    materializesDefaultSelection: false,
-                    isSending: isSending || isRewinding || !didRestoreDraft,
-                    isWorking: detail.thread.state == .working || detail.thread.state == .queued
-                        || isCompacting,
-                    focused: $composerFocused,
-                    onSend: send,
-                    onStop: {
-                        Task { await model.cancelTurn(threadID: thread.id) }
-                    },
-                    pendingApprovals: detail.approvals,
-                    pendingUserInputs: detail.userInputs,
-                    resolvingRequestIDs: model.resolvingRequestIDs,
-                    powerFeatures: composerPowerFeatures,
-                    showsKeyboardDismissControl: true,
-                    onDismissKeyboard: dismissKeyboard,
-                    onApprovalDecision: { id, decision in
-                        Task { await model.resolveApproval(id, decision: decision) }
-                    },
-                    onUserInputSubmit: { id, answers, attachments in
-                        await model.resolveUserInput(id, answers: answers, attachmentsByQuestionID: attachments)
-                    },
-                    onUserInputDismiss: { id in
-                        await model.dismissUserInput(id)
-                    },
-                    onRefreshModels: refreshThreadEnvironmentModels,
-                    draftSaveError: draftSaveError,
-                    onRetryDraftSave: missingFileRecoverySnapshot == nil ? {
-                        if didRestoreDraft {
-                            persistDraftImmediately()
-                        } else {
-                            Task { await restoreDraft(from: draftRestoreBaseline ?? composerDraft, key: draftKey) }
-                        }
-                    } : nil,
-                    context: contextBinding,
-                    onInputPreparationChange: { isPreparingInput = $0 },
-                    contextAttachmentResolver: model.client as? any FeatureContextAttachmentResolving
-                )
-                .disabled(isRewinding)
+                if detail.execution?.isReadOnly == true {
+                    Text("Read-only conversation")
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.textSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 18)
+                } else {
+                    FeatureComposerView(
+                        text: $draft,
+                        selection: $selection,
+                        attachments: attachmentBinding,
+                        draftOwnerID: "thread:\(currentThread.id)",
+                        environmentID: currentThread.environmentID,
+                        draftStorageKey: draftKey,
+                        environmentIsConnected: threadConnectionState == .connected,
+                        attachmentUploads: model.attachmentUploads,
+                        attachmentPreferences: currentThread.environmentID.flatMap {
+                            model.snapshot.preferencesByEnvironment?[$0]
+                        } ?? FeatureEnvironmentPreferences(),
+                        providers: threadProviders,
+                        threadSelection: currentSelection,
+                        materializesDefaultSelection: false,
+                        isSending: isSending || isRewinding || !didRestoreDraft || isUpdatingQueue,
+                        isWorking: detail.execution.map { $0.canInterrupt && queueControlsAvailable }
+                            ?? (detail.thread.state == .working || detail.thread.state == .queued || isCompacting),
+                        focused: $composerFocused,
+                        onSend: { send() },
+                        onStop: stopThreadWork,
+                        pendingApprovals: detail.approvals,
+                        pendingUserInputs: detail.userInputs,
+                        resolvingRequestIDs: model.resolvingRequestIDs,
+                        powerFeatures: composerPowerFeatures,
+                        showsKeyboardDismissControl: true,
+                        onDismissKeyboard: dismissKeyboard,
+                        onApprovalDecision: { id, decision in
+                            Task { await model.resolveApproval(id, decision: decision) }
+                        },
+                        onUserInputSubmit: { id, answers, attachments in
+                            await model.resolveUserInput(id, answers: answers, attachmentsByQuestionID: attachments)
+                        },
+                        onUserInputDismiss: { id in
+                            await model.dismissUserInput(id)
+                        },
+                        onRefreshModels: refreshThreadEnvironmentModels,
+                        draftSaveError: draftSaveError,
+                        onRetryDraftSave: missingFileRecoverySnapshot == nil ? {
+                            if didRestoreDraft {
+                                persistDraftImmediately()
+                            } else {
+                                Task { await restoreDraft(from: draftRestoreBaseline ?? composerDraft, key: draftKey) }
+                            }
+                        } : nil,
+                        context: contextBinding,
+                        onInputPreparationChange: { isPreparingInput = $0 },
+                        contextAttachmentResolver: model.client as? any FeatureContextAttachmentResolving,
+                        messageDeliveries: messageDeliveries,
+                        onSendWithDelivery: { send(delivery: $0) }
+                    )
+                    .disabled(isRewinding)
+                }
             }
             .background(T3Colors.background)
         }
@@ -1069,8 +1195,10 @@ public struct ThreadDetailView: View {
         )
     }
 
-    private func send() {
-        guard !isRewinding, didRestoreDraft else { return }
+    private func send(delivery: FeatureMessageDelivery = .auto) {
+        guard !isSending, !isUpdatingQueue, !isRewinding, didRestoreDraft else { return }
+        guard detail?.execution?.isReadOnly != true else { return }
+        guard delivery == .auto || messageDeliveries.contains(delivery) else { return }
         let message = draft
         let pendingContext = composerContext
         let pendingAttachments = currentThread.environmentID.map {
@@ -1109,11 +1237,12 @@ public struct ThreadDetailView: View {
             await pendingDraftSave?.value
             let sent = await submitMessage(
                 FeatureMessageSubmission(
-                threadID: thread.id,
-                text: message,
-                selection: selection,
-                attachments: pendingAttachments,
-                context: pendingContext
+                    threadID: thread.id,
+                    text: message,
+                    selection: selection,
+                    attachments: pendingAttachments,
+                    context: pendingContext,
+                    delivery: delivery
                 )
             )
             if sent {

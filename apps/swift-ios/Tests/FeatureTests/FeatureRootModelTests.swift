@@ -10,6 +10,159 @@ import XCTest
 @Suite("Feature root model")
 struct FeatureRootModelTests {
     @Test
+    func readOnlyV2ConversationRejectsSendBeforeOutboxInsertion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let client = DeliveryFeatureClientStub()
+        let thread = FeatureThread(id: "thread-v2", projectID: "project-v2", environmentID: "environment", title: "Provider child")
+        client.snapshot = FeatureSnapshot(threads: [thread])
+        var projection = try #require(V2Fixture.load("v2-thread-bounded-snapshot")["projection"]).v2Object
+        let source = try #require(projection["thread"])
+        projection["thread"] = V2Fixture.patch(source, [
+            "creationSource": .string("provider"),
+            "lineage": .object(["parentThreadId": .string("parent"), "rootThreadId": .string("parent"), "relationshipToParent": .string("subagent")]),
+        ])
+        let execution = try FeatureThreadExecution(projection: .object(projection))
+        client.emit(.detail(FeatureThreadDetail(thread: thread, execution: execution)))
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: store)
+        await model.start()
+        #expect(!(await model.sendMessage(.init(threadID: thread.id, text: "Do not send", selection: nil))))
+        #expect(try await store.submissions().isEmpty)
+        #expect(client.deliveries.isEmpty)
+        #expect(model.errorMessage == "This conversation is read-only.")
+        await model.disconnect()
+    }
+
+    @Test(arguments: FeatureMessageDelivery.allCases)
+    func deliveryChoiceReachesAdapterAndSurvivesRestoredRetry(_ delivery: FeatureMessageDelivery) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("outbox.json")
+        let store = FeatureOutboxStore(fileURL: fileURL)
+        let thread = FeatureThread(
+            id: "thread", wireID: "wire-thread", projectID: "project", environmentID: "environment", title: "Follow up"
+        )
+        let snapshot = FeatureSnapshot(
+            connection: .init(state: .connected),
+            environments: [.init(
+                id: "environment", name: "Computer", endpoint: "https://example.test", connectionState: .connected
+            )],
+            threads: [thread]
+        )
+        let client = DeliveryFeatureClientStub()
+        client.snapshot = snapshot
+        client.sendMessageError = URLError(.notConnectedToInternet)
+        let model = FeatureRootModel(client: client, outboxStore: store)
+        await model.reload()
+
+        #expect(await model.sendMessage(.init(
+            threadID: thread.id, text: "Keep my choice", selection: nil, delivery: delivery
+        )))
+        await model.disconnect()
+        let queued = try #require(await store.submissions().first)
+        #expect(queued.delivery == delivery)
+        #expect(client.deliveries == [delivery])
+
+        let retried = AsyncStream<Void>.makeStream()
+        let restoredClient = DeliveryFeatureClientStub()
+        restoredClient.snapshot = snapshot
+        restoredClient.beforeSendMessage = { retried.continuation.yield() }
+        restoredClient.finishEvents()
+        let restoredModel = FeatureRootModel(
+            client: restoredClient, outboxStore: FeatureOutboxStore(fileURL: fileURL)
+        )
+        await restoredModel.start()
+        _ = await retried.stream.first { _ in true }
+        await restoredModel.disconnect()
+
+        #expect(restoredClient.deliveries == [delivery])
+        #expect(restoredClient.sentIdentities == [queued.identity])
+    }
+
+    @Test(arguments: ["optimistic", "snapshot", "delta"])
+    func authoritativeQueueRetiresOutboxWithoutPublishingItsMessage(source: String) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let thread = FeatureThread(
+            id: "thread-v2", projectID: "project-v2", environmentID: "environment", title: "Queue receipt"
+        )
+        let queued = FeatureQueuedSubmission(
+            environmentID: "environment",
+            identity: .init(threadID: thread.id, messageID: "message-v2-queued", createdAt: Date(timeIntervalSince1970: 1)),
+            threadID: thread.id, text: "Accepted queue message", selection: nil,
+            runtimeMode: .automatic, interactionMode: .standard, attachments: []
+        )
+        let sentinel = FeatureQueuedSubmission(
+            environmentID: "environment",
+            identity: .init(threadID: thread.id, createdAt: Date(timeIntervalSince1970: 2)),
+            threadID: thread.id, text: "Later message", selection: nil,
+            runtimeMode: .automatic, interactionMode: .standard, attachments: []
+        )
+        try await store.enqueue(queued)
+        try await store.enqueue(sentinel)
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            environments: [.init(
+                id: "environment", name: "Computer", endpoint: "https://example.test", connectionState: .disconnected
+            )],
+            threads: [thread]
+        )
+        let local = FeatureThreadDetail(thread: thread, messages: [.init(
+            id: queued.identity.messageID, role: .user, text: queued.text, state: .queued
+        )])
+        client.emit(.detail(local))
+        if source != "optimistic" {
+            let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .deletingLastPathComponent().appendingPathComponent("Fixtures/Wire/v2-thread-bounded-snapshot.json")
+            let snapshot = try JSONDecoder.t3.decode(JSONValue.self, from: Data(contentsOf: fixture))
+            let execution = try FeatureThreadExecution(projection: #require(snapshot["projection"]))
+            let accepted = FeatureThreadDetail(thread: thread, execution: execution)
+            if source == "delta" {
+                client.emit(.detailDelta(accepted, .init(changedMessages: [])))
+            } else {
+                client.emit(.detail(accepted))
+                client.emit(.detail(accepted))
+            }
+        }
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: store)
+        await model.start()
+
+        let authoritative = source != "optimistic"
+        #expect(model.details[thread.id]?.messages.contains { $0.id == queued.identity.messageID } == !authoritative)
+        #expect((model.details[thread.id]?.execution != nil) == authoritative)
+        if source == "delta" {
+            guard case .full = model.detailRenderUpdates[thread.id]?.change else {
+                Issue.record("Removing an optimistic row must invalidate the transcript")
+                await model.disconnect()
+                return
+            }
+        }
+
+        // The next send is a deterministic boundary after any acknowledged entry
+        // has been retired. An optimistic row must still retry its original ID.
+        let started = AsyncStream<Void>.makeStream()
+        var response: CheckedContinuation<Void, any Error>?
+        client.beforeSendMessageReturn = {
+            try await withCheckedThrowingContinuation { continuation in
+                response = continuation
+                started.continuation.yield()
+            }
+        }
+        client.snapshot.environments[0].connectionState = .connected
+        #expect(await model.setEnvironmentEnabled("environment", enabled: true))
+        _ = await started.stream.first { _ in true }
+        #expect(client.sentIdentities == [authoritative ? sentinel.identity : queued.identity])
+        #expect(try await store.submissions().contains { $0.id == queued.id } == !authoritative)
+        client.beforeSendMessageReturn = nil
+        response?.resume(throwing: CancellationError())
+        await model.disconnect()
+    }
+
+    @Test
     func rewindLocksSendingAndSavesRecoveredInputAfterLeavingTheThread() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -3857,7 +4010,7 @@ private func orchestrationThread(
 }
 
 @MainActor
-private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
+private class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var rewindHandler: ((String, String) async throws -> FeatureRevertedMessage)?
     var rewindAttachments: [FeatureDraftAttachment] = []
     func canRewindConversation(threadID: String, messageID: String) -> Bool { rewindHandler != nil }
@@ -4152,5 +4305,22 @@ private final class FeatureSettingsSaveGate {
     func releaseFirst() {
         firstRelease?.resume()
         firstRelease = nil
+    }
+}
+
+@MainActor
+private final class DeliveryFeatureClientStub: FeatureClientStub, FeatureMessageDeliveryManaging {
+    var deliveries: [FeatureMessageDelivery] = []
+
+    func sendMessage(
+        threadID: String, text: String, selection: FeatureSelection?, runtimeMode: FeatureRuntimeMode,
+        attachments: [FeatureUploadAttachment], identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?, delivery: FeatureMessageDelivery
+    ) async throws {
+        deliveries.append(delivery)
+        try await super.sendMessage(
+            threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
+            attachments: attachments, identity: identity, context: context
+        )
     }
 }

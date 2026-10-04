@@ -5,6 +5,26 @@ import XCTest
 
 @MainActor
 final class NativeMultiEnvironmentTests: XCTestCase {
+    func testPreferenceChangeRejectsAnAlreadyRunningPassiveRefresh() async throws {
+        let fixture = try await Self.makeFixture(
+            fallbackPollingInitialDelay: .seconds(60), aggregateRefreshInterval: .seconds(60)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let before = try await fixture.client.initialSnapshot()
+        XCTAssertTrue(before.projects.contains { $0.environmentID == "two" })
+        await fixture.transport.holdNextShellRead(host: "two.example")
+        let refresh = Task { try await fixture.client.backgroundSnapshot() }
+        await fixture.transport.waitForHeldShellRead()
+        try await fixture.client.setOrchestrationPreference(environmentID: "two", preference: .v2)
+        await fixture.transport.releaseShellRead()
+        let after = try await refresh.value
+        XCTAssertFalse(after.projects.contains { $0.environmentID == "two" })
+        XCTAssertTrue(after.projects.contains { $0.environmentID == "one" })
+        let preference = try await fixture.client.orchestrationPreference(environmentID: "two")
+        XCTAssertEqual(preference, .v2)
+        await fixture.client.disconnect()
+    }
+
     func testScratchCreationUsesTheSelectedComputer() async throws {
         let server = MultiEnvironmentConfigurationServer()
         let fixture = try await Self.makeFixture(
@@ -369,7 +389,7 @@ final class NativeMultiEnvironmentTests: XCTestCase {
                     originalEnvironment.id: EnvironmentCredential(accessToken: "token"),
                 ]
             ),
-            httpTransport: RuntimeReplacementHTTPTransport(),
+            httpTransport: RuntimeReplacementHTTPTransport(environments: [originalEnvironment, updatedEnvironment]),
             webSocketConnector: connector
         )
         let original = await runtime.client(for: originalEnvironment)
@@ -1322,7 +1342,7 @@ final class NativeMultiEnvironmentTests: XCTestCase {
                 modelID: "gpt-5.6-sol"
             )
         }
-        let transport = MultiEnvironmentHTTPTransport(shells: shells)
+        let transport = MultiEnvironmentHTTPTransport(shells: shells, environments: environments)
         var environmentCredentials = [
             "one": EnvironmentCredential(accessToken: "one-token"),
             "two": EnvironmentCredential(accessToken: "two-token"),
@@ -1544,21 +1564,24 @@ struct NativePassiveThreadRefreshTests {
         await refreshSleep.resume()
         let secondCadence = await refreshSleep.waitUntilRequested(count: 2)
         #expect(secondCadence == .seconds(5))
-        let initialFailedReadCount = await fixture.transport.shellReadCount(host: "three.example")
-        #expect(initialFailedReadCount == 2)
+        let initialFailedDiscoveryCount = await fixture.transport.failedDiscoveryCount(host: "three.example")
+        #expect(initialFailedDiscoveryCount == 1)
+        #expect(await fixture.transport.shellReadCount(host: "three.example") == 1)
 
         for requestCount in 2...4 {
             await refreshSleep.resume()
             let cadence = await refreshSleep.waitUntilRequested(count: requestCount + 1)
             #expect(cadence == .seconds(5))
-            let failedReadCount = await fixture.transport.shellReadCount(host: "three.example")
-            #expect(failedReadCount == 2)
+            let failedDiscoveryCount = await fixture.transport.failedDiscoveryCount(host: "three.example")
+            #expect(failedDiscoveryCount == 1)
+            #expect(await fixture.transport.shellReadCount(host: "three.example") == 1)
         }
 
         await refreshSleep.resume()
         _ = await refreshSleep.waitUntilRequested(count: 6)
-        let retriedReadCount = await fixture.transport.shellReadCount(host: "three.example")
-        #expect(retriedReadCount == 3)
+        let retriedDiscoveryCount = await fixture.transport.failedDiscoveryCount(host: "three.example")
+        #expect(retriedDiscoveryCount == 2)
+        #expect(await fixture.transport.shellReadCount(host: "three.example") == 1)
         await fixture.client.disconnect()
     }
 }
@@ -1728,7 +1751,17 @@ private actor BlockingRuntimeCloseConnection: WebSocketConnection {
 }
 
 private actor RuntimeReplacementHTTPTransport: HTTPTransport {
+    private let environments: [Environment]
+
+    init(environments: [Environment]) {
+        self.environments = environments
+    }
+
     func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        if request.url?.path == "/.well-known/t3/environment",
+           let environment = environments.first(where: { $0.httpBaseURL.host == request.url?.host }) {
+            return (try legacyEnvironmentDescriptorData(for: environment), multiEnvironmentResponse(request))
+        }
         guard request.url?.path == "/api/auth/websocket-ticket" else {
             throw URLError(.unsupportedURL)
         }
@@ -1842,20 +1875,26 @@ private struct MultiEnvironmentFixture {
 }
 
 private actor MultiEnvironmentHTTPTransport: HTTPTransport {
+    private var heldShellHost: String?
+    private var heldShellRead: (response: (Data, HTTPURLResponse), continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>)?
+    private var heldShellWaiters: [CheckedContinuation<Void, Never>] = []
     private let shells: [String: OrchestrationShellSnapshot]
+    private let environments: [Environment]
     private var shellData: [String: Data]
     private var detailData: [String: [String: Data]] = [:]
     private var reachableHosts: Set<String>
     private var shellReadsEnabledHosts: Set<String>
     private var shellReadCounts: [String: Int] = [:]
+    private var failedDiscoveryCounts: [String: Int] = [:]
     private var dispatched: [MultiEnvironmentDispatchRecord] = []
     private var hostsDroppingNextCreateReply = Set<String>()
     private var diffRequests: [(host: String, input: JSONValue)] = []
 
     func pullRequestDiffRequests() -> [(host: String, input: JSONValue)] { diffRequests }
 
-    init(shells: [String: OrchestrationShellSnapshot]) {
+    init(shells: [String: OrchestrationShellSnapshot], environments: [Environment]) {
         self.shells = shells
+        self.environments = environments
         shellData = shells.mapValues { try! JSONEncoder.t3.encode($0) }
         reachableHosts = Set(shells.keys)
         shellReadsEnabledHosts = Set(shells.keys)
@@ -1900,18 +1939,42 @@ private actor MultiEnvironmentHTTPTransport: HTTPTransport {
         shellReadCounts[host, default: 0]
     }
 
+    func failedDiscoveryCount(host: String) -> Int {
+        failedDiscoveryCounts[host, default: 0]
+    }
+
     func dropNextCreateReply(host: String) {
         hostsDroppingNextCreateReply.insert(host)
     }
 
-    func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
+    func holdNextShellRead(host: String) { heldShellHost = host }
+
+    func waitForHeldShellRead() async {
+        if heldShellRead != nil { return }
+        await withCheckedContinuation { heldShellWaiters.append($0) }
+    }
+
+    func releaseShellRead() {
+        guard let held = heldShellRead else { return }
+        heldShellRead = nil
+        held.continuation.resume(returning: held.response)
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let host = request.url?.host ?? ""
         let path = request.url?.path ?? ""
         if path == "/api/orchestration/shell" {
             shellReadCounts[host, default: 0] += 1
         }
         guard reachableHosts.contains(host) else {
+            if path == "/.well-known/t3/environment" {
+                failedDiscoveryCounts[host, default: 0] += 1
+            }
             throw URLError(.cannotConnectToHost)
+        }
+        if path == "/.well-known/t3/environment",
+           let environment = environments.first(where: { $0.httpBaseURL.host == host }) {
+            return (try legacyEnvironmentDescriptorData(for: environment), multiEnvironmentResponse(request))
         }
         if path == "/api/pull-requests/diff", let body = request.httpBody {
             diffRequests.append((host, try JSONDecoder.t3.decode(JSONValue.self, from: body)))
@@ -1920,6 +1983,15 @@ private actor MultiEnvironmentHTTPTransport: HTTPTransport {
         if path == "/api/orchestration/shell",
            shellReadsEnabledHosts.contains(host),
            let data = shellData[host] {
+            if heldShellHost == host {
+                heldShellHost = nil
+                return try await withCheckedThrowingContinuation { continuation in
+                    heldShellRead = ((data, multiEnvironmentResponse(request)), continuation)
+                    let waiters = heldShellWaiters
+                    heldShellWaiters.removeAll()
+                    waiters.forEach { $0.resume() }
+                }
+            }
             return (data, multiEnvironmentResponse(request))
         }
         if path.hasPrefix("/api/orchestration/threads/") {

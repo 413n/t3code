@@ -5,6 +5,20 @@ import Testing
 @Suite("Native work log accumulator")
 struct NativeWorkLogAccumulatorTests {
     @Test
+    func updatedDurableToolRecordReplacesItsOutputWithoutCountingTwice() {
+        var accumulator = NativeWorkLogAccumulator()
+        for (status, output) in [("inProgress", "Starting"), ("completed", "First output"), ("completed", "Final output")] {
+            accumulator.append(activity(id: "durable-tool", kind: "tool.updated", summary: "Run tests", payload: [
+                "toolCallId": .string("call"), "status": .string(status),
+            ]), preview: output, createdAt: Date(timeIntervalSince1970: 1))
+        }
+        let message = accumulator.message(groupID: "run")
+        #expect(message.activeWorkLabel == nil)
+        #expect(message.toolName == "Work log · 1")
+        #expect(message.text == "• Final output")
+    }
+
+    @Test
     func lifecycleUpdatesReplaceActiveWorkAndCompletionAddsOneLine() {
         var accumulator = NativeWorkLogAccumulator()
         accumulator.append(

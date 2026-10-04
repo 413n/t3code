@@ -57,6 +57,12 @@ public actor PairingService {
     ) async throws -> Environment {
         let api = EnvironmentAPI(transport: transport, credentials: credentialStore)
         let descriptor = try await api.descriptor(at: target.httpBaseURL)
+        let previousEnvironment = try await environmentStore.load()
+            .first { $0.id == descriptor.environmentId }
+        let preference = previousEnvironment?.orchestrationProtocolPreference ?? .auto
+        // Validate before consuming the one-time pairing token. Re-pairing
+        // renews authorization without resetting the server's saved preference.
+        _ = try OrchestrationProtocolSelection(descriptor: descriptor, preference: preference)
         let access = try await exchange(target: target, clientLabel: clientLabel)
         guard access.tokenType == "Bearer" else {
             throw HTTPError.status(
@@ -70,7 +76,8 @@ public actor PairingService {
             label: descriptor.label,
             httpBaseURL: target.httpBaseURL,
             webSocketBaseURL: target.webSocketBaseURL,
-            descriptor: descriptor
+            descriptor: descriptor,
+            orchestrationProtocolPreference: preference
         )
         let credential = EnvironmentCredential(
             accessToken: access.accessToken,

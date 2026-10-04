@@ -24,7 +24,7 @@ final class NativeRetryIdentityTests: XCTestCase {
             )
             let connection = PartialBootstrapWebSocketConnection()
             let transport = PartialBootstrapHTTPTransport(
-                shell: retryShellSnapshot(), committedMessages: committed ? [message] : []
+                environment: environment, shell: retryShellSnapshot(), committedMessages: committed ? [message] : []
             )
             let runtime = EnvironmentRuntime(
                 environmentStore: store,
@@ -86,7 +86,7 @@ final class NativeRetryIdentityTests: XCTestCase {
         )
         try await store.save([environment])
         try await store.setActiveEnvironment(id: environment.id)
-        let transport = ConcurrentBootstrapHTTPTransport(shell: retryShellSnapshot())
+        let transport = ConcurrentBootstrapHTTPTransport(environment: environment, shell: retryShellSnapshot())
         let connection = ConcurrentBootstrapWebSocketConnection()
         let runtime = EnvironmentRuntime(
             environmentStore: store,
@@ -144,7 +144,7 @@ final class NativeRetryIdentityTests: XCTestCase {
         )
         try await store.save([environment])
         try await store.setActiveEnvironment(id: environment.id)
-        let transport = ConcurrentBootstrapHTTPTransport(shell: retryShellSnapshot())
+        let transport = ConcurrentBootstrapHTTPTransport(environment: environment, shell: retryShellSnapshot())
         let connection = ConcurrentBootstrapWebSocketConnection()
         let runtime = EnvironmentRuntime(
             environmentStore: store,
@@ -211,7 +211,7 @@ final class NativeRetryIdentityTests: XCTestCase {
         try await store.setActiveEnvironment(id: environment.id)
 
         let connection = AmbiguousDispatchWebSocketConnection()
-        let transport = RetryIdentityHTTPTransport(shell: retryShellSnapshot())
+        let transport = RetryIdentityHTTPTransport(environment: environment, shell: retryShellSnapshot())
         let runtime = EnvironmentRuntime(
             environmentStore: store,
             credentialStore: InMemoryCredentialStore(
@@ -326,7 +326,7 @@ final class NativeRetryIdentityTests: XCTestCase {
         try await store.setActiveEnvironment(id: environment.id)
 
         let connection = PartialBootstrapWebSocketConnection()
-        let transport = PartialBootstrapHTTPTransport(shell: retryShellSnapshot())
+        let transport = PartialBootstrapHTTPTransport(environment: environment, shell: retryShellSnapshot())
         let runtime = EnvironmentRuntime(
             environmentStore: store,
             credentialStore: InMemoryCredentialStore(
@@ -530,10 +530,12 @@ private actor ConcurrentBootstrapWebSocketConnection: WebSocketConnection {
 }
 
 private actor ConcurrentBootstrapHTTPTransport: HTTPTransport {
+    private let environment: Environment
     private let shellData: Data
     private var acceptsShellReads = true
 
-    init(shell: OrchestrationShellSnapshot) {
+    init(environment: Environment, shell: OrchestrationShellSnapshot) {
+        self.environment = environment
         shellData = try! JSONEncoder.t3.encode(shell)
     }
 
@@ -543,6 +545,8 @@ private actor ConcurrentBootstrapHTTPTransport: HTTPTransport {
 
     func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
         switch request.url?.path {
+        case "/.well-known/t3/environment":
+            (try legacyEnvironmentDescriptorData(for: environment), retryHTTPResponse(request))
         case "/api/orchestration/shell" where acceptsShellReads:
             (shellData, retryHTTPResponse(request))
         case "/api/auth/websocket-ticket":
@@ -608,15 +612,20 @@ private func retryShellSnapshot() -> OrchestrationShellSnapshot {
 }
 
 private actor RetryIdentityHTTPTransport: HTTPTransport {
+    private let environment: Environment
     private let shellData: Data
     private var commands: [JSONValue] = []
 
-    init(shell: OrchestrationShellSnapshot) {
+    init(environment: Environment, shell: OrchestrationShellSnapshot) {
+        self.environment = environment
         shellData = try! JSONEncoder.t3.encode(shell)
     }
 
     func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
         let path = request.url?.path ?? ""
+        if path == "/.well-known/t3/environment" {
+            return (try legacyEnvironmentDescriptorData(for: environment), retryHTTPResponse(request))
+        }
         if path == "/api/orchestration/shell" {
             return (shellData, retryHTTPResponse(request))
         }
@@ -657,17 +666,22 @@ private struct RetryIdentityWebSocketConnector: WebSocketConnecting {
 }
 
 private actor PartialBootstrapHTTPTransport: HTTPTransport {
+    private let environment: Environment
     private let shellData: Data
     private let committedMessages: [OrchestrationMessage]
     private var commands: [JSONValue] = []
 
-    init(shell: OrchestrationShellSnapshot, committedMessages: [OrchestrationMessage] = []) {
+    init(environment: Environment, shell: OrchestrationShellSnapshot, committedMessages: [OrchestrationMessage] = []) {
+        self.environment = environment
         shellData = try! JSONEncoder.t3.encode(shell)
         self.committedMessages = committedMessages
     }
 
     func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
         let path = request.url?.path ?? ""
+        if path == "/.well-known/t3/environment" {
+            return (try legacyEnvironmentDescriptorData(for: environment), retryHTTPResponse(request))
+        }
         if path == "/api/orchestration/shell" {
             return (shellData, retryHTTPResponse(request))
         }

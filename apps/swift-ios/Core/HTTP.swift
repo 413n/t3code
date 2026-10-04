@@ -214,8 +214,27 @@ public actor EnvironmentAPI {
 
     public func descriptor(at httpBaseURL: URL) async throws -> EnvironmentDescriptor {
         try await send(
-            URLRequest(url: endpoint(httpBaseURL, path: "/.well-known/t3/environment")),
+            URLRequest(url: endpoint(httpBaseURL, path: "/.well-known/t3/environment"), timeoutInterval: 8),
             as: EnvironmentDescriptor.self
+        )
+    }
+
+    /// V2 keeps HTTP reads on the same authenticated transport as pairing and
+    /// other environment requests, including relay credential refresh.
+    public func orchestrationV2Snapshot(
+        path: String,
+        environment: Environment,
+        queryItems: [URLQueryItem] = [],
+        timeoutInterval: TimeInterval? = nil
+    ) async throws -> JSONValue {
+        try await authorized(
+            environment: environment,
+            path: path,
+            queryItems: queryItems,
+            method: "GET",
+            headers: ["x-t3-orchestration-protocol": "2"],
+            timeoutInterval: timeoutInterval,
+            as: JSONValue.self
         )
     }
 
@@ -410,6 +429,7 @@ public actor EnvironmentAPI {
         queryItems: [URLQueryItem] = [],
         method: String,
         body: Data? = nil,
+        headers: [String: String] = [:],
         timeoutInterval: TimeInterval? = nil,
         isUnauthorizedResponse: (@Sendable (Result) -> Bool)? = nil,
         as type: Result.Type
@@ -427,7 +447,8 @@ public actor EnvironmentAPI {
                 path: path,
                 queryItems: queryItems,
                 method: method,
-                body: body
+                body: body,
+                headers: headers
             )
             if let timeoutInterval {
                 request.timeoutInterval = timeoutInterval
@@ -471,7 +492,8 @@ public actor EnvironmentAPI {
                     path: path,
                     queryItems: queryItems,
                     method: method,
-                    body: body
+                    body: body,
+                    headers: headers
                 ),
                 environment: environment,
                 credential: current
@@ -506,7 +528,8 @@ public actor EnvironmentAPI {
                         path: path,
                         queryItems: queryItems,
                         method: method,
-                        body: body
+                        body: body,
+                        headers: headers
                     ),
                     environment: environment,
                     credential: current
@@ -529,13 +552,17 @@ public actor EnvironmentAPI {
         path: String,
         queryItems: [URLQueryItem],
         method: String,
-        body: Data?
+        body: Data?,
+        headers: [String: String] = [:]
     ) -> URLRequest {
         var request = URLRequest(
             url: endpoint(environment.httpBaseURL, path: path, queryItems: queryItems)
         )
         request.httpMethod = method
         request.httpBody = body
+        for (name, value) in headers {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         if body != nil {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }

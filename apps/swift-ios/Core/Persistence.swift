@@ -308,6 +308,20 @@ public actor EnvironmentStore {
     }
 
     @discardableResult
+    public func setOrchestrationProtocolPreference(
+        id: String,
+        preference: OrchestrationProtocolPreference
+    ) throws -> [Environment] {
+        var document = try loadDocument()
+        guard let index = document.environments.firstIndex(where: { $0.id == id }) else {
+            return document.environments
+        }
+        document.environments[index].orchestrationProtocolPreference = preference
+        try save(document)
+        return document.environments
+    }
+
+    @discardableResult
     public func upsert(_ environment: Environment) throws -> [Environment] {
         var environments = try load()
         if let index = environments.firstIndex(where: { $0.id == environment.id }) {

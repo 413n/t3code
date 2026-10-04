@@ -18,6 +18,8 @@ public protocol FeatureClient: AnyObject {
 
     func pair(endpoint: String, token: String?) async throws
     func setEnvironmentEnabled(id: String, enabled: Bool) async throws
+    func orchestrationPreference(environmentID: String) async throws -> OrchestrationProtocolPreference
+    func setOrchestrationPreference(environmentID: String, preference: OrchestrationProtocolPreference) async throws
     func removeEnvironment(id: String) async throws
     func disconnect() async
 
@@ -349,6 +351,10 @@ public extension FeatureClient {
     }
 
     func setEnvironmentEnabled(id: String, enabled: Bool) async throws {}
+    func orchestrationPreference(environmentID: String) async throws -> OrchestrationProtocolPreference { .auto }
+    func setOrchestrationPreference(environmentID: String, preference: OrchestrationProtocolPreference) async throws {
+        throw FeatureCapabilityUnavailable("Orchestrator selection")
+    }
     func removeEnvironment(id: String) async throws {}
     func disconnect() async {}
     func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async throws -> [FeatureProvider] {

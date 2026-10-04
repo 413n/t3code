@@ -859,6 +859,7 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
     public var activeSubagentCount: Int
     public var backgroundWorkIsActive: Bool
     public var isCompacting: Bool?
+    public var execution: FeatureThreadExecution? = nil
 
     public init(
         thread: FeatureThread,
@@ -868,7 +869,8 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
         page: FeatureThreadPage? = nil,
         activeSubagentCount: Int = 0,
         backgroundWorkIsActive: Bool = false,
-        isCompacting: Bool = false
+        isCompacting: Bool = false,
+        execution: FeatureThreadExecution? = nil
     ) {
         self.thread = thread
         self.messages = messages
@@ -878,6 +880,7 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
         self.activeSubagentCount = activeSubagentCount
         self.backgroundWorkIsActive = backgroundWorkIsActive
         self.isCompacting = isCompacting
+        self.execution = execution
     }
 }
 

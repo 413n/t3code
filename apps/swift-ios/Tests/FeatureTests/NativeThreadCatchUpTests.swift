@@ -1303,6 +1303,13 @@ private actor CatchUpHTTPTransport: HTTPTransport {
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let value: JSONValue
         switch request.url!.path {
+        case "/.well-known/t3/environment":
+            value = .object([
+                "environmentId": .string("one"), "label": .string("Computer"),
+                "platform": .object(["os": .string("darwin"), "arch": .string("arm64")]),
+                "serverVersion": .string("1.0.0"),
+                "capabilities": .object(["repositoryIdentity": .bool(false)]),
+            ])
         case "/api/auth/websocket-ticket":
             value = .object(["ticket": .string("test"), "expiresAt": .string("2027-01-01T00:00:00Z")])
         case "/api/orchestration/shell":

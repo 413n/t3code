@@ -756,7 +756,7 @@ final class T3ConnectRuntimeTests: XCTestCase {
                 proofKeyThumbprint: thumbprint
             ),
         ])
-        let transport = T3ConnectScriptedHTTPTransport { request, ordinal in
+        let transport = T3ConnectScriptedHTTPTransport(discoveryEnvironment: environment) { request, ordinal in
             XCTAssertEqual(request.url?.path, "/api/auth/websocket-ticket")
             return (.webSocketTicket("ticket-\(ordinal)"), 200)
         }
@@ -1497,13 +1497,19 @@ private actor T3ConnectScriptedHTTPTransport: HTTPTransport {
     typealias Handler = @Sendable (URLRequest, Int) throws -> (Data, Int)
 
     private let handler: Handler
+    private let discoveryEnvironment: Environment?
     private(set) var requests: [URLRequest] = []
 
-    init(handler: @escaping Handler) {
+    init(discoveryEnvironment: Environment? = nil, handler: @escaping Handler) {
+        self.discoveryEnvironment = discoveryEnvironment
         self.handler = handler
     }
 
     func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        // Opt in for T3Client without changing the scripted ticket ordinals.
+        if let discoveryEnvironment, request.url?.path == "/.well-known/t3/environment" {
+            return (try legacyEnvironmentDescriptorData(for: discoveryEnvironment), response(request, status: 200))
+        }
         requests.append(request)
         let (data, status) = try handler(request, requests.count)
         return (data, response(request, status: status))

@@ -159,7 +159,7 @@ final class TransportReliabilityTests: XCTestCase {
                 environment.id: EnvironmentCredential(accessToken: "access-token"),
             ]
         )
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             let body = """
             {
               "ticket": "websocket-ticket",
@@ -245,7 +245,7 @@ final class TransportReliabilityTests: XCTestCase {
         let credentials = InMemoryCredentialStore(credentials: [
             environment.id: EnvironmentCredential(accessToken: "access-token"),
         ])
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             if request.url?.path == "/api/auth/websocket-ticket" {
                 return (
                     Data(#"{"ticket":"websocket-ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
@@ -313,7 +313,7 @@ final class TransportReliabilityTests: XCTestCase {
         let credentials = InMemoryCredentialStore(credentials: [
             environment.id: EnvironmentCredential(accessToken: "access-token"),
         ])
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             (
                 Data(#"{"ticket":"websocket-ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
                 transportResponse(request)
@@ -362,7 +362,7 @@ final class TransportReliabilityTests: XCTestCase {
             webSocketBaseURL: URL(string: "wss://studio.example")!,
             descriptor: descriptor
         )
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             if request.url?.path == "/api/auth/websocket-ticket" {
                 return (
                     Data(#"{"ticket":"ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
@@ -412,7 +412,7 @@ final class TransportReliabilityTests: XCTestCase {
             webSocketBaseURL: URL(string: "wss://studio.example")!,
             descriptor: descriptor
         )
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             (
                 Data(#"{"ticket":"ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
                 transportResponse(request)
@@ -458,7 +458,7 @@ final class TransportReliabilityTests: XCTestCase {
             webSocketBaseURL: URL(string: "wss://studio.example")!,
             descriptor: try attachmentDescriptor(#"{"attachmentUploads":true}"#)
         )
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             if request.url?.path == "/api/auth/websocket-ticket" {
                 return (
                     Data(#"{"ticket":"ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
@@ -519,7 +519,7 @@ final class TransportReliabilityTests: XCTestCase {
             webSocketBaseURL: URL(string: "wss://studio.example")!,
             descriptor: descriptor
         )
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             if request.url?.path == "/api/auth/websocket-ticket" {
                 return (
                     Data(#"{"ticket":"websocket-ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
@@ -659,7 +659,7 @@ final class TransportReliabilityTests: XCTestCase {
         let credentials = InMemoryCredentialStore(credentials: [
             environment.id: EnvironmentCredential(accessToken: "access-token"),
         ])
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             (
                 Data(#"{"ticket":"websocket-ticket","expiresAt":"2026-07-30T12:05:00.000Z"}"#.utf8),
                 transportResponse(request)
@@ -705,7 +705,7 @@ final class TransportReliabilityTests: XCTestCase {
                 environment.id: EnvironmentCredential(accessToken: "access-token"),
             ]
         )
-        let transport = RecordingHTTPTransport { request in
+        let transport = RecordingHTTPTransport(environment: environment) { request in
             let body = if request.url?.path == "/api/auth/websocket-ticket" {
                 """
                 {
@@ -955,12 +955,18 @@ private actor RecordingHTTPTransport: HTTPTransport {
 
     private(set) var requests: [URLRequest] = []
     private let handler: Handler
+    private let environment: Environment?
 
-    init(handler: @escaping Handler) {
+    init(environment: Environment? = nil, handler: @escaping Handler) {
+        self.environment = environment
         self.handler = handler
     }
 
     func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        // Client discovery must not change the recorded upload and dispatch requests.
+        if let environment, request.url?.path == "/.well-known/t3/environment" {
+            return (try legacyEnvironmentDescriptorData(for: environment), transportResponse(request))
+        }
         requests.append(request)
         return try handler(request)
     }

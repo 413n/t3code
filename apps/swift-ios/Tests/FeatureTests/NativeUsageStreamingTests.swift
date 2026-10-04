@@ -135,6 +135,17 @@ private struct UsageStreamingFixture {
 
 private struct UsageStreamingHTTPTransport: HTTPTransport {
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        if let url = request.url, url.path == "/.well-known/t3/environment",
+           let host = url.host, ["fast.example", "slow.example"].contains(host) {
+            let id = String(host.prefix { $0 != "." })
+            let data = try JSONEncoder.t3.encode(JSONValue.object([
+                "environmentId": .string(id), "label": .string(id),
+                "platform": .object(["os": .string("darwin"), "arch": .string("arm64")]),
+                "serverVersion": .string("1.0.0"),
+                "capabilities": .object(["repositoryIdentity": .bool(false)]),
+            ]))
+            return (data, HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
         guard let url = request.url, url.path == "/api/auth/websocket-ticket" else {
             throw URLError(.unsupportedURL)
         }

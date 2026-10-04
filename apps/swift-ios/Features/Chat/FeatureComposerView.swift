@@ -78,6 +78,8 @@ struct FeatureComposerView: View {
     private let resolvingRequestIDs: Set<String>
     private let powerFeatures: FeatureComposerPowerFeatures
     private let onSend: () -> Void
+    private let messageDeliveries: [FeatureMessageDelivery]
+    private let onSendWithDelivery: ((FeatureMessageDelivery) -> Void)?
     private let onStop: () -> Void
     private let showsKeyboardDismissControl: Bool
     private let onDismissKeyboard: (() -> Void)?
@@ -119,7 +121,9 @@ struct FeatureComposerView: View {
         onRetryDraftSave: (() -> Void)? = nil,
         context: Binding<OrchestrationMessageContext?> = .constant(nil),
         onInputPreparationChange: ((Bool) -> Void)? = nil,
-        contextAttachmentResolver: (any FeatureContextAttachmentResolving)? = nil
+        contextAttachmentResolver: (any FeatureContextAttachmentResolving)? = nil,
+        messageDeliveries: [FeatureMessageDelivery] = [],
+        onSendWithDelivery: ((FeatureMessageDelivery) -> Void)? = nil
     ) {
         _text = text
         _selection = selection
@@ -143,6 +147,8 @@ struct FeatureComposerView: View {
         self.isWorking = isWorking
         _focused = focused
         self.onSend = onSend
+        self.messageDeliveries = messageDeliveries
+        self.onSendWithDelivery = onSendWithDelivery
         self.onStop = onStop
         self.contextUsage = contextUsage
         self.forceExpanded = forceExpanded
@@ -717,10 +723,24 @@ struct FeatureComposerView: View {
         .opacity(submitDisabled ? 0.3 : 1)
         .accessibilityLabel(submitAccessibilityLabel)
         .accessibilityIdentifier(showsStop ? "thread-stop" : "message-send")
+        .contextMenu {
+            if !showsStop, canSend, let onSendWithDelivery {
+                if messageDeliveries.contains(.queue) {
+                    Button("Queue") { onSendWithDelivery(.queue) }
+                }
+                if messageDeliveries.contains(.steer) {
+                    Button("Steer") { onSendWithDelivery(.steer) }
+                }
+                if messageDeliveries.contains(.restart) {
+                    Button("Restart") { onSendWithDelivery(.restart) }
+                }
+            }
+        }
     }
 
     private var composerPlaceholder: String {
-        isWorking ? "Queue a message…" : "Ask anything…"
+        if !messageDeliveries.isEmpty { return "Follow up…" }
+        return isWorking ? "Queue a message…" : "Ask anything…"
     }
 
     private var submitSymbol: String {
@@ -731,6 +751,7 @@ struct FeatureComposerView: View {
     private var submitAccessibilityLabel: String {
         if isSending { return "Sending message" }
         if showsStop { return "Stop agent" }
+        if !messageDeliveries.isEmpty { return "Send message" }
         return isWorking ? "Queue message" : "Send message"
     }
 

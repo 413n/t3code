@@ -49,6 +49,7 @@ public struct Environment: Codable, Identifiable, Equatable, Sendable {
     public var kind: EnvironmentKind
     public var descriptor: EnvironmentDescriptor?
     public var isEnabled: Bool
+    public var orchestrationProtocolPreference: OrchestrationProtocolPreference
 
     public init(
         id: String,
@@ -57,7 +58,8 @@ public struct Environment: Codable, Identifiable, Equatable, Sendable {
         webSocketBaseURL: URL,
         kind: EnvironmentKind = .bearer,
         descriptor: EnvironmentDescriptor? = nil,
-        isEnabled: Bool = true
+        isEnabled: Bool = true,
+        orchestrationProtocolPreference: OrchestrationProtocolPreference = .auto
     ) {
         self.id = id
         self.label = label
@@ -66,6 +68,7 @@ public struct Environment: Codable, Identifiable, Equatable, Sendable {
         self.kind = kind
         self.descriptor = descriptor
         self.isEnabled = isEnabled
+        self.orchestrationProtocolPreference = orchestrationProtocolPreference
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -76,6 +79,7 @@ public struct Environment: Codable, Identifiable, Equatable, Sendable {
         case kind
         case descriptor
         case isEnabled
+        case orchestrationProtocolPreference
     }
 
     public init(from decoder: any Decoder) throws {
@@ -87,6 +91,10 @@ public struct Environment: Codable, Identifiable, Equatable, Sendable {
         kind = try container.decodeIfPresent(EnvironmentKind.self, forKey: .kind) ?? .bearer
         descriptor = try container.decodeIfPresent(EnvironmentDescriptor.self, forKey: .descriptor)
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        orchestrationProtocolPreference = try container.decodeIfPresent(
+            OrchestrationProtocolPreference.self,
+            forKey: .orchestrationProtocolPreference
+        ) ?? .auto
     }
 }
 
@@ -103,6 +111,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         }
 
         public let repositoryIdentity: Bool
+        public var serverResolvedCommandContext: Bool? = nil
         public let connectionProbe: Bool?
         public let attachmentUploads: Bool?
         public let fileAttachments: FileAttachments?
@@ -155,6 +164,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case questionAttachments
             case projectSettingsOverrides
             case inlineMessageContext
+            case serverResolvedCommandContext
         }
 
         public init(from decoder: any Decoder) throws {
@@ -164,6 +174,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             questionAttachments = try container.decodeIfPresent(Bool.self, forKey: .questionAttachments)
             projectSettingsOverrides = try container.decodeIfPresent(Bool.self, forKey: .projectSettingsOverrides)
             inlineMessageContext = try container.decodeIfPresent(Bool.self, forKey: .inlineMessageContext)
+            serverResolvedCommandContext = try container.decodeIfPresent(Bool.self, forKey: .serverResolvedCommandContext)
             repositoryIdentity =
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
             connectionProbe = try container.decodeIfPresent(Bool.self, forKey: .connectionProbe)
@@ -215,6 +226,26 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
     public let platform: Platform
     public let serverVersion: String
     public let capabilities: Capabilities
+    public var orchestrationProtocolVersion: Int? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case environmentId, label, platform, serverVersion, capabilities
+        case orchestrationProtocolVersion
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        environmentId = try container.decode(String.self, forKey: .environmentId)
+        label = try container.decode(String.self, forKey: .label)
+        platform = try container.decode(Platform.self, forKey: .platform)
+        serverVersion = try container.decode(String.self, forKey: .serverVersion)
+        capabilities = try container.decode(Capabilities.self, forKey: .capabilities)
+        // The contract allows the key to be absent, not null or malformed.
+        // Preserve unknown integers so negotiation can explain incompatibility.
+        orchestrationProtocolVersion = container.contains(.orchestrationProtocolVersion)
+            ? try container.decode(Int.self, forKey: .orchestrationProtocolVersion)
+            : nil
+    }
 }
 
 public struct ProviderUploadFeedbackResult: Codable, Equatable, Sendable {
@@ -415,7 +446,7 @@ public struct OrchestrationProject: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let title: String
     public let workspaceRoot: String
-    public let repositoryIdentity: RepositoryIdentity?
+    public var repositoryIdentity: RepositoryIdentity?
     public let defaultModelSelection: ModelSelection?
     public let scripts: [ProjectScript]
     public let createdAt: String
@@ -604,6 +635,9 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     @ForwardCompatibleArray public var activities: [OrchestrationActivity]
     @ForwardCompatibleArray public var checkpoints: [CheckpointSummary]
     public let session: OrchestrationSession?
+    /// Native V2 controls are separate from the shared transcript records.
+    public var orchestrationV2Control: JSONValue? = nil
+    public var orchestrationV2Revision: Int? = nil
 }
 
 public struct OrchestrationShellSnapshot: Codable, Equatable, Sendable {
@@ -611,6 +645,7 @@ public struct OrchestrationShellSnapshot: Codable, Equatable, Sendable {
     @ForwardCompatibleArray public var projects: [OrchestrationProject]
     @ForwardCompatibleArray public var threads: [OrchestrationThreadShell]
     public let updatedAt: String
+    public var orchestrationProtocolVersion: Int? = nil
 }
 
 public struct OrchestrationReadModel: Codable, Equatable, Sendable {
@@ -624,6 +659,7 @@ public struct OrchestrationThreadDetailSnapshot: Codable, Equatable, Sendable {
     public let snapshotSequence: Int
     public let thread: OrchestrationThread
     public let page: OrchestrationThreadDetailPage?
+    public var orchestrationProtocolVersion: Int? = nil
 
     public init(
         snapshotSequence: Int,
@@ -658,6 +694,7 @@ public struct OrchestrationThreadDetailPage: Codable, Equatable, Sendable {
 public enum ShellStreamItem: Decodable, Sendable {
     case synchronized
     case snapshot(OrchestrationShellSnapshot)
+    case repositoryIdentitiesUpdated(projects: [OrchestrationProject], resolvedRoots: Set<String>)
     case projectUpserted(sequence: Int, project: OrchestrationProject)
     case projectRemoved(sequence: Int, projectID: String)
     case threadUpserted(sequence: Int, thread: OrchestrationThreadShell)
@@ -741,6 +778,8 @@ public enum ThreadStreamItem: Decodable, Sendable {
     case synchronized
     case snapshot(OrchestrationThreadDetailSnapshot)
     case event(JSONValue)
+    /// A V2 batch has already been reduced by its own state machine.
+    case projection(OrchestrationThreadDetailSnapshot)
 
     private enum CodingKeys: String, CodingKey { case kind, snapshot, event }
 

@@ -58,8 +58,18 @@ the active selection are stored separately in Application Support.
 - DPoP-bound T3 Connect sessions with account-scoped relay credentials, APNs
   device registration on iOS 18+, and automatic credential recovery.
 
-The app speaks the existing HTTP and Effect RPC WebSocket contracts directly. It
-does not embed a JavaScript runtime.
+The app supports both Orchestrator V1 and V2 servers. Each connection defaults
+to automatic detection. To select a version, open Settings → Environments,
+choose the connection, and change Protocol. A forced version must match the
+server. Connections to different server versions can share one inbox.
+
+On V2, hold Send during a running task to choose how to deliver a follow-up.
+Queued messages can be edited, reordered, removed, or sent to the running agent
+when the provider supports it. Stopping a run pauses its queue; resume it from
+the queue view.
+
+The app speaks HTTP and Effect RPC WebSocket contracts directly. It does not
+embed a JavaScript runtime.
 
 ## Build configuration
 

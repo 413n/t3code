@@ -429,7 +429,11 @@ private struct ServerConfigTicketTransport: HTTPTransport {
         if failAttachmentUploads, request.url?.path.hasPrefix("/api/attachments/upload/") == true {
             throw URLError(.networkConnectionLost)
         }
-        let data = Data(#"{"ticket":"ticket","expiresAt":"2026-09-01T12:05:00.000Z"}"#.utf8)
+        let data = if request.url?.path == "/.well-known/t3/environment" {
+            Data(#"{"environmentId":"environment-1","label":"Studio","platform":{"os":"darwin","arch":"arm64"},"serverVersion":"1.0.0","capabilities":{"repositoryIdentity":false}}"#.utf8)
+        } else {
+            Data(#"{"ticket":"ticket","expiresAt":"2026-09-01T12:05:00.000Z"}"#.utf8)
+        }
         return (data, HTTPURLResponse(
             url: request.url!,
             statusCode: 200,

@@ -3,6 +3,109 @@ import XCTest
 
 @MainActor
 final class PairingServiceTests: XCTestCase {
+    func testRepairPreservesSavedProtocolPreference() async throws {
+        for (preference, version) in [(OrchestrationProtocolPreference.v1, 1), (.v2, 2)] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("t3-pairing-protocol-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let environments = EnvironmentStore(fileURL: directory.appendingPathComponent("environments.json"))
+            try await environments.upsert(Environment(
+                id: "environment-1",
+                label: "Studio",
+                httpBaseURL: URL(string: "https://old.example")!,
+                webSocketBaseURL: URL(string: "wss://old.example/ws")!,
+                orchestrationProtocolPreference: preference
+            ))
+            let service = PairingService(
+                transport: PairingHTTPTransport(protocolVersion: version),
+                environmentStore: environments,
+                credentialStore: InMemoryCredentialStore()
+            )
+
+            let repaired = try await service.pair(url: "https://studio.example/#token=pair-once")
+
+            XCTAssertEqual(repaired.orchestrationProtocolPreference, preference)
+            XCTAssertEqual(repaired.descriptor?.orchestrationProtocolVersion, version)
+            XCTAssertEqual(repaired.httpBaseURL.absoluteString, "https://studio.example/")
+            let stored = try await environments.load()
+            XCTAssertEqual(stored, [repaired])
+        }
+    }
+
+    func testIncompatibleProtocolDoesNotConsumePairingTokenOrChangeSavedEnvironment() async throws {
+        for version in [2, 3] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("t3-pairing-incompatible-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let environments = EnvironmentStore(fileURL: directory.appendingPathComponent("environments.json"))
+            let saved = Environment(
+                id: "environment-1",
+                label: "Studio",
+                httpBaseURL: URL(string: "https://old.example")!,
+                webSocketBaseURL: URL(string: "wss://old.example/ws")!,
+                orchestrationProtocolPreference: .v1
+            )
+            try await environments.upsert(saved)
+            let credentials = InMemoryCredentialStore(credentials: [
+                saved.id: EnvironmentCredential(accessToken: "previous-access-token"),
+            ])
+            let transport = PairingHTTPTransport(protocolVersion: version)
+            let service = PairingService(
+                transport: transport,
+                environmentStore: environments,
+                credentialStore: credentials
+            )
+
+            do {
+                _ = try await service.pair(url: "https://studio.example/#token=pair-once")
+                XCTFail("An incompatible protocol must block pairing")
+            } catch {
+                let expected: OrchestrationProtocolError = version == 2
+                    ? .preferenceMismatch(preference: .v1, serverVersion: .v2)
+                    : .unsupportedServerVersion(version)
+                XCTAssertEqual(error as? OrchestrationProtocolError, expected)
+            }
+
+            let requests = await transport.requests
+            XCTAssertEqual(requests.map { $0.url?.path }, ["/.well-known/t3/environment"])
+            let stored = try await environments.load()
+            XCTAssertEqual(stored, [saved])
+            let credential = await credentials.credential(for: saved.id)
+            XCTAssertEqual(credential?.accessToken, "previous-access-token")
+        }
+    }
+
+    func testDescriptorFailureDoesNotFallBackToV1Pairing() async throws {
+        for status in [401, 503] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("t3-pairing-discovery-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let environments = EnvironmentStore(fileURL: directory.appendingPathComponent("environments.json"))
+            let transport = PairingHTTPTransport(descriptorStatus: status)
+            let service = PairingService(
+                transport: transport,
+                environmentStore: environments,
+                credentialStore: InMemoryCredentialStore()
+            )
+
+            do {
+                _ = try await service.pair(url: "https://studio.example/#token=pair-once")
+                XCTFail("Descriptor failure must block pairing")
+            } catch {
+                guard case let HTTPError.status(actual, _, _) = error else {
+                    XCTFail("Expected the original HTTP error, got \(error)")
+                    continue
+                }
+                XCTAssertEqual(actual, status)
+            }
+
+            let requests = await transport.requests
+            XCTAssertEqual(requests.map { $0.url?.path }, ["/.well-known/t3/environment"])
+            let stored = try await environments.load()
+            XCTAssertTrue(stored.isEmpty)
+        }
+    }
+
     func testPairingFormPreservesLiteralPlusInTokenAndClientLabel() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("t3-pairing-form-\(UUID().uuidString)", isDirectory: true)
@@ -259,6 +362,13 @@ private actor InterleavedCredentialStore: CredentialStore {
 
 private actor PairingHTTPTransport: HTTPTransport {
     private(set) var requests: [URLRequest] = []
+    private let protocolVersion: Int?
+    private let descriptorStatus: Int
+
+    init(protocolVersion: Int? = nil, descriptorStatus: Int = 200) {
+        self.protocolVersion = protocolVersion
+        self.descriptorStatus = descriptorStatus
+    }
 
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         requests.append(request)
@@ -271,6 +381,7 @@ private actor PairingHTTPTransport: HTTPTransport {
               "label": "Studio",
               "platform": {"os": "darwin", "arch": "arm64"},
               "serverVersion": "1.0.0",
+              \(protocolVersion.map { "\"orchestrationProtocolVersion\": \($0)," } ?? "")
               "capabilities": {"repositoryIdentity": true}
             }
             """
@@ -290,7 +401,7 @@ private actor PairingHTTPTransport: HTTPTransport {
         }
         let response = HTTPURLResponse(
             url: request.url!,
-            statusCode: 200,
+            statusCode: request.url?.path == "/.well-known/t3/environment" ? descriptorStatus : 200,
             httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": "application/json"]
         )!

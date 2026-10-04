@@ -213,6 +213,142 @@ struct NativeConversationRewindTests {
         try await wait(stream.stream)
     }
 
+    @Test
+    func v2ProjectionReportsFailureForTheRequestedRollback() async throws {
+        var failed = thread(messages: [message("user", role: "user")])
+        failed.orchestrationV2Control = .object(["thread": .object([
+            "rollbackFailure": .object(["requestId": .string("rollback"), "message": .string("Provider history is unavailable")]),
+        ])])
+        let stream = AsyncThrowingStream<[ThreadStreamItem], Error>.makeStream()
+        stream.continuation.yield([.projection(.init(snapshotSequence: 11, thread: failed))])
+        stream.continuation.finish()
+        do {
+            _ = try await NativeConversationRewind.waitForCompletion(
+                batches: stream.stream, threadID: "thread", messageID: "user", turnCount: 0,
+                afterSequence: 10, previousFailureIDs: [], rollbackRequestID: "rollback"
+            )
+            Issue.record("The requested rollback failure must reach the user")
+        } catch {
+            #expect(error.localizedDescription == "Provider history is unavailable")
+        }
+    }
+
+    @Test
+    func v2ProjectionConfirmsRollbackWithoutLegacyEvents() async throws {
+        let stream = AsyncThrowingStream<[ThreadStreamItem], Error>.makeStream()
+        stream.continuation.yield([.projection(.init(snapshotSequence: 11, thread: thread()))])
+        stream.continuation.finish()
+        try await wait(stream.stream)
+    }
+
+    @Test
+    func olderV2MessagesValidateWithAFullReadWithoutReplacingPagedState() async throws {
+        let transport = try RewindHTTPTransport()
+        let environment = Environment(id: "rewind", label: "Rewind", httpBaseURL: URL(string: "https://rewind.example")!,
+                                      webSocketBaseURL: URL(string: "wss://rewind.example")!)
+        let client = T3Client(environment: environment,
+            credentialStore: InMemoryCredentialStore(credentials: [environment.id: .init(accessToken: "fixture-token")]),
+            httpTransport: transport)
+        let bounded = try await client.threadSnapshot(id: "thread-v2")
+        let cursor = try #require(bounded.page?.beforeCursor)
+        let selectedID = "message-v2-history-user"
+        #expect(!bounded.thread.messages.contains { $0.id == selectedID })
+        #expect(bounded.thread.checkpoints.isEmpty)
+
+        let full = try await client.fullThreadSnapshot(id: "thread-v2")
+        #expect(full.thread.messages.contains { $0.id == selectedID })
+        #expect(full.page?.hasMore == false)
+        #expect(full.snapshotSequence > bounded.snapshotSequence)
+        let loaded = try await client.threadSnapshot(id: "thread-v2", beforeCursor: cursor)
+        // The validation read must not replace the display cursor or its sequence.
+        #expect(loaded.snapshotSequence == bounded.snapshotSequence)
+        #expect(loaded.thread.messages.contains { $0.id == selectedID })
+        #expect(loaded.thread.checkpoints.isEmpty)
+        #expect(NativeConversationRewind.canRewind(before: selectedID, in: loaded.thread))
+        let target = try NativeConversationRewind.target(before: selectedID, in: full.thread)
+        #expect(target.runID == "run-v2-history")
+        let command = target.command(threadID: "thread-v2")
+        #expect(command["checkpointId"] == .string("genesis"))
+        #expect(command["scopeId"] == .string("scope-v2"))
+        #expect(command["restoreFiles"] == .bool(false))
+        #expect(command["turnCount"] == nil)
+        let paths = await transport.paths
+        #expect(paths.filter { $0.contains("/api/orchestration/threads/") } == [
+            "/api/orchestration/threads/thread-v2/bounded", "/api/orchestration/threads/thread-v2",
+            "/api/orchestration/threads/thread-v2/history",
+        ])
+    }
+
+    @Test
+    func v2InheritedAndReadOnlyMessagesCannotRewind() {
+        var local = thread(messages: [message("user", role: "user")])
+        local.orchestrationV2Control = .object(["thread": .object([:]), "runs": .array([])])
+        #expect(NativeConversationRewind.canRewind(before: "user", in: local))
+        var inherited = local
+        inherited.messages = [message("v2-inherited:source:user", role: "user")]
+        #expect(!NativeConversationRewind.canRewind(before: "v2-inherited:source:user", in: inherited))
+        local.orchestrationV2Control = .object(["thread": .object([
+            "creationSource": .string("provider"),
+            "lineage": .object(["relationshipToParent": .string("subagent")]),
+        ])])
+        #expect(!NativeConversationRewind.canRewind(before: "user", in: local))
+    }
+
+    @Test
+    func v2CompletionNeedsTheSelectedRunRolledBackAfterAcceptance() async throws {
+        var accepted = thread(messages: [message("user", role: "user")])
+        accepted.orchestrationV2Control = .object([
+            "runs": .array([.object(["id": .string("turn"), "status": .string("completed")])]),
+        ])
+        var missingMessage = accepted
+        missingMessage.messages = []
+        var completed = missingMessage
+        completed.orchestrationV2Control = .object([
+            "runs": .array([.object(["id": .string("turn"), "status": .string("rolled_back")])]),
+        ])
+        #expect(!NativeConversationRewind.isComplete(missingMessage, messageID: "user", turnCount: 0, rollbackRunID: "turn"))
+        let stream = AsyncThrowingStream<[ThreadStreamItem], Error>.makeStream()
+        stream.continuation.yield([
+            .projection(.init(snapshotSequence: 10, thread: completed)),
+            .projection(.init(snapshotSequence: 11, thread: accepted)),
+            .projection(.init(snapshotSequence: 12, thread: missingMessage)),
+            .projection(.init(snapshotSequence: 13, thread: completed)),
+        ])
+        stream.continuation.finish()
+        let sequence = try await NativeConversationRewind.waitForCompletion(
+            batches: stream.stream, threadID: "thread", messageID: "user", turnCount: 0,
+            afterSequence: 10, previousFailureIDs: [], rollbackRequestID: "rollback", rollbackRunID: "turn"
+        )
+        #expect(sequence == 13)
+    }
+
+    @Test
+    func v2FailureMatchesRequestIDWithoutAnInventedTurnCount() async throws {
+        let stream = AsyncThrowingStream<[ThreadStreamItem], Error>.makeStream()
+        for (sequence, requestID) in [(11, "other"), (12, "rollback")] {
+            stream.continuation.yield([.event(.object([
+                "type": .string("thread.activity-appended"), "sequence": .number(Double(sequence)),
+                "payload": .object([
+                    "threadId": .string("thread"), "activity": .object([
+                        "kind": .string("checkpoint.revert.failed"),
+                        "payload": .object(["requestId": .string(requestID), "detail": .string("Failure for \(requestID)")]),
+                    ]),
+                ]),
+            ]))])
+        }
+        stream.continuation.finish()
+        do {
+            _ = try await NativeConversationRewind.waitForCompletion(
+                batches: stream.stream, threadID: "thread", messageID: "user", turnCount: 0,
+                afterSequence: 10, previousFailureIDs: [], rollbackRequestID: "rollback", rollbackRunID: "turn"
+            )
+            Issue.record("The matching failure must reject this rewind")
+        } catch {
+            #expect(error.localizedDescription == "Failure for rollback")
+            #expect((error as? FeatureConversationRewindError)?.didNotRevert == true)
+        }
+    }
+
     private func wait(_ events: AsyncThrowingStream<[ThreadStreamItem], Error>) async throws {
         _ = try await NativeConversationRewind.waitForCompletion(
             batches: events, threadID: "thread", messageID: "user", turnCount: 0,
@@ -242,5 +378,77 @@ struct NativeConversationRewindTests {
             snoozedAt: nil, pinnedAt: nil, deletedAt: nil, messages: messages, activities: [],
             checkpoints: checkpoints, session: nil
         )
+    }
+}
+
+private actor RewindHTTPTransport: HTTPTransport {
+    private let bounded: JSONValue
+    private let full: JSONValue
+    private let history: JSONValue
+    private(set) var paths: [String] = []
+
+    init() throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Fixtures/Wire")
+        func fixture(_ name: String) throws -> JSONValue {
+            try JSONDecoder.t3.decode(JSONValue.self, from: Data(contentsOf: directory.appendingPathComponent(name + ".json")))
+        }
+        func stopped(_ snapshot: JSONValue) -> [String: JSONValue] {
+            var result = snapshot.v2Object
+            var projection = result["projection"]!.v2Object
+            projection["runs"] = .array((projection["runs"]?.v2Array ?? []).map { run in
+                var fields = run.v2Object
+                fields["status"] = .string(run["id"]?.stringValue == "run-v2-queued" ? "cancelled" : "completed")
+                return .object(fields)
+            })
+            projection["providerThreads"] = .array((projection["providerThreads"]?.v2Array ?? []).map { provider in
+                .object(provider.v2Object.merging(["pendingBackgroundTasks": .array([])]) { _, new in new })
+            })
+            projection["turnItems"] = .array((projection["turnItems"]?.v2Array ?? []).map { item in
+                .object(item.v2Object.merging(["status": .string("completed")]) { _, new in new })
+            })
+            result["projection"] = .object(projection)
+            return result
+        }
+        var bounded = stopped(try fixture("v2-thread-bounded-snapshot"))
+        var boundedProjection = bounded["projection"]!.v2Object
+        // Match the real SQL bounded read: older controls are absent, even after paging.
+        boundedProjection["runs"] = .array((boundedProjection["runs"]?.v2Array ?? []).filter { $0["id"] != .string("run-v2-history") })
+        boundedProjection["checkpoints"] = .array([])
+        boundedProjection["checkpointScopes"] = .array([])
+        bounded["projection"] = .object(boundedProjection)
+        self.bounded = .object(bounded)
+        var full = stopped(try fixture("v2-thread-with-history-snapshot"))
+        var fullProjection = full["projection"]!.v2Object
+        var genesis = fullProjection["checkpoints"]!.v2Array!.first!.v2Object
+        genesis["id"] = .string("genesis")
+        genesis["runId"] = .null
+        genesis["appRunOrdinal"] = .null
+        fullProjection["checkpoints"] = .array([.object(genesis)] + fullProjection["checkpoints"]!.v2Array!)
+        full["projection"] = .object(fullProjection)
+        full["snapshotSequence"] = .number(102)
+        full["historyCursor"] = .null
+        full["hasMoreHistory"] = .bool(false)
+        self.full = .object(full)
+        history = try fixture("v2-thread-older-history")
+    }
+
+    func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        let url = try #require(request.url)
+        paths.append(url.path)
+        let response: JSONValue
+        switch url.path {
+        case "/.well-known/t3/environment":
+            response = .object([
+                "environmentId": .string("rewind"), "label": .string("Rewind"),
+                "platform": .object(["os": .string("darwin"), "arch": .string("arm64")]),
+                "serverVersion": .string("fixture"), "capabilities": .object([:]), "orchestrationProtocolVersion": .number(2),
+            ])
+        case "/api/orchestration/threads/thread-v2/bounded": response = bounded
+        case "/api/orchestration/threads/thread-v2": response = full
+        case "/api/orchestration/threads/thread-v2/history": response = history
+        default: throw URLError(.unsupportedURL)
+        }
+        return (try JSONEncoder.t3.encode(response), try #require(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)))
     }
 }

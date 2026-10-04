@@ -237,10 +237,12 @@ enum EndpointNetworkScope {
 
 enum ConnectionErrorCopy {
     static func message(for rawMessage: String?) -> String {
-        let message = rawMessage?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() ?? ""
+        let original = rawMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let message = original.lowercased()
 
+        if message.contains("orchestration protocol") {
+            return original
+        }
         if message.isEmpty || message == "cancelled" || message == "canceled" {
             return "The connection stopped before it finished. Make sure T3 Code is running, then try again."
         }
