@@ -2,14 +2,15 @@ import {
   AuthMcpApprovalDetails,
   AuthMcpApprovalError,
   AuthMcpApprovalResult,
-  type RuntimeMode,
+  AuthMcpClientAccess,
 } from "@t3tools/contracts";
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
+import { EyeIcon, type LucideIcon } from "lucide-react";
 import * as Schema from "effect/Schema";
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 
 import { cn } from "~/lib/utils";
-import { runtimeModeConfig, runtimeModeOptions } from "../chat/runtimeModeConfig";
+import { runtimeModeConfig } from "../chat/runtimeModeConfig";
 import { Alert, AlertDescription } from "../ui/alert";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -21,6 +22,18 @@ const decodeDetails = Schema.decodeUnknownOption(AuthMcpApprovalDetails);
 const decodeResult = Schema.decodeUnknownOption(AuthMcpApprovalResult);
 const decodeError = Schema.decodeUnknownOption(AuthMcpApprovalError);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
+const accessConfig: Record<
+  AuthMcpClientAccess,
+  { readonly label: string; readonly description: string; readonly icon: LucideIcon }
+> = {
+  "read-only": {
+    label: "Read only",
+    description: "Read projects and threads. Cannot start, message or change anything.",
+    icon: EyeIcon,
+  },
+  ...runtimeModeConfig,
+};
 
 type Loaded =
   | { readonly status: "loading" }
@@ -76,7 +89,7 @@ function readRequestParams(): Record<string, string> {
 export function ConnectAgentSurface() {
   const [params] = useState(readRequestParams);
   const [loaded, setLoaded] = useState<Loaded>({ status: "loading" });
-  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("approval-required");
+  const [access, setAccess] = useState<AuthMcpClientAccess>("read-only");
   const [pairingCode, setPairingCode] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [pending, setPending] = useState<"approve" | "deny" | null>(null);
@@ -113,7 +126,7 @@ export function ConnectAgentSurface() {
       const answer = await postApproval("/oauth/mcp/decision", {
         ...params,
         decision,
-        runtime_mode: runtimeMode,
+        access,
         ...(loaded.details.csrfToken === undefined
           ? { pairing_code: pairingCode.trim() }
           : { csrf_token: loaded.details.csrfToken }),
@@ -125,7 +138,7 @@ export function ConnectAgentSurface() {
       setPending(null);
       setErrorMessage(answer.kind === "error" ? answer.message : "The sign-in could not continue.");
     },
-    [loaded, params, pairingCode, runtimeMode],
+    [access, loaded, params, pairingCode],
   );
 
   if (loaded.status === "loading") {
@@ -161,7 +174,7 @@ export function ConnectAgentSurface() {
         title={`Connect ${details.clientName}`}
         description={
           <>
-            This agent wants to read, start, message and stop threads in every project on{" "}
+            This agent wants to use the threads in every project on{" "}
             <span className="font-medium text-foreground">{details.environmentHost}</span>.
           </>
         }
@@ -179,20 +192,21 @@ export function ConnectAgentSurface() {
         }}
       >
         <div className="space-y-2">
-          <span id="connect-agent-mode-label" className="text-sm font-medium">
-            The most it may allow
+          <span id="connect-agent-access-label" className="text-sm font-medium">
+            What it may do
           </span>
           <RadioGroup
-            aria-labelledby="connect-agent-mode-label"
-            value={runtimeMode}
-            onValueChange={(value) => setRuntimeMode(value as RuntimeMode)}
+            aria-labelledby="connect-agent-access-label"
+            value={access}
+            onValueChange={(value) => setAccess(value as AuthMcpClientAccess)}
           >
-            {runtimeModeOptions.map((mode) => (
-              <RuntimeModeOption key={mode} mode={mode} selected={mode === runtimeMode} />
+            {AuthMcpClientAccess.literals.map((option) => (
+              <AccessOption key={option} access={option} selected={option === access} />
             ))}
           </RadioGroup>
           <p className="text-xs text-muted-foreground">
-            Threads it starts or messages can never run with more than this.
+            Beyond read only, it can start, message and stop threads, and none of them can run with
+            more than the mode you pick.
           </p>
         </div>
 
@@ -260,17 +274,17 @@ function ConnectAgentHeading({
   );
 }
 
-function RuntimeModeOption({
-  mode,
+function AccessOption({
+  access,
   selected,
 }: {
-  readonly mode: RuntimeMode;
+  readonly access: AuthMcpClientAccess;
   readonly selected: boolean;
 }) {
-  const { label, description, icon: Icon } = runtimeModeConfig[mode];
+  const { label, description, icon: Icon } = accessConfig[access];
   return (
     <RadioPrimitive.Root
-      value={mode}
+      value={access}
       className={cn(
         "flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 text-left outline-none transition-[background-color,border-color,box-shadow]",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",

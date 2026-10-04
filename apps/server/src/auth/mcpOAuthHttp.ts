@@ -188,10 +188,8 @@ const decide = Effect.gen(function* () {
   if (params("decision") !== "approve") {
     return oauthJson({ redirectTo: oauth.deny(resolved.authorization) });
   }
-  const runtimeModeCeiling = Option.getOrUndefined(
-    McpOAuth.decodeRuntimeMode(params("runtime_mode")),
-  );
-  if (runtimeModeCeiling === undefined) return approvalError("Choose what the agent may do.");
+  const access = Option.getOrUndefined(McpOAuth.decodeClientAccess(params("access")));
+  if (access === undefined) return approvalError("Choose what the agent may do.");
   const pairingCode = params("pairing_code");
   const csrfToken = params("csrf_token");
   if (pairingCode === undefined && csrfToken === undefined) {
@@ -201,7 +199,7 @@ const decide = Effect.gen(function* () {
     .approve({
       request,
       authorization: resolved.authorization,
-      runtimeModeCeiling,
+      access,
       method:
         pairingCode !== undefined
           ? { type: "pairing-code", code: pairingCode }

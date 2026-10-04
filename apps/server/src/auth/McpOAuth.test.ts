@@ -237,7 +237,7 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
       const wrongCode = yield* decide(handler, {
         ...params,
         decision: "approve",
-        runtime_mode: "auto",
+        access: "auto",
         pairing_code: "nope",
       });
       expect(wrongCode.status).toBe(400);
@@ -246,7 +246,7 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
       const approved = yield* decide(handler, {
         ...params,
         decision: "approve",
-        runtime_mode: "auto",
+        access: "auto",
         pairing_code: pairing.credential,
       });
       expect(approved.status).toBe(200);
@@ -286,7 +286,7 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
           at("/mcp", { headers: { authorization: `Bearer ${token.access_token}` } }),
         ),
       );
-      expect(client).toMatchObject({ label: "Claude Code", runtimeModeCeiling: "auto" });
+      expect(client).toMatchObject({ label: "Claude Code", access: "auto" });
 
       // The same token is refused by the rest of the environment.
       const session = yield* handler(
@@ -313,7 +313,7 @@ it.live("rejects a wrong PKCE verifier and spends the code", () =>
       const approved = yield* decide(handler, {
         ...params,
         decision: "approve",
-        runtime_mode: "approval-required",
+        access: "approval-required",
         pairing_code: pairing.credential,
       });
       const code = new URL(approved.redirectTo!).searchParams.get("code")!;
@@ -338,47 +338,81 @@ it.live("rejects a wrong PKCE verifier and spends the code", () =>
   ),
 );
 
-it.live("denies and refuses codes bound to another client's key or without thread scopes", () =>
-  withRoutes((handler, auth) =>
-    Effect.gen(function* () {
-      const clientId = yield* registeredClientId(handler);
-      const params = authorizeParams(clientId);
+it.live(
+  "denies and refuses codes bound to another client's key or without the scopes it grants",
+  () =>
+    withRoutes((handler, auth) =>
+      Effect.gen(function* () {
+        const clientId = yield* registeredClientId(handler);
+        const params = authorizeParams(clientId);
 
-      const denied = yield* decide(handler, { ...params, decision: "deny" });
-      const deniedUrl = new URL(denied.redirectTo!);
-      expect(deniedUrl.searchParams.get("error")).toBe("access_denied");
-      expect(deniedUrl.searchParams.get("state")).toBe("state-1");
+        const denied = yield* decide(handler, { ...params, decision: "deny" });
+        const deniedUrl = new URL(denied.redirectTo!);
+        expect(deniedUrl.searchParams.get("error")).toBe("access_denied");
+        expect(deniedUrl.searchParams.get("state")).toBe("state-1");
 
-      const approveWith = (code: string) =>
-        decide(handler, {
+        const approveWith = (code: string) =>
+          decide(handler, {
+            ...params,
+            decision: "approve",
+            access: "auto",
+            pairing_code: code,
+          });
+
+        // A T3 Connect code is bound to a device key: refused, and still usable by its device.
+        const bound = yield* auth.createPairingLink({
+          proofKeyThumbprint: "device-key-thumbprint",
+        });
+        expect((yield* approveWith(bound.credential)).status).toBe(400);
+        const stillValid = yield* auth
+          .exchangeBootstrapCredentialForAccessToken(
+            bound.credential,
+            undefined,
+            { deviceType: "mobile" },
+            { proofKeyThumbprint: "device-key-thumbprint" },
+          )
+          .pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          );
+        expect(stillValid).toBe(true);
+
+        const readOnly = yield* auth.issuePairingCredential({ scopes: ["orchestration:read"] });
+        const readOnlyResponse = yield* approveWith(readOnly.credential);
+        expect(readOnlyResponse.status).toBe(400);
+        expect(readOnlyResponse.error).toContain("cannot grant this access");
+
+        // A read-only code can approve read-only access.
+        const readOnlyCode = yield* auth.issuePairingCredential({ scopes: ["orchestration:read"] });
+        const readOnlyApproval = yield* decide(handler, {
           ...params,
           decision: "approve",
-          runtime_mode: "auto",
-          pairing_code: code,
+          access: "read-only",
+          pairing_code: readOnlyCode.credential,
         });
-
-      // A T3 Connect code is bound to a device key: refused, and still usable by its device.
-      const bound = yield* auth.createPairingLink({ proofKeyThumbprint: "device-key-thumbprint" });
-      expect((yield* approveWith(bound.credential)).status).toBe(400);
-      const stillValid = yield* auth
-        .exchangeBootstrapCredentialForAccessToken(
-          bound.credential,
-          undefined,
-          { deviceType: "mobile" },
-          { proofKeyThumbprint: "device-key-thumbprint" },
-        )
-        .pipe(
-          Effect.as(true),
-          Effect.orElseSucceed(() => false),
+        expect(readOnlyApproval.status).toBe(200);
+        const readOnlyToken = yield* handler(
+          at(
+            "/oauth/mcp/token",
+            form({
+              grant_type: "authorization_code",
+              code: new URL(readOnlyApproval.redirectTo!).searchParams.get("code")!,
+              redirect_uri: params.redirect_uri,
+              client_id: clientId,
+              code_verifier: verifier,
+              resource: `${ORIGIN}/mcp`,
+            }),
+          ),
+        ).pipe(Effect.flatMap(json<{ access_token: string; scope: string }>));
+        expect(readOnlyToken.scope).toBe("orchestration:read");
+        const readOnlyClient = yield* auth.authenticateMcpClient(
+          HttpServerRequest.fromWeb(
+            at("/mcp", { headers: { authorization: `Bearer ${readOnlyToken.access_token}` } }),
+          ),
         );
-      expect(stillValid).toBe(true);
-
-      const readOnly = yield* auth.issuePairingCredential({ scopes: ["orchestration:read"] });
-      const readOnlyResponse = yield* approveWith(readOnly.credential);
-      expect(readOnlyResponse.status).toBe(400);
-      expect(readOnlyResponse.error).toContain("cannot control threads");
-    }),
-  ),
+        expect(readOnlyClient.access).toBe("read-only");
+      }),
+    ),
 );
 
 it.live("offers one-click only to a browser session that holds the scopes it would grant", () =>
@@ -412,7 +446,7 @@ it.live("offers one-click only to a browser session that holds the scopes it wou
         {
           ...params,
           decision: "approve",
-          runtime_mode: "auto",
+          access: "auto",
           csrf_token: adminDetails.csrfToken!,
         },
         admin,
@@ -424,7 +458,7 @@ it.live("offers one-click only to a browser session that holds the scopes it wou
       expect((yield* details(accessOnly)).csrfToken).toBeUndefined();
       const forged = yield* decide(
         handler,
-        { ...params, decision: "approve", runtime_mode: "auto", csrf_token: "forged" },
+        { ...params, decision: "approve", access: "auto", csrf_token: "forged" },
         accessOnly,
       );
       expect(forged.status).toBe(400);

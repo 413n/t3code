@@ -364,6 +364,28 @@ it.effect.each([
   ).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("refuses preview tools to a client outside a thread before they run", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const readOnly = {
+      ...invocation,
+      thread: undefined,
+      requestNamespace: "client:session-1",
+      client: { sessionId: "session-1", label: "Claude Code", access: "read-only" as const },
+    };
+    const click = yield* server
+      .callTool({ name: "preview_click", arguments: { locator: "text=Send" } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, readOnly),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(click.isError).toBe(true);
+    expect(click.content).toEqual([
+      { type: "text", text: expect.stringContaining("needs an agent running inside T3 Code") },
+    ]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("rejects non-boolean snapshot image options before selecting a browser host", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -907,7 +929,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         environmentId,
         requestNamespace: "client:session-1",
         thread: undefined,
-        client: { sessionId: "session-1", label: "Claude Code", runtimeModeCeiling: "auto" },
+        client: { sessionId: "session-1", label: "Claude Code", access: "auto" },
         capabilities: new Set(["orchestration"]),
         issuedAt: 1,
       };

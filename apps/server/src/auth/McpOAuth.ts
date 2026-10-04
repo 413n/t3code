@@ -2,8 +2,9 @@ import * as NodeCrypto from "node:crypto";
 
 import {
   AuthAccessWriteScope,
-  RuntimeMode,
-  type RuntimeMode as RuntimeModeType,
+  AuthMcpClientAccess,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Clock from "effect/Clock";
@@ -51,8 +52,8 @@ const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const CODE_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9\-._~]{43,128}$/;
 
-const MCP_OAUTH_SCOPE = encodeOAuthScope(EnvironmentAuth.MCP_CLIENT_SCOPES);
-export const decodeRuntimeMode = Schema.decodeUnknownOption(RuntimeMode);
+const MCP_OAUTH_SCOPES = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+export const decodeClientAccess = Schema.decodeUnknownOption(AuthMcpClientAccess);
 
 export interface McpOAuthUrls {
   readonly issuer: string;
@@ -70,7 +71,7 @@ export const requestUrls = (
 export const protectedResourceMetadata = (urls: McpOAuthUrls) => ({
   resource: urls.resource,
   authorization_servers: [urls.issuer],
-  scopes_supported: [...EnvironmentAuth.MCP_CLIENT_SCOPES],
+  scopes_supported: MCP_OAUTH_SCOPES,
   bearer_methods_supported: ["header"],
   resource_name: "T3 Code",
 });
@@ -84,7 +85,7 @@ export const authorizationServerMetadata = (urls: McpOAuthUrls) => ({
   grant_types_supported: ["authorization_code"],
   code_challenge_methods_supported: ["S256"],
   token_endpoint_auth_methods_supported: ["none"],
-  scopes_supported: [...EnvironmentAuth.MCP_CLIENT_SCOPES],
+  scopes_supported: MCP_OAUTH_SCOPES,
   authorization_response_iss_parameter_supported: true,
 });
 
@@ -201,7 +202,7 @@ interface PendingCode {
   readonly redirectUri: string;
   readonly codeChallenge: string;
   readonly resource: string;
-  readonly runtimeModeCeiling: RuntimeModeType;
+  readonly access: AuthMcpClientAccess;
   readonly expiresAtMs: number;
 }
 
@@ -227,7 +228,7 @@ export class McpOAuth extends Context.Service<
     readonly approve: (input: {
       readonly request: HttpServerRequest.HttpServerRequest;
       readonly authorization: AuthorizationRequest;
-      readonly runtimeModeCeiling: RuntimeModeType;
+      readonly access: AuthMcpClientAccess;
       readonly method: ApprovalMethod;
     }) => Effect.Effect<string, EnvironmentAuth.ServerAuthMcpApprovalCodeError | McpOAuthPageError>;
     readonly deny: (authorization: AuthorizationRequest) => string;
@@ -415,14 +416,14 @@ const make = Effect.gen(function* () {
       Effect.map((session) =>
         // Approving manages access, and a session may only hand out scopes it holds.
         session.scopes.includes(AuthAccessWriteScope) &&
-        EnvironmentAuth.MCP_CLIENT_SCOPES.every((scope) => session.scopes.includes(scope))
+        MCP_OAUTH_SCOPES.every((scope) => session.scopes.includes(scope))
           ? { csrfToken: csrfToken(session.sessionId, authorization) }
           : undefined,
       ),
       Effect.orElseSucceed(() => undefined),
     );
 
-  const mintCode = (authorization: AuthorizationRequest, runtimeModeCeiling: RuntimeModeType) =>
+  const mintCode = (authorization: AuthorizationRequest, access: AuthMcpClientAccess) =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const code = Buffer.from(yield* crypto.randomBytes(32).pipe(Effect.orDie)).toString(
@@ -438,7 +439,7 @@ const make = Effect.gen(function* () {
           redirectUri: authorization.redirectUri,
           codeChallenge: authorization.codeChallenge,
           resource: authorization.resource,
-          runtimeModeCeiling,
+          access,
           expiresAtMs: now + AUTHORIZATION_CODE_TTL_MS,
         });
         return next;
@@ -449,7 +450,7 @@ const make = Effect.gen(function* () {
   const approve: McpOAuth["Service"]["approve"] = (input) =>
     Effect.gen(function* () {
       if (input.method.type === "pairing-code") {
-        yield* environmentAuth.consumeMcpApprovalCode(input.method.code).pipe(
+        yield* environmentAuth.consumeMcpApprovalCode(input.method.code, input.access).pipe(
           Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (cause) =>
             Effect.logError("MCP approval code check failed.", { cause }).pipe(
               Effect.andThen(
@@ -473,10 +474,10 @@ const make = Effect.gen(function* () {
           });
         }
       }
-      const code = yield* mintCode(input.authorization, input.runtimeModeCeiling);
+      const code = yield* mintCode(input.authorization, input.access);
       yield* Effect.logInfo("Approved an MCP client sign-in.", {
         client: input.authorization.client.name,
-        runtimeModeCeiling: input.runtimeModeCeiling,
+        access: input.access,
         method: input.method.type,
       });
       return redirectWith(input.authorization.redirectUri, {
@@ -536,7 +537,7 @@ const make = Effect.gen(function* () {
       const issued = yield* environmentAuth
         .issueMcpClientSession({
           label: pending.clientName,
-          runtimeModeCeiling: pending.runtimeModeCeiling,
+          access: pending.access,
           client: deriveAuthClientMetadata({ request }),
         })
         .pipe(
@@ -552,7 +553,7 @@ const make = Effect.gen(function* () {
         access_token: issued.token,
         token_type: "Bearer" as const,
         expires_in: Math.max(0, Math.floor((issued.expiresAt.epochMilliseconds - now) / 1000)),
-        scope: MCP_OAUTH_SCOPE,
+        scope: encodeOAuthScope(EnvironmentAuth.mcpClientScopes(pending.access)),
       };
     });
 
@@ -591,7 +592,7 @@ export const layerMcpClientAuthenticator = Layer.effect(
                 client: {
                   sessionId: client.sessionId,
                   label: client.label,
-                  runtimeModeCeiling: client.runtimeModeCeiling,
+                  access: client.access,
                 },
                 capabilities: new Set<McpInvocationContext.McpCapability>([
                   "orchestration",

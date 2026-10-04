@@ -1,5 +1,5 @@
 import {
-  type OrchestratorMcpFailure,
+  OrchestratorMcpFailure,
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
@@ -91,8 +91,24 @@ export class Declaration<out Handler> {
   }
 }
 
-/** The caller of a tool that changes something. */
-const writingCaller = loadCaller().pipe(Effect.tap(assertLiveCaller));
+/**
+ * The caller of a tool that changes something. A client approved for
+ * read-only access changes nothing.
+ */
+const writingCaller = McpInvocationContext.McpInvocationContext.pipe(
+  Effect.flatMap((scope) =>
+    scope.client?.access === "read-only"
+      ? Effect.fail(
+          new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message:
+              "This tool changes the environment, and this MCP client was approved for read-only access.",
+          }),
+        )
+      : loadCaller(),
+  ),
+  Effect.tap(assertLiveCaller),
+);
 
 const requireThreadCaller = McpInvocationContext.McpInvocationContext.pipe(
   Effect.flatMap((scope) => McpInvocationContext.requireThreadScope(scope, "This tool")),

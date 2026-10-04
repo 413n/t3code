@@ -11,6 +11,7 @@ import {
   type AuthClientSession,
   type AuthCreatePairingCredentialInput,
   type AuthEnvironmentScope,
+  type AuthMcpClientAccess,
   type AuthPairingLink,
   type AuthPairingCredentialResult,
   type AuthSessionId,
@@ -20,7 +21,6 @@ import {
   type AuthWebSocketTicketResult,
   DpopFailureReason,
   type DpopFailureReason as DpopFailureReasonType,
-  type RuntimeMode,
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Context from "effect/Context";
@@ -69,20 +69,26 @@ export interface IssuedBearerSession {
 /**
  * Sessions an MCP client (an agent T3 Code did not launch) obtains through
  * OAuth. They are accepted only by `/mcp`, where every action is capped by the
- * runtime-mode ceiling the user approved; the HTTP API and WebSocket reject
- * them so an agent token cannot reach the full RPC surface around that cap.
+ * access the user approved; the HTTP API and WebSocket reject them so an agent
+ * token cannot reach the full RPC surface around that cap.
+ *
+ * A read-only grant holds `orchestration:read` alone. Any other grant also
+ * holds `orchestration:operate` and carries its runtime-mode ceiling.
  */
 const MCP_CLIENT_SUBJECT = "mcp-client";
-export const MCP_CLIENT_SCOPES = [
-  AuthOrchestrationReadScope,
-  AuthOrchestrationOperateScope,
-] as const;
 const MCP_CLIENT_SESSION_TTL = Duration.days(30);
+
+export const mcpClientScopes = (
+  access: AuthMcpClientAccess,
+): ReadonlyArray<AuthEnvironmentScope> =>
+  access === "read-only"
+    ? [AuthOrchestrationReadScope]
+    : [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
 
 export interface McpClientSession {
   readonly sessionId: AuthSessionId;
   readonly label: string;
-  readonly runtimeModeCeiling: RuntimeMode;
+  readonly access: AuthMcpClientAccess;
 }
 
 export interface AuthenticatedSession {
@@ -434,7 +440,7 @@ export class ServerAuthMcpApprovalCodeError extends Schema.TaggedError<ServerAut
 ) {
   override get message(): string {
     return this.reason === "insufficient_scope"
-      ? "That pairing code cannot control threads. Create one with the standard scopes."
+      ? "That pairing code cannot grant this access. Create one with the standard scopes, or choose Read only."
       : this.reason === "not_a_pairing_code"
         ? "That is not a one-time pairing code."
         : "That pairing code is unknown, expired, or already used.";
@@ -543,19 +549,21 @@ export class EnvironmentAuth extends Context.Service<
     ) => Effect.Effect<McpClientSession, ServerAuthCredentialError | ServerAuthInternalError>;
     readonly issueMcpClientSession: (input: {
       readonly label: string;
-      readonly runtimeModeCeiling: RuntimeMode;
+      readonly access: AuthMcpClientAccess;
       readonly client: AuthClientMetadata;
     }) => Effect.Effect<
       { readonly token: string; readonly expiresAt: DateTime.DateTime },
       ServerAuthInternalError
     >;
     /**
-     * Spends a one-time pairing code as approval for an MCP client. Proof-bound
-     * codes (T3 Connect) are refused without being spent, and desktop bootstrap
-     * grants never qualify.
+     * Spends a one-time pairing code as approval for an MCP client with the
+     * given access; the code must hold every scope that access grants.
+     * Proof-bound codes (T3 Connect) are refused without being spent, and
+     * desktop bootstrap grants never qualify.
      */
     readonly consumeMcpApprovalCode: (
       code: string,
+      access: AuthMcpClientAccess,
     ) => Effect.Effect<void, ServerAuthMcpApprovalCodeError | ServerAuthInternalError>;
     /** A browser cookie session only; a bearer header never counts as one. */
     readonly authenticateBrowserSession: (
@@ -1174,7 +1182,9 @@ export const make = Effect.gen(function* () {
           ? Effect.succeed({
               sessionId: session.sessionId,
               label: session.client.label ?? "MCP client",
-              runtimeModeCeiling: session.runtimeModeCeiling ?? "approval-required",
+              access: session.scopes.includes(AuthOrchestrationOperateScope)
+                ? (session.runtimeModeCeiling ?? "approval-required")
+                : "read-only",
             } satisfies McpClientSession)
           : Effect.fail(
               new ServerAuthInvalidCredentialError({
@@ -1191,9 +1201,9 @@ export const make = Effect.gen(function* () {
       .issue({
         subject: MCP_CLIENT_SUBJECT,
         method: "bearer-access-token",
-        scopes: MCP_CLIENT_SCOPES,
+        scopes: mcpClientScopes(input.access),
         ttl: MCP_CLIENT_SESSION_TTL,
-        runtimeModeCeiling: input.runtimeModeCeiling,
+        ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
         client: { ...input.client, label: input.label, deviceType: "bot" },
       })
       .pipe(
@@ -1219,7 +1229,10 @@ export const make = Effect.gen(function* () {
     );
   };
 
-  const consumeMcpApprovalCode: EnvironmentAuth["Service"]["consumeMcpApprovalCode"] = (code) =>
+  const consumeMcpApprovalCode: EnvironmentAuth["Service"]["consumeMcpApprovalCode"] = (
+    code,
+    access,
+  ) =>
     // No proof key: a code bound to a T3 Connect client's key fails without being spent.
     resolveBootstrapGrant(code.trim()).pipe(
       Effect.catchIf(
@@ -1230,7 +1243,7 @@ export const make = Effect.gen(function* () {
       Effect.flatMap((grant) =>
         grant.method !== "one-time-token" && grant.method !== "reusable-dev-token"
           ? Effect.fail(new ServerAuthMcpApprovalCodeError({ reason: "not_a_pairing_code" }))
-          : MCP_CLIENT_SCOPES.every((scope) => grant.scopes.includes(scope))
+          : mcpClientScopes(access).every((scope) => grant.scopes.includes(scope))
             ? Effect.void
             : Effect.fail(new ServerAuthMcpApprovalCodeError({ reason: "insufficient_scope" })),
       ),
