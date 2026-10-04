@@ -185,11 +185,15 @@ claude mcp add --transport http t3 https://<environment-address>/mcp
 
 The first time the agent connects, it opens a sign-in page on the environment.
 Enter a pairing code from **Settings → Connections** on a device that can manage
-access, or from `t3 auth pairing create` on the host, and choose the most the
-agent may allow. A browser already signed in to that environment as an
-administrator can approve without a code. The agent can then read, start,
-message and stop threads in every project, but cannot start or steer a thread
-with more permissions than you chose.
+access, or from `t3 auth pairing create` on the host, and choose what the agent
+may do. A browser already signed in to that environment as an administrator can
+approve without a code.
+
+- **Read only** lets the agent read projects and threads in every project, and
+  nothing else.
+- **Supervised** through **Full access** also let it start, message and stop
+  threads in every project, but it cannot start or steer a thread with more
+  permissions than the mode you chose.
 
 Use an HTTPS address: T3 Connect, Tailscale Serve, or `localhost` on the host
 itself. Agents refuse to sign in through a plain `http://` LAN or tailnet
