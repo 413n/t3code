@@ -296,6 +296,8 @@ function makeProviderAdapter(
     readonly beforeUnload?: Effect.Effect<void>;
     /** Registers the process's closeCount finalizer before `beforeOpen` runs. */
     readonly spawnBeforeOpen?: boolean;
+    /** Completed when a hanging scope close reaches its wedged finalizer. */
+    readonly scopeCloseReached?: Deferred.Deferred<void>;
   } = {},
 ): ProviderAdapterV2Shape {
   const countClose = Effect.addFinalizer(() =>
@@ -303,6 +305,15 @@ function makeProviderAdapter(
       ...current,
       closeCount: current.closeCount + 1,
     })),
+  );
+  // Registered after countClose so it runs first on scope close, wedging the
+  // close before the closeCount finalizer, like a provider process that never
+  // yields its message stream.
+  const hangClose = Effect.addFinalizer(() =>
+    (options.scopeCloseReached === undefined
+      ? Effect.void
+      : Deferred.succeed(options.scopeCloseReached, undefined)
+    ).pipe(Effect.andThen(Effect.never)),
   );
   return {
     instanceId: ProviderInstanceId.make("codex"),
@@ -313,6 +324,7 @@ function makeProviderAdapter(
       Effect.gen(function* () {
         if (options.spawnBeforeOpen === true) {
           yield* countClose;
+          if (options.hangSessionScopeClose === true) yield* hangClose;
         }
         if (options.mcpConfigs !== undefined && options.spawnBeforeOpen === true) {
           yield* Ref.update(options.mcpConfigs, (configs) => [
@@ -347,12 +359,7 @@ function makeProviderAdapter(
         });
         if (options.spawnBeforeOpen !== true) {
           yield* countClose;
-        }
-        if (options.hangSessionScopeClose === true) {
-          // Registered last so it runs first on scope close, wedging the
-          // close before the closeCount finalizer, like a provider process
-          // that never yields its message stream.
-          yield* Effect.addFinalizer(() => Effect.never);
+          if (options.hangSessionScopeClose === true) yield* hangClose;
         }
 
         return {
@@ -425,6 +432,7 @@ function makeTestLayer(input: {
   readonly hangSessionScopeClose?: boolean;
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
+  readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -448,6 +456,9 @@ function makeTestLayer(input: {
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
+      ...(input.scopeCloseReached === undefined
+        ? {}
+        : { scopeCloseReached: input.scopeCloseReached }),
     }),
   );
   const providerEventIngestorTestLayer = ProviderEventIngestor.layer.pipe(
@@ -983,6 +994,63 @@ it.effect("ProviderSessionManagerV2 cleans up an open interrupted mid-handshake"
             ),
           // The process is spawned before the handshake that is interrupted.
           spawnBeforeOpen: true,
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 cleans up an interrupted open whose scope close hangs", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const mcpConfigs = yield* Ref.make<
+      ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
+    >([]);
+    const handshakeStarted = yield* Deferred.make<void>();
+    const scopeCloseReached = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const registry = yield* McpSessionRegistry.McpSessionRegistry;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-interrupted-hung-open");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+
+      // Detached so the layer's close does not wait on the wedged scope.
+      const opening = yield* manager
+        .open({ threadId, providerSessionId, modelSelection, runtimePolicy })
+        .pipe(Effect.forkDetach);
+      yield* Deferred.await(handshakeStarted);
+      const issued = (yield* Ref.get(mcpConfigs)).at(-1);
+      const token = issued?.authorizationHeader.replace(/^Bearer\s+/, "");
+      assert.isDefined(token);
+
+      // The interrupt starts cleanup; the scope close then never finishes.
+      opening.interruptUnsafe();
+      yield* Deferred.await(scopeCloseReached);
+
+      // The session cleanup already ran, ahead of the stuck close.
+      assert.isUndefined(yield* registry.resolve(token!));
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
+      assert.equal((yield* Ref.get(state)).closeCount, 0);
+    }).pipe(
+      Effect.provide(
+        makeTestLayer({
+          state,
+          idleTimeoutMs: 60_000,
+          mcpConfigs,
+          beforeOpen: () =>
+            Deferred.succeed(handshakeStarted, undefined).pipe(Effect.andThen(Effect.never)),
+          spawnBeforeOpen: true,
+          hangSessionScopeClose: true,
+          scopeCloseReached,
         }),
       ),
     );

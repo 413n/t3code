@@ -1787,18 +1787,20 @@ export const layerWithOptions = (
                   Effect.provideService(Scope.Scope, sessionScope),
                   // Any failure, including a Stop that interrupts a slow
                   // handshake, stops the provider process this open started.
+                  // The session cleanup runs first, so an adapter finalizer
+                  // that never finishes cannot hold it up; the process it
+                  // was set up for is being stopped either way.
                   Effect.onError(() =>
-                    Scope.close(sessionScope, Exit.void).pipe(
-                      Effect.ignore,
-                      Effect.andThen(dropReservation),
-                      // Revoke only a credential this open freshly minted: a
-                      // reused credential is held by another live provider
-                      // process and must survive this open's failure.
+                    dropReservation.pipe(
+                      // Clear only a session this open freshly set up: a reused
+                      // one is held by another live provider process and must
+                      // survive this open's failure.
                       Effect.andThen(
                         prepared.issued
                           ? clearMcpSession(input.threadId, mcpCredentialId)
                           : Effect.void,
                       ),
+                      Effect.ensuring(Scope.close(sessionScope, Exit.void).pipe(Effect.ignore)),
                     ),
                   ),
                   Effect.mapError(

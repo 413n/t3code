@@ -2342,6 +2342,8 @@ export function makePiAdapterV2(
               activeProviderRetry: null,
               failure: null,
             };
+            // Set together with the send, with no gap for an interrupt to land in.
+            let sent = false;
             // Only the install/send/start-event boundary excludes the event
             // pump. Earlier correlated requests must leave the pump free so
             // project trust, login, and session-switch dialogs can be shown
@@ -2349,17 +2351,25 @@ export function makePiAdapterV2(
             yield* Effect.gen(function* () {
               state.activeTurn = activeTurn;
               if (compactCommand !== null) {
-                yield* connection.send(compactRpcRecord(compactCommand));
+                yield* connection.send(compactRpcRecord(compactCommand)).pipe(
+                  Effect.tap(() => Effect.sync(() => (sent = true))),
+                  Effect.uninterruptible,
+                );
                 pendingCompactResponses.push({
                   providerTurnId: providerTurn.id,
                   kind: "turn_start",
                 });
               } else if (payload !== null) {
-                yield* connection.send({
-                  type: "prompt",
-                  message: payload.message,
-                  ...(payload.images.length === 0 ? {} : { images: payload.images }),
-                });
+                yield* connection
+                  .send({
+                    type: "prompt",
+                    message: payload.message,
+                    ...(payload.images.length === 0 ? {} : { images: payload.images }),
+                  })
+                  .pipe(
+                    Effect.tap(() => Effect.sync(() => (sent = true))),
+                    Effect.uninterruptible,
+                  );
                 pendingPromptResponses.push({
                   providerTurnId: providerTurn.id,
                   kind: "turn_start",
@@ -2382,10 +2392,13 @@ export function makePiAdapterV2(
               }
             }).pipe(
               sessionEventPermit.withPermits(1),
-              // On interrupt too: a Stop that lands here must not leave the
-              // turn installed, or every later turn is rejected as active.
-              Effect.onError(() =>
+              // A turn interrupted before its prompt went out is cleared, or
+              // every later turn is rejected as active. Once the prompt is out,
+              // Pi is running it: the turn stays installed so its events stay
+              // its own, and Stop (interruptTurn) or settlement ends it.
+              Effect.onError((cause) =>
                 Effect.sync(() => {
+                  if (sent && Cause.hasInterruptsOnly(cause)) return;
                   if (state.activeTurn === activeTurn) state.activeTurn = null;
                 }),
               ),

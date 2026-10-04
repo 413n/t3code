@@ -89,7 +89,10 @@ interface FakePi {
   readonly resolveDeferredState: (data: unknown) => Effect.Effect<void>;
   /** Reject the next `get_state` request. */
   readonly failNextState: () => void;
-  readonly deferNextLifecycle: (type: "switch_session" | "new_session") => void;
+  /** Leave the next request of this type unanswered. */
+  readonly deferNextLifecycle: (
+    type: "switch_session" | "new_session" | "set_session_name",
+  ) => void;
   readonly queueModels: (models: ReadonlyArray<unknown>) => void;
   readonly vetoNextNewSession: () => void;
   /** Every request received by the fake process. */
@@ -1184,7 +1187,43 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.effect("clears a turn whose start is interrupted while it is installed", () =>
+  it.effect("leaves no turn behind when a start is interrupted before its prompt", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      // The start waits on naming the session before it sends the prompt.
+      fake.deferNextLifecycle("set_session_name");
+      const starting = yield* startTurn(runtime, providerThread).pipe(Effect.forkChild);
+      yield* fake.takeRequest("set_session_name");
+      const interrupted = yield* Fiber.interrupt(starting).pipe(
+        Effect.andThen(Fiber.await(starting)),
+      );
+      assert.isTrue(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause));
+
+      // Nothing is left installed, so the next turn starts and completes.
+      yield* startTurn(runtime, providerThread, "default", [], "Second turn", undefined, 2);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "agent_settled" });
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+      // Only the second turn's prompt ever reached Pi.
+      assert.deepStrictEqual(
+        fake
+          .allRequests()
+          .filter((request) => request["type"] === "prompt")
+          .map((request) => request["message"]),
+        ["Second turn"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("keeps a turn whose start is interrupted after its prompt is sent", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
       const { runtime, takeEvent } = yield* openRuntime(fake);
@@ -1195,15 +1234,20 @@ describe("PiAdapterV2", () => {
       });
       const appThread = yield* makeAppThread("default");
       const runId = RunId.make(`run:${THREAD_ID}:1`);
-      // The install block reads `runOrdinal` once the turn is installed and its
-      // prompt sent. Interrupting the starting fiber there is a Stop that lands
-      // between installing the turn and returning, with no wait to race.
+      // The install block first reads `runOrdinal` after it sent the prompt.
+      // Interrupting the starting fiber there is a Stop that lands once Pi is
+      // already running the prompt, with no wait to race. Later reads (the
+      // event pump settling the turn) are left alone.
+      let interruptOnRead = true;
       const turnInput = {
         appThread,
         threadId: THREAD_ID,
         runId,
         get runOrdinal() {
-          Fiber.getCurrent()?.interruptUnsafe();
+          if (interruptOnRead) {
+            interruptOnRead = false;
+            Fiber.getCurrent()?.interruptUnsafe();
+          }
           return 1;
         },
         providerTurnOrdinal: 1,
@@ -1224,14 +1268,33 @@ describe("PiAdapterV2", () => {
       const interrupted = yield* Fiber.await(starting);
       assert.isTrue(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause));
       yield* fake.takeRequest("prompt");
+      const running = yield* takeEvent(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      const providerTurnId =
+        running.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
+      assert.isDefined(providerTurnId);
 
-      // A turn left installed would reject this one as already active.
-      yield* startTurn(runtime, providerThread, "default", [], "Second turn", undefined, 2);
-      yield* fake.takeRequest("prompt");
+      // Pi is running that prompt, so the turn still owns the thread.
+      const rejected = yield* startTurn(
+        runtime,
+        providerThread,
+        "default",
+        [],
+        "Second turn",
+        undefined,
+        2,
+      ).pipe(Effect.flip);
+      assert.include(String(rejected.cause), "already has an active turn");
+
+      // Its events stay its own, and Stop settles it as interrupted.
       yield* fake.emit({ type: "agent_start" });
+      yield* runtime.interruptTurn({ providerThread, providerTurnId: providerTurnId! });
+      yield* fake.takeRequest("abort");
       yield* fake.emit({ type: "agent_settled" });
       const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
-      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
+      assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "interrupted");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
