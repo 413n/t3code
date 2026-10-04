@@ -104,7 +104,23 @@ const withRoutes = <A, E>(
   }).pipe(Effect.provide(NodeServices.layer));
 
 const json = <A>(response: Response) => Effect.promise(() => response.json() as Promise<A>);
-const text = (response: Response) => Effect.promise(() => response.text());
+
+/** What the approval page posts: the agent's request plus the user's choice. */
+const postJson = (path: string, body: Record<string, string>, cookie?: string) =>
+  at(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
+    body: encodeJson(body),
+  });
+
+const decide = (handler: Handler, body: Record<string, string>, cookie?: string) =>
+  handler(postJson("/oauth/mcp/decision", body, cookie)).pipe(
+    Effect.flatMap((response) =>
+      json<{ redirectTo?: string; error?: string }>(response).pipe(
+        Effect.map((payload) => ({ status: response.status, ...payload })),
+      ),
+    ),
+  );
 
 const register = (handler: Handler, redirect = REDIRECT) =>
   handler(
@@ -187,12 +203,26 @@ it.live("registers only loopback clients and never redirects for an unverified c
       expect(unregistered.status).toBe(400);
       expect(unregistered.headers.get("location")).toBeNull();
 
-      const page = yield* handler(
-        at(`/oauth/mcp/authorize?${new URLSearchParams(authorizeParams(clientId))}`),
+      // A valid request is handed to the web app's approval page, query intact.
+      const query = new URLSearchParams(authorizeParams(clientId)).toString();
+      const handoff = yield* handler(at(`/oauth/mcp/authorize?${query}`));
+      expect(handoff.status).toBe(302);
+      expect(handoff.headers.get("location")).toBe(`/connect-agent?${query}`);
+      const details = yield* handler(
+        postJson("/oauth/mcp/approval", authorizeParams(clientId)),
+      ).pipe(Effect.flatMap(json<Record<string, unknown>>));
+      expect(details).toEqual({
+        clientName: "Claude Code",
+        redirectHost: "localhost:51234",
+        environmentHost: "box.example.ts.net",
+      });
+
+      // The approval endpoints re-check the request: a forged client gets a message, not a URL.
+      const forgedDetails = yield* handler(
+        postJson("/oauth/mcp/approval", authorizeParams(`${clientId.split(".")[0]}.forged`)),
       );
-      expect(page.status).toBe(200);
-      expect(page.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
-      expect(yield* text(page)).toContain("Pairing code");
+      expect(forgedDetails.status).toBe(400);
+      expect(yield* json<Record<string, unknown>>(forgedDetails)).not.toHaveProperty("redirectTo");
     }),
   ),
 );
@@ -204,28 +234,23 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
       const pairing = yield* auth.issuePairingCredential();
       const params = authorizeParams(clientId);
 
-      const wrongCode = yield* handler(
-        at(
-          "/oauth/mcp/authorize",
-          form({ ...params, decision: "approve", runtime_mode: "auto", pairing_code: "nope" }),
-        ),
-      );
+      const wrongCode = yield* decide(handler, {
+        ...params,
+        decision: "approve",
+        runtime_mode: "auto",
+        pairing_code: "nope",
+      });
       expect(wrongCode.status).toBe(400);
-      expect(yield* text(wrongCode)).toContain("unknown, expired, or already used");
+      expect(wrongCode.error).toContain("unknown, expired, or already used");
 
-      const approved = yield* handler(
-        at(
-          "/oauth/mcp/authorize",
-          form({
-            ...params,
-            decision: "approve",
-            runtime_mode: "auto",
-            pairing_code: pairing.credential,
-          }),
-        ),
-      );
-      expect(approved.status).toBe(302);
-      const callback = new URL(approved.headers.get("location")!);
+      const approved = yield* decide(handler, {
+        ...params,
+        decision: "approve",
+        runtime_mode: "auto",
+        pairing_code: pairing.credential,
+      });
+      expect(approved.status).toBe(200);
+      const callback = new URL(approved.redirectTo!);
       expect(callback.origin).toBe("http://localhost:51234");
       expect(callback.searchParams.get("state")).toBe("state-1");
       expect(callback.searchParams.get("iss")).toBe(ORIGIN);
@@ -285,18 +310,13 @@ it.live("rejects a wrong PKCE verifier and spends the code", () =>
       const clientId = yield* registeredClientId(handler);
       const pairing = yield* auth.issuePairingCredential();
       const params = authorizeParams(clientId);
-      const approved = yield* handler(
-        at(
-          "/oauth/mcp/authorize",
-          form({
-            ...params,
-            decision: "approve",
-            runtime_mode: "approval-required",
-            pairing_code: pairing.credential,
-          }),
-        ),
-      );
-      const code = new URL(approved.headers.get("location")!).searchParams.get("code")!;
+      const approved = yield* decide(handler, {
+        ...params,
+        decision: "approve",
+        runtime_mode: "approval-required",
+        pairing_code: pairing.credential,
+      });
+      const code = new URL(approved.redirectTo!).searchParams.get("code")!;
       const exchange = (codeVerifier: string) =>
         handler(
           at(
@@ -324,21 +344,18 @@ it.live("denies and refuses codes bound to another client's key or without threa
       const clientId = yield* registeredClientId(handler);
       const params = authorizeParams(clientId);
 
-      const denied = yield* handler(
-        at("/oauth/mcp/authorize", form({ ...params, decision: "deny" })),
-      );
-      expect(denied.status).toBe(302);
-      const deniedUrl = new URL(denied.headers.get("location")!);
+      const denied = yield* decide(handler, { ...params, decision: "deny" });
+      const deniedUrl = new URL(denied.redirectTo!);
       expect(deniedUrl.searchParams.get("error")).toBe("access_denied");
       expect(deniedUrl.searchParams.get("state")).toBe("state-1");
 
       const approveWith = (code: string) =>
-        handler(
-          at(
-            "/oauth/mcp/authorize",
-            form({ ...params, decision: "approve", runtime_mode: "auto", pairing_code: code }),
-          ),
-        );
+        decide(handler, {
+          ...params,
+          decision: "approve",
+          runtime_mode: "auto",
+          pairing_code: code,
+        });
 
       // A T3 Connect code is bound to a device key: refused, and still usable by its device.
       const bound = yield* auth.createPairingLink({ proofKeyThumbprint: "device-key-thumbprint" });
@@ -359,7 +376,7 @@ it.live("denies and refuses codes bound to another client's key or without threa
       const readOnly = yield* auth.issuePairingCredential({ scopes: ["orchestration:read"] });
       const readOnlyResponse = yield* approveWith(readOnly.credential);
       expect(readOnlyResponse.status).toBe(400);
-      expect(yield* text(readOnlyResponse)).toContain("cannot control threads");
+      expect(readOnlyResponse.error).toContain("cannot control threads");
     }),
   ),
 );
@@ -382,28 +399,36 @@ it.live("offers one-click only to a browser session that holds the scopes it wou
           );
           return response.headers.getSetCookie()[0]!.split(";", 1)[0]!;
         });
-      const page = (cookie: string) =>
-        handler(
-          at(`/oauth/mcp/authorize?${new URLSearchParams(params)}`, { headers: { cookie } }),
-        ).pipe(Effect.flatMap(text));
+      const details = (cookie: string) =>
+        handler(postJson("/oauth/mcp/approval", params, cookie)).pipe(
+          Effect.flatMap(json<{ csrfToken?: string }>),
+        );
 
       const admin = yield* browserCookie([...AuthAdministrativeScopes]);
-      expect(yield* page(admin)).toContain('name="csrf_token"');
+      const adminDetails = yield* details(admin);
+      expect(adminDetails.csrfToken).toEqual(expect.any(String));
+      const oneClick = yield* decide(
+        handler,
+        {
+          ...params,
+          decision: "approve",
+          runtime_mode: "auto",
+          csrf_token: adminDetails.csrfToken!,
+        },
+        admin,
+      );
+      expect(new URL(oneClick.redirectTo!).searchParams.get("code")).toEqual(expect.any(String));
 
       // access:write alone cannot hand an agent thread control it does not hold.
       const accessOnly = yield* browserCookie(["access:read", "access:write"]);
-      expect(yield* page(accessOnly)).not.toContain('name="csrf_token"');
-      const forged = yield* handler(
-        at("/oauth/mcp/authorize", {
-          ...form({ ...params, decision: "approve", runtime_mode: "auto", csrf_token: "forged" }),
-          headers: {
-            "content-type": "application/x-www-form-urlencoded",
-            cookie: accessOnly,
-          },
-        }),
+      expect((yield* details(accessOnly)).csrfToken).toBeUndefined();
+      const forged = yield* decide(
+        handler,
+        { ...params, decision: "approve", runtime_mode: "auto", csrf_token: "forged" },
+        accessOnly,
       );
       expect(forged.status).toBe(400);
-      expect(yield* text(forged)).toContain("Enter a pairing code instead");
+      expect(forged.error).toContain("Enter a pairing code instead");
     }),
   ),
 );

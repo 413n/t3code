@@ -353,3 +353,31 @@ export const AuthSessionState = Schema.Struct({
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
 });
 export type AuthSessionState = typeof AuthSessionState.Type;
+
+/**
+ * What the approval page needs to show for an MCP OAuth sign-in. The server
+ * has already validated the request; nothing here is trusted by the client
+ * except for display.
+ */
+export const AuthMcpApprovalDetails = Schema.Struct({
+  /** Self-declared by the client, so shown as such. */
+  clientName: Schema.String,
+  /** Where the code goes: always a loopback address on the browser's machine. */
+  redirectHost: Schema.String,
+  environmentHost: Schema.String,
+  /** Present when this browser's session may approve without a pairing code. */
+  csrfToken: Schema.optionalKey(Schema.String),
+});
+export type AuthMcpApprovalDetails = typeof AuthMcpApprovalDetails.Type;
+
+/** Where the approval page sends the browser after approve or deny. */
+export const AuthMcpApprovalResult = Schema.Struct({
+  redirectTo: Schema.String,
+});
+export type AuthMcpApprovalResult = typeof AuthMcpApprovalResult.Type;
+
+/** A problem the approval page shows the user without redirecting anywhere. */
+export const AuthMcpApprovalError = Schema.Struct({
+  error: Schema.String,
+});
+export type AuthMcpApprovalError = typeof AuthMcpApprovalError.Type;
