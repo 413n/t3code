@@ -11,7 +11,6 @@ import type * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as References from "effect/References";
-import type * as Rpc from "effect/unstable/rpc/Rpc";
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 import * as RpcSchema from "effect/unstable/rpc/RpcSchema";
 
@@ -240,15 +239,12 @@ const recordRpcMetrics = (
   });
 
 /**
- * Wraps one WebSocket RPC call in its `ws.rpc.<method>` span and records its request counter and
- * duration. For a stream RPC, `effect` runs the whole stream, so the span and the metrics cover the
- * subscription until it ends, fails, or is interrupted. Methods in
+ * Wraps each WebSocket RPC call in its `ws.rpc.<method>` span and records its request counter and
+ * duration. For a stream RPC, the middleware receives the whole stream run, so the span and the
+ * metrics cover the subscription until it ends, fails, or is interrupted. Methods in
  * `RPC_METHODS_WITH_TRACING_DISABLED` record metrics but no spans, for the call or anything it runs.
  */
-export const instrumentRpc = <A, E, R>(
-  rpc: Rpc.AnyWithProps,
-  effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> => {
+export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect, { rpc }) => {
   const method = rpc._tag;
   const measured = RpcSchema.isStreamSchema(rpc.successSchema)
     ? Effect.flatMap(Clock.currentTimeNanos, (startedAt) =>
@@ -274,9 +270,4 @@ export const instrumentRpc = <A, E, R>(
       },
     }),
   );
-};
-
-/** Instruments every WebSocket RPC. */
-export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect, { rpc }) =>
-  instrumentRpc(rpc, effect),
-);
+});
