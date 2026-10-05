@@ -158,6 +158,17 @@ function rowToApplicationStoredEvent(
   return row.aggregate_kind === "project" ? rowToProjectEvent(row) : rowToV2StoredEvent(row);
 }
 
+const isKnownProjectEventType = Schema.is(ProjectEventType);
+
+/** Whether `row.event_type` is a discriminant this build knows for its aggregate kind. */
+function isKnownApplicationEventType(
+  row: Pick<ApplicationEventRow, "aggregate_kind" | "event_type">,
+): boolean {
+  return row.aggregate_kind === "project"
+    ? isKnownProjectEventType(row.event_type)
+    : isKnownOrchestrationV2EventType(row.event_type);
+}
+
 function inferActorKind(
   event: OrchestrationEventStore.UnsequencedProjectEvent,
 ): typeof ActorKind.Type {
@@ -530,53 +541,53 @@ const makeEventStore = Effect.gen(function* () {
     ),
   );
 
-  const readApplicationEventPage = (input: {
-    readonly afterSequence: number;
-    readonly throughSequence: number;
-    readonly limit: number;
-  }): Stream.Stream<ApplicationStoredEvent, OrchestrationEventStoreError> =>
-    Stream.fromEffect(
-      readApplicationRows(input).pipe(
-        Effect.mapError(
-          toPersistenceSqlError("OrchestrationEventStore.readApplicationEvents:query"),
-        ),
-      ),
-    ).pipe(
-      Stream.flatMap(Stream.fromIterable),
-      Stream.mapEffect((row) =>
-        rowToApplicationStoredEvent(row).pipe(
-          Effect.mapError(
-            toPersistenceDecodeError("OrchestrationEventStore.readApplicationEvents:decode"),
-          ),
-        ),
-      ),
-    );
-
+  // Pagination counts raw SQL rows (not post-filter decoded events), exactly
+  // like readAgentEvents: a page that reads a full READ_PAGE_SIZE of raw rows
+  // must keep paginating even if some of those rows get dropped below as
+  // unknown, or the cursor and the "more pages?" check would both undercount.
   const catchUpApplicationEvents = (input: {
     readonly afterSequence: number;
     readonly throughSequence: number;
-  }): Stream.Stream<ApplicationStoredEvent, OrchestrationEventStoreError> => {
-    return Stream.paginate(input.afterSequence, (afterSequence) =>
-      readApplicationEventPage({
+    readonly skipUnknownEventTypes?: boolean;
+  }): Stream.Stream<ApplicationStoredEvent, OrchestrationEventStoreError> =>
+    Stream.paginate(input.afterSequence, (afterSequence) =>
+      readApplicationRows({
         afterSequence,
         throughSequence: input.throughSequence,
         limit: READ_PAGE_SIZE,
       }).pipe(
-        Stream.runCollect,
-        Effect.map((events) => {
-          const last = events.at(-1);
+        Effect.mapError(
+          toPersistenceSqlError("OrchestrationEventStore.readApplicationEvents:query"),
+        ),
+        Effect.map((rows) => {
+          const last = rows.at(-1);
           return [
-            events,
+            rows,
             last === undefined ||
-            events.length < READ_PAGE_SIZE ||
+            rows.length < READ_PAGE_SIZE ||
             last.sequence >= input.throughSequence
               ? Option.none()
               : Option.some(last.sequence),
           ] as const;
         }),
       ),
+    ).pipe(
+      Stream.filterMapEffect((row) =>
+        input.skipUnknownEventTypes === true && !isKnownApplicationEventType(row)
+          ? // Written by a newer build; a known type with a bad payload still fails.
+            Effect.logWarning("Skipping an application event row with an unknown event type", {
+              threadId: row.stream_id,
+              sequence: row.sequence,
+              eventTypeLength: row.event_type.length,
+            }).pipe(Effect.as(Result.failVoid))
+          : rowToApplicationStoredEvent(row).pipe(
+              Effect.mapError(
+                toPersistenceDecodeError("OrchestrationEventStore.readApplicationEvents:decode"),
+              ),
+              Effect.map(Result.succeed),
+            ),
+      ),
     );
-  };
 
   const streamProjectedApplicationEvents: OrchestrationEventStore.OrchestrationEventStoreShape["streamProjectedApplicationEvents"] =
     (input) =>

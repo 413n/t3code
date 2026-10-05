@@ -104,10 +104,17 @@ export interface OrchestrationEventStoreShape {
 
   readonly latestApplicationSequence: Effect.Effect<number, OrchestrationEventStoreError>;
 
-  /** Read the finite retained application-event range `(afterSequence, throughSequence]`. */
+  /**
+   * Read the finite retained application-event range `(afterSequence, throughSequence]`.
+   *
+   * A row whose `event_type` this build does not know fails the read unless
+   * `skipUnknownEventTypes` is set, which logs and drops it instead. Only
+   * client shell replay opts in; anything that builds server state stays strict.
+   */
   readonly readApplicationEvents: (input: {
     readonly afterSequence: number;
     readonly throughSequence: number;
+    readonly skipUnknownEventTypes?: boolean;
   }) => Stream.Stream<ApplicationStoredEvent, OrchestrationEventStoreError>;
 
   /** Publish only after the surrounding event/projection transaction commits. */
