@@ -23,6 +23,7 @@ import type {
   OrchestrationV2ThreadShell,
   OrchestrationV2ThreadProjection,
   OrchestrationV2TurnItem,
+  ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
@@ -315,6 +316,18 @@ export interface ProjectionStoreV2Shape {
     options: ProjectionTimelinePageOptions,
   ) => Effect.Effect<ProjectionTimelinePage, ProjectionStoreV2Error>;
   readonly getMessageCount: (threadId: ThreadId) => Effect.Effect<number, ProjectionStoreV2Error>;
+  /**
+   * Whether another active (non-deleted, non-archived) thread in the same
+   * project records the same worktreePath. Backs the worktree-branch-drift
+   * follow's exclusivity guard (#11078): two threads sharing one worktree
+   * make "whose branch is it" ambiguous, so a drifted checkout is only
+   * adopted while a thread is its sole owner.
+   */
+  readonly hasSiblingThreadWithWorktreePath: (input: {
+    readonly threadId: ThreadId;
+    readonly projectId: ProjectId;
+    readonly worktreePath: string;
+  }) => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly getNextTurnItemOrdinal: (
     threadId: ThreadId,
   ) => Effect.Effect<number, ProjectionStoreV2Error>;
@@ -4502,6 +4515,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.map((rows) => rows[0]?.count ?? 0),
         Effect.mapError(controlReadError(threadId)),
       );
+
+    const hasSiblingThreadWithWorktreePath: ProjectionStoreV2Shape["hasSiblingThreadWithWorktreePath"] =
+      (input) =>
+        sql<{ readonly thread_id: string }>`
+          SELECT thread_id FROM orchestration_v2_projection_threads
+          WHERE project_id = ${input.projectId}
+            AND thread_id != ${input.threadId}
+            AND deleted_at IS NULL
+            AND archived_at IS NULL
+            AND json_extract(payload_json, '$.worktreePath') = ${input.worktreePath}
+          LIMIT 1
+        `.pipe(
+          Effect.map((rows) => rows.length > 0),
+          Effect.mapError(controlReadError(input.threadId)),
+        );
     const getNextTurnItemOrdinal: ProjectionStoreV2Shape["getNextTurnItemOrdinal"] = (threadId) =>
       sql<{ ordinal: number | null }>`SELECT MAX(ordinal) AS ordinal
         FROM orchestration_v2_projection_turn_items WHERE thread_id = ${threadId}`.pipe(
@@ -5555,6 +5583,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getPendingNativeUserInputs,
       hasUnpairedRunInterruptRequest,
       getMessageCount,
+      hasSiblingThreadWithWorktreePath,
       getNextTurnItemOrdinal,
       getTurnItem,
       getThreadRecords,
@@ -5799,6 +5828,19 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       getMessageCount: (threadId) =>
         Ref.get(replayState).pipe(
           Effect.map((state) => state.projections.get(threadId)?.messages.length ?? 0),
+        ),
+      hasSiblingThreadWithWorktreePath: (input) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].some(
+              ({ thread }) =>
+                thread.id !== input.threadId &&
+                thread.projectId === input.projectId &&
+                thread.worktreePath === input.worktreePath &&
+                thread.deletedAt === null &&
+                thread.archivedAt === null,
+            ),
+          ),
         ),
       getNextTurnItemOrdinal: (threadId) =>
         Ref.get(replayState).pipe(

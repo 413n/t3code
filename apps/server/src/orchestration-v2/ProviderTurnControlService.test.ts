@@ -226,6 +226,8 @@ it.effect(
           getThreadAttachmentIds: () => Effect.die("Unused attachment lookup"),
           getTimelinePage: () => Effect.die("Unused timeline read"),
           getMessageCount: () => Effect.die("unused message count"),
+          hasSiblingThreadWithWorktreePath: () =>
+            Effect.die("unused hasSiblingThreadWithWorktreePath"),
           getNextTurnItemOrdinal: () => Effect.die("unused ordinal read"),
           getTurnItem: () => Effect.die("unused turn item read"),
           getThreadRecords: () => Effect.die("unused record read"),

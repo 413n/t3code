@@ -2612,6 +2612,17 @@ export const OrchestrationV2Command = Schema.Union([
     branch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+    expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+    /**
+     * Reject unless this thread's worktree is still exclusive to it. Set by
+     * the server's own worktree-branch-drift follow (#11078): a worktree two
+     * threads both point at makes "whose branch is it" ambiguous, so a
+     * drifted checkout is only adopted while the thread is its sole owner.
+     * Rechecked against the live projection when the command is decided, not
+     * against a stale read, so a thread that starts sharing the worktree in
+     * between cannot be adopted into.
+     */
+    requireExclusiveWorktree: Schema.optional(Schema.Boolean),
     /** Reject unless no message or run has landed on this thread. */
     expectedEmpty: Schema.optional(Schema.Boolean),
     limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),

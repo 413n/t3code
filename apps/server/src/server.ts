@@ -156,6 +156,7 @@ import {
   OrchestrationV2ProductionLayerLive,
   ProjectServiceLayerLive,
   ProjectSetupScriptRunnerLayerLive,
+  ThreadManagementServiceRuntimeLive,
 } from "./orchestration-v2/runtimeLayer.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
@@ -454,6 +455,19 @@ const OrchestrationV2RuntimeLayerLive = OrchestrationV2ProductionLayerLive.pipe(
       Layer.provide(ProjectionStoreV2.layer),
       Layer.provide(PullRequestServiceLive),
       Layer.provide(ProjectServiceLayerLive),
+      // ThreadManagementServiceRuntimeLive is the same orchestrator instance
+      // OrchestrationV2ProductionLayerLive runs; its own remaining
+      // requirements (satisfied for that instance above) must be repeated
+      // here too, since a dependency's open requirements are not inherited
+      // from a sibling `Layer.provide` step. Layer memoization still builds
+      // each of these once and shares it, so this is one orchestrator, not two.
+      Layer.provide(
+        ThreadManagementServiceRuntimeLive.pipe(
+          Layer.provide(ProviderEventIngestor.analyticsLive),
+          Layer.provide(CheckpointStoreLayerLive),
+          Layer.provide(GitWorkflowLayerLive),
+        ),
+      ),
     ),
   ),
 );

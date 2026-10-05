@@ -2379,6 +2379,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} worktree changed before the metadata update could be applied.`,
       });
     }
+    if (
+      command.type === "thread.metadata.update" &&
+      command.expectedBranch !== undefined &&
+      command.expectedBranch !== thread.branch
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
+      });
+    }
+    if (
+      command.type === "thread.metadata.update" &&
+      command.requireExclusiveWorktree === true &&
+      thread.worktreePath !== null
+    ) {
+      // Rechecked here, against the live projection at decision time, rather
+      // than by the caller before dispatch: a sibling thread can start
+      // sharing this worktree between that earlier read and this command's
+      // turn to commit, and a stale read would miss it (#11078 review).
+      const sharedWithAnotherThread = yield* projectionStore
+        .hasSiblingThreadWithWorktreePath({
+          threadId: command.threadId,
+          projectId: thread.projectId,
+          worktreePath: thread.worktreePath,
+        })
+        .pipe(mapDispatchError(command));
+      if (sharedWithAnotherThread) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId}'s worktree is shared with another thread; not adopting the checked-out branch.`,
+        });
+      }
+    }
     if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
       const records = yield* projectionStore
         .getThreadRecords(command.threadId, ["runs"])
