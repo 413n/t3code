@@ -1162,6 +1162,75 @@ it.effect("renames a temporary t3code/<hash> branch off the provisioning critica
   }),
 );
 
+it.effect(
+  "drops the background branch rename once the agent's own checkout already corrected the stamp",
+  () =>
+    Effect.gen(function* () {
+      const branchNameStarted = yield* Deferred.make<void>();
+      const allowBranchName = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        createWorktree: (input) =>
+          Effect.succeed({
+            worktree: { path: "/repo-worktrees/temp", refName: input.newRefName, headSha: "abc" },
+          } as never),
+        generateBranchName: () =>
+          Deferred.succeed(branchNameStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(allowBranchName)),
+            Effect.as({ branch: "generated-branch" }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const dispatch = threads.dispatch;
+        const settledCommandIds: Array<string> = [];
+        vi.spyOn(threads, "dispatch").mockImplementation((command) =>
+          dispatch(command).pipe(
+            Effect.onExit(() => Effect.sync(() => settledCommandIds.push(command.commandId))),
+          ),
+        );
+        const launched = yield* launches.launch(
+          launchInput({
+            command: "command:launch:stale-rename",
+            thread: "thread:launch:stale-rename",
+            message: "Build the feature",
+            workspace: { type: "worktree", baseRef: "main", branch: "t3code/abcd1234" },
+          }),
+        );
+        yield* Deferred.await(branchNameStarted);
+        // The agent checked out a real branch during the first turn, and
+        // followBranchDrift (RunFinalizationService) already corrected the
+        // stamp before generation finishes and the rename lands.
+        yield* threads.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make("command:drift-follow:stale-rename"),
+          threadId: launched.threadId,
+          branch: "feature/agent-chosen",
+          expectedBranch: "t3code/abcd1234",
+          expectedWorktreePath: "/repo-worktrees/temp",
+          requireExclusiveWorktree: true,
+        });
+        assert.equal(
+          (yield* threads.getThreadProjection(launched.threadId)).thread.branch,
+          "feature/agent-chosen",
+        );
+        yield* Deferred.succeed(allowBranchName, undefined);
+        yield* waitUntil(() =>
+          Effect.sync(() =>
+            settledCommandIds.includes("command:launch:stale-rename:branch-rename"),
+          ),
+        );
+        // The rename's compare-and-swap (expectedBranch/expectedWorktreePath)
+        // found the stamp already moved on, so it no-opped instead of
+        // overwriting the agent's real branch with the generated name.
+        assert.equal(
+          (yield* threads.getThreadProjection(launched.threadId)).thread.branch,
+          "feature/agent-chosen",
+        );
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
 it.effect("keeps an explicit branch name instead of generating one", () =>
   Effect.gen(function* () {
     const harness = makeHarness();

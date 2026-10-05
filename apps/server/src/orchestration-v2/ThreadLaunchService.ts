@@ -436,6 +436,14 @@ const make = Effect.gen(function* () {
               threadId,
               branch: renamed.branch,
               worktreePath: worktreeCwd,
+              // Generation and the actual `git branch -m` both take a beat,
+              // during which the agent can check out a real branch itself
+              // (followBranchDrift then corrects the stamp before this
+              // lands). A compare-and-swap drops the rename instead of
+              // overwriting that correction with a branch nothing has
+              // checked out.
+              expectedBranch: oldBranch,
+              expectedWorktreePath: worktreeCwd,
             }),
           ),
           Effect.catchCause((cause) =>
