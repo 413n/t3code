@@ -582,7 +582,6 @@ layer("OrchestrationEventStore", (it) => {
       Effect.gen(function* () {
         const store = yield* OrchestrationEventStore.OrchestrationEventStore;
         const sql = yield* SqlClient.SqlClient;
-        const baseline = yield* store.latestApplicationSequence;
         const now = "2026-01-05T00:00:01.000Z";
         const threadId = "thread:shell-skip-unknown-page-boundary";
         const projectEvent = (suffix: string) => ({
@@ -630,22 +629,23 @@ layer("OrchestrationEventStore", (it) => {
         const after = yield* store.appendProjectEvent(projectEvent("after"));
 
         const throughSequence = yield* store.latestApplicationSequence;
+        // Start after "before" so the first page holds only unknown rows.
         const replayed = yield* store
           .readApplicationEvents({
-            afterSequence: baseline,
+            afterSequence: before.sequence,
             throughSequence,
             skipUnknownEventTypes: true,
           })
           .pipe(Stream.runCollect);
         assert.deepEqual(
           Array.from(replayed, (event) => event.sequence),
-          [before.sequence, after.sequence],
+          [after.sequence],
         );
 
         // Same range, strict: still fails outright without the opt-in.
         const strictResult = yield* Effect.result(
           store
-            .readApplicationEvents({ afterSequence: baseline, throughSequence })
+            .readApplicationEvents({ afterSequence: before.sequence, throughSequence })
             .pipe(Stream.runCollect),
         );
         assert.equal(strictResult._tag, "Failure");
