@@ -1150,14 +1150,36 @@ export const make = Effect.gen(function* () {
     const localRefs: string[] = [];
     appendUnique(localRefs, `refs/heads/${headContext.localBranch}`);
     appendUnique(localRefs, `refs/heads/${headContext.headBranch}`);
-    const remotePattern =
-      headContext.remoteName === null
-        ? `${REMOTE_REF_PREFIX}*/${headContext.headBranch}`
-        : `${REMOTE_REF_PREFIX}${headContext.remoteName}/${headContext.headBranch}`;
+    let remotePatterns: string[];
+    if (headContext.remoteName !== null) {
+      remotePatterns = [`${REMOTE_REF_PREFIX}${headContext.remoteName}/${headContext.headBranch}`];
+    } else {
+      // A `*` glob only stands in for one path segment, so a remote name
+      // that itself contains a slash (same reasoning as findRemoteTrackingRemote
+      // above) would never match it. List the real remotes and match each
+      // literally instead.
+      const remoteNames = (yield* gitCore.execute({
+        operation: "GitManager.readBranchTipOid.remotes",
+        cwd,
+        args: ["remote"],
+        timeoutMs: 5_000,
+      })).stdout
+        .split("\n")
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0);
+      remotePatterns = remoteNames.map(
+        (name) => `${REMOTE_REF_PREFIX}${name}/${headContext.headBranch}`,
+      );
+    }
     const result = yield* gitCore.execute({
       operation: "GitManager.readBranchTipOid",
       cwd,
-      args: ["for-each-ref", "--format=%(refname)%00%(objectname)", ...localRefs, remotePattern],
+      args: [
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)",
+        ...localRefs,
+        ...remotePatterns,
+      ],
       timeoutMs: 5_000,
     });
     const oidByRefName = new Map<string, string>();
