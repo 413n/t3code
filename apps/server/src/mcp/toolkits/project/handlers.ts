@@ -125,7 +125,8 @@ export const ProjectHandlersLive = ProjectToolkit.toLayer({
             }),
         createdBy: "agent",
         creationSource: "mcp",
-        groupedUnderThreadId: scope.threadId,
+        // A thread's launches join its group; a client's launches stand alone.
+        ...(caller === undefined ? {} : { groupedUnderThreadId: caller.id }),
       }).pipe(
         Effect.mapError((error) =>
           error._tag === "AttachmentClaimError"
