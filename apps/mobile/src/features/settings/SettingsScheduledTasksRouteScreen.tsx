@@ -1,3 +1,5 @@
+import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
+import { useEnvironmentScope, readEnvironmentScope } from "../../state/session";
 import type {
   EnvironmentId,
   ProjectId,
@@ -569,6 +571,7 @@ function TaskForm({
   const projects = useProjects().filter((project) => project.environmentId === environmentId);
   const config = useEnvironmentServerConfig(environmentId);
   const modelOptions = useMemo(() => buildModelOptions(config, null), [config]);
+  const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const upsert = useAtomCommand(serverEnvironment.upsertScheduledTask, {
     label: "scheduled task upsert",
     reportFailure: false,
@@ -591,6 +594,7 @@ function TaskForm({
 
   const save = async () => {
     if (
+      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope) ||
       submissionPending.current ||
       saving ||
       dictationPending ||
@@ -932,7 +936,9 @@ function TaskForm({
         accessibilityState={{
           disabled: saving || dictationPending || taskMissing || environmentUnavailable,
         }}
-        disabled={saving || dictationPending || taskMissing || environmentUnavailable}
+        disabled={
+          !canOperate || saving || dictationPending || taskMissing || environmentUnavailable
+        }
         onPress={() => void save()}
         className="min-h-12 items-center justify-center rounded-[14px] bg-primary px-4 disabled:opacity-50"
       >
@@ -962,6 +968,7 @@ function EnvironmentTasks({
   const visibleTasks = tasks.data?.tasks.filter(
     (task) => projectIds === null || projectIds.includes(task.projectId),
   );
+  const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const setEnabled = useAtomCommand(serverEnvironment.setScheduledTaskEnabled, {
     label: "scheduled task enabled",
     reportFailure: false,
@@ -981,6 +988,7 @@ function EnvironmentTasks({
   };
 
   const act = async (task: ScheduledTask, action: "run" | "toggle" | "delete") => {
+    if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) return;
     const result =
       action === "run"
         ? await runNow({ environmentId, input: { id: task.id } })
@@ -1049,9 +1057,17 @@ function EnvironmentTasks({
             <ControlPillMenu
               actions={[
                 { id: "edit", title: "Edit" },
-                { id: "toggle", title: task.enabled ? "Pause" : "Resume" },
-                { id: "run", title: "Run now" },
-                { id: "delete", title: "Delete", attributes: { destructive: true } },
+                {
+                  id: "toggle",
+                  title: task.enabled ? "Pause" : "Resume",
+                  attributes: { disabled: !canOperate },
+                },
+                { id: "run", title: "Run now", attributes: { disabled: !canOperate } },
+                {
+                  id: "delete",
+                  title: "Delete",
+                  attributes: { destructive: true, disabled: !canOperate },
+                },
               ]}
               onPressAction={({ nativeEvent }) => {
                 const action = nativeEvent.event;
