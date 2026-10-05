@@ -8,6 +8,7 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ThreadId,
+  type ProviderThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -52,6 +53,10 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
 const RELEASE_SCOPE_CLOSE_TIMEOUT_MS = 30 * 1000;
+
+/** The identity a turn's start and its `turn.terminal` share. */
+const busyTurnKey = (providerThreadId: ProviderThreadId, runOrdinal: number) =>
+  `${providerThreadId}#${runOrdinal}`;
 const UNLOAD_THREAD_TIMEOUT_MS = 10 * 1000;
 
 export const ProviderSessionReleaseReason = Schema.Literals([
@@ -206,7 +211,12 @@ interface LiveSessionEntry {
   readonly requestEventPermit: Semaphore.Semaphore;
   readonly scope: Scope.Closeable;
   readonly idleGeneration: number;
-  readonly busyCount: number;
+  /**
+   * Turns this session is running, keyed by `busyTurnKey`. A turn's start adds
+   * it and its `turn.terminal` (or a failed start) removes it, so a turn can
+   * only clear itself and the session is idle when the set is empty.
+   */
+  readonly busyTurns: ReadonlySet<string>;
   readonly lastActivityAtMs: number;
   readonly idleFiber: Fiber.Fiber<void, never> | null;
   /** Set when idle release is deferred for pending background work; bounds total deferral. */
@@ -835,7 +845,8 @@ export const layerWithOptions = (
               }
               if (
                 input.onlyIfIdleGeneration !== undefined &&
-                (existing.busyCount > 0 || existing.idleGeneration !== input.onlyIfIdleGeneration)
+                (existing.busyTurns.size > 0 ||
+                  existing.idleGeneration !== input.onlyIfIdleGeneration)
               ) {
                 return ["kept", current] as const;
               }
@@ -1006,7 +1017,7 @@ export const layerWithOptions = (
           const entry = current.get(key);
           if (
             entry === undefined ||
-            entry.busyCount > 0 ||
+            entry.busyTurns.size > 0 ||
             entry.idleGeneration !== input.generation
           ) {
             return;
@@ -1028,7 +1039,7 @@ export const layerWithOptions = (
                 const latestEntry = latest.get(key);
                 if (
                   latestEntry === undefined ||
-                  latestEntry.busyCount > 0 ||
+                  latestEntry.busyTurns.size > 0 ||
                   latestEntry.idleGeneration !== input.generation ||
                   latestEntry.runtime !== probedRuntime
                 ) {
@@ -1060,7 +1071,7 @@ export const layerWithOptions = (
           }
           // hasPendingBackgroundWork yields to the adapter, so the idle
           // decision above can go stale; the generation guard revalidates
-          // busyCount and idleGeneration inside releaseEntry's atomic
+          // busyTurns and idleGeneration inside releaseEntry's atomic
           // entry removal.
           yield* releaseEntry({
             providerSessionId: input.providerSessionId,
@@ -1097,7 +1108,7 @@ export const layerWithOptions = (
           const key = sessionKey(providerSessionId);
           const current = yield* Ref.get(sessions);
           const entry = current.get(key);
-          if (entry === undefined || entry.busyCount > 0) {
+          if (entry === undefined || entry.busyTurns.size > 0) {
             return;
           }
 
@@ -1110,7 +1121,7 @@ export const layerWithOptions = (
           const lastActivityAtMs = yield* Clock.currentTimeMillis;
           yield* Ref.update(sessions, (latest) => {
             const latestEntry = latest.get(key);
-            if (latestEntry === undefined || latestEntry.busyCount > 0) {
+            if (latestEntry === undefined || latestEntry.busyTurns.size > 0) {
               return latest;
             }
             const updated = new Map(latest);
@@ -1305,7 +1316,7 @@ export const layerWithOptions = (
           );
         });
 
-      const markBusy = (providerSessionId: ProviderSessionId) =>
+      const markBusy = (providerSessionId: ProviderSessionId, turnKey: string) =>
         withActivityError(
           providerSessionId,
           Effect.gen(function* () {
@@ -1319,7 +1330,7 @@ export const layerWithOptions = (
               const updated = new Map(current);
               updated.set(key, {
                 ...entry,
-                busyCount: entry.busyCount + 1,
+                busyTurns: new Set(entry.busyTurns).add(turnKey),
                 idleFiber: null,
                 lastActivityAtMs: now,
                 pinnedSinceMs: null,
@@ -1330,7 +1341,10 @@ export const layerWithOptions = (
           }),
         );
 
-      const markIdle = (providerSessionId: ProviderSessionId) =>
+      // Clearing a turn that is not marked busy (one whose failed start already
+      // cleared it, or a subagent turn the manager never started) only
+      // records activity.
+      const markIdle = (providerSessionId: ProviderSessionId, turnKey: string) =>
         withActivityError(
           providerSessionId,
           Effect.gen(function* () {
@@ -1341,10 +1355,12 @@ export const layerWithOptions = (
               if (entry === undefined) {
                 return current;
               }
+              const busyTurns = new Set(entry.busyTurns);
+              busyTurns.delete(turnKey);
               const updated = new Map(current);
               updated.set(key, {
                 ...entry,
-                busyCount: Math.max(0, entry.busyCount - 1),
+                busyTurns,
                 lastActivityAtMs: now,
               });
               return updated;
@@ -1518,17 +1534,30 @@ export const layerWithOptions = (
                 providerInstanceId: runtime.instanceId,
               }),
             ).pipe(
-              // A start that fails or is stopped never emits turn.terminal, so
-              // it undoes its own busy mark or the session never goes idle.
-              // Only a mark it made: on a session shared by several threads,
-              // undoing another thread's would idle-release its running turn.
+              // A start that fails or is stopped may never emit turn.terminal,
+              // so it clears its own turn or the session never goes idle. If
+              // the adapter emits the terminal anyway, clearing the same turn
+              // again changes nothing, so another thread's turn on a shared
+              // session stays busy either way.
               Effect.andThen(
                 Effect.acquireUseRelease(
-                  observeActivity(providerSessionId, markBusy(providerSessionId)),
+                  observeActivity(
+                    providerSessionId,
+                    markBusy(
+                      providerSessionId,
+                      busyTurnKey(input.providerThread.id, input.runOrdinal),
+                    ),
+                  ),
                   () => runtime.startTurn(input),
                   (_, exit) =>
                     Exit.isFailure(exit)
-                      ? observeActivity(providerSessionId, markIdle(providerSessionId))
+                      ? observeActivity(
+                          providerSessionId,
+                          markIdle(
+                            providerSessionId,
+                            busyTurnKey(input.providerThread.id, input.runOrdinal),
+                          ),
+                        )
                       : Effect.void,
                 ),
               ),
@@ -1588,7 +1617,10 @@ export const layerWithOptions = (
             return observeActivity(
               entry.runtime.providerSessionId,
               event.type === "turn.terminal"
-                ? markIdle(entry.runtime.providerSessionId)
+                ? markIdle(
+                    entry.runtime.providerSessionId,
+                    busyTurnKey(event.providerThreadId, event.runOrdinal),
+                  )
                 : touchActivity(entry.runtime.providerSessionId),
             ).pipe(
               Effect.andThen(
@@ -1852,7 +1884,7 @@ export const layerWithOptions = (
                 requestEventPermit: yield* Semaphore.make(1),
                 scope: sessionScope,
                 idleGeneration: 0,
-                busyCount: 0,
+                busyTurns: new Set(),
                 lastActivityAtMs: now,
                 idleFiber: null,
                 pinnedSinceMs: null,

@@ -243,11 +243,13 @@ function makeProviderThread(input: {
   readonly threadId: ThreadId;
   readonly providerSessionId: ProviderSessionId;
   readonly now: DateTime.Utc;
+  readonly nativeThreadId?: string;
 }): OrchestrationV2ProviderThread {
+  const nativeThreadId = input.nativeThreadId ?? "native-thread";
   return {
     id: input.idAllocator.derive.providerThread({
       driver: CODEX_DRIVER,
-      nativeThreadId: "native-thread",
+      nativeThreadId,
     }),
     driver: CODEX_DRIVER,
     providerInstanceId: modelSelection.instanceId,
@@ -256,7 +258,7 @@ function makeProviderThread(input: {
     ownerNodeId: null,
     nativeThreadRef: {
       driver: CODEX_DRIVER,
-      nativeId: "native-thread",
+      nativeId: nativeThreadId,
       strength: "strong",
     },
     nativeConversationHeadRef: null,
@@ -1249,6 +1251,125 @@ it.effect(
             serverSettingsLayer: ServerSettings.layerTest({
               projectSettingsOverrides: { [projectId]: { enableAgentBrowserAccess: true } },
             }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 keeps a shared session busy when a stopped start still ends its turn",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      // A's adapter start installs its turn, then is stopped mid-request; like
+      // OpenCode2, the adapter still ends that turn with turn.terminal later.
+      const holdStart = yield* Ref.make(false);
+      const startHeld = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadA = ThreadId.make("thread-provider-session-manager-stopped-ended-a");
+        const threadB = ThreadId.make("thread-provider-session-manager-stopped-ended-b");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: threadA, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: threadB, now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId: threadA,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* manager.open({
+          threadId: threadB,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThreadOf = (threadId: ThreadId) =>
+          makeProviderThread({
+            idAllocator,
+            threadId,
+            providerSessionId,
+            now,
+            nativeThreadId: `native-${threadId}`,
+          });
+        const startTurn = (threadId: ThreadId) =>
+          Effect.gen(function* () {
+            const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+            return yield* runtime.startTurn({
+              appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+              threadId,
+              runId,
+              runOrdinal: 1,
+              providerTurnOrdinal: 1,
+              attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+              rootNodeId: idAllocator.derive.rootNode({ runId }),
+              providerThread: providerThreadOf(threadId),
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                text: "turn",
+                attachments: [],
+              },
+              modelSelection,
+              runtimePolicy,
+            });
+          });
+
+        // B's turn is accepted and still running.
+        yield* startTurn(threadB);
+
+        // A's start is stopped after the adapter began the turn.
+        yield* Ref.set(holdStart, true);
+        const startingA = yield* startTurn(threadA).pipe(Effect.forkChild);
+        yield* Deferred.await(startHeld);
+        yield* Fiber.interrupt(startingA);
+
+        // The adapter ends A's turn anyway.
+        const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(queue);
+        yield* Queue.offer(queue!, {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: providerThreadOf(threadA).id,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: CODEX_DRIVER,
+            nativeTurnId: "native-turn-stopped-a",
+          }),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+
+        // B's running turn keeps the session busy past the idle timeout.
+        yield* TestClock.adjust("2 seconds");
+        yield* Effect.yieldNow;
+        assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+      }).pipe(
+        Effect.provide(
+          makeTestLayer({
+            state,
+            idleTimeoutMs: 1000,
+            startTurn: Ref.get(holdStart).pipe(
+              Effect.flatMap((hold) =>
+                hold
+                  ? Deferred.succeed(startHeld, undefined).pipe(Effect.andThen(Effect.never))
+                  : Effect.void,
+              ),
+            ),
           }),
         ),
       );
@@ -3311,17 +3432,20 @@ it.effect(
           providerInstanceId: modelSelection.instanceId,
           threadId: firstThreadId,
         });
+        // Each thread has its own native thread on the shared session.
         const firstProviderThread = makeProviderThread({
           idAllocator,
           threadId: firstThreadId,
           providerSessionId,
           now,
+          nativeThreadId: "native-thread-a",
         });
         const secondProviderThread = makeProviderThread({
           idAllocator,
           threadId: secondThreadId,
           providerSessionId,
           now,
+          nativeThreadId: "native-thread-b",
         });
         const firstRunId = idAllocator.derive.run({ threadId: firstThreadId, ordinal: 1 });
         const secondRunId = idAllocator.derive.run({ threadId: secondThreadId, ordinal: 1 });
