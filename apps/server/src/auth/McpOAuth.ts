@@ -12,6 +12,7 @@ import {
   type AuthMcpTokenRequest,
   type AuthMcpTokenResult,
   type AuthMcpClientAccess,
+  type AuthEnvironmentScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
 } from "@t3tools/contracts";
@@ -218,11 +219,18 @@ export class McpOAuth extends Context.Service<
       readonly urls: McpOAuthUrls;
       readonly request: AuthMcpAuthorizationRequest;
     }) => Effect.Effect<AuthorizationRequest, McpOAuthPageError | McpOAuthRedirectError>;
-    /** The signed-in owner on this origin, when their browser session may approve. */
+    /**
+     * The signed-in owner on this origin, when their browser session may
+     * approve at least read-only access. `approve` checks the chosen access
+     * against the session's scopes.
+     */
     readonly approvingBrowserSession: (
       request: HttpServerRequest.HttpServerRequest,
       authorization: AuthorizationRequest,
-    ) => Effect.Effect<{ readonly csrfToken: string } | undefined>;
+    ) => Effect.Effect<
+      | { readonly csrfToken: string; readonly scopes: ReadonlyArray<AuthEnvironmentScope> }
+      | undefined
+    >;
     /** Approves and returns the URL to send the browser to. */
     readonly approve: (input: {
       readonly request: HttpServerRequest.HttpServerRequest;
@@ -395,8 +403,8 @@ const make = Effect.gen(function* () {
       Effect.map((session) =>
         // Approving manages access, and a session may only hand out scopes it holds.
         session.scopes.includes(AuthAccessWriteScope) &&
-        MCP_OAUTH_SCOPES.every((scope) => session.scopes.includes(scope))
-          ? { csrfToken: csrfToken(session.sessionId, authorization) }
+        session.scopes.includes(AuthOrchestrationReadScope)
+          ? { csrfToken: csrfToken(session.sessionId, authorization), scopes: session.scopes }
           : undefined,
       ),
       Effect.orElseSucceed(() => undefined),
@@ -447,7 +455,10 @@ const make = Effect.gen(function* () {
         const session = yield* approvingBrowserSession(input.request, input.authorization);
         if (
           session === undefined ||
-          !timingSafeEqualBase64Url(decision.csrfToken, session.csrfToken)
+          !timingSafeEqualBase64Url(decision.csrfToken, session.csrfToken) ||
+          !EnvironmentAuth.mcpClientScopes(decision.access).every((scope) =>
+            session.scopes.includes(scope),
+          )
         ) {
           return yield* new McpOAuthPageError({
             description: "Your session cannot approve this request. Enter a pairing code instead.",

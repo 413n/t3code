@@ -87,6 +87,14 @@ function readAuthorizationRequest(): AuthMcpAuthorizationRequest {
  * approves with a pairing code, or in one click when this browser is already
  * signed in to the environment as an administrator.
  */
+/**
+ * Whether this browser's session may approve `access` without a pairing code.
+ * A session may only grant access whose scopes it holds itself.
+ */
+function oneClickApproves(details: AuthMcpApprovalDetails, access: AuthMcpClientAccess) {
+  return details.csrfToken !== undefined && (details.oneClickAccess ?? []).includes(access);
+}
+
 export function ConnectAgentSurface() {
   const [authorization] = useState(readAuthorizationRequest);
   const [loaded, setLoaded] = useState<Loaded>({ status: "loading" });
@@ -125,9 +133,9 @@ export function ConnectAgentSurface() {
       const decision: AuthMcpApprovalDecision =
         choice === "deny"
           ? { _tag: "deny" }
-          : csrfToken === undefined
-            ? { _tag: "pairing-code", access, code: pairingCode.trim() }
-            : { _tag: "browser-session", access, csrfToken };
+          : csrfToken !== undefined && oneClickApproves(loaded.details, access)
+            ? { _tag: "browser-session", access, csrfToken }
+            : { _tag: "pairing-code", access, code: pairingCode.trim() };
       const answer = await runApproval((client) =>
         client.mcpOAuth.decision({ payload: { authorization, decision } }),
       );
@@ -165,7 +173,7 @@ export function ConnectAgentSurface() {
   }
 
   const { details } = loaded;
-  const oneClick = details.csrfToken !== undefined;
+  const oneClick = oneClickApproves(details, access);
   const canApprove = pending === null && (oneClick || pairingCode.trim().length > 0);
 
   return (

@@ -453,6 +453,11 @@ export const AuthMcpApprovalDetails = Schema.Struct({
   environmentHost: Schema.String,
   /** Present when this browser's session may approve without a pairing code. */
   csrfToken: Schema.optionalKey(Schema.String),
+  /**
+   * What that session may approve in one click: only access whose scopes it
+   * holds. Anything else still needs a pairing code. Absent with `csrfToken`.
+   */
+  oneClickAccess: Schema.optionalKey(Schema.Array(AuthMcpClientAccess)),
 });
 export type AuthMcpApprovalDetails = typeof AuthMcpApprovalDetails.Type;
 

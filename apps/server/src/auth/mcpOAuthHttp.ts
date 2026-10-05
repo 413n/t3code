@@ -1,6 +1,7 @@
 import {
   AuthMcpApprovalError,
   type AuthMcpAuthorizationRequest,
+  AuthMcpClientAccess,
   EnvironmentHttpApi,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -9,6 +10,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as HttpEffect from "effect/http/HttpEffect";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
+import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as McpOAuth from "./McpOAuth.ts";
 import { renderErrorPage } from "./mcpOAuthHtml.ts";
 
@@ -121,7 +123,16 @@ export const layer = HttpApiBuilder.group(
               clientName: resolved.client.name,
               redirectHost: new URL(resolved.redirectUri).host,
               environmentHost: new URL(urls.issuer).host,
-              ...(session === undefined ? {} : { csrfToken: session.csrfToken }),
+              ...(session === undefined
+                ? {}
+                : {
+                    csrfToken: session.csrfToken,
+                    oneClickAccess: AuthMcpClientAccess.literals.filter((access) =>
+                      EnvironmentAuth.mcpClientScopes(access).every((scope) =>
+                        session.scopes.includes(scope),
+                      ),
+                    ),
+                  }),
             };
           }),
         )
