@@ -45,6 +45,7 @@ import {
   type ProviderAdapterV2Event,
   type ProviderAdapterV2EventSubscription,
   type ProviderAdapterV2SessionRuntime,
+  type ProviderAdapterV2Shape,
 } from "./ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -198,6 +199,8 @@ interface LiveSessionEntry {
    */
   readonly mcpCredentialIdByThread: ReadonlyMap<ThreadId, string>;
   readonly supportsMultipleProviderThreads: boolean;
+  /** The adapter that opened this session, to notice a settings rebuild. */
+  readonly adapter: ProviderAdapterV2Shape;
   readonly runtime: ProviderAdapterV2SessionRuntime;
   readonly exposedRuntime: ProviderAdapterV2SessionRuntime;
   readonly eventSubscribers: Ref.Ref<
@@ -1702,7 +1705,30 @@ export const layerWithOptions = (
                 }
               }
               const key = sessionKey(input.providerSessionId);
-              const existing = (yield* Ref.get(sessions)).get(key);
+              const live = (yield* Ref.get(sessions)).get(key);
+              // Editing a provider instance's settings rebuilds its adapter, and
+              // a session keeps the environment (API key, base URL) of the
+              // adapter that opened it. Replace a session from an older adapter
+              // so the next turn uses the current settings, unless a turn or
+              // background work is still running in it.
+              const outdated =
+                live !== undefined &&
+                live.busyCount === 0 &&
+                (yield* registry.get(live.runtime.instanceId).pipe(
+                  Effect.map((current) => current !== live.adapter),
+                  Effect.orElseSucceed(() => false),
+                )) &&
+                !(yield* (live.runtime.hasPendingBackgroundWork ?? Effect.succeed(false)).pipe(
+                  Effect.catchCause(() => Effect.succeed(false)),
+                ));
+              if (outdated) {
+                yield* releaseEntry({
+                  providerSessionId: input.providerSessionId,
+                  reason: "manual_shutdown",
+                  detail: `Provider instance ${live.runtime.instanceId} settings changed.`,
+                });
+              }
+              const existing = outdated ? undefined : live;
               if (existing !== undefined) {
                 if (
                   !existing.attachedThreadIds.has(input.threadId) &&
@@ -1810,6 +1836,7 @@ export const layerWithOptions = (
                 supportsMultipleProviderThreads:
                   runtime.providerSession.capabilities.sessions
                     .supportsMultipleProviderThreadsPerSession,
+                adapter,
                 runtime,
                 exposedRuntime,
                 eventSubscribers,
