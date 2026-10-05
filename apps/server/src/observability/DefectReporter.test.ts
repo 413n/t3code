@@ -94,8 +94,8 @@ describe("DefectReporter", () => {
         yield* ErrorReporter.report(Cause.interrupt());
         yield* ErrorReporter.report(Cause.die(new Error("bug")));
 
-        assert.equal(errorMessage(yield* Queue.take(logs)), "bug");
-        assert.equal(yield* Queue.size(logs), 0);
+        // Reporters log synchronously, so the logs are already written.
+        assert.deepEqual((yield* Queue.clear(logs)).map(errorMessage), ["bug"]);
       }).pipe(Effect.provide(DefectReporter.layer)),
     ),
   );

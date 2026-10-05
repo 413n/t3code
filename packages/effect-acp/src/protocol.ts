@@ -3,6 +3,7 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import type * as PlatformError from "effect/PlatformError";
@@ -366,8 +367,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const dispatchNotification = (notification: AcpIncomingNotification) =>
     Queue.offer(notificationQueue, notification).pipe(
       Effect.andThen(
+        // A failing or dying handler must not stop the reader, or every later
+        // message on the connection goes unanswered.
         options.onNotification
-          ? options.onNotification(notification).pipe(Effect.ignore)
+          ? options
+              .onNotification(notification)
+              .pipe(Effect.ignoreCause({ log: true, message: "ACP notification handler failed" }))
           : Effect.void,
       ),
       Effect.asVoid,
@@ -439,12 +444,26 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         method: message.tag,
       })
       .pipe(
-        Effect.matchEffect({
-          onFailure: (error) =>
-            respondWithError(
+        Effect.matchCauseEffect({
+          // A dying handler answers its own request, like a core handler, and
+          // leaves the reader running.
+          onFailure: (cause) => {
+            const failure = Cause.findErrorOption(cause);
+            return respondWithError(
               message.id,
-              AcpError.AcpRequestError.fromExtensionHandlerError(error, message.tag),
-            ),
+              Option.isSome(failure)
+                ? AcpError.AcpRequestError.fromExtensionHandlerError(failure.value, message.tag)
+                : AcpError.AcpRequestError.internalError(
+                    `ACP extension request handler failed for method '${message.tag}'`,
+                    undefined,
+                    {
+                      method: message.tag,
+                      operation: "handle-extension-request",
+                      cause: Cause.squash(cause),
+                    },
+                  ),
+            );
+          },
           onSuccess: (value) => respondWithSuccess(message.id, value),
         }),
       );

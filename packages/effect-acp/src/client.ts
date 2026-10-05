@@ -838,9 +838,15 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
     registration: BufferedNotificationHandler<A>,
     notification: A,
   ) =>
-    Effect.forEach(registration.handlers, (handler) => handler(notification).pipe(Effect.ignore), {
-      discard: true,
-    });
+    // One handler failing or dying does not stop the others, or the reader.
+    Effect.forEach(
+      registration.handlers,
+      (handler) =>
+        handler(notification).pipe(
+          Effect.ignoreCause({ log: true, message: "ACP notification handler failed" }),
+        ),
+      { discard: true },
+    );
 
   const flushBufferedNotifications = <A>(registration: BufferedNotificationHandler<A>) =>
     Effect.suspend(() => {

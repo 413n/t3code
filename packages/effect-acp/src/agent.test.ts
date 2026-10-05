@@ -35,8 +35,14 @@ const SessionCancelNotification = jsonRpcNotification(
 const ExtPingNotification = jsonRpcNotification("x/ping", Schema.Struct({ count: Schema.Number }));
 const ExtRequest = jsonRpcRequest("x/test", Schema.Struct({ hello: Schema.String }));
 const ExtResponse = jsonRpcResponse(Schema.Struct({ ok: Schema.Boolean }));
-/** A JSON-RPC error response; only its id and the presence of an error matter here. */
-const ErrorResponse = Schema.Struct({ id: Schema.Number, error: Schema.Unknown });
+/** A response whose cause is a handler's defect, as RpcServer encodes it. */
+const DieResponse = Schema.Struct({
+  id: Schema.Number,
+  error: Schema.Struct({
+    _tag: Schema.Literal("Cause"),
+    data: Schema.Tuple([Schema.Struct({ _tag: Schema.Literal("Die") })]),
+  }),
+});
 const decodeRequestPermissionRequest = Schema.decodeEffect(
   Schema.fromJsonString(RequestPermissionRequest),
 );
@@ -322,10 +328,9 @@ it.effect("effect-acp agent answers a request whose handler dies with an error f
       }),
     );
     const response = yield* Queue.take(output).pipe(
-      Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ErrorResponse))),
+      Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(DieResponse))),
     );
     assert.equal(response.id, 7);
-    assert.isNotNull(response.error);
     yield* Scope.close(scope, Exit.void);
   }),
 );

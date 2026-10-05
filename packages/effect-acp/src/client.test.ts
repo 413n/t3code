@@ -52,6 +52,14 @@ const ElicitationRequest = jsonRpcRequest("elicitation/create", AcpSchema.Create
 const ElicitationResponse = jsonRpcResponse(AcpSchema.CreateElicitationResponse);
 /** A JSON-RPC error response; only its id and the presence of an error matter here. */
 const ErrorResponse = Schema.Struct({ id: Schema.String, error: Schema.Unknown });
+/** A response whose cause is a handler's defect, as RpcServer encodes it. */
+const DieResponse = Schema.Struct({
+  id: Schema.String,
+  error: Schema.Struct({
+    _tag: Schema.Literal("Cause"),
+    data: Schema.Tuple([Schema.Struct({ _tag: Schema.Literal("Die") })]),
+  }),
+});
 const decodePromptRequestLine = Schema.decodeEffect(Schema.fromJsonString(PromptRequest));
 const XAiPromptCompleteNotification = jsonRpcNotification(
   "_x.ai/session/prompt_complete",
@@ -1132,16 +1140,28 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
     }),
   );
 
-  it.effect("answers a request whose handler dies with an error for that request", () =>
+  it.effect("answers each request whose handler dies, and keeps reading", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();
       const scope = yield* Scope.make();
       const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
-      yield* acp.handleRequestPermission(() => Effect.die(new Error("handler bug")));
+      const bug = () => Effect.die(new Error("handler bug"));
+      yield* acp.handleRequestPermission(bug);
+      yield* acp.handleExtRequest("x/dies", Schema.Unknown, bug);
+      yield* acp.handleSessionUpdate(bug);
+      const updates = yield* Queue.unbounded<string>();
+      yield* acp.handleSessionUpdate((notification) =>
+        Queue.offer(updates, notification.sessionId).pipe(Effect.asVoid),
+      );
+      yield* acp.handleExtRequest("x/test", Schema.Struct({ hello: Schema.String }), () =>
+        Effect.succeed({ ok: true }),
+      );
+      const send = <E>(line: Effect.Effect<Uint8Array, E>) =>
+        Effect.flatMap(line, (bytes) => Queue.offer(input, bytes));
+      const decodeDie = Schema.decodeEffect(Schema.fromJsonString(DieResponse));
 
-      yield* Queue.offer(
-        input,
-        yield* encodeJsonl(PermissionRequest, {
+      yield* send(
+        encodeJsonl(PermissionRequest, {
           jsonrpc: "2.0",
           id: "permission-a",
           method: "session/request_permission",
@@ -1157,11 +1177,50 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           headers: [],
         }),
       );
-      const response = yield* Queue.take(output).pipe(
+      assert.equal((yield* Queue.take(output).pipe(Effect.flatMap(decodeDie))).id, "permission-a");
+
+      yield* send(
+        encodeJsonl(jsonRpcRequest("x/dies", Schema.Unknown), {
+          jsonrpc: "2.0",
+          id: "ext-a",
+          method: "x/dies",
+          params: {},
+          headers: [],
+        }),
+      );
+      const extDied = yield* Queue.take(output).pipe(
         Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ErrorResponse))),
       );
-      assert.equal(response.id, "permission-a");
-      assert.isNotNull(response.error);
+      assert.equal(extDied.id, "ext-a");
+
+      yield* send(
+        encodeJsonl(SessionUpdateNotification, {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "session-1",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } },
+          },
+        }),
+      );
+
+      // The next session handler still ran.
+      assert.equal(yield* Queue.take(updates), "session-1");
+
+      // The reader survived all three: a later request is still answered.
+      yield* send(
+        encodeJsonl(ExtRequest, {
+          jsonrpc: "2.0",
+          id: "ext-b",
+          method: "x/test",
+          params: { hello: "world" },
+          headers: [],
+        }),
+      );
+      const answered = yield* Queue.take(output).pipe(
+        Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ExtResponse))),
+      );
+      assert.deepEqual([answered.id, answered.result], ["ext-b", { ok: true }]);
       yield* Scope.close(scope, Exit.void);
     }),
   );
