@@ -14,6 +14,7 @@ import * as GitHubCredentials from "./GitHubCredentials.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
 import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as ServerSettings from "../serverSettings.ts";
 
 const NOW = Date.parse("2026-10-05T12:00:00.000Z");
 
@@ -343,6 +344,7 @@ describe("GitHubCredentials", () => {
     GitHubCredentials.layer.pipe(
       Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run })),
       Layer.provide(NodeServices.layer),
+      Layer.provide(ServerSettings.layerTest()),
     );
 
   it.effect("fails with GitHubCliMissingError when gh is not on PATH", () =>
