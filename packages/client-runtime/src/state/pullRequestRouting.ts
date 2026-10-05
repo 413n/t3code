@@ -19,7 +19,7 @@ import {
 import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
 import * as ConnectionProfileStore from "../connection/profileStore.ts";
 import {
-  request,
+  requestGuarded as request,
   EnvironmentRpcUnavailableError,
   type EnvironmentRpcInput,
   type EnvironmentUnaryRpcTag,

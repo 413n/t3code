@@ -45,7 +45,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { WorktreeBaseBranchPicker } from "../WorktreeBaseBranchPicker";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
-import { useEnvironmentScope, readEnvironmentScope } from "~/state/session";
+import { readEnvironmentScope } from "~/state/session";
 import { useSettingsScope } from "./SettingsScopeContext";
 import {
   matchesScheduledTaskScope,
@@ -221,9 +221,8 @@ export function ScheduledTasksSettings(target: {
     setEditor({ environmentId, task });
   }, []);
   const defaultEnvironment = environment ?? connectedEnvironments[0];
-  const canCreate = useEnvironmentScope(
-    defaultEnvironment?.environmentId ?? null,
-    AuthOrchestrationOperateScope,
+  const canCreate = useAtomValue(
+    serverEnvironment.upsertScheduledTask.permissionAtom(defaultEnvironment?.environmentId ?? null),
   );
   return (
     <SettingsPageContainer>
@@ -383,7 +382,9 @@ function ScheduledTaskRow({
   readonly task: ScheduledTask;
   readonly onEdit: () => void;
 }) {
-  const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+  const canOperate = useAtomValue(
+    serverEnvironment.upsertScheduledTask.permissionAtom(environmentId),
+  );
   const [busy, setBusy] = useState(false);
   const toggle = useAtomCommand(serverEnvironment.setScheduledTaskEnabled, {
     label: "scheduled task enabled",
@@ -507,7 +508,9 @@ function ScheduledTaskEditorDialog({
   const settings = useEnvironmentSettings(environmentId);
   const providers =
     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
-  const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+  const canOperate = useAtomValue(
+    serverEnvironment.upsertScheduledTask.permissionAtom(environmentId),
+  );
   const upsertTask = useAtomCommand(serverEnvironment.upsertScheduledTask, {
     label: "scheduled task upsert",
   });
