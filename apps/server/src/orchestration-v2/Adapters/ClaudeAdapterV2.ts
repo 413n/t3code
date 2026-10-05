@@ -1506,7 +1506,7 @@ export interface ClaudeBypassAvailability {
   readonly autoDisabled: boolean;
 }
 
-export const CLAUDE_BYPASS_FULLY_AVAILABLE: ClaudeBypassAvailability = {
+const CLAUDE_BYPASS_FULLY_AVAILABLE: ClaudeBypassAvailability = {
   bypassDisabled: false,
   autoDisabled: false,
 };
@@ -1589,7 +1589,7 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
 // turn the fix off for the common default-instance case.
 // Resolution failures fail closed: treat bypass as disabled rather than risk
 // requesting a mode a hidden policy actually forbids.
-export function resolveClaudeBypassAvailability(
+function resolveClaudeBypassAvailability(
   cwd: string | null,
   options: { readonly hasCustomClaudeHome: boolean },
 ): Effect.Effect<ClaudeBypassAvailability> {
