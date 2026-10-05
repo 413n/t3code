@@ -7467,6 +7467,14 @@ export function makeClaudeAdapterV2(
             yield* Ref.set(activeTurn, context);
             const bypassAvailability = yield* Ref.get(claudeBypassAvailabilityCache);
             if (
+              // The cache is keyed on cwd, not on what this turn actually
+              // requested: a full-access turn's cached "bypass is disabled"
+              // for this cwd must not announce a downgrade on a later
+              // approval-required or Auto turn in the same cwd (or a sibling
+              // thread sharing this session), which never asked for bypass
+              // in the first place.
+              permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) ===
+                "bypassPermissions" &&
               bypassAvailability !== null &&
               bypassAvailability.cwd === turnInput.runtimePolicy.cwd &&
               bypassAvailability.availability.bypassDisabled
