@@ -3949,6 +3949,21 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }),
     );
 
+  const listWorktreePaths: GitVcsDriver.GitVcsDriver["Service"]["listWorktreePaths"] = (cwd) =>
+    runGitStdout("GitVcsDriver.listWorktreePaths", cwd, [
+      "worktree",
+      "list",
+      "--porcelain",
+      "-z",
+    ]).pipe(
+      Effect.map((stdout) =>
+        stdout
+          .split("\0")
+          .filter((field) => field.startsWith("worktree "))
+          .map((field) => path.resolve(cwd, field.slice("worktree ".length))),
+      ),
+    );
+
   const withListRefsInvalidation = <A, E>(
     cwd: string,
     effect: Effect.Effect<A, E>,
@@ -4019,5 +4034,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     switchRef: (input) => withListRefsInvalidation(input.cwd, switchRef(input)),
     initRepo: initRepoWithListRefsInvalidation,
     listLocalBranchNames,
+    listWorktreePaths,
   });
 });

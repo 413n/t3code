@@ -1,11 +1,13 @@
 import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Repositories from "../../../sourceControl/SourceControlRepositoryService.ts";
+import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { resolveRuntimeMode } from "../../OrchestratorMcpService.ts";
 import {
   newCommandId,
@@ -27,6 +29,30 @@ function projectFailure(error: Project.ProjectServiceError) {
         : "The project is not empty; force=true is required to delete it.";
   return new OrchestratorMcpFailure({ code: "invalid_request", message });
 }
+
+/**
+ * An existing checkout a launch may bind: one of the project's own git
+ * worktrees. Without this check a launch could point an agent at any directory
+ * on the machine.
+ */
+const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
+  workspaceRoot: string,
+  worktreePath: string,
+) {
+  const git = yield* GitVcsDriver.GitVcsDriver;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const real = (path: string) => fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
+  const worktrees = yield* git.listWorktreePaths(workspaceRoot).pipe(
+    Effect.flatMap((paths) => Effect.forEach(paths, real)),
+    Effect.orElseSucceed((): ReadonlyArray<string> => []),
+  );
+  if (!worktrees.includes(yield* real(worktreePath)))
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message:
+        "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
+    });
+});
 
 const access = Effect.gen(function* () {
   yield* readCaller();
@@ -88,16 +114,25 @@ export const layer = ProjectToolkit.toLayer({
               ),
             )).projectId
           : yield* resolveProjectId(context, input.projectId);
+      const readProject = Project.ProjectService.pipe(
+        Effect.flatMap((projects) => projects.getById(projectId)),
+        Effect.mapError(unavailable),
+        Effect.map(Option.getOrUndefined),
+      );
+      if (input.workspaceStrategy?.type === "existing_worktree") {
+        const project = yield* readProject;
+        if (project === undefined)
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "The project was not found.",
+          });
+        yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
+      }
       const modelSelection =
         input.modelSelection ??
         caller?.modelSelection ??
-        (yield* Project.ProjectService.pipe(
-          Effect.flatMap((projects) => projects.getById(projectId)),
-          Effect.mapError(unavailable),
-          Effect.map((project) =>
-            Option.getOrUndefined(Option.flatMapNullishOr(project, (p) => p.defaultModelSelection)),
-          ),
-        ));
+        (yield* readProject)?.defaultModelSelection ??
+        undefined;
       if (modelSelection === undefined)
         return yield* new OrchestratorMcpFailure({
           code: "invalid_request",
