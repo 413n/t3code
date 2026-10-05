@@ -23,7 +23,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { ProjectHandlersLive } from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
 
-it.effect("attributes a launched thread's first message to the calling thread", () =>
+it.effect("attributes a launched thread and its first message to the calling thread", () =>
   Effect.gen(function* () {
     const sourceThreadId = ThreadId.make("source-thread");
     const projectId = ProjectId.make("project");
@@ -41,6 +41,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       deletedAt: null,
     } as OrchestrationV2ThreadShell;
     let launchedSender: ThreadId | undefined;
+    let launchedBy: ThreadId | undefined;
     const dependencies = Layer.mergeAll(
       NodeCrypto.layer,
       Layer.succeed(McpInvocationContext.McpInvocationContext, {
@@ -61,6 +62,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
         launch: (input) => {
           launchedSender = input.initialMessage?.senderThreadId;
+          launchedBy = input.groupedUnderThreadId;
           return Effect.succeed({
             threadId: input.threadId,
             projection: {
@@ -86,6 +88,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
     expect(result.at(-1)?.result).toMatchObject({ projectId, modelSelection });
     expect(launchedSender).toBe(sourceThreadId);
+    expect(launchedBy).toBe(sourceThreadId);
   }),
 );
 

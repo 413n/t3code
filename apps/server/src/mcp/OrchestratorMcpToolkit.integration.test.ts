@@ -1893,6 +1893,8 @@ describe("orchestrator MCP toolkit", () => {
               senderThreadId: parentThreadId,
             });
             const emptyProjection = yield* orchestrator.getThreadProjection(emptyThread.threadId);
+            // Clients nest launched threads under the thread that launched them.
+            expect(emptyProjection.thread.groupedUnderThreadId).toBe(parentThreadId);
             expect(emptyProjection.thread.lineage).toEqual({
               parentThreadId: null,
               relationshipToParent: null,

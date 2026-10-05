@@ -130,6 +130,8 @@ export interface UpdateThreadMetadataInput extends ThreadCommandInput {
   readonly regenerateTitle?: boolean;
   /** Link (object) or unlink (null) a pull request (#8160). */
   readonly linkedPullRequest?: ThreadLinkedPullRequest | null;
+  /** Move the thread under a launcher's group (id) or out of its group (null). */
+  readonly groupedUnderThreadId?: ThreadId | null;
 }
 
 export interface SetThreadRuntimeModeInput extends ThreadCommandInput {
@@ -566,7 +568,8 @@ export const updateThreadMetadata = Effect.fn("EnvironmentCommands.updateThreadM
       input.worktreePath !== undefined ||
       input.regenerateTitle !== undefined ||
       input.linkedPullRequest !== undefined ||
-      input.limitRecovery !== undefined
+      input.limitRecovery !== undefined ||
+      input.groupedUnderThreadId !== undefined
     ) {
       result = yield* dispatch({
         type: "thread.metadata.update",
@@ -580,6 +583,9 @@ export const updateThreadMetadata = Effect.fn("EnvironmentCommands.updateThreadM
         ...(input.linkedPullRequest === undefined
           ? {}
           : { linkedPullRequest: input.linkedPullRequest }),
+        ...(input.groupedUnderThreadId === undefined
+          ? {}
+          : { groupedUnderThreadId: input.groupedUnderThreadId }),
       });
     }
     if (input.modelSelection !== undefined) {
