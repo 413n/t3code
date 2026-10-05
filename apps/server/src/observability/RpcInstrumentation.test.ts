@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  type AuthEnvironmentScope,
   ScheduledTaskError,
   ScheduledTaskId,
   WS_METHODS,
@@ -20,7 +21,8 @@ import * as Tracer from "effect/Tracer";
 import * as RpcTest from "effect/unstable/rpc/RpcTest";
 import * as TestClock from "effect/testing/TestClock";
 
-import { RPC_REQUIRED_SCOPES, wsRpcGuardLayer } from "../auth/RpcAuthorization.ts";
+import { RPC_REQUIRED_SCOPES, rpcScopeAuthorizationLayer } from "../auth/RpcAuthorization.ts";
+import { rpcInstrumentationLayer } from "./RpcInstrumentation.ts";
 
 type WsRpcMethod = keyof typeof RPC_REQUIRED_SCOPES;
 
@@ -33,7 +35,10 @@ const groupOf = <const Tags extends ReadonlyArray<WsRpcMethod>>(...tags: Tags) =
     ),
   );
 
-const readOnlyGuard = wsRpcGuardLayer([AuthOrchestrationReadScope]);
+/** The middleware ws.ts installs for a connection with `scopes`. */
+const connectionMiddleware = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+  Layer.merge(rpcScopeAuthorizationLayer(scopes), rpcInstrumentationLayer);
+const readOnlyConnection = connectionMiddleware([AuthOrchestrationReadScope]);
 const taskId = ScheduledTaskId.make("scheduled-task:instrumented");
 const rpcSpanDefaults = { "rpc.transport": "websocket", "rpc.system": "effect-rpc" };
 
@@ -64,7 +69,7 @@ const rpcSpans = (ended: ReadonlyArray<Tracer.NativeSpan>) =>
   ended.filter((span) => span.name.startsWith("ws.rpc."));
 
 // RpcTest keeps Effect's own RpcServer/RpcClient spans, which ws.ts turns off with
-// `disableTracing: true`. Everything else comes from the guard or the handlers.
+// `disableTracing: true`. Everything else comes from the middleware or the handlers.
 const appSpans = (ended: ReadonlyArray<Tracer.NativeSpan>) =>
   ended.filter((span) => !/^Rpc(Server|Client)\./.test(span.name));
 
@@ -95,7 +100,7 @@ const requestDuration = (snapshots: ReadonlyArray<Metric.Metric.Snapshot>, metho
       snapshot.attributes?.["method"] === method,
   )?.state;
 
-describe("WS RPC guard instrumentation", () => {
+describe("WS RPC instrumentation middleware", () => {
   it.effect("records one span and request metric per call, including rejected calls", () =>
     withTelemetry((ended) =>
       Effect.gen(function* () {
@@ -119,7 +124,7 @@ describe("WS RPC guard instrumentation", () => {
                 ),
               ),
               group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () =>
-                Effect.die("the guard let a rejected call through"),
+                Effect.die("authorization let a rejected call through"),
               ),
               group.toLayerHandler(WS_METHODS.pullRequestsSubscribeRefreshes, () =>
                 Stream.make(1, 2),
@@ -131,7 +136,7 @@ describe("WS RPC guard instrumentation", () => {
                 ),
               ),
               group.toLayerHandler(WS_METHODS.serverGetSettings, () => Effect.die("broken")),
-              readOnlyGuard,
+              readOnlyConnection,
             ),
           ),
         );
@@ -259,7 +264,7 @@ describe("WS RPC guard instrumentation", () => {
                   ),
                 ),
               ),
-              readOnlyGuard,
+              readOnlyConnection,
             ),
           ),
         );
@@ -307,7 +312,7 @@ describe("WS RPC guard instrumentation", () => {
                   message: Option.none(),
                 }).pipe(Effect.withSpan("signalProcess.child")),
               ),
-              wsRpcGuardLayer([AuthOrchestrationReadScope, AuthOrchestrationOperateScope]),
+              connectionMiddleware([AuthOrchestrationReadScope, AuthOrchestrationOperateScope]),
             ),
           ),
         );

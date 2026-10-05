@@ -1,8 +1,14 @@
-import { ORCHESTRATION_V2_WS_METHODS, WS_METHODS, type WsRpcGroup } from "@t3tools/contracts";
+import {
+  ORCHESTRATION_V2_WS_METHODS,
+  RpcInstrumentation,
+  WS_METHODS,
+  type WsRpcGroup,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import type * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as References from "effect/References";
 import type * as Rpc from "effect/unstable/rpc/Rpc";
@@ -269,3 +275,8 @@ export const instrumentRpc = <A, E, R>(
     }),
   );
 };
+
+/** Instruments every WebSocket RPC. */
+export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect, { rpc }) =>
+  instrumentRpc(rpc, effect),
+);

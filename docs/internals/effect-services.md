@@ -29,10 +29,10 @@ message) are fine next to the service; the capability itself is the method.
     .pipe(Effect.mapError((cause) => new ProjectCreateNewError({ cause }))),
 ```
 
-Handlers don't add their own spans or request metrics. The `WsRpcGroup` middleware
-([`RpcAuthorization.ts`](../../apps/server/src/auth/RpcAuthorization.ts)) authorizes and instruments
-every call. A handler with per-call context, such as a thread id, adds it with
-`Effect.annotateCurrentSpan`.
+Handlers don't add their own spans or request metrics. `WsRpcGroup` middleware authorizes every
+call ([`RpcAuthorization.ts`](../../apps/server/src/auth/RpcAuthorization.ts)) and instruments it
+([`RpcInstrumentation.ts`](../../apps/server/src/observability/RpcInstrumentation.ts)). A handler
+with per-call context, such as a thread id, adds it with `Effect.annotateCurrentSpan`.
 
 ## Shape of a service module
 

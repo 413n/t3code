@@ -206,8 +206,9 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   requiredScopeForDeviceList,
   rpcAuthorizationError,
-  wsRpcGuardLayer,
+  rpcScopeAuthorizationLayer,
 } from "./auth/RpcAuthorization.ts";
+import { rpcInstrumentationLayer } from "./observability/RpcInstrumentation.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -1310,8 +1311,8 @@ const makeWsRpcLayer = (
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const resourceTelemetry = yield* ResourceTelemetry.ResourceTelemetry;
       const relayClient = yield* RelayClient.RelayClient;
-      // WsRpcGuard checks each RPC's declared scope before its handler runs.
-      // This covers the one RPC whose scope depends on its input.
+      // RpcScopeAuthorization checks each RPC's declared scope before its handler
+      // runs. This covers the one RPC whose scope depends on its input.
       const authorizeEffect = <A, E, R>(
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
@@ -3128,7 +3129,9 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
           yield* RpcServer.make(ServerWsRpcGroup, { disableTracing: true }).pipe(
             Effect.provideService(RpcServer.Protocol, withTerminalOutputWindow(protocol)),
-            Effect.provide(wsRpcGuardLayer(session.scopes)),
+            Effect.provide(
+              Layer.merge(rpcScopeAuthorizationLayer(session.scopes), rpcInstrumentationLayer),
+            ),
             Effect.forkScoped,
           );
           // @effect-diagnostics-next-line returnEffectInGen:off
