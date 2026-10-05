@@ -5,6 +5,8 @@ import { View, type ViewInstance } from "react-native";
 type ComposerPopoverHostValue = {
   readonly hostRef: RefObject<ViewInstance | null>;
   readonly setContent: (content: ReactNode) => void;
+  /** Changes when the host resizes, which moves the bottom-anchored composer. */
+  readonly layoutVersion: number;
 };
 
 const ComposerPopoverHostContext = createContext<ComposerPopoverHostValue | null>(null);
@@ -22,11 +24,18 @@ export function useComposerPopoverHost() {
 export function ComposerPopoverHost(props: { readonly children: ReactNode }) {
   const hostRef = useRef<ViewInstance>(null);
   const [content, setContent] = useState<ReactNode>(null);
-  const value = useMemo(() => ({ hostRef, setContent }), []);
+  const [layoutVersion, setLayoutVersion] = useState(0);
+  const value = useMemo(() => ({ hostRef, setContent, layoutVersion }), [layoutVersion]);
 
   return (
     <ComposerPopoverHostContext.Provider value={value}>
-      <View ref={hostRef} collapsable={false} pointerEvents="box-none" className="absolute inset-0">
+      <View
+        ref={hostRef}
+        collapsable={false}
+        pointerEvents="box-none"
+        className="absolute inset-0"
+        onLayout={() => setLayoutVersion((version) => version + 1)}
+      >
         {props.children}
         {content}
       </View>
