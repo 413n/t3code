@@ -1,9 +1,14 @@
+import { createCommandPermissions } from "./commandPermissions.ts";
+import { RpcPermissionGuard } from "../rpc/client.ts";
+import { vi } from "vite-plus/test";
 import {
   EnvironmentId,
+  AuthSourceControlWriteScope,
   ProjectId,
   PullRequestOperationError,
   WS_METHODS,
   type PullRequestStack,
+  type AuthSessionState,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Data from "effect/Data";
@@ -194,6 +199,7 @@ for (const scenario of [
             : route(WS_METHODS.pullRequestsRunAction, input)
         ).pipe(
           Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
           Effect.provideService(GitHubRoutingPermissions, {
             ...trustedRouting,
             get: () => Effect.succeed(trusted ? "read-write" : "off"),
@@ -293,6 +299,7 @@ it.effect.each(["github", "gitlab", "bitbucket", "azure-devops"] as const)(
         }).pipe(
           Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
           Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
           Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         );
         const environment = provider === "github" ? "local" : "origin";
@@ -459,10 +466,12 @@ it.effect.each(["default", "origin-off", "destination-off", "read-only"] as cons
         }).pipe(
           Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
           Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
         );
         yield* permission === "default"
           ? request
           : request.pipe(
+              Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
               Effect.provideService(GitHubRoutingPermissions, {
                 ...trustedRouting,
                 get: (entry) =>
@@ -581,6 +590,7 @@ it.effect.each(
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         // This also represents a user enabling the stale catalog entry after re-resolution.
         Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+        Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
       );
       yield* stored === "unavailable"
         ? route
@@ -636,6 +646,7 @@ it.live.each(["origin", "alternate"] as const)(
           Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
           Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
           Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
           Effect.flip,
         );
         expect(error._tag).toBe("PullRequestOperationError");
@@ -697,6 +708,7 @@ it.effect.each(
       }).pipe(
         Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
         Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+        Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
       );
       const fiber = yield* request.pipe(Effect.forkChild);
@@ -753,6 +765,7 @@ it.live("keeps source workspace metadata when an alternate answers a detail read
       }).pipe(
         Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
         Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+        Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
       );
       expect(result).toEqual({
@@ -840,6 +853,7 @@ it.live(
         }).pipe(
           Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
           Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
           Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         );
       }),
@@ -1235,6 +1249,7 @@ it.effect.each([false, true])(
         }).pipe(
           Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
           Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+          Effect.provideService(RpcPermissionGuard, { authorize: () => Effect.void }),
           Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         );
         expect(result).toEqual({ state: "open", checks: [] });
@@ -1563,6 +1578,81 @@ it.effect("refreshes stack state after reopening and head SHAs after a turn", ()
       yield* PubSub.publish(refreshEvents, 1);
       yield* refreshed.await;
       expect((yield* AtomRegistry.getResult(registry, stack))?.layers[0]?.headSha).toBe("new-head");
+    }),
+  ),
+);
+
+// Transport fixtures have a source-control-only session; authorization edge cases
+// are exercised by commandPermissions.test.ts.
+vi.mock("./session.ts", () => ({
+  createEnvironmentSessionAtoms: () => ({ sessionStateAtom: grantedSessions }),
+}));
+const grantedSessions = Atom.family((_id: EnvironmentId) =>
+  Atom.make<AsyncResult.AsyncResult<AuthSessionState>>(
+    AsyncResult.success({
+      authenticated: true,
+      auth: {
+        policy: "remote-reachable" as const,
+        bootstrapMethods: [],
+        sessionMethods: [],
+        sessionCookieName: "test",
+      },
+      scopes: [AuthSourceControlWriteScope],
+    }),
+  ),
+);
+
+it.effect("denies a routed write when only the origin has source-control permission", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let writes = 0;
+      const identity = { host: "github.com", provider: "github", viewer: "test", accountId: "123" };
+      const client = {
+        [WS_METHODS.pullRequestsRouting]: () => Effect.succeed(identity),
+        [WS_METHODS.pullRequestsRoutingIdentity]: () => Effect.succeed(identity),
+        [WS_METHODS.pullRequestsRunAction]: () =>
+          Effect.sync(() => {
+            writes++;
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const fixture = yield* makeTestRuntime(client, client);
+      const local = EnvironmentId.make("local-environment");
+      const stop = fixture.registry.mount(grantedSessions(local));
+      yield* Effect.addFinalizer(() => Effect.sync(stop));
+      fixture.registry.set(
+        grantedSessions(local),
+        AsyncResult.success({
+          authenticated: true,
+          scopes: [],
+          auth: {
+            policy: "remote-reachable" as const,
+            bootstrapMethods: [],
+            sessionMethods: [],
+            sessionCookieName: "test",
+          },
+        }),
+      );
+      const error = yield* createPullRequestRouter()(WS_METHODS.pullRequestsRunAction, {
+        projectId: ProjectId.make("project"),
+        repository: "acme/repo",
+        number: 1,
+        action: "merge",
+      }).pipe(
+        Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, fixture.environmentRegistry),
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, fixture.supervisor),
+        Effect.provideService(GitHubRoutingPermissions, trustedRouting),
+        Effect.provideService(RpcPermissionGuard, {
+          authorize: (id, method, input) =>
+            createCommandPermissions(fixture.runtime, method).authorize(
+              fixture.registry,
+              id,
+              input,
+            ),
+        }),
+        Effect.flip,
+      );
+      expect(error._tag).toBe("EnvironmentAuthorizationError");
+      expect(writes).toBe(0);
     }),
   ),
 );

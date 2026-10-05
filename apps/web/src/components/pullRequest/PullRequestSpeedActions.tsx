@@ -1,5 +1,5 @@
-import { useEnvironmentScope } from "~/state/session";
-import { AuthSourceControlWriteScope, type PullRequestAction } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
+import { type PullRequestAction } from "@t3tools/contracts";
 import { Effect } from "effect";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
@@ -31,7 +31,9 @@ export function PullRequestSpeedActions({
   visible: boolean;
   onActed: (result: PullRequestSpeedActionResult) => void;
 }) {
-  const canWrite = useEnvironmentScope(entry.environmentId, AuthSourceControlWriteScope);
+  const canWrite = useAtomValue(
+    pullRequestEnvironment.runAction.permissionAtom(entry.environmentId),
+  );
   const resolveProjectDefault = usePullRequestDefaultMergeMethodResolver(
     entry.environmentId,
     entry.projectId,
