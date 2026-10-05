@@ -395,7 +395,7 @@ layer("OrchestrationEventStore", (it) => {
 
   it.effect("readAgentEvents with skipUnknownEventTypes drops rows of an unknown event type", () =>
     Effect.gen(function* () {
-      const store = yield* OrchestrationEventStore;
+      const store = yield* OrchestrationEventStore.OrchestrationEventStore;
       const sql = yield* SqlClient.SqlClient;
       const threadId = ThreadId.make("thread:skip-unknown");
       const baseline = yield* store.latestApplicationSequence;
@@ -468,7 +468,7 @@ layer("OrchestrationEventStore", (it) => {
     "readAgentEvents with skipUnknownEventTypes still fails a known type with a broken payload",
     () =>
       Effect.gen(function* () {
-        const store = yield* OrchestrationEventStore;
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
         const sql = yield* SqlClient.SqlClient;
         const threadId = ThreadId.make("thread:skip-unknown-broken-known");
         const baseline = yield* store.latestApplicationSequence;
