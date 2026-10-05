@@ -10,6 +10,7 @@ import {
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
@@ -103,6 +104,8 @@ describe("WS RPC guard instrumentation", () => {
           WS_METHODS.scheduledTasksList,
           WS_METHODS.serverRetryResourceTelemetry,
           WS_METHODS.pullRequestsSubscribeRefreshes,
+          WS_METHODS.scheduledTasksSubscribe,
+          WS_METHODS.serverGetSettings,
         );
         const client = yield* RpcTest.makeClient(group).pipe(
           Effect.provide(
@@ -119,6 +122,13 @@ describe("WS RPC guard instrumentation", () => {
               group.toLayerHandler(WS_METHODS.pullRequestsSubscribeRefreshes, () =>
                 Stream.make(1, 2),
               ),
+              group.toLayerHandler(WS_METHODS.scheduledTasksSubscribe, () =>
+                Stream.concat(
+                  Stream.make({ tasks: [] }),
+                  Stream.fail(new ScheduledTaskError({ message: "Subscription failed." })),
+                ),
+              ),
+              group.toLayerHandler(WS_METHODS.serverGetSettings, () => Effect.die("broken")),
               readOnlyGuard,
             ),
           ),
@@ -136,6 +146,12 @@ describe("WS RPC guard instrumentation", () => {
           client[WS_METHODS.pullRequestsSubscribeRefreshes]({}),
         );
         assert.deepStrictEqual(Array.from(refreshes), [1, 2]);
+        const subscribeError = yield* Stream.runDrain(
+          client[WS_METHODS.scheduledTasksSubscribe]({}),
+        ).pipe(Effect.flip);
+        assert.equal(subscribeError._tag, "ScheduledTaskError");
+        const settingsExit = yield* Effect.exit(client[WS_METHODS.serverGetSettings]({}));
+        assert.isTrue(Exit.hasDies(settingsExit));
 
         assert.deepStrictEqual(
           rpcSpans(ended).map((span) => [span.name, Object.fromEntries(span.attributes)]),
@@ -173,6 +189,22 @@ describe("WS RPC guard instrumentation", () => {
                 "rpc.aggregate": "pull-requests",
               },
             ],
+            [
+              "ws.rpc.scheduledTasks.subscribe",
+              {
+                ...rpcSpanDefaults,
+                "rpc.method": WS_METHODS.scheduledTasksSubscribe,
+                "rpc.aggregate": "scheduledTasks",
+              },
+            ],
+            [
+              "ws.rpc.server.getSettings",
+              {
+                ...rpcSpanDefaults,
+                "rpc.method": WS_METHODS.serverGetSettings,
+                "rpc.aggregate": "server",
+              },
+            ],
           ],
         );
         assert.deepStrictEqual(rpcSpans(ended).map(exitTag), [
@@ -180,6 +212,8 @@ describe("WS RPC guard instrumentation", () => {
           "Failure",
           "Failure",
           "Success",
+          "Failure",
+          "Failure",
         ]);
         const probeSpan = rpcSpans(ended)[0];
         const child = ended.find((span) => span.name === "serverProbe.child");
@@ -192,8 +226,10 @@ describe("WS RPC guard instrumentation", () => {
             requestCount(snapshots, WS_METHODS.scheduledTasksList, "failure"),
             requestCount(snapshots, WS_METHODS.serverRetryResourceTelemetry, "failure"),
             requestCount(snapshots, WS_METHODS.pullRequestsSubscribeRefreshes, "success"),
+            requestCount(snapshots, WS_METHODS.scheduledTasksSubscribe, "failure"),
+            requestCount(snapshots, WS_METHODS.serverGetSettings, "failure"),
           ].map((state) => state?.count),
-          [1, 1, 1, 1],
+          [1, 1, 1, 1, 1, 1],
         );
         for (const method of group.requests.keys()) {
           assert.equal(requestDuration(snapshots, method)?.count, 1);
