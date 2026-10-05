@@ -1099,7 +1099,7 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
     }),
   );
 
-  yield* RpcServer.make(AcpRpcs.CompatClientRpcs).pipe(
+  yield* RpcServer.make(AcpRpcs.CompatClientRpcs, { disableFatalDefects: true }).pipe(
     Effect.provideService(RpcServer.Protocol, transport.serverProtocol),
     Effect.provide(clientHandlerLayer),
     Effect.forkScoped,

@@ -421,7 +421,7 @@ export const make = Effect.fn("effect-acp/AcpAgent.make")(function* (
     }),
   );
 
-  yield* RpcServer.make(AcpRpcs.AgentRpcs).pipe(
+  yield* RpcServer.make(AcpRpcs.AgentRpcs, { disableFatalDefects: true }).pipe(
     Effect.provideService(RpcServer.Protocol, transport.serverProtocol),
     Effect.provide(agentHandlerLayer),
     Effect.forkScoped,

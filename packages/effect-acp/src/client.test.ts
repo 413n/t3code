@@ -50,6 +50,8 @@ const PermissionRequest = jsonRpcRequest(
 const PermissionResponse = jsonRpcResponse(AcpSchema.RequestPermissionResponse);
 const ElicitationRequest = jsonRpcRequest("elicitation/create", AcpSchema.CreateElicitationRequest);
 const ElicitationResponse = jsonRpcResponse(AcpSchema.CreateElicitationResponse);
+/** A JSON-RPC error response; only its id and the presence of an error matter here. */
+const ErrorResponse = Schema.Struct({ id: Schema.String, error: Schema.Unknown });
 const decodePromptRequestLine = Schema.decodeEffect(Schema.fromJsonString(PromptRequest));
 const XAiPromptCompleteNotification = jsonRpcNotification(
   "_x.ai/session/prompt_complete",
@@ -1126,6 +1128,40 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           { requestId: "permission-b", method: "session/request_permission" },
         ],
       );
+      yield* Scope.close(scope, Exit.void);
+    }),
+  );
+
+  it.effect("answers a request whose handler dies with an error for that request", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const scope = yield* Scope.make();
+      const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* acp.handleRequestPermission(() => Effect.die(new Error("handler bug")));
+
+      yield* Queue.offer(
+        input,
+        yield* encodeJsonl(PermissionRequest, {
+          jsonrpc: "2.0",
+          id: "permission-a",
+          method: "session/request_permission",
+          params: {
+            sessionId: "session-1",
+            title: "Tool",
+            subject: {
+              type: "tool_call" as const,
+              toolCall: { toolCallId: "tool-1", title: "Tool" },
+            },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }],
+          },
+          headers: [],
+        }),
+      );
+      const response = yield* Queue.take(output).pipe(
+        Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ErrorResponse))),
+      );
+      assert.equal(response.id, "permission-a");
+      assert.isNotNull(response.error);
       yield* Scope.close(scope, Exit.void);
     }),
   );

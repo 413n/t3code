@@ -205,6 +205,7 @@ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolve
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
+import * as DefectReporter from "./observability/DefectReporter.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
@@ -3763,9 +3764,9 @@ const makeWsRpcLayer = (
     }),
   );
 
-// A handler defect fails only its own request. RpcServer's default sends a
-// socket-level Defect frame instead, and the client ends every pending request on
-// the socket with it. DefectReporter logs the defect either way.
+// A defect in a handler's effect fails only its own request. RpcServer's default
+// sends a socket-level Defect frame instead, and the client ends every pending
+// request on the socket with it. DefectReporter logs these defects.
 export const WS_RPC_SERVER_OPTIONS = {
   disableTracing: true,
   disableFatalDefects: true,
@@ -3829,6 +3830,9 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               previewAutomationBroker,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
+              // Request fibers run in the handlers' context, so this reporter sees
+              // their defects and nothing else on the server.
+              Layer.provide(DefectReporter.layer),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(AgentSessionScanner.layer),
               Layer.provide(ProviderMaintenanceRunner.layer),
