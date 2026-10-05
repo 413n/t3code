@@ -193,8 +193,13 @@ export function ThreadArrangementSheet(props: { onClose: () => void }) {
     const pinned = getThreadListV2OrderedSection({ ...shared, section: "pinned" });
     const active = getThreadListV2OrderedSection({ ...shared, section: "active" });
     const visible = new Set([...pinned, ...active].map(keyOf));
+    // Live threads grouped under another one move with their group, so only
+    // snoozed and settled threads fill the parked lists.
     const parked = threads.filter(
-      (thread) => thread.archivedAt === null && !visible.has(keyOf(thread)),
+      (thread) =>
+        thread.archivedAt === null &&
+        !visible.has(keyOf(thread)) &&
+        (thread.settledOverride === "settled" || effectiveSnoozed(thread, { now })),
     );
     return {
       pinned,

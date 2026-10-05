@@ -796,13 +796,6 @@ export function buildThreadListV2Items(input: {
   );
   const selectedThreadKey = input.selectedThreadKey ?? null;
   const orderedSettled = sortSettledThreads(settled);
-  const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
-  const pagedSettled =
-    orderedSettled.length > settledLimit ? orderedSettled.slice(0, settledLimit) : orderedSettled;
-  const selectedSettled = orderedSettled
-    .slice(pagedSettled.length)
-    .find((thread) => threadListKey(thread) === selectedThreadKey);
-  if (selectedSettled !== undefined) pagedSettled.push(selectedSettled);
 
   // Grouped threads render under their group's top thread, each row keeping
   // its own section look. A collapsed shelf shows only the open thread.
@@ -812,7 +805,7 @@ export function buildThreadListV2Items(input: {
       active: orderedActive,
       working: orderedWorking,
       snoozed: orderedSnoozed,
-      settled: pagedSettled,
+      settled: orderedSettled,
     },
     order: LIST_SECTIONS,
     live: LIVE_LIST_SECTIONS,
@@ -821,13 +814,17 @@ export function buildThreadListV2Items(input: {
   });
   const rowCount = (blocks: readonly ThreadListBlock[]) =>
     blocks.reduce((total, block) => total + block.rows.length, 0);
-  // Settled threads pulled into a live group render there, not on the shelf.
-  const settledInLiveGroups = LIST_SECTIONS.flatMap((section) =>
-    section === "settled" ? [] : layout[section],
-  ).reduce(
-    (total, block) => total + block.rows.filter((row) => row.section === "settled").length,
-    0,
-  );
+  // The settled shelf pages whole groups, so a group never splits across
+  // Show more. The open thread's group stays even past the page.
+  const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
+  const pagedSettled: ThreadListBlock[] = [];
+  let pagedSettledRows = 0;
+  for (const block of layout.settled) {
+    const holdsSelected = block.rows.some((row) => row.key === selectedThreadKey);
+    if (pagedSettledRows >= settledLimit && !holdsSelected) continue;
+    pagedSettled.push(block);
+    pagedSettledRows += block.rows.length;
+  }
   const shelf = (blocks: readonly ThreadListBlock[], expanded: boolean) =>
     expanded ? blocks : routeRowOnly(blocks, selectedThreadKey);
 
@@ -859,16 +856,16 @@ export function buildThreadListV2Items(input: {
   const snoozedCount = rowCount(layout.snoozed);
   const snoozedShelfHeaderIndex = snoozedCount > 0 ? items.length : null;
   pushBlocks(shelf(layout.snoozed, input.snoozedShelfExpanded === true));
-  const settledCount = orderedSettled.length - settledInLiveGroups;
+  const settledCount = rowCount(layout.settled);
   const settledShelfHeaderIndex = settledCount > 0 ? items.length : null;
-  pushBlocks(shelf(layout.settled, input.settledShelfExpanded !== false));
+  pushBlocks(shelf(pagedSettled, input.settledShelfExpanded !== false));
   const last = items.at(-1);
   if (last) {
     items[items.length - 1] = { ...last, isLast: true };
   }
   return {
     items,
-    hiddenSettledCount: orderedSettled.length - pagedSettled.length,
+    hiddenSettledCount: settledCount - pagedSettledRows,
     workingCount,
     workingShelfHeaderIndex,
     snoozedCount,

@@ -325,6 +325,24 @@ it.effect("moves a launched thread out of its launch group and back without acti
       }),
     );
     assert.equal(selfLaunch._tag, "Failure");
+    const selfCreate = yield* Effect.exit(
+      orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-launch-group-self"),
+        threadId: ThreadId.make("thread:launch-group-self"),
+        projectId: ProjectId.make("project:launch-group"),
+        title: "Self",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "agent",
+        creationSource: "mcp",
+        groupedUnderThreadId: ThreadId.make("thread:launch-group-self"),
+      }),
+    );
+    assert.equal(selfCreate._tag, "Failure");
   }).pipe(Effect.provide(testLayer)),
 );
 

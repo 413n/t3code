@@ -2135,6 +2135,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.driver": command.modelSelection.instanceId,
     });
 
+    if (command.groupedUnderThreadId === command.threadId) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} cannot be grouped under itself.`,
+      });
+    }
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
     const thread: OrchestrationV2AppThread = {
@@ -2389,7 +2396,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
-        cause: `Thread ${command.threadId} cannot be its own launcher.`,
+        cause: `Thread ${command.threadId} cannot be grouped under itself.`,
       });
     }
     if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {

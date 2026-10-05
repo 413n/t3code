@@ -462,6 +462,22 @@ describe("thread groups", () => {
     expect(layout.settledCount).toBe(0);
   });
 
+  it("keeps a settled top thread with its live group past the settled page", () => {
+    const settledParent = { ...parent, settledOverride: "settled" as const, settledAt: NOW };
+    const layout = buildThreadListV2Items({
+      threads: [settledParent, child],
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      settledLimit: 0,
+    });
+    expect(layout.items.map((item) => [item.thread.title, item.group?.role ?? null])).toEqual([
+      ["Parent", "parent"],
+      ["Child", "child"],
+    ]);
+    expect(layout.settledCount).toBe(0);
+  });
+
   it("moves a group as one row", () => {
     expect(
       getThreadListV2OrderedSection({ threads, section: "active", now: NOW }).map(
