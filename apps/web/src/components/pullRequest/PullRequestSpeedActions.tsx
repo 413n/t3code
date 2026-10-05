@@ -1,4 +1,5 @@
-import type { PullRequestAction } from "@t3tools/contracts";
+import { useEnvironmentScope } from "~/state/session";
+import { AuthSourceControlWriteScope, type PullRequestAction } from "@t3tools/contracts";
 import { Effect } from "effect";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
@@ -30,6 +31,7 @@ export function PullRequestSpeedActions({
   visible: boolean;
   onActed: (result: PullRequestSpeedActionResult) => void;
 }) {
+  const canWrite = useEnvironmentScope(entry.environmentId, AuthSourceControlWriteScope);
   const resolveProjectDefault = usePullRequestDefaultMergeMethodResolver(
     entry.environmentId,
     entry.projectId,
@@ -106,7 +108,9 @@ export function PullRequestSpeedActions({
                 <Button
                   variant={action === "close" ? "destructive-outline" : "outline"}
                   size="xs"
-                  disabled={actionPending || (action === "merge" && entry.stack !== undefined)}
+                  disabled={
+                    !canWrite || actionPending || (action === "merge" && entry.stack !== undefined)
+                  }
                   aria-label={`${label} #${entry.number}`}
                   onClick={() => void perform(action)}
                 />
