@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -1142,12 +1143,20 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
 
   it.effect("answers each request whose handler dies, and keeps reading", () =>
     Effect.gen(function* () {
+      const errorLogs = yield* Queue.unbounded<string>();
+      const logger = Logger.make(({ logLevel, message }) => {
+        if (logLevel === "Error") Queue.offerUnsafe(errorLogs, String([message].flat()[0]));
+      });
       const { stdio, input, output } = yield* makeInMemoryStdio();
       const scope = yield* Scope.make();
-      const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+      const acp = yield* AcpClient.make(stdio).pipe(
+        Effect.provideService(Scope.Scope, scope),
+        Effect.provide(Logger.layer([logger])),
+      );
       const bug = () => Effect.die(new Error("handler bug"));
       yield* acp.handleRequestPermission(bug);
       yield* acp.handleExtRequest("x/dies", Schema.Unknown, bug);
+      yield* acp.handleExtNotification("x/notification-dies", Schema.Unknown, bug);
       yield* acp.handleSessionUpdate(bug);
       const updates = yield* Queue.unbounded<string>();
       yield* acp.handleSessionUpdate((notification) =>
@@ -1194,6 +1203,13 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
       assert.equal(extDied.id, "ext-a");
 
       yield* send(
+        encodeJsonl(jsonRpcNotification("x/notification-dies", Schema.Unknown), {
+          jsonrpc: "2.0",
+          method: "x/notification-dies",
+          params: {},
+        }),
+      );
+      yield* send(
         encodeJsonl(SessionUpdateNotification, {
           jsonrpc: "2.0",
           method: "session/update",
@@ -1221,6 +1237,14 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
         Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ExtResponse))),
       );
       assert.deepEqual([answered.id, answered.result], ["ext-b", { ok: true }]);
+
+      // Every defect was logged at Error, once.
+      assert.deepEqual((yield* Queue.clear(errorLogs)).toSorted(), [
+        "ACP extension request handler failed for 'x/dies'",
+        "ACP notification handler failed",
+        "ACP notification handler failed",
+        "ACP request handler failed for 'session/request_permission'",
+      ]);
       yield* Scope.close(scope, Exit.void);
     }),
   );

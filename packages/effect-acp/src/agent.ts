@@ -18,6 +18,7 @@ import {
   callRpc,
   decodeExtNotificationRegistration,
   decodeExtRequestRegistration,
+  isolateNotificationHandler,
   runHandler,
 } from "./_internal/shared.ts";
 
@@ -280,7 +281,11 @@ export const make = Effect.fn("effect-acp/AcpAgent.make")(function* (
             ),
           ),
           Effect.flatMap((decoded) =>
-            Effect.forEach(cancelHandlers, (handler) => handler(decoded), { discard: true }),
+            Effect.forEach(
+              cancelHandlers,
+              (handler) => isolateNotificationHandler(handler(decoded)),
+              { discard: true },
+            ),
           ),
         );
       }

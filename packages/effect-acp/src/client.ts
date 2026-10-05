@@ -22,6 +22,7 @@ import {
   callRpc,
   decodeExtNotificationRegistration,
   decodeExtRequestRegistration,
+  isolateNotificationHandler,
   runHandler,
 } from "./_internal/shared.ts";
 import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
@@ -841,10 +842,7 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
     // One handler failing or dying does not stop the others, or the reader.
     Effect.forEach(
       registration.handlers,
-      (handler) =>
-        handler(notification).pipe(
-          Effect.ignoreCause({ log: true, message: "ACP notification handler failed" }),
-        ),
+      (handler) => isolateNotificationHandler(handler(notification)),
       { discard: true },
     );
 
