@@ -42,7 +42,6 @@ describe("DefectReporter", () => {
       Effect.gen(function* () {
         const subscription = yield* Queue.unbounded<number>();
         // The same client/server pairing as RpcTest.makeClient, with ws.ts's options.
-        // oxlint-disable-next-line prefer-const
         let client!: Effect.Success<
           ReturnType<typeof RpcClient.makeNoSerialization<TestRpc, never>>
         >;
