@@ -322,6 +322,20 @@ export interface ProjectionStoreV2Shape {
    * follow's exclusivity guard (#11078): two threads sharing one worktree
    * make "whose branch is it" ambiguous, so a drifted checkout is only
    * adopted while a thread is its sole owner.
+   *
+   * This read is not part of the same atomic commit as the write it gates
+   * (#11078 review): the orchestrator serializes commands per thread
+   * (KeyedSerialExecutor keyed by threadId), not globally, so two different
+   * threads' commands can run this read and their own commit concurrently.
+   * If both are the first to move into the same previously-unrecorded
+   * worktree, both can see "not shared" and both adopt a branch there. This
+   * is judged acceptable rather than worth a second, worktreePath-keyed lock
+   * (which would need careful ordering against the existing per-thread one
+   * to add zero deadlock risk, for a narrow race): the bad outcome is
+   * cosmetic, not data loss, and self-corrects the next time either
+   * thread's branch or location actually changes again, since that
+   * re-evaluates this same check against the (by then) genuinely shared
+   * worktree and drops the branch.
    */
   readonly hasSiblingThreadWithWorktreePath: (input: {
     readonly threadId: ThreadId;
