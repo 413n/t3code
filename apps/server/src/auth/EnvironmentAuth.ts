@@ -1235,11 +1235,10 @@ export const make = Effect.gen(function* () {
   ) =>
     // No proof key: a code bound to a T3 Connect client's key fails without being spent.
     resolveBootstrapGrant(code.trim()).pipe(
-      Effect.catchIf(
-        (error): error is ServerAuthInvalidCredentialError =>
-          error._tag === "ServerAuthInvalidCredentialError",
-        () => Effect.fail(new ServerAuthMcpApprovalCodeError({ reason: "unknown_or_used" })),
-      ),
+      Effect.catchTags({
+        ServerAuthInvalidCredentialError: () =>
+          Effect.fail(new ServerAuthMcpApprovalCodeError({ reason: "unknown_or_used" })),
+      }),
       Effect.flatMap((grant) =>
         grant.method !== "one-time-token" && grant.method !== "reusable-dev-token"
           ? Effect.fail(new ServerAuthMcpApprovalCodeError({ reason: "not_a_pairing_code" }))

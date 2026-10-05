@@ -36,8 +36,6 @@ const noStore = HttpEffect.appendPreResponseHandler((_request, response) =>
 /** Issuer and resource for the origin this request reached. */
 const requestUrls = Effect.map(HttpServerRequest.HttpServerRequest, McpOAuth.requestUrls);
 
-const approvalError = (message: string) => new AuthMcpApprovalError({ message });
-
 /**
  * Validates the request the approval page forwards. An unverified client or
  * redirect is reported, never redirected; any other problem goes back to the
@@ -51,7 +49,8 @@ const forwardedAuthorization = (
     const urls = yield* requestUrls;
     return yield* oauth.validateAuthorization({ urls, request }).pipe(
       Effect.catchTags({
-        McpOAuthPageError: (error) => Effect.fail(approvalError(error.description)),
+        McpOAuthPageError: (error) =>
+          Effect.fail(new AuthMcpApprovalError({ message: error.description })),
         McpOAuthRedirectError: (error) =>
           Effect.succeed({ redirectTo: McpOAuth.redirectForError(error, urls.issuer) }),
       }),
@@ -145,7 +144,7 @@ export const layer = HttpApiBuilder.group(
             if (decision._tag === "deny") return { redirectTo: oauth.deny(resolved) };
             return yield* oauth.approve({ request, authorization: resolved, decision }).pipe(
               Effect.map((redirectTo) => ({ redirectTo })),
-              Effect.mapError((error) => approvalError(error.message)),
+              Effect.mapError((error) => new AuthMcpApprovalError({ message: error.message })),
             );
           }),
         )
