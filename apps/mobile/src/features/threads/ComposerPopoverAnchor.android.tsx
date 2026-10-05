@@ -41,12 +41,15 @@ export function ComposerPopoverAnchor(props: { readonly children: ReactNode }) {
     });
   }, []);
 
+  // The overlay remounts when the screen regains focus, and the composer may
+  // have moved while it was away, so measure both.
   const measureOverlay = useCallback(() => {
+    measureAnchor();
     overlayRef.current?.measureInWindow((x, y, width, height) => {
       const next = { x, y, width, height };
       setOverlay((current) => (sameFrame(current, next) ? current : next));
     });
-  }, []);
+  }, [measureAnchor]);
 
   // The composer moves without resizing when the keyboard opens or closes.
   // Measure once the keyboard has settled, not while it animates.
