@@ -4648,6 +4648,34 @@ export default function Sidebar() {
           )
             return;
         }
+        // A group whose top thread is parked sits at one of its live threads,
+        // and which one can change as members unpin. Give every live member
+        // the dropped key so the group lands where it was dropped either way.
+        if (
+          plan.kind === "move-active" &&
+          plan.order !== null &&
+          droppedGroup !== undefined &&
+          droppedGroup.block.key !== activeKey
+        ) {
+          const orderKey =
+            plan.assignments.find((assignment) => assignment.id === activeKey)?.orderKey ??
+            activeKeysById.get(activeKey);
+          if (orderKey == null) return;
+          for (const row of droppedGroup.block.rows) {
+            if (row.key === activeKey || row.section === "snoozed" || row.section === "settled")
+              continue;
+            if (
+              !(await run(
+                reorderActiveThread(
+                  scopeThreadRef(row.thread.environmentId, row.thread.id),
+                  orderKey,
+                ),
+                "Failed to reorder active threads",
+              ))
+            )
+              return;
+          }
+        }
       })();
     },
     [
