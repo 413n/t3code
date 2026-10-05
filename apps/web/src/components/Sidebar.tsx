@@ -3676,11 +3676,15 @@ export default function Sidebar() {
     [attemptSettle],
   );
   // Settles a launcher and every thread it launched, like a bulk settle.
+  // Settles each thread. Navigation away from the open thread skips every
+  // thread settling with it, `coSettlingKeys` by default.
   const settleLaunchGroup = useCallback(
-    (threads: readonly EnvironmentThreadShell[]) => {
-      const coSettlingKeys = new Set(
+    (
+      threads: readonly EnvironmentThreadShell[],
+      coSettlingKeys: ReadonlySet<string> = new Set(
         threads.map((thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
-      );
+      ),
+    ) => {
       for (const thread of threads) {
         if (thread.settledOverride === "settled") continue;
         attemptSettle(scopeThreadRef(thread.environmentId, thread.id), { coSettlingKeys });
@@ -4323,14 +4327,23 @@ export default function Sidebar() {
       scopedThreadKey(scopeThreadRef(candidate.environmentId, candidate.id));
     // Only rows that lead a settled block take a slot of their own; grouped
     // rows ride with their block, folded or not.
+    // A collapsed shelf shows only the open thread, on its own.
     const settledLeads = new Set(launchLayout.settled.map((block) => block.leadKey));
+    if (!settledShelfExpanded && routeThreadKey !== null) settledLeads.add(routeThreadKey);
     return sortSettledThreads([
       ...settledThreads.filter(
         (candidate) => key(candidate) !== dragState.activeKey && settledLeads.has(key(candidate)),
       ),
       applySidebarThreadDrop(thread, "settled", dragState.occurredAt),
     ]).map(key);
-  }, [dragState, launchLayout.settled, settledThreads, threadByKey]);
+  }, [
+    dragState,
+    launchLayout.settled,
+    routeThreadKey,
+    settledShelfExpanded,
+    settledThreads,
+    threadByKey,
+  ]);
   // Working beta: the inbox is time-ordered too, so the preview shows the
   // slot a drop will land in, not the slot under the pointer.
   const draggedActiveOrder = useMemo(() => {
@@ -4356,9 +4369,10 @@ export default function Sidebar() {
         ...(draggedActiveOrder === undefined ? {} : { activeOrder: draggedActiveOrder }),
         settledExpanded: settledShelfExpanded,
         settledVisibleCount,
-        // The settled order lists block leads, so a grouped open thread keeps
-        // its whole block by its lead.
-        routeThreadKey: routeBlockLeadKey,
+        // The expanded settled order lists block leads, so a grouped open
+        // thread keeps its whole block by its lead. Collapsed, the open
+        // thread shows on its own.
+        routeThreadKey: settledShelfExpanded ? routeBlockLeadKey : routeThreadKey,
         snoozedThreadCount: shelfThreadCounts.snoozed,
       }),
     [
@@ -4366,6 +4380,7 @@ export default function Sidebar() {
       draggedSettledOrder,
       isContextDrag,
       routeBlockLeadKey,
+      routeThreadKey,
       settledShelfExpanded,
       settledVisibleCount,
       sidebarListItems,
@@ -4550,15 +4565,20 @@ export default function Sidebar() {
                   !isNestedSidebarListItem(item),
               )?.group ?? "",
             );
+            const groupKeys =
+              droppedGroup === undefined
+                ? undefined
+                : new Set(droppedGroup.block.rows.map((row) => row.key));
             if (droppedGroup !== undefined) {
               settleLaunchGroup(
                 droppedGroup.block.rows
                   .filter((row) => row.key !== activeKey)
                   .map((row) => row.thread),
+                groupKeys,
               );
             }
             settlingThreadKeysRef.current.add(activeKey);
-            const navigateAfterSettle = planForwardNavigation(activeKey);
+            const navigateAfterSettle = planForwardNavigation(activeKey, groupKeys);
             const settled = await run(settleThread(threadRef), "Failed to settle thread").finally(
               () => settlingThreadKeysRef.current.delete(activeKey),
             );
