@@ -1722,13 +1722,16 @@ export const layerWithOptions = (
                   Effect.catchCause(() => Effect.succeed(false)),
                 ));
               if (outdated) {
+                // Another thread sharing the session can start a turn while the
+                // checks above yield; the generation guard keeps it then.
                 yield* releaseEntry({
                   providerSessionId: input.providerSessionId,
                   reason: "manual_shutdown",
                   detail: `Provider instance ${live.runtime.instanceId} settings changed.`,
+                  onlyIfIdleGeneration: live.idleGeneration,
                 });
               }
-              const existing = outdated ? undefined : live;
+              const existing = outdated ? (yield* Ref.get(sessions)).get(key) : live;
               if (existing !== undefined) {
                 if (
                   !existing.attachedThreadIds.has(input.threadId) &&

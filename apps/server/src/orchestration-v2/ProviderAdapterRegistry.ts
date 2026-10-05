@@ -46,6 +46,11 @@ export const ProviderAdapterRegistryV2Error = Schema.Union([
 export type ProviderAdapterRegistryV2Error = typeof ProviderAdapterRegistryV2Error.Type;
 
 export interface ProviderAdapterRegistryV2Shape {
+  /**
+   * Returns the same adapter object until the instance is rebuilt. Live
+   * sessions compare it to notice a settings change, so a wrapper built per
+   * call would restart every session on every turn.
+   */
   readonly get: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2Shape, ProviderAdapterRegistryV2Error>;

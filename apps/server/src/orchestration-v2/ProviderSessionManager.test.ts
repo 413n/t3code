@@ -928,7 +928,14 @@ it.effect("ProviderSessionManagerV2 keeps a busy session after a rebuild until i
         events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
       });
       const first = yield* open;
-      yield* first.events.pipe(Stream.runDrain, Effect.forkScoped);
+      // The manager marks the session idle before it forwards turn.terminal.
+      const turnEnded = yield* Deferred.make<void>();
+      yield* first.events.pipe(
+        Stream.runForEach((event) =>
+          event.type === "turn.terminal" ? Deferred.succeed(turnEnded, undefined) : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
       const appThread = (yield* projectionStore.getThreadProjection(threadId)).thread;
       yield* first.startTurn({
         appThread,
@@ -967,9 +974,7 @@ it.effect("ProviderSessionManagerV2 keeps a busy session after a rebuild until i
         failure: null,
         threadDisposition: "reusable",
       });
-      for (let i = 0; i < 10; i += 1) {
-        yield* Effect.yieldNow;
-      }
+      yield* Deferred.await(turnEnded);
 
       // The next turn after it ends gets a session from the rebuilt adapter.
       assert.notStrictEqual(yield* open, first);
@@ -979,6 +984,106 @@ it.effect("ProviderSessionManagerV2 keeps a busy session after a rebuild until i
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, layerRegistry })));
   }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 keeps a session whose turn starts while a rebuild is checked",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const firstProbe = yield* Ref.make(true);
+      const probeEntered = yield* Deferred.make<void>();
+      const probeGate = yield* Deferred.make<void>();
+      // The old adapter's pending-work probe parks the first check so a turn
+      // can start in the gap between the idle check and the release.
+      let adapter = makeProviderAdapter(state, {
+        hasPendingBackgroundWork: Effect.gen(function* () {
+          if (yield* Ref.getAndSet(firstProbe, false)) {
+            yield* Deferred.succeed(probeEntered, undefined);
+            yield* Deferred.await(probeGate);
+          }
+          return false;
+        }),
+      });
+      const layerRegistry = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+          get: () => Effect.sync(() => adapter),
+          list: () => Effect.succeed([modelSelection.instanceId]),
+        }),
+      );
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-rebuild-race",
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-rebuild-race",
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        const open = manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const first = yield* open;
+        // The manager marks the session idle before it forwards turn.terminal.
+        const turnEnded = yield* Deferred.make<void>();
+        yield* first.events.pipe(
+          Stream.runForEach((event) =>
+            event.type === "turn.terminal" ? Deferred.succeed(turnEnded, undefined) : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        const appThread = (yield* projectionStore.getThreadProjection(threadId)).thread;
+        const startTurn = first.startTurn({
+          appThread,
+          threadId,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: idAllocator.derive.rootNode({ runId }),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "hello",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+
+        adapter = makeProviderAdapter(state);
+        const reopen = yield* open.pipe(Effect.forkScoped);
+        yield* Deferred.await(probeEntered);
+        yield* startTurn;
+        yield* Deferred.succeed(probeGate, undefined);
+
+        assert.strictEqual(yield* Fiber.join(reopen), first);
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, layerRegistry })),
+      );
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 keeps a session with background work after a rebuild", () =>
