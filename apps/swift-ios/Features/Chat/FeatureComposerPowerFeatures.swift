@@ -315,6 +315,7 @@ enum FeatureComposerFileLinkSerializer {
 
 enum FeatureComposerMenuItem: Identifiable, Sendable, Equatable {
     case modelCommand
+    case interactionMode(FeatureInteractionMode)
     case model(selection: FeatureSelection, label: String, description: String)
     case providerCommand(FeatureProviderSlashCommand)
     case skill(FeatureProviderSkill)
@@ -323,6 +324,7 @@ enum FeatureComposerMenuItem: Identifiable, Sendable, Equatable {
     var id: String {
         switch self {
         case .modelCommand: "command:model"
+        case let .interactionMode(mode): "interaction-mode:\(mode.rawValue)"
         case let .model(selection, _, _): "model:\(selection.providerID):\(selection.modelID)"
         case let .providerCommand(command): "command:\(command.id)"
         case let .skill(skill): "skill:\(skill.id)"
@@ -333,6 +335,7 @@ enum FeatureComposerMenuItem: Identifiable, Sendable, Equatable {
     var label: String {
         switch self {
         case .modelCommand: "/model"
+        case let .interactionMode(mode): mode == .plan ? "/plan" : "/default"
         case let .model(_, label, _): label
         case let .providerCommand(command): "/\(command.name)"
         case let .skill(skill): skill.displayName ?? skill.name
@@ -343,6 +346,7 @@ enum FeatureComposerMenuItem: Identifiable, Sendable, Equatable {
     var description: String {
         switch self {
         case .modelCommand: "Switch model"
+        case let .interactionMode(mode): "Switch to \(mode.label.lowercased()) mode"
         case let .model(_, _, description): description
         case let .providerCommand(command):
             command.description ?? command.inputHint ?? ""
@@ -374,7 +378,9 @@ enum FeatureComposerMenuBuilder {
         currentSelection: FeatureSelection?,
         threadSelection: FeatureSelection?,
         powerFeatures: FeatureComposerPowerFeatures,
-        pathEntries: [FeatureComposerPathEntry]
+        pathEntries: [FeatureComposerPathEntry],
+        allowProviderSwitch: Bool = false,
+        allowInteractionMode: Bool = false
     ) -> [FeatureComposerMenuItem] {
         switch trigger.kind {
         case .slashCommand:
@@ -385,6 +391,10 @@ enum FeatureComposerMenuBuilder {
             var items: [FeatureComposerMenuItem] = []
             if query.isEmpty || "model".contains(query) {
                 items.append(.modelCommand)
+            }
+            if allowInteractionMode {
+                if query.isEmpty || "plan".contains(query) { items.append(.interactionMode(.plan)) }
+                if query.isEmpty || "default".contains(query) { items.append(.interactionMode(.standard)) }
             }
             let enabledSkills = enabledSkills(in: powerFeatures.skills)
             let skills = enabledSkills
@@ -400,8 +410,8 @@ enum FeatureComposerMenuBuilder {
                         == .orderedAscending
                 }
             let enabledSkillNames = Set(enabledSkills.map { normalizedName($0.name) })
-            let excludedCommandNames = Set(["model", "plan", "default"].map(normalizedName))
-            let commands = powerFeatures.slashCommands
+            let excludedCommandNames = Set(["model"].map(normalizedName))
+            let commands = (trigger.range.lowerBound == 0 ? powerFeatures.slashCommands : [])
                 .filter { !excludedCommandNames.contains(normalizedName($0.name)) }
                 .filter { normalizedName($0.name) != "compact" || powerFeatures.canCompactContext }
                 .filter { !enabledSkillNames.contains(normalizedName($0.name)) }
@@ -416,13 +426,14 @@ enum FeatureComposerMenuBuilder {
             return providers
                 .filter(\.isAvailable)
                 .filter { provider in
-                    threadSelection == nil || provider.id == threadSelection?.providerID
+                    allowProviderSwitch || threadSelection == nil || provider.id == threadSelection?.providerID
                 }
                 .flatMap { provider in
                     provider.models
                         .filter { model in
                             guard provider.requiresNewThreadForModelChange,
-                                  let threadSelection else { return true }
+                                  let threadSelection,
+                                  provider.id == threadSelection.providerID else { return true }
                             return model.id == threadSelection.modelID
                         }
                         .map { model in

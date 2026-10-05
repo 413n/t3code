@@ -1,5 +1,17 @@
 import Foundation
 
+public enum BranchNamingMode: String, Codable, CaseIterable, Sendable {
+    case `static`, semantic, custom
+
+    public var label: String {
+        switch self {
+        case .static: "Static prefix"
+        case .semantic: "Semantic prefix"
+        case .custom: "Custom instructions"
+        }
+    }
+}
+
 public enum WorktreeSubmodules: String, Codable, CaseIterable, Sendable {
     case recursive
     case topLevel = "top-level"
@@ -28,8 +40,9 @@ public enum ResponseStreamingMode: String, Codable, CaseIterable, Sendable {
 
 /// Keys the native settings controls can change. Other override keys stay intact.
 public enum ServerProjectSettingKey: String, Sendable {
-    case defaultModelSelection, defaultThreadEnvMode, newWorktreesStartFromOrigin
+    case defaultModelSelection, defaultRuntimeMode, defaultThreadEnvMode, newWorktreesStartFromOrigin
     case defaultAutoPull, sidebarAutoSettleOnMerge, sidebarAutoSettleAfterDays
+    case branchNamingMode, branchNamePrefix, branchNameInstructions, enableAgentBrowserAccess
     case continueThreadsAfterServerUpdate, responseStreamingMode, worktreeSubmodules, worktreeCleanup
 }
 
@@ -91,6 +104,15 @@ public extension ServerSettingsSnapshot {
         if let value = entry["defaultThreadEnvMode"]?.stringValue.flatMap(ServerThreadEnvironmentMode.init(rawValue:)) {
             resolved.defaultThreadEnvMode = value
         }
+        if let value = entry["defaultRuntimeMode"]?.stringValue.flatMap(RuntimeMode.init(rawValue:)) {
+            resolved.defaultRuntimeMode = value
+        }
+        if let value = entry["branchNamingMode"]?.stringValue.flatMap(BranchNamingMode.init(rawValue:)) {
+            resolved.branchNamingMode = value
+        }
+        if let value = entry["branchNamePrefix"]?.stringValue { resolved.branchNamePrefix = value }
+        if let value = entry["branchNameInstructions"]?.stringValue { resolved.branchNameInstructions = value }
+        if let value = entry["enableAgentBrowserAccess"]?.boolValue { resolved.enableAgentBrowserAccess = value }
         if let value = entry["newWorktreesStartFromOrigin"]?.boolValue {
             resolved.newWorktreesStartFromOrigin = value
         }

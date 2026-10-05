@@ -125,6 +125,7 @@ private struct FeatureComposerCommandRow: View {
     private var iconName: String {
         switch item {
         case .modelCommand, .model: return "cpu"
+        case .interactionMode: return "list.bullet.clipboard"
         case .providerCommand: return "terminal"
         case let .skill(skill): return skill.source.systemImage
         case let .path(entry): return entry.kind == .directory ? "folder" : "doc"

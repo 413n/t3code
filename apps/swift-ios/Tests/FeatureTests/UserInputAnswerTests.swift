@@ -54,6 +54,7 @@ struct UserInputAnswerTests {
             #"{"id":"old","threadID":"thread","questions":[]}"#.utf8
         ))
         #expect(!input.canDismiss)
+        #expect(input.canRespond)
     }
 
     @Test
@@ -88,59 +89,110 @@ struct UserInputAnswerTests {
     }
 
     @Test
-    func testMultiSelectTogglesWithoutFlatteningSelections() {
-        let first = FeatureInputAnswer.selections([])
-            .togglingOption("Server", allowsMultiple: true)
-        let second = first.togglingOption("Web", allowsMultiple: true)
-        let deselected = second.togglingOption("Server", allowsMultiple: true)
-
-        #expect(first == .selections(["Server"]))
-        #expect(second == .selections(["Server", "Web"]))
-        #expect(deselected == .selections(["Web"]))
-        #expect(
-            second.togglingOption("CLI", allowsMultiple: false)
-                == .text("CLI")
-        )
+    func singleSelectUsesDistinctWireValuesForDuplicateLabels() {
+        let question = valueQuestion()
+        #expect(Set(question.options.map(\.id)).count == question.options.count)
+        var draft = FeatureInputDraftAnswer()
+        #expect(draft.normalized(for: question) == nil)
+        draft.toggleOption("existing_branch", for: question)
+        #expect(draft.normalized(for: question)?.jsonValue == .string("existing_branch"))
+        draft.toggleOption("", for: question)
+        #expect(draft.isOptionSelected("", for: question))
+        #expect(!draft.isOptionSelected("existing_branch", for: question))
+        #expect(draft.normalized(for: question)?.jsonValue == .string(""))
+        draft.toggleOption("  exact  ", for: question)
+        #expect(draft.normalized(for: question)?.jsonValue == .string("  exact  "))
     }
 
     @Test
-    func testAnswersNormalizeBeforeSubmission() {
-        #expect(FeatureInputAnswer.text("  ship it  ").normalized == .text("ship it"))
-        #expect(
-            FeatureInputAnswer.selections([" Server ", "", "Server", "Web"]).normalized
-                == .selections(["Server", "Web"])
-        )
-        #expect(FeatureInputAnswer.text("   ").normalized == nil)
-        #expect(FeatureInputAnswer.selections([]).normalized == nil)
+    func multipleSelectionsKeepEmptyAndUntrimmedWireValues() {
+        let question = valueQuestion(allowsMultiple: true)
+        var draft = FeatureInputDraftAnswer()
+        draft.toggleOption("existing_branch", for: question)
+        draft.toggleOption("", for: question)
+        draft.toggleOption("  exact  ", for: question)
+        #expect(draft.normalized(for: question)?.jsonValue == .array([
+            .string("existing_branch"), .string(""), .string("  exact  "),
+        ]))
+        draft.toggleOption("existing_branch", for: question)
+        draft.toggleOption("  exact  ", for: question)
+        #expect(draft.normalized(for: question)?.jsonValue == .array([.string("")]))
+        draft.toggleOption("", for: question)
+        #expect(draft.normalized(for: question) == nil)
+    }
+
+    @Test(arguments: [false, true])
+    func customTextReplacesSelectionsAndSelectionClearsCustomText(allowsMultiple: Bool) {
+        let question = valueQuestion(allowsMultiple: allowsMultiple)
+        var draft = FeatureInputDraftAnswer()
+        draft.toggleOption("", for: question)
+        draft.setCustomAnswer("  existing_branch  ", for: question)
+        #expect(draft.selectedOptionValues.isEmpty)
+        #expect(draft.customAnswer == "  existing_branch  ")
+        #expect(draft.normalized(for: question) == .text("existing_branch"))
+        #expect(!draft.isOptionSelected("existing_branch", for: question))
+        draft.setCustomAnswer("", for: question)
+        #expect(draft.normalized(for: question) == nil)
+        draft.setCustomAnswer("Custom", for: question)
+        draft.toggleOption("existing_branch", for: question)
+        #expect(draft.customAnswer.isEmpty)
+        #expect(draft.normalized(for: question) == (
+            allowsMultiple ? .selections(["existing_branch"]) : .text("existing_branch")
+        ))
     }
 
     @Test
-    func testMultiSelectCustomTextStaysInTheSelectionArray() {
-        let question = FeatureInputQuestion(
-            id: "surfaces",
-            header: "Surfaces",
-            question: "Where should this ship?",
+    func legacyLabelsTrimButExplicitValuesDoNot() throws {
+        let option = try JSONDecoder().decode(FeatureInputOption.self, from: Data(
+            #"{"label":"  Legacy  ","detail":"No value"}"#.utf8
+        ))
+        #expect(option.value == nil)
+        #expect(option.wireValue == "Legacy")
+        let question = FeatureInputQuestion(id: "legacy", header: "Legacy", question: "Choose", options: [option])
+        var draft = FeatureInputDraftAnswer()
+        draft.toggleOption(option.wireValue, for: question)
+        draft.setCustomAnswer("  ", for: question)
+        #expect(draft.normalized(for: question) == .text("Legacy"))
+        draft.setCustomAnswer("  custom answer  ", for: question)
+        #expect(draft.normalized(for: question) == .text("custom answer"))
+    }
+
+    @Test
+    func changedQuestionsDiscardInvalidSelectionsAndRejectDisallowedCustomAnswers() {
+        var question = valueQuestion()
+        var draft = FeatureInputDraftAnswer()
+        draft.toggleOption("existing_branch", for: question)
+        question.options.removeFirst()
+        #expect(draft.normalized(for: question) == nil)
+        draft.toggleOption("existing_branch", for: question)
+        #expect(draft.normalized(for: question) == nil)
+        draft.setCustomAnswer("Custom", for: question)
+        question.allowCustomAnswer = false
+        #expect(draft.normalized(for: question) == nil)
+        draft.setCustomAnswer("Replacement", for: question)
+        #expect(draft.customAnswer == "Custom")
+        draft.toggleOption("", for: question)
+        #expect(draft.normalized(for: question) == .text(""))
+    }
+
+    @Test
+    func cachedApprovalsWithoutCapabilityOrWarningRemainUsable() throws {
+        let approval = try JSONDecoder().decode(FeatureApproval.self, from: Data(
+            #"{"id":"old","threadID":"thread","kind":"command","title":"Run","detail":"ls","options":[{"decision":"allowOnce","label":"Approve"}]}"#.utf8
+        ))
+        #expect(approval.canRespond)
+        #expect(approval.options?.first?.warning == nil)
+    }
+
+    private func valueQuestion(allowsMultiple: Bool = false) -> FeatureInputQuestion {
+        FeatureInputQuestion(
+            id: "branch", header: "Branch", question: "Which branch?",
             options: [
-                .init(label: "Server", detail: "Backend"),
-                .init(label: "Web", detail: "Browser"),
+                .init(label: "Use existing branch", detail: "Named", value: "existing_branch"),
+                .init(label: "Use existing branch", detail: "Current", value: ""),
+                .init(label: "Exact", detail: "Keep whitespace", value: "  exact  "),
             ],
-            allowsMultiple: true
-        )
-        let selected = FeatureInputAnswer.selections(["Server"])
-        let withCustom = FeatureComposerCustomAnswer.replacingText(
-            in: selected,
-            with: "CLI",
-            for: question
-        )
-
-        #expect(withCustom == .selections(["Server", "CLI"]))
-        #expect(FeatureComposerCustomAnswer.text(in: withCustom, for: question) == "CLI")
-        #expect(
-            FeatureComposerCustomAnswer.replacingText(
-                in: withCustom,
-                with: "",
-                for: question
-            ) == .selections(["Server"])
+            allowsMultiple: allowsMultiple
         )
     }
 }

@@ -83,6 +83,8 @@ public final class T3ConnectController: T3ConnectDeviceManaging {
 
     private let auth: T3ConnectClerkSession?
     private let relay: T3ConnectRelayClient?
+    private let localLinkTransport: any HTTPTransport
+    private var isSettingUpLiveActivities = false
     private var registeredDeviceID: String?
     private var refreshGeneration: UInt64 = 0
     private var authorizationGeneration: UInt64 = 0
@@ -113,6 +115,7 @@ public final class T3ConnectController: T3ConnectDeviceManaging {
         configureAuth: Bool,
         signOutOperation: (@MainActor @Sendable () async throws -> Void)?
     ) {
+        localLinkTransport = transport
         self.resolution = resolution
         self.signOutOperation = signOutOperation
         managedAuthorizer = T3ConnectManagedEnvironmentAuthorizer(
@@ -367,6 +370,67 @@ public final class T3ConnectController: T3ConnectDeviceManaging {
             errorMessage = error.localizedDescription
             return false
         }
+    }
+
+    /// Called only by an explicit Live Activity setup action, never by sign-in.
+    func setUpLiveActivityUpdates(
+        environments: [T3ConnectLocalEnvironment], enabled: Bool, previousEnabled: Bool,
+        deviceID: String,
+        makeDeviceRegistration: @escaping @MainActor (Bool) -> T3ConnectDeviceRegistration
+    ) async throws {
+        guard !isSettingUpLiveActivities else {
+            throw T3ConnectRelayError.invalidConfiguration("Live Activity setup is already running.")
+        }
+        guard let auth, let relay, let configuration = resolution.configuration else {
+            throw T3ConnectRelayError.invalidConfiguration(unavailableReason ?? "T3 Connect is unavailable.")
+        }
+        isSettingUpLiveActivities = true
+        defer { isSettingUpLiveActivities = false }
+        let token = try await loadedRelayToken(auth)
+        let generation = authorizationGeneration
+        guard let accountID = account?.id else { throw T3ConnectAuthError.noSession }
+        try beginAuthorizationOperation(generation)
+        defer { endAuthorizationOperation() }
+        let validateAccount: @MainActor () throws -> Void = { [self] in
+            try requireCurrentAuthorization(generation)
+            guard account?.id == accountID, auth.account?.id == accountID else {
+                throw T3ConnectAuthError.noSession
+            }
+        }
+        let linker = T3ConnectLocalEnvironmentLinker(
+            relay: relay, relayURL: configuration.relayHTTPURL, transport: localLinkTransport
+        )
+        // Disabling updates must not publish a host that has never been linked.
+        let linkedIDs: Set<String>?
+        if enabled { linkedIDs = nil }
+        else {
+            linkedIDs = Set(try await relay.listEnvironments(clerkToken: token).map(\.environmentId))
+            try validateAccount()
+        }
+        let selected = environments.filter { linkedIDs?.contains($0.environment.id) ?? true }
+        let byID = Dictionary(selected.map { ($0.environment.id, $0) }, uniquingKeysWith: { first, _ in first })
+        registeredDeviceID = deviceID
+        try await PlatformLiveActivitySetupTransaction.run(
+            environmentIDs: selected.map(\.environment.id), enabled: enabled, previousEnabled: previousEnabled,
+            validateAccount: validateAccount,
+            updateDevice: { value in
+                try validateAccount()
+                let registration = makeDeviceRegistration(value)
+                try await relay.registerDevice(registration, clerkToken: token)
+                do { try validateAccount() }
+                catch {
+                    // This request belongs to the captured account, even if a
+                    // different account signed in while it was in flight.
+                    try? await relay.unregisterDevice(deviceID: deviceID, clerkToken: token)
+                    throw error
+                }
+            },
+            linkEnvironment: { id, preference in
+                guard let local = byID[id] else { throw HTTPError.invalidResponse }
+                try await linker.link(local, enabled: preference, clerkToken: token,
+                                      accountID: accountID, deviceID: deviceID, validateAccount: validateAccount)
+            }
+        )
     }
 
     public func registerDevice(_ registration: T3ConnectDeviceRegistration) async throws {

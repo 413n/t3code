@@ -746,13 +746,13 @@ struct FeatureComposerPowerTests {
     }
 
     @Test
-    func commandMenuIncludesProviderCommandsButNotRemovedMobileModes() throws {
+    func commandMenuKeepsProviderNativePlanCommandsWhenLegacyModeIsDisabled() throws {
         let trigger = try #require(FeatureComposerTriggerParser.detect(in: "/"))
         let powerFeatures = FeatureComposerPowerFeatures(
             slashCommands: [
                 FeatureProviderSlashCommand(name: "review", description: "Review changes"),
-                FeatureProviderSlashCommand(name: "plan", description: "Legacy mode"),
-                FeatureProviderSlashCommand(name: "default", description: "Legacy mode"),
+                FeatureProviderSlashCommand(name: "plan", description: "Provider plan command"),
+                FeatureProviderSlashCommand(name: "default", description: "Provider default command"),
             ]
         )
         let items = FeatureComposerMenuBuilder.items(
@@ -764,7 +764,7 @@ struct FeatureComposerPowerTests {
             pathEntries: []
         )
 
-        #expect(items.map(\.label) == ["/model", "/review"])
+        #expect(items.map(\.label) == ["/model", "/default", "/plan", "/review"])
     }
 
     @Test
@@ -1363,14 +1363,17 @@ struct FeatureComposerPowerTests {
             ) == 1
         )
 
+        let question = FeatureInputQuestion(id: "one", header: "One", question: "Answer")
+        var kept = FeatureInputDraftAnswer()
+        kept.setCustomAnswer("keep", for: question)
         let reconciled = FeatureComposerQuestionReconciliation.answers(
             [
-                "one": .text("keep"),
-                "removed": .text("drop"),
+                "one": kept,
+                "removed": FeatureInputDraftAnswer(),
             ],
             currentQuestionIDs: ["one"]
         )
-        #expect(reconciled == ["one": .text("keep")])
+        #expect(reconciled == ["one": kept])
     }
 
     @Test

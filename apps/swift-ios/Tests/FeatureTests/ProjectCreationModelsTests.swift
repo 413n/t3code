@@ -4,6 +4,22 @@ import Testing
 
 @Suite("Native project creation")
 struct ProjectCreationModelsTests {
+    @Test func forgejoUsesDiscoveredReadinessAndRepositoryLookupKind() {
+        #expect(ProjectRemoteSource.forgejo.provider == .forgejo)
+        #expect(ProjectRemoteSource.forgejo.prompt == "owner/repository")
+        let discovery = SourceControlDiscoveryResult(versionControlSystems: [], sourceControlProviders: [
+            SourceControlProviderDiscoveryItem(kind: .forgejo, label: "Forgejo", status: .available, installHint: "Install tea",
+                auth: SourceControlProviderAuth(status: .authenticated, account: "forge-user")),
+        ])
+        let option = ProjectRemoteSourceOptions.options(discovery: discovery).first { $0.source == .forgejo }
+        #expect(option?.isReady == true)
+        #expect(option?.detail == "Signed in as forge-user")
+        #expect(ProjectRemoteSourceOptions.options(discovery: nil).first { $0.source == .forgejo }?.isReady == false)
+        let repository = SourceControlRepositoryInfo(provider: .forgejo, nameWithOwner: "team/project",
+            url: "https://forge.example/team/project", sshUrl: "git@forge.example:team/project.git")
+        #expect(ProjectCreationPath.defaultCloneURL(for: repository) == repository.url)
+    }
+
     @Test func newProjectNamesMatchServerFolderNames() {
         #expect(ProjectCreationPath.newProjectFolderName("Café Notes") == "cafe-notes")
         #expect(ProjectCreationPath.newProjectFolderName("COM1") == "com1-project")

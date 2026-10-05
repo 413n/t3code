@@ -7,6 +7,14 @@ struct MarkdownImageContext: Equatable, @unchecked Sendable {
     let resolver: any FeatureWorkspaceAssetResolving
     var sourceFilePath: String? = nil
 
+    var mediaBasePath: String {
+        guard let sourceFilePath else { return workspaceRoot }
+        let isWindows = sourceFilePath.contains("\\")
+        let normalized = sourceFilePath.replacingOccurrences(of: "\\", with: "/")
+        let parent = (normalized as NSString).deletingLastPathComponent
+        return isWindows ? parent.replacingOccurrences(of: "/", with: "\\") : parent
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.threadID == rhs.threadID
             && lhs.workspaceRoot == rhs.workspaceRoot
@@ -310,7 +318,11 @@ private struct MarkdownBlockView: View, Equatable {
             )
 
         case let .image(image):
-            MarkdownImageView(image: image, context: imageContext)
+            if MarkdownEmbeddedMedia(image.source, workspaceRoot: imageContext?.mediaBasePath).isVideo {
+                MarkdownVideoView(image: image, context: imageContext)
+            } else {
+                MarkdownImageView(image: image, context: imageContext)
+            }
 
         case let .heading(level, inline):
             MarkdownInlineText(
@@ -514,6 +526,55 @@ private struct MarkdownListView: View {
     }
 }
 
+private struct MarkdownVideoView: View {
+    let image: MarkdownImage
+    let context: MarkdownImageContext?
+    @State private var playbackRequested = false
+    @SwiftUI.Environment(\.openURL) private var openURL
+
+    private var media: MarkdownEmbeddedMedia {
+        MarkdownEmbeddedMedia(image.source, workspaceRoot: context?.mediaBasePath)
+    }
+
+    private var canResolve: Bool {
+        switch media.source {
+        case .direct: true
+        case .workspaceFile: context != nil
+        case .blocked: false
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !canResolve {
+                Label("Video unavailable", systemImage: "video.slash")
+                    .foregroundStyle(T3Colors.textSecondary)
+            } else if playbackRequested {
+                FeatureVideoPlayerView(resolveURL: { try await media.resolveURL(context: context) })
+                    .aspectRatio(16 / 9, contentMode: .fit)
+            } else {
+                Button { playbackRequested = true } label: {
+                    Label("Play video", systemImage: "play.rectangle")
+                        .font(T3Typography.control)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 160)
+                        .background(T3Colors.surfaceRaised)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(image.alternativeText.isEmpty ? "Play video" : "Play \(image.alternativeText)")
+            }
+            if canResolve, let previewURL = media.previewURL {
+                Button("Open video", systemImage: "arrow.up.left.and.arrow.down.right") { openURL(previewURL) }
+                    .font(T3Typography.supporting)
+                    .buttonStyle(.plain)
+            }
+        }
+        .onChange(of: image) { _, _ in playbackRequested = false }
+        .onChange(of: context) { _, _ in playbackRequested = false }
+        .onDisappear { playbackRequested = false }
+    }
+}
+
 private struct MarkdownImageView: View {
     private struct Request: Equatable {
         let image: MarkdownImage
@@ -537,13 +598,7 @@ private struct MarkdownImageView: View {
     }
 
     private var classifiedSource: MarkdownImageSource {
-        let basePath = context?.sourceFilePath.map {
-            let isWindows = $0.contains("\\")
-            let normalized = $0.replacingOccurrences(of: "\\", with: "/")
-            let parent = (normalized as NSString).deletingLastPathComponent
-            return isWindows ? parent.replacingOccurrences(of: "/", with: "\\") : parent
-        } ?? context?.workspaceRoot
-        return MarkdownImageSource.classify(image.source, workspaceRoot: basePath)
+        MarkdownImageSource.classify(image.source, workspaceRoot: context?.mediaBasePath)
     }
 
     var body: some View {

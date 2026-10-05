@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// A live queue view with a separate text editor, leaving the composer draft intact.
+/// Queue management delegates rich editing to the thread's existing composer.
 struct FeatureThreadQueueView: View {
     let execution: FeatureThreadExecution
     let controlsAvailable: Bool
@@ -8,8 +8,20 @@ struct FeatureThreadQueueView: View {
     let error: String?
     let performAction: @MainActor (FeatureThreadQueueAction) async -> Bool
 
-    @State private var editingRunID: String?
-    @State private var editedText = ""
+    let onEdit: (@MainActor (FeatureThreadExecution.QueuedEntry) async -> Void)?
+
+    init(
+        execution: FeatureThreadExecution, controlsAvailable: Bool, isUpdating: Bool, error: String?,
+        performAction: @escaping @MainActor (FeatureThreadQueueAction) async -> Bool,
+        onEdit: (@MainActor (FeatureThreadExecution.QueuedEntry) async -> Void)? = nil
+    ) {
+        self.execution = execution
+        self.controlsAvailable = controlsAvailable
+        self.isUpdating = isUpdating
+        self.error = error
+        self.performAction = performAction
+        self.onEdit = onEdit
+    }
 
     private var controlsDisabled: Bool { !controlsAvailable || isUpdating }
 
@@ -43,9 +55,6 @@ struct FeatureThreadQueueView: View {
                     }
                     .font(T3Typography.control)
                     .accessibilityIdentifier("thread-queue-resume")
-                }
-                if editingRunID != nil {
-                    editor
                 }
                 if execution.queuedEntries.isEmpty {
                     Text("No queued messages")
@@ -85,18 +94,17 @@ struct FeatureThreadQueueView: View {
                     .lineLimit(2)
             }
             HStack(spacing: 20) {
-                Button(editingRunID == entry.id ? "Editing" : "Edit") {
-                    editingRunID = entry.id
-                    editedText = entry.text
+                Button("Edit") {
+                    Task { await onEdit?(entry) }
                 }
-                .disabled(controlsDisabled || !execution.canManageQueue || !entry.hasMessage || editingRunID != nil)
+                .disabled(controlsDisabled || !execution.canManageQueue || !entry.hasMessage || onEdit == nil)
                 .accessibilityLabel("Edit queued message \(index + 1)")
 
                 if execution.canPromoteToSteer, let activeRun = execution.activeRun {
                     Button("Send now") {
                         submit(.promoteToSteer(queuedRunID: entry.id, targetRunID: activeRun.id))
                     }
-                    .disabled(controlsDisabled || editingRunID != nil || !entry.hasMessage)
+                    .disabled(controlsDisabled || !entry.hasMessage)
                     .accessibilityHint("Sends this message into the current run")
                 }
 
@@ -124,7 +132,7 @@ struct FeatureThreadQueueView: View {
                     Image(systemName: "ellipsis")
                         .frame(width: T3Metrics.minimumTapTarget, height: T3Metrics.minimumTapTarget)
                 }
-                .disabled(controlsDisabled || !execution.canManageQueue || editingRunID != nil)
+                .disabled(controlsDisabled || !execution.canManageQueue)
                 .accessibilityLabel("Actions for queued message \(index + 1)")
             }
             .font(T3Typography.control)
@@ -132,44 +140,6 @@ struct FeatureThreadQueueView: View {
         }
         .padding(.top, 12)
         .accessibilityIdentifier("thread-queue-entry-\(entry.id)")
-    }
-
-    private var editor: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Editing queued message")
-                Spacer()
-                Button("Cancel") { editingRunID = nil }
-                    .disabled(isUpdating)
-                    .frame(minHeight: T3Metrics.minimumTapTarget)
-            }
-            .font(T3Typography.control)
-            TextField("Queued message", text: $editedText, axis: .vertical)
-                .font(T3Typography.threadBody)
-                .lineLimit(3...8)
-                .disabled(isUpdating)
-                .accessibilityIdentifier("thread-queue-edit-text")
-            if let runID = editingRunID {
-                let entry = execution.queuedEntries.first { $0.id == runID }
-                if entry == nil {
-                    Text("This message is no longer queued.")
-                        .font(T3Typography.supporting)
-                }
-                Button("Save message") {
-                    Task {
-                        if await performAction(.edit(runID: runID, text: editedText)) {
-                            editingRunID = nil
-                        }
-                    }
-                }
-                .font(T3Typography.control)
-                .frame(minHeight: T3Metrics.minimumTapTarget)
-                .disabled(controlsDisabled || entry?.text == editedText
-                    || !execution.allows(.edit(runID: runID, text: editedText)))
-            }
-            Divider().overlay(Color.white.opacity(0.18))
-        }
-        .padding(.vertical, 8)
     }
 
     private func submit(_ action: FeatureThreadQueueAction) {

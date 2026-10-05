@@ -65,6 +65,19 @@ struct FeatureComposerApprovalPanel: View {
                         .stroke(T3Colors.border, lineWidth: 1)
                 }
                 .padding(.top, 9)
+
+                if !approval.canRespond {
+                    Text("The provider process for this request is no longer available. Interrupt or restart the run to continue.")
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.textSecondary)
+                        .padding(.top, 9)
+                }
+                if let warning = options.compactMap(\.warning).first(where: { !$0.isEmpty }) {
+                    Text(warning)
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.warning)
+                        .padding(.top, 9)
+                }
             }
             .padding(.horizontal, 15)
             .padding(.vertical, 12)
@@ -84,6 +97,8 @@ struct FeatureComposerApprovalPanel: View {
                         )
                     }
                 }
+                .disabled(!approval.canRespond)
+                .opacity(approval.canRespond ? 1 : 0.56)
 
                 HStack(spacing: 26) {
                     ForEach(negativeOptions) { option in
@@ -92,6 +107,8 @@ struct FeatureComposerApprovalPanel: View {
                         }
                         .foregroundStyle(T3Colors.danger)
                         .frame(minHeight: T3Metrics.minimumTapTarget)
+                        .disabled(!approval.canRespond)
+                        .opacity(approval.canRespond ? 1 : 0.56)
                     }
 
                     Button("Cancel turn", action: onCancelTurn)
@@ -169,7 +186,7 @@ struct FeatureComposerUserInputPanel: View {
     var environmentID: String? = nil
     var attachmentPreferences = FeatureEnvironmentPreferences()
 
-    @State private var answers: [String: FeatureInputAnswer] = [:]
+    @State private var answers: [String: FeatureInputDraftAnswer] = [:]
     @State private var questionIndex = 0
     @State private var attachmentsByQuestionID: [String: [FeatureDraftAttachment]] = [:]
     @State private var preparation = FeatureAttachmentPreparationState()
@@ -212,6 +229,12 @@ struct FeatureComposerUserInputPanel: View {
                                 .foregroundStyle(T3Colors.textTertiary)
                                 .padding(.top, 4)
                         }
+                        if !input.canRespond {
+                            Text("The provider process for this request is no longer available. Interrupt or restart the run to continue.")
+                                .font(T3Typography.supporting)
+                                .foregroundStyle(T3Colors.textSecondary)
+                                .padding(.top, 9)
+                        }
                     }
                     .padding(.horizontal, 15)
                     .padding(.vertical, 12)
@@ -225,10 +248,11 @@ struct FeatureComposerUserInputPanel: View {
                             VStack(spacing: 6) {
                                 ForEach(
                                     Array(question.options.enumerated()),
-                                    id: \.element.label
+                                    id: \.element.id
                                 ) { index, option in
                                     optionButton(option, number: index + 1, question: question)
-                                        .disabled(preparation.isPreparing || attachmentFlowActive)
+                                        .disabled(!input.canRespond || preparation.isPreparing || attachmentFlowActive)
+                                        .opacity(input.canRespond ? 1 : 0.56)
                                 }
                             }
                             .padding(.horizontal, 10)
@@ -278,11 +302,13 @@ struct FeatureComposerUserInputPanel: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.top, 7)
+                        .disabled(!input.canRespond)
                     }
 
                     if !(attachmentsByQuestionID[question.id] ?? []).isEmpty {
                         FeatureAttachmentStrip(attachments: attachmentBinding(questionID: question.id))
                             .padding(.horizontal, 10)
+                            .disabled(!input.canRespond)
                     }
                     if preparation.isPreparing || isResponding || isSubmittingAnswer {
                         Text(preparation.isPreparing ? preparation.statusLabel : responseStatus)
@@ -318,7 +344,7 @@ struct FeatureComposerUserInputPanel: View {
                                 .foregroundStyle(T3Colors.textSecondary)
                                 .frame(minHeight: T3Metrics.minimumTapTarget)
                                 .accessibilityLabel("Dismiss question without replying")
-                                .disabled(preparation.isPreparing || attachmentFlowActive)
+                                .disabled(!input.canRespond || preparation.isPreparing || attachmentFlowActive)
                         }
                         if questionIndex > 0 {
                             Button("Back") {
@@ -424,8 +450,10 @@ struct FeatureComposerUserInputPanel: View {
     }
 
     private var canAdvance: Bool {
-        guard let activeQuestion, !isSubmittingAnswer, !preparation.isPreparing, !attachmentFlowActive,
-              restoredInputID == input.id, attachmentBlocker == nil else { return false }
+        guard let activeQuestion, !isSubmittingAnswer, !preparation.isPreparing,
+              !attachmentFlowActive else { return false }
+        if !input.canRespond { return !isLastQuestion }
+        guard restoredInputID == input.id, attachmentBlocker == nil else { return false }
         return normalizedAnswer(for: activeQuestion.id) != nil || hasAttachments(for: activeQuestion.id)
     }
 
@@ -446,10 +474,10 @@ struct FeatureComposerUserInputPanel: View {
         number: Int,
         question: FeatureInputQuestion
     ) -> some View {
-        let isSelected = isOptionSelected(option.label, for: question)
+        let isSelected = answers[question.id]?.isOptionSelected(option.wireValue, for: question) == true
 
         return Button {
-            select(option.label, for: question)
+            select(option.wireValue, for: question)
         } label: {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -502,25 +530,17 @@ struct FeatureComposerUserInputPanel: View {
 
     private func answerBinding(for question: FeatureInputQuestion) -> Binding<String> {
         Binding(
-            get: {
-                FeatureComposerCustomAnswer.text(
-                    in: answers[question.id],
-                    for: question
-                )
-            },
+            get: { answers[question.id]?.customAnswer ?? "" },
             set: {
-                answers[question.id] = FeatureComposerCustomAnswer.replacingText(
-                    in: answers[question.id],
-                    with: $0,
-                    for: question
-                )
+                guard input.canRespond else { return }
+                answers[question.id, default: FeatureInputDraftAnswer()].setCustomAnswer($0, for: question)
             }
         )
     }
 
-    private func select(_ label: String, for question: FeatureInputQuestion) {
-        answers[question.id] = (answers[question.id] ?? .selections([]))
-            .togglingOption(label, allowsMultiple: question.allowsMultiple)
+    private func select(_ value: String, for question: FeatureInputQuestion) {
+        guard input.canRespond else { return }
+        answers[question.id, default: FeatureInputDraftAnswer()].toggleOption(value, for: question)
         if question.allowsMultiple {
             return
         }
@@ -594,51 +614,8 @@ struct FeatureComposerUserInputPanel: View {
     }
 
     private func normalizedAnswer(for questionID: String) -> FeatureInputAnswer? {
-        answers[questionID]?.normalized
-    }
-
-    private func isOptionSelected(_ label: String, for question: FeatureInputQuestion) -> Bool {
-        switch answers[question.id] {
-        case let .text(value):
-            return !question.allowsMultiple && value == label
-        case let .selections(values):
-            return values.contains(label)
-        case nil:
-            return false
-        }
-    }
-}
-
-enum FeatureComposerCustomAnswer {
-    static func text(
-        in answer: FeatureInputAnswer?,
-        for question: FeatureInputQuestion
-    ) -> String {
-        let optionLabels = Set(question.options.map(\.label))
-        switch answer {
-        case let .text(value):
-            return optionLabels.contains(value) ? "" : value
-        case let .selections(values):
-            return values.first(where: { !optionLabels.contains($0) }) ?? ""
-        case nil:
-            return ""
-        }
-    }
-
-    static func replacingText(
-        in answer: FeatureInputAnswer?,
-        with text: String,
-        for question: FeatureInputQuestion
-    ) -> FeatureInputAnswer {
-        guard question.allowsMultiple else { return .text(text) }
-        let optionLabels = Set(question.options.map(\.label))
-        let selectedOptions: [String]
-        if case let .selections(values) = answer {
-            selectedOptions = values.filter(optionLabels.contains)
-        } else {
-            selectedOptions = []
-        }
-        return .selections(text.isEmpty ? selectedOptions : selectedOptions + [text])
+        guard let question = input.questions.first(where: { $0.id == questionID }) else { return nil }
+        return answers[questionID]?.normalized(for: question)
     }
 }
 
@@ -659,9 +636,9 @@ enum FeatureComposerQuestionReconciliation {
     }
 
     static func answers(
-        _ answers: [String: FeatureInputAnswer],
+        _ answers: [String: FeatureInputDraftAnswer],
         currentQuestionIDs: [String]
-    ) -> [String: FeatureInputAnswer] {
+    ) -> [String: FeatureInputDraftAnswer] {
         let liveIDs = Set(currentQuestionIDs)
         return answers.filter { liveIDs.contains($0.key) }
     }

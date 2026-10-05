@@ -28,6 +28,10 @@ struct FeatureComposerTextInput: UIViewRepresentable {
     var draftOwnerID: String = ""
     var onCopyContext: ((String) throws -> Bool)? = nil
     var onPasteContext: ((ComposerContextClipboard.Content, String, NSRange) -> Void)? = nil
+    var composerEnterBehavior: FeatureComposerEnterBehavior = .send
+    var hardwareSubmitTitle = "Send Message"
+    var hardwareAlternateSubmitTitle = "Send Message"
+    var onHardwareSubmit: ((Bool) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -49,6 +53,7 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         }
         textView.onCopyError = onPasteTextError
         textView.onPasteContext = onPasteContext
+        updateHardwareReturn(textView)
         if onDismissKeyboard != nil {
             textView.installDismissPanRecognizer()
         }
@@ -88,6 +93,7 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         }
         textView.onCopyError = onPasteTextError
         textView.onPasteContext = onPasteContext
+        updateHardwareReturn(textView)
         textView.isReadOnly = isReadOnly
 
         let previousAttributedText = textView.attributedText ?? NSAttributedString()
@@ -189,6 +195,13 @@ struct FeatureComposerTextInput: UIViewRepresentable {
                 availableHeight: proposal.height
             )
         )
+    }
+
+    private func updateHardwareReturn(_ textView: FeatureComposerUITextView) {
+        textView.composerEnterBehavior = composerEnterBehavior
+        textView.hardwareSubmitTitle = hardwareSubmitTitle
+        textView.hardwareAlternateSubmitTitle = hardwareAlternateSubmitTitle
+        textView.onHardwareSubmit = onHardwareSubmit
     }
 
     private func updateAccessibility(_ textView: FeatureComposerUITextView) {
@@ -517,6 +530,10 @@ final class FeatureComposerUITextView: FeatureInlineSkillTextView {
     var onPasteTextError: ((String) -> Void)?
     var onPasteContext: ((ComposerContextClipboard.Content, String, NSRange) -> Void)?
     private var wantsFirstResponderOnAttach = false
+    var composerEnterBehavior: FeatureComposerEnterBehavior = .send
+    var hardwareSubmitTitle = "Send Message"
+    var hardwareAlternateSubmitTitle = "Send Message"
+    var onHardwareSubmit: ((Bool) -> Void)?
 
     override var keyCommands: [UIKeyCommand]? {
         let pasteAsTextCommand = UIKeyCommand(
@@ -526,7 +543,32 @@ final class FeatureComposerUITextView: FeatureInlineSkillTextView {
         )
         pasteAsTextCommand.discoverabilityTitle = "Paste as Text"
         pasteAsTextCommand.wantsPriorityOverSystemBehavior = true
-        return (super.keyCommands ?? []) + [pasteAsTextCommand]
+        var commands = (super.keyCommands ?? []) + [pasteAsTextCommand]
+        if canHandleHardwareReturn {
+            commands += FeatureComposerHardwareReturnPolicy.commands(
+                behavior: composerEnterBehavior,
+                submitTitle: hardwareSubmitTitle,
+                alternateSubmitTitle: hardwareAlternateSubmitTitle,
+                target: #selector(handleHardwareReturn(_:))
+            )
+        }
+        return commands
+    }
+
+    private var canHandleHardwareReturn: Bool {
+        isEditable && !isReadOnly && markedTextRange == nil && onHardwareSubmit != nil
+    }
+
+    @objc private func handleHardwareReturn(_ command: UIKeyCommand) {
+        guard canHandleHardwareReturn else { return }
+        switch FeatureComposerHardwareReturnPolicy.action(
+            behavior: composerEnterBehavior,
+            modifiers: command.modifierFlags
+        ) {
+        case .submit(let alternate): onHardwareSubmit?(alternate)
+        case .newline: insertText("\n")
+        case nil: break
+        }
     }
 
     /// Programmatic focus can arrive before the view joins a window (a host
@@ -629,6 +671,9 @@ final class FeatureComposerUITextView: FeatureInlineSkillTextView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(handleHardwareReturn(_:)) {
+            return canHandleHardwareReturn
+        }
         if action == #selector(pasteAsText(_:)) {
             return !isReadOnly && UIPasteboard.general.hasStrings
         }

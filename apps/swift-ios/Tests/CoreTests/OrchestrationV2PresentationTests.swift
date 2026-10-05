@@ -114,7 +114,8 @@ final class OrchestrationV2PresentationTests: XCTestCase {
         XCTAssertNotNil(controls["providerTurns"])
         XCTAssertNotNil(controls["attempts"])
         XCTAssertNil(controls["turnItems"])
-        XCTAssertNil(controls["visibleTurnItems"])
+        let assistantSources = try XCTUnwrap(controls["visibleTurnItems"]?.v2Array)
+        XCTAssertTrue(assistantSources.allSatisfy { $0["item"]?["type"] == .string("assistant_message") && $0["item"]?["text"] == nil })
         XCTAssertTrue(detail.thread.messages.contains { $0.attachments?.isEmpty == false })
         XCTAssertFalse(detail.thread.messages.contains { $0.id == "message-v2-queued" })
         XCTAssertTrue(detail.thread.activities.contains { $0.kind == "approval.requested" && $0.payload["requestId"] == .string("request-v2-approval") })
@@ -149,7 +150,7 @@ final class OrchestrationV2PresentationTests: XCTestCase {
         XCTAssertEqual(final.map(\.kind), ["approval.resolved", "user-input.resolved"])
     }
 
-    func testInheritedRequestsAreReadOnlyAndNonResumableRequestsDoNotAskForInput() throws {
+    func testInheritedRequestsStayReadOnlyAndNonResumableRequestsStayPending() throws {
         let item = V2Fixture.item("approval", type: "approval_request", ordinal: 1, fields: ["requestId": .string("approve"), "requestKind": .string("command")])
         let inherited = V2Fixture.patch(item, ["id": .string("parent-approval"), "threadId": .string("parent")])
         let snapshot = V2Fixture.snapshot(items: [item], fields: [
@@ -158,8 +159,12 @@ final class OrchestrationV2PresentationTests: XCTestCase {
         ])
         let state = try OrchestrationV2ThreadState(snapshot: snapshot)
         let activities = state.normalizedSnapshot().thread.activities
-        XCTAssertEqual(activities.count, 1)
+        XCTAssertEqual(activities.count, 2)
         XCTAssertEqual(activities.first?.kind, "approval.resolved")
+        XCTAssertEqual(activities.first?.v2Timeline?.visibility, "inherited")
+        XCTAssertNotEqual(activities.first?.payload["requestId"], .string("approve"))
+        XCTAssertEqual(activities.last?.kind, "approval.requested")
+        XCTAssertEqual(activities.last?.payload["responseCapability"]?["type"], .string("not_resumable"))
     }
 
     func testQuestionAnswerResolutionKeepsTextSelectionsAndAttachmentsAcrossLiveUpdates() throws {
@@ -222,7 +227,7 @@ final class OrchestrationV2PresentationTests: XCTestCase {
         }
     }
 
-    func testInheritedAndNonResumableQuestionsKeepAnswerHistoryWithoutControls() throws {
+    func testInheritedQuestionsKeepReadOnlyHistoryAndNonResumableLocalQuestionsStayPending() throws {
         for response in ["live", "message", "not_resumable"] {
             let question = V2Fixture.item("question", type: "user_input_request", ordinal: 1, fields: [
                 "requestId": .string("input"), "questions": .array([]),
@@ -238,11 +243,13 @@ final class OrchestrationV2PresentationTests: XCTestCase {
                 "runtimeRequests": .array([V2Fixture.request("input", kind: "user_input", response: response)]),
             ]))
             let activities = state.normalizedSnapshot().thread.activities
-            XCTAssertEqual(activities.count, 2)
-            XCTAssertEqual(activities.first?.kind, "user-input.answer-submitted")
-            XCTAssertEqual(activities.first?.payload["answers"]?["scope"], .string("Server"))
-            XCTAssertTrue(activities.first?.id.contains("inherited") == true)
-            XCTAssertEqual(activities.last?.kind, response == "not_resumable" ? "user-input.resolved" : "user-input.requested")
+            XCTAssertEqual(activities.count, 4)
+            let savedAnswer = try XCTUnwrap(activities.first { $0.kind == "user-input.answer-submitted" })
+            XCTAssertEqual(savedAnswer.payload["answers"]?["scope"], .string("Server"))
+            XCTAssertTrue(savedAnswer.id.contains("inherited"))
+            XCTAssertFalse(activities.filter { $0.v2Timeline?.visibility == "inherited" }.contains { $0.kind == "user-input.requested" })
+            XCTAssertEqual(activities.last?.kind, "user-input.requested")
+            XCTAssertEqual(activities.last?.payload["responseCapability"]?["type"], .string(response))
         }
     }
 
@@ -283,16 +290,18 @@ final class OrchestrationV2PresentationTests: XCTestCase {
         let items = [
             V2Fixture.item("reason", type: "reasoning", ordinal: 1, fields: ["text": .string("Checking the state"), "streaming": .bool(true)]),
             V2Fixture.item("plan", type: "proposed_plan", ordinal: 2, fields: ["planId": .string("plan"), "markdown": .string("## Fix\nUse the reducer"), "streaming": .bool(false)]),
-            V2Fixture.item("error", type: "error", ordinal: 3, fields: ["failure": .object(["class": .string("provider_error"), "message": .string("Provider stopped"), "code": .null, "retryable": .bool(true)])]),
+            V2Fixture.item("error", type: "error", ordinal: 3, fields: ["status": .string("failed"), "failure": .object(["class": .string("provider_error"), "message": .string("Provider stopped"), "code": .null, "retryable": .bool(true)])]),
             V2Fixture.item("handoff", type: "handoff", ordinal: 4, fields: ["contextHandoffId": .string("handoff"), "fromProviderThreadIds": .array([]), "toProviderThreadId": .string("next"), "fromProviderInstanceIds": .array([]), "toProviderInstanceId": .string("claude"), "strategy": .string("full_thread_summary"), "summary": .string("Continue with the checked state")]),
         ]
         let state = try OrchestrationV2ThreadState(snapshot: V2Fixture.snapshot(items: items))
         let detail = state.normalizedSnapshot().thread
-        XCTAssertEqual(detail.messages.map(\.role), ["reasoning", "assistant", "system"])
-        XCTAssertEqual(detail.messages.first?.streaming, true)
-        XCTAssertTrue(detail.messages.contains { $0.text == "Continue with the checked state" })
-        XCTAssertEqual(detail.activities.first?.tone, "error")
-        XCTAssertEqual(detail.activities.first?.payload["message"], .string("Provider stopped"))
+        XCTAssertEqual(detail.messages.map(\.role), ["assistant"])
+        XCTAssertTrue(detail.activities.contains { $0.v2Item?["text"] == .string("Checking the state") })
+        XCTAssertTrue(detail.activities.contains { $0.v2Item?["summary"] == .string("Continue with the checked state") })
+        let failure = try XCTUnwrap(detail.activities.first { $0.v2Timeline?.itemType == "error" })
+        XCTAssertEqual(failure.tone, "error")
+        XCTAssertEqual(failure.payload["message"], .string("Provider stopped"))
+        XCTAssertEqual(detail.v2Timeline?.count, 4)
     }
 
     func testSubagentControlUpdateClosesItsWorkLogAndPreservesUniqueActivityIDs() throws {

@@ -153,6 +153,7 @@ final class TerminalInputSession {
 public struct FeatureTerminalView: View {
     let client: any FeatureClient
     let threadID: String
+    let initialTerminalID: String?
     let onAttachContext: ((ComposerContextRecord) throws -> Void)?
 
     @SwiftUI.Environment(\.dismiss) private var dismiss
@@ -160,6 +161,7 @@ public struct FeatureTerminalView: View {
     @State private var terminal: FeatureTerminalSnapshot?
     @State private var sessions = [FeatureTerminalSnapshot]()
     @State private var activeTerminalID = "default"
+    @State private var terminalAttachmentVersion = 0
     @State private var resolvedThreadID: String?
     @State private var columns = 80
     @State private var rows = 24
@@ -167,12 +169,16 @@ public struct FeatureTerminalView: View {
     @State private var isLoading = true
     @State private var isOpening = false
     @State private var errorMessage: String?
+    @State private var scriptErrorMessage: String?
     @State private var inputSession = TerminalInputSession()
 
-    public init(client: any FeatureClient, threadID: String, onAttachContext: ((ComposerContextRecord) throws -> Void)? = nil) {
+    public init(client: any FeatureClient, threadID: String, initialTerminalID: String? = nil,
+                onAttachContext: ((ComposerContextRecord) throws -> Void)? = nil) {
         self.client = client
         self.threadID = threadID
+        self.initialTerminalID = initialTerminalID
         self.onAttachContext = onAttachContext
+        _activeTerminalID = State(initialValue: initialTerminalID ?? "default")
     }
 
     public var body: some View {
@@ -253,14 +259,26 @@ public struct FeatureTerminalView: View {
         }
         .background(T3Colors.background.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
+        .alert("Script could not start", isPresented: Binding(
+            get: { scriptErrorMessage != nil },
+            set: { if !$0 { scriptErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { scriptErrorMessage = nil }
+        } message: {
+            Text(scriptErrorMessage ?? "")
+        }
         .onAppear { inputSession.attach(to: inputTarget) }
         .onDisappear { inputSession.detach() }
         .onChange(of: threadID) { _, _ in
             updateTerminal(nil)
             sessions = []
-            activeTerminalID = "default"
+            activeTerminalID = initialTerminalID ?? "default"
             resolvedThreadID = nil
             errorMessage = nil
+            scriptErrorMessage = nil
+        }
+        .onChange(of: initialTerminalID) { _, terminalID in
+            if let terminalID { selectTerminal(terminalID) }
         }
         .task(id: threadID) {
             inputSession.updateTarget(inputTarget)
@@ -268,7 +286,7 @@ public struct FeatureTerminalView: View {
                 guard !Task.isCancelled else { return }
                 sessions = updates
                 if !sessionsResolved {
-                    activeTerminalID = TerminalSessionList.initialID(in: updates)
+                    activeTerminalID = initialTerminalID ?? TerminalSessionList.initialID(in: updates)
                     resolvedThreadID = threadID
                 }
             }
@@ -367,6 +385,15 @@ public struct FeatureTerminalView: View {
                 }
             }
 
+            FeatureProjectScriptsMenu(
+                client: client, threadID: threadID, columns: columns, rows: rows,
+                onError: { scriptErrorMessage = $0 }
+            ) {
+                selectTerminal($0)
+                // A script can restart the selected, previously closed session.
+                terminalAttachmentVersion += 1
+            }
+
             Section {
                 Menu {
                     Button {
@@ -428,7 +455,7 @@ public struct FeatureTerminalView: View {
     }
 
     private var terminalTaskID: String {
-        "\(threadID):\(sessionsResolved):\(activeTerminalID)"
+        "\(threadID):\(sessionsResolved):\(activeTerminalID):\(terminalAttachmentVersion)"
     }
 
     private var sessionsResolved: Bool {

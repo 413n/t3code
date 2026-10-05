@@ -34,6 +34,7 @@ extension FeatureProjectCreationClient {
 enum ProjectRemoteSource: String, CaseIterable, Hashable, Identifiable {
     case url
     case github
+    case forgejo
     case gitlab
     case bitbucket
     case azureDevOps = "azure-devops"
@@ -44,6 +45,7 @@ enum ProjectRemoteSource: String, CaseIterable, Hashable, Identifiable {
         switch self {
         case .url: nil
         case .github: .github
+        case .forgejo: .forgejo
         case .gitlab: .gitlab
         case .bitbucket: .bitbucket
         case .azureDevOps: .azureDevOps
@@ -54,6 +56,7 @@ enum ProjectRemoteSource: String, CaseIterable, Hashable, Identifiable {
         switch self {
         case .url: "Git URL"
         case .github: "GitHub"
+        case .forgejo: "Forgejo"
         case .gitlab: "GitLab"
         case .bitbucket: "Bitbucket"
         case .azureDevOps: "Azure DevOps"
@@ -63,7 +66,7 @@ enum ProjectRemoteSource: String, CaseIterable, Hashable, Identifiable {
     var prompt: String {
         switch self {
         case .url: "https://github.com/org/repository.git"
-        case .github, .gitlab, .bitbucket: "owner/repository"
+        case .github, .forgejo, .gitlab, .bitbucket: "owner/repository"
         case .azureDevOps: "organization/project/repository"
         }
     }
@@ -146,7 +149,7 @@ enum ProjectCreationPath {
     }
 
     static func defaultCloneURL(for repository: SourceControlRepositoryInfo) -> String {
-        repository.provider == .github ? repository.url : repository.sshUrl
+        [.github, .forgejo].contains(repository.provider) ? repository.url : repository.sshUrl
     }
 
     static func validated(_ rawValue: String) -> Result<String, ProjectCreationValidationError> {

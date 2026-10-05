@@ -38,7 +38,7 @@ struct FeatureOutboxStoreTests {
         #expect(restored.count == 1)
         #expect(restored[0].identity == identity)
         #expect(restored[0].runtimeMode == .automatic)
-        #expect(restored[0].interactionMode == .standard)
+        #expect(restored[0].interactionMode == .plan)
         #expect(restored[0].attachments.first?.data == Data([0x01, 0x02]))
     }
 

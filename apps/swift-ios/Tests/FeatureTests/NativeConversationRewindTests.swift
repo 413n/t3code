@@ -148,6 +148,18 @@ struct NativeConversationRewindTests {
     }
 
     @Test
+    func rewindRecoveryUsesTheComposerAttachmentLimit() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureComposerDraftStore(fileURL: directory.appendingPathComponent("drafts.json"))
+        let files = (0..<9).map { FeatureDraftAttachment(data: Data([1]), filename: "file-\($0).txt", mimeType: "text/plain") }
+        try await store.setDraft(.init(attachments: files), for: FeatureComposerDraftStore.rewindRecoveryKey(for: "thread"))
+        let recovered = try await store.consumeRewindRecovery(for: "thread")
+        #expect(recovered?.attachments.map(\.id) == files.map(\.id))
+        #expect(try await store.hasRewindRecovery(for: "thread") == false)
+    }
+
+    @Test
     func recoveryKeysDoNotOverwriteAnotherThreadsDraft() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

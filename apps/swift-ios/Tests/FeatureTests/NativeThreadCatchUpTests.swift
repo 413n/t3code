@@ -5,6 +5,49 @@ import XCTest
 @MainActor
 @available(iOS 18.0, *)
 final class NativeThreadCatchUpTests: XCTestCase {
+    func testFirstConnectedShellPublishesThreadsBeforeWakingOutbox() async throws {
+        let fixture = try await CatchUpFixture.make(shellInitiallyUnavailable: true)
+        defer { fixture.cleanUp() }
+        var snapshot = fixture.initialSnapshot
+        XCTAssertTrue(snapshot.threads.isEmpty)
+        XCTAssertNotEqual(snapshot.environments.first?.connectionState, .connected)
+        let submission = FeatureQueuedSubmission(
+            environmentID: "one", identity: .init(threadID: "first"), threadID: fixture.firstID,
+            text: "Queued offline", selection: nil, runtimeMode: .automatic,
+            interactionMode: .standard, attachments: []
+        )
+        var requests = fixture.requests.makeAsyncIterator()
+        var events = fixture.client.events().makeAsyncIterator()
+        var shellRequest: CatchUpRequest?
+        while let request = await requests.next() {
+            if request.tag == RPCMethod.subscribeShell.rawValue {
+                shellRequest = request
+                break
+            }
+        }
+        let stream = try XCTUnwrap(shellRequest)
+        let shell = multiEnvironmentShell(projectID: "project", threadID: "first", title: "First")
+        try await stream.socket.chunk(id: stream.id, values: [.object([
+            "kind": .string("snapshot"), "snapshot": try .encode(shell),
+        ])])
+        while let event = await events.next(isolation: #isolation) {
+            switch event {
+            case let .snapshot(value): snapshot = value
+            case let .connection(connection, environmentID):
+                if let index = snapshot.environments.firstIndex(where: { $0.id == environmentID }) {
+                    snapshot.environments[index].connectionState = connection.state
+                }
+            default: continue
+            }
+            if snapshot.environments.first?.connectionState == .connected {
+                XCTAssertTrue(snapshot.threads.contains { $0.id == fixture.firstID })
+                XCTAssertEqual(FeatureOutboxPolicy.decision(for: submission, snapshot: snapshot), .send)
+                break
+            }
+        }
+        await fixture.client.disconnect()
+    }
+
     func testStaleDetailReplaySkipsReductionOnlyAfterEnvelopeValidation() throws {
         let thread = multiEnvironmentDetail(
             projectID: "project", threadID: "first", snapshotSequence: 2, messages: []
@@ -296,6 +339,118 @@ final class NativeThreadCatchUpTests: XCTestCase {
             XCTAssertEqual(error.localizedDescription, "The input request is no longer active.")
         }
         await fixture.client.disconnect()
+    }
+
+    func testV2ApprovalChoicesWarningsAndEmptyOptionsReachFeatureRequests() async throws {
+        let items = [
+            V2Fixture.item("approval", type: "approval_request", ordinal: 1, fields: [
+                "requestId": .string("approve"), "requestKind": .string("mcp-elicitation"),
+                "prompt": .string("Allow app access?"), "appName": .string("Drive"),
+                "options": .array([
+                    .object(["decision": .string("acceptAlways"), "label": .string("Always"),
+                             "warning": .string("This grants access for future requests.")]),
+                    .object(["decision": .string("cancel"), "label": .string("Cancel")]),
+                ]),
+            ]),
+            V2Fixture.item("empty", type: "approval_request", ordinal: 2, fields: [
+                "requestId": .string("empty"), "requestKind": .string("command"),
+                "options": .array([]),
+            ]),
+            V2Fixture.item("defaults", type: "approval_request", ordinal: 3, fields: [
+                "requestId": .string("defaults"), "requestKind": .string("command"),
+            ]),
+        ]
+        let state = try OrchestrationV2ThreadState(snapshot: V2Fixture.snapshot(items: items, fields: [
+            "runtimeRequests": .array([
+                V2Fixture.request("approve", kind: "mcp-elicitation"),
+                V2Fixture.request("empty"), V2Fixture.request("defaults"),
+            ]),
+        ]))
+        let fixture = try await CatchUpFixture.make(activities: state.normalizedSnapshot().thread.activities)
+        defer { fixture.cleanUp() }
+        let detail = try await fixture.client.loadThread(id: fixture.firstID)
+        await fixture.client.disconnect()
+
+        let approval = try XCTUnwrap(detail.approvals.first { $0.wireID == "approve" })
+        XCTAssertEqual(approval.appName, "Drive")
+        XCTAssertEqual(approval.title, "Drive")
+        XCTAssertEqual(approval.options, [
+            FeatureApprovalOption(decision: .allowAlways, label: "Always", warning: "This grants access for future requests."),
+            FeatureApprovalOption(decision: .cancel, label: "Cancel"),
+        ])
+        XCTAssertEqual(approval.responseCapability, "live")
+        XCTAssertTrue(approval.canRespond)
+        XCTAssertEqual(try XCTUnwrap(detail.approvals.first { $0.wireID == "empty" }).options, [])
+        XCTAssertNil(try XCTUnwrap(detail.approvals.first { $0.wireID == "defaults" }).options)
+    }
+
+    func testV2QuestionOptionsRetainWireValuesThroughFeatureSubmission() async throws {
+        let item = V2Fixture.item("question", type: "user_input_request", ordinal: 1, fields: [
+            "requestId": .string("input"), "questions": .array([.object([
+                "id": .string("branch"), "header": .string("Branch"), "question": .string("Which branch?"),
+                "multiSelect": .bool(true), "options": .array([
+                    .object(["label": .string("Use existing branch"), "description": .string("Named"),
+                             "value": .string("existing_branch")]),
+                    .object(["label": .string("Use existing branch"), "description": .string("Current"),
+                             "value": .string("")]),
+                    .object(["label": .string(" Legacy "), "description": .string("No value")]),
+                ]),
+            ])]),
+        ])
+        let state = try OrchestrationV2ThreadState(snapshot: V2Fixture.snapshot(items: [item], fields: [
+            "runtimeRequests": .array([V2Fixture.request("input", kind: "user_input")]),
+        ]))
+        let fixture = try await CatchUpFixture.make(activities: state.normalizedSnapshot().thread.activities)
+        defer { fixture.cleanUp() }
+        let detail = try await fixture.client.loadThread(id: fixture.firstID)
+        await fixture.client.disconnect()
+
+        let question = try XCTUnwrap(detail.userInputs.first?.questions.first)
+        XCTAssertEqual(question.options.map(\.value), ["existing_branch", "", nil])
+        XCTAssertEqual(question.options.map(\.id), ["existing_branch", "", "Legacy"])
+        var draft = FeatureInputDraftAnswer()
+        for option in question.options { draft.toggleOption(option.wireValue, for: question) }
+        XCTAssertEqual(draft.normalized(for: question)?.jsonValue, .array([
+            .string("existing_branch"), .string(""), .string("Legacy"),
+        ]))
+    }
+
+    func testV2UnresumableRequestsStayVisibleWhileMessageQuestionsRemainAnswerable() async throws {
+        let items = [
+            V2Fixture.item("approval", type: "approval_request", ordinal: 1, fields: [
+                "requestId": .string("approve"), "requestKind": .string("command"),
+            ]),
+        ] + ["callback", "async"].enumerated().map { index, id in
+            V2Fixture.item(id, type: "user_input_request", ordinal: index + 2, fields: [
+                "requestId": .string(id), "questions": .array([.object([
+                    "id": .string("answer"), "header": .string("Answer"),
+                    "question": .string("What next?"), "options": .array([]),
+                    "allowCustomAnswer": .bool(true),
+                ])]),
+            ])
+        }
+        let state = try OrchestrationV2ThreadState(snapshot: V2Fixture.snapshot(items: items, fields: [
+            "runtimeRequests": .array([
+                V2Fixture.request("approve", response: "not_resumable"),
+                V2Fixture.request("callback", kind: "user_input", response: "not_resumable"),
+                V2Fixture.request("async", kind: "user_input", response: "message"),
+            ]),
+        ]))
+        let fixture = try await CatchUpFixture.make(activities: state.normalizedSnapshot().thread.activities)
+        defer { fixture.cleanUp() }
+        let detail = try await fixture.client.loadThread(id: fixture.firstID)
+        await fixture.client.disconnect()
+
+        let approval = try XCTUnwrap(detail.approvals.first)
+        XCTAssertEqual(approval.responseCapability, "not_resumable")
+        XCTAssertFalse(approval.canRespond)
+        let callback = try XCTUnwrap(detail.userInputs.first { $0.wireID == "callback" })
+        XCTAssertEqual(callback.responseCapability, "not_resumable")
+        XCTAssertFalse(callback.canRespond)
+        let message = try XCTUnwrap(detail.userInputs.first { $0.wireID == "async" })
+        XCTAssertEqual(message.responseCapability, "message")
+        XCTAssertTrue(message.canRespond)
+        XCTAssertTrue(message.canDismiss)
     }
 
     func testRequestSnapshotsKeepTerminalRequestsClosedAndOtherFailuresRetryable() async throws {
@@ -1219,6 +1374,7 @@ final class NativeThreadCatchUpTests: XCTestCase {
 @MainActor
 private struct CatchUpFixture {
     let client: NativeFeatureClient
+    let initialSnapshot: FeatureSnapshot
     let http: CatchUpHTTPTransport
     let requests: AsyncStream<CatchUpRequest>
     let delay: CatchUpDelay
@@ -1228,6 +1384,7 @@ private struct CatchUpFixture {
 
     static func make(
         completionMarker: Bool = true,
+        shellInitiallyUnavailable: Bool = false,
         activities: [OrchestrationActivity] = [],
         threadRetryDelay: @escaping @Sendable (Int) async throws -> Void = { _ in
             try await Task.sleep(for: .milliseconds(250))
@@ -1240,7 +1397,7 @@ private struct CatchUpFixture {
             webSocketBaseURL: URL(string: "wss://one.example/ws")!
         )])
         try await store.setActiveEnvironment(id: "one")
-        let http = CatchUpHTTPTransport()
+        let http = CatchUpHTTPTransport(shellInitiallyUnavailable: shellInitiallyUnavailable)
         await http.setActivities(activities)
         let requests = AsyncStream<CatchUpRequest>.makeStream()
         let delay = CatchUpDelay()
@@ -1259,8 +1416,9 @@ private struct CatchUpFixture {
             catchUpDelay: { try await delay.wait() },
             threadRetryDelay: threadRetryDelay
         )
-        _ = try await client.initialSnapshot()
-        return Self(client: client, http: http, requests: requests.stream, delay: delay, directory: directory)
+        let initialSnapshot = try await client.initialSnapshot()
+        return Self(client: client, initialSnapshot: initialSnapshot, http: http,
+                    requests: requests.stream, delay: delay, directory: directory)
     }
 
     func cleanUp() { try? FileManager.default.removeItem(at: directory) }
@@ -1275,8 +1433,10 @@ private actor CatchUpHTTPTransport: HTTPTransport {
     private var holdsThreadReads = false
     private let heldReadContinuation: AsyncStream<CatchUpHTTPRead>.Continuation
     nonisolated let heldRequests: AsyncStream<CatchUpHTTPRead>
+    private let shellInitiallyUnavailable: Bool
 
-    init() {
+    init(shellInitiallyUnavailable: Bool = false) {
+        self.shellInitiallyUnavailable = shellInitiallyUnavailable
         let reads = AsyncStream<CatchUpHTTPRead>.makeStream()
         heldRequests = reads.stream
         heldReadContinuation = reads.continuation
@@ -1313,6 +1473,7 @@ private actor CatchUpHTTPTransport: HTTPTransport {
         case "/api/auth/websocket-ticket":
             value = .object(["ticket": .string("test"), "expiresAt": .string("2027-01-01T00:00:00Z")])
         case "/api/orchestration/shell":
+            if shellInitiallyUnavailable { throw URLError(.notConnectedToInternet) }
             let first = multiEnvironmentShell(projectID: "project", threadID: "first", title: "First")
             let second = multiEnvironmentShell(projectID: "project", threadID: "second", title: "Second")
             value = try .encode(OrchestrationShellSnapshot(

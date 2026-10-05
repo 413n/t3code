@@ -121,7 +121,7 @@ public enum FeatureMessageDelivery: String, Sendable, Equatable, Codable, CaseIt
 
 /// Optional adapter support for explicit follow-up delivery. Existing clients keep auto delivery.
 @MainActor
-public protocol FeatureMessageDeliveryManaging {
+public protocol FeatureMessageDeliveryManaging: FeatureClient {
     func sendMessage(
         threadID: String,
         text: String,
@@ -132,6 +132,42 @@ public protocol FeatureMessageDeliveryManaging {
         context: OrchestrationMessageContext?,
         delivery: FeatureMessageDelivery
     ) async throws
+
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        interactionMode: FeatureInteractionMode?,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?,
+        delivery: FeatureMessageDelivery
+    ) async throws
+}
+
+public extension FeatureMessageDeliveryManaging {
+    /// Older adapters apply a requested mode before using their existing send path.
+    /// NativeFeatureClient sends both modes in the same turn command instead.
+    func sendMessage(
+        threadID: String,
+        text: String,
+        selection: FeatureSelection?,
+        runtimeMode: FeatureRuntimeMode,
+        interactionMode: FeatureInteractionMode?,
+        attachments: [FeatureUploadAttachment],
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?,
+        delivery: FeatureMessageDelivery
+    ) async throws {
+        if let interactionMode {
+            try await setInteractionMode(id: threadID, mode: interactionMode)
+        }
+        try await sendMessage(
+            threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
+            attachments: attachments, identity: identity, context: context, delivery: delivery
+        )
+    }
 }
 
 public extension FeatureClient {
@@ -140,6 +176,7 @@ public extension FeatureClient {
         text: String,
         selection: FeatureSelection?,
         runtimeMode: FeatureRuntimeMode,
+        interactionMode: FeatureInteractionMode? = nil,
         attachments: [FeatureUploadAttachment],
         identity: FeatureSubmissionIdentity,
         context: OrchestrationMessageContext?,
@@ -148,10 +185,14 @@ public extension FeatureClient {
         if let client = self as? any FeatureMessageDeliveryManaging {
             try await client.sendMessage(
                 threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
-                attachments: attachments, identity: identity, context: context, delivery: delivery
+                interactionMode: interactionMode, attachments: attachments, identity: identity,
+                context: context, delivery: delivery
             )
         } else {
             guard delivery == .auto else { throw FeatureCapabilityUnavailable("Message delivery options") }
+            if let interactionMode {
+                try await setInteractionMode(id: threadID, mode: interactionMode)
+            }
             try await sendMessage(
                 threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
                 attachments: attachments, identity: identity, context: context
@@ -162,6 +203,8 @@ public extension FeatureClient {
 
 public struct FeatureMessageSubmission: Sendable, Equatable {
     public var context: OrchestrationMessageContext?
+    public var runtimeMode: FeatureRuntimeMode?
+    public var interactionMode: FeatureInteractionMode?
     public var threadID: String
     public var text: String
     public var selection: FeatureSelection?
@@ -174,6 +217,8 @@ public struct FeatureMessageSubmission: Sendable, Equatable {
         selection: FeatureSelection?,
         attachments: [FeatureDraftAttachment] = [],
         context: OrchestrationMessageContext? = nil,
+        runtimeMode: FeatureRuntimeMode? = nil,
+        interactionMode: FeatureInteractionMode? = nil,
         delivery: FeatureMessageDelivery = .auto
     ) {
         self.threadID = threadID
@@ -181,6 +226,8 @@ public struct FeatureMessageSubmission: Sendable, Equatable {
         self.selection = selection
         self.attachments = attachments
         self.context = context
+        self.runtimeMode = runtimeMode
+        self.interactionMode = interactionMode
         self.delivery = delivery
     }
 }
@@ -757,6 +804,7 @@ enum DailyUXProjectGrouping {
 struct DailyUXSidebarIndex {
     let pinned: [FeatureThread]
     let active: [FeatureThread]
+    let working: [FeatureThread]
     let snoozed: [FeatureThread]
     let settled: [FeatureThread]
     let searchResults: [FeatureThread]
@@ -766,6 +814,7 @@ struct DailyUXSidebarIndex {
         query: String,
         projectID: String? = nil,
         now: Date = .now,
+        inboxReturns: FeatureInboxReturnTracker = .init(),
         pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation] = [:]
     ) {
         // Delegate children remain addressable through their parent, but do not
@@ -778,7 +827,16 @@ struct DailyUXSidebarIndex {
 
         pinned = Self.orderedSection(visible, section: .pinned, now: now)
 
-        active = Self.orderedSection(visible, section: .active, now: now)
+        let unpinned = Self.orderedSection(visible, section: .active, now: now)
+        if snapshot.settings.workingShelfEnabled {
+            working = FeatureInboxPolicy.sortWorking(unpinned.filter(FeatureInboxPolicy.isWorking))
+            active = FeatureInboxPolicy.sortInbox(
+                unpinned.filter { !FeatureInboxPolicy.isWorking($0) }, returns: inboxReturns
+            )
+        } else {
+            active = unpinned
+            working = []
+        }
 
         snoozed = visible
             .filter { $0.isEffectivelySnoozed(at: now) }
@@ -804,7 +862,7 @@ struct DailyUXSidebarIndex {
             }
 
         searchResults = Self.matchingThreads(
-            pinned + active + snoozed + settled,
+            pinned + active + working + snoozed + settled,
             snapshot: snapshot,
             query: query
         )
@@ -912,6 +970,7 @@ struct HomeOrderKey: Equatable {
     let environmentID: String?
     let wireID: String?
     let isArchived: Bool
+    let isSubagent: Bool
     let state: FeatureThreadState
     let createdAt: Date
     let unsettledAt: Date?
@@ -927,6 +986,11 @@ struct HomeOrderKey: Equatable {
     let latestUserMessageAt: Date?
     let sessionStatus: String?
     let latestTurn: FeatureThreadSettlementFacts.LatestTurn?
+    let hasPendingApprovals: Bool
+    let hasPendingUserInput: Bool
+    private let inboxFacts: InboxOrderFacts?
+    let hasPendingLocalMessages: Bool
+    let interactionMode: FeatureInteractionMode
     let keepsActive: Bool
     let isSettled: Bool
     let title: String
@@ -941,6 +1005,7 @@ struct HomeOrderKey: Equatable {
         environmentID = thread.environmentID
         wireID = thread.wireID
         isArchived = thread.isArchived
+        isSubagent = thread.isSubagent
         state = thread.state
         createdAt = thread.createdAt
         unsettledAt = thread.unsettledAt
@@ -956,12 +1021,51 @@ struct HomeOrderKey: Equatable {
         latestUserMessageAt = thread.settlementFacts?.latestUserMessageAt
         sessionStatus = thread.settlementFacts?.sessionStatus
         latestTurn = thread.settlementFacts?.latestTurn
+        hasPendingApprovals = thread.settlementFacts?.hasPendingApprovals == true
+        hasPendingUserInput = thread.settlementFacts?.hasPendingUserInput == true
+        inboxFacts = thread.inboxFacts.map { facts in
+            InboxOrderFacts(facts, snoozedUntil: thread.snoozedUntil, state: thread.state)
+        }
+        hasPendingLocalMessages = thread.hasPendingLocalMessages == true
+        interactionMode = thread.interactionMode
         keepsActive = thread.keepsActive
         isSettled = thread.isSettled
         title = thread.title
         pullRequestSearchTerms = ThreadPullRequests.searchTerms(thread.pullRequests, legacy: thread.linkedPullRequest)
         archivedSortDate = thread.isArchived ? thread.updatedAt : nil
         settledSortDate = thread.isEffectivelySettled() ? thread.settledSortDate : nil
+    }
+
+    /// Read state and streaming timestamps refresh a row without sorting every thread.
+    private struct InboxOrderFacts: Equatable {
+        let orchestrationVersion: Int?
+        let runtimeStatus: String?
+        let activeRunID: String?
+        let latestRunID: String?
+        let latestRunStatus: String?
+        let latestRunRequestedAt: Date?
+        let latestRunCompletedAt: Date?
+        let hasActionableProposedPlan: Bool
+        let latestUserAuthoredMessageAt: Date?
+        let latestUserAuthoredMessageAtIsPresent: Bool
+        let lastErrorClass: String?
+        let snoozedFailureUpdatedAt: Date?
+
+        init(_ facts: FeatureThreadInboxFacts, snoozedUntil: Date?, state: FeatureThreadState) {
+            orchestrationVersion = facts.orchestrationVersion
+            runtimeStatus = facts.runtimeStatus
+            activeRunID = facts.activeRunID
+            latestRunID = facts.latestRunID
+            latestRunStatus = facts.latestRunStatus
+            latestRunRequestedAt = facts.latestRunRequestedAt
+            latestRunCompletedAt = facts.latestRunCompletedAt
+            hasActionableProposedPlan = facts.hasActionableProposedPlan
+            latestUserAuthoredMessageAt = facts.latestUserAuthoredMessageAt
+            latestUserAuthoredMessageAtIsPresent = facts.latestUserAuthoredMessageAtIsPresent
+            lastErrorClass = facts.lastErrorClass
+            let failed = facts.orchestrationVersion == 2 ? facts.runtimeStatus == "failed" : state == .failed
+            snoozedFailureUpdatedAt = failed && snoozedUntil != nil ? facts.runtimeUpdatedAt : nil
+        }
     }
 }
 
@@ -1120,7 +1224,10 @@ enum HomeDoneDuration {
 
 extension FeatureThread {
     var homeStatus: HomeThreadStatus {
-        switch state {
+        if state != .waitingForApproval && state != .waitingForInput && isWaitingForBackgroundWork {
+            return .monitoring
+        }
+        return switch state {
         case .queued, .working:
             .working
         case .monitoring:
@@ -1132,9 +1239,9 @@ extension FeatureThread {
         case .failed:
             .failed
         case .completed:
-            .done
+            inboxFacts?.orchestrationVersion == 2 && !hasUnseenCompletion ? .ready : .done
         case .idle:
-            .ready
+            inboxFacts?.orchestrationVersion == 2 && hasUnseenCompletion ? .done : .ready
         }
     }
 
@@ -1143,8 +1250,8 @@ extension FeatureThread {
         case .approval: "Approval"
         case .input: "Input"
         case .working: "Working"
-        case .monitoring: "Monitoring"
-        case .failed: "Failed"
+        case .monitoring: isWaitingForBackgroundWork ? "Waiting" : "Monitoring"
+        case .failed: isUsageLimited ? "Limited" : "Failed"
         case .done: "Done"
         case .ready: nil
         }
@@ -1259,12 +1366,11 @@ extension FeatureThread {
     }
 
     func isEffectivelySettled() -> Bool {
-        effectiveSettlementOverride == .settled
+        FeatureThreadLifecyclePolicy.isSettled(self)
     }
 
     func canSettleNow(at now: Date = .now) -> Bool {
-        guard canToggleSettlement else { return false }
-        return !hasSettlementActivityBlock(at: now)
+        FeatureThreadLifecyclePolicy.canSettle(self, at: now)
     }
 
     var effectiveSettlementOverride: FeatureThreadSettlementOverride? {
@@ -1275,72 +1381,23 @@ extension FeatureThread {
     }
 
     func hasSettlementActivityBlock(at now: Date) -> Bool {
-        guard settlementFacts != nil else {
-            return [.queued, .working, .monitoring, .waitingForApproval, .waitingForInput]
-                .contains(state)
-        }
-        if hasHardSettlementActivityBlock { return true }
-        return hasQueuedTurnStart(at: now)
+        FeatureThreadLifecyclePolicy.hasSettlementActivityBlock(self, at: now)
     }
 
     var hasHardSettlementActivityBlock: Bool {
-        guard let facts = settlementFacts else {
-            return [
-                .queued,
-                .working,
-                .monitoring,
-                .waitingForApproval,
-                .waitingForInput,
-            ].contains(state)
-        }
-        return facts.hasPendingApprovals
-            || facts.hasPendingUserInput
-            || facts.sessionStatus == "starting"
-            || facts.sessionStatus == "running"
+        FeatureThreadLifecyclePolicy.hasHardSettlementActivityBlock(self)
     }
 
     func hasQueuedTurnStart(at now: Date) -> Bool {
-        guard let facts = settlementFacts,
-              facts.sessionStatus != "error",
-              let messageAt = facts.latestUserMessageAt,
-              abs(now.timeIntervalSince(messageAt)) <= 2 * 60 else {
-            return false
-        }
-        guard let turn = facts.latestTurn else { return true }
-        if turn.requestedAtIsInvalid || turn.startedAtIsInvalid || turn.completedAtIsInvalid {
-            return false
-        }
-        return [turn.requestedAt, turn.startedAt, turn.completedAt].allSatisfy {
-            $0 == nil || $0! < messageAt
-        }
+        FeatureThreadLifecyclePolicy.hasQueuedTurnStart(self, at: now)
     }
 
     func queuedSettlementBoundary(after now: Date) -> Date? {
-        guard hasQueuedTurnStart(at: now),
-              let messageAt = settlementFacts?.latestUserMessageAt else {
-            return nil
-        }
-        let boundary = messageAt.addingTimeInterval(2 * 60 + 0.001)
-        return boundary > now ? boundary : nil
+        FeatureThreadLifecyclePolicy.queuedSettlementBoundary(self, after: now)
     }
 
     func isEffectivelySnoozed(at now: Date) -> Bool {
-        guard let snoozedUntil, snoozedUntil > now else { return false }
-        if state == .waitingForApproval || state == .waitingForInput {
-            return false
-        }
-        if state == .failed,
-           let snoozedAt,
-           let attentionAt,
-           attentionAt > snoozedAt {
-            return false
-        }
-        if let snoozedAt,
-           let latestTurnCompletedAt,
-           latestTurnCompletedAt > snoozedAt {
-            return false
-        }
-        return true
+        FeatureThreadLifecyclePolicy.isSnoozed(self, at: now)
     }
 
     var settledSortDate: Date {

@@ -92,7 +92,7 @@ final class ProjectSettingsContractTests: XCTestCase {
             id: "project", legacyModelSelection: legacy, legacyWorkspaceMode: .worktree
         )
         XCTAssertNil(afterReset.defaultModelSelection)
-        XCTAssertEqual(afterReset.defaultThreadEnvMode, .local)
+        XCTAssertNil(afterReset.defaultThreadEnvMode)
     }
 
     func testExplicitOverridesWinBeforeFoldAndDisabledModelsInherit() throws {

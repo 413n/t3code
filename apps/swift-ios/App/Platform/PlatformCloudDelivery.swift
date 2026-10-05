@@ -1,6 +1,7 @@
 import ActivityKit
 import CryptoKit
 import Foundation
+import Observation
 import Security
 import UIKit
 
@@ -87,24 +88,32 @@ enum PlatformCloudDeliveryRegistrationFactory {
 /// only travel over DPoP-authenticated relay requests; local success caches store
 /// SHA-256 fingerprints rather than reusable push credentials.
 @MainActor
+@Observable
 final class PlatformCloudDeliveryCoordinator {
     static let shared = PlatformCloudDeliveryCoordinator()
+
+    private(set) var registrationStatus: PlatformCloudRegistrationStatus = .idle
+    private(set) var isSettingUpLiveActivities = false
+    private(set) var liveActivitySetupStatus: PlatformCloudRegistrationStatus?
+    var selectedLiveActivityEnvironmentIDs: Set<String> = []
 
     private let defaults: UserDefaults
     private let tokenSink: PlatformPersistedDeviceTokenSink
     private let deviceID: String
+    private let systemVersion: OperatingSystemVersion
+    private let liveActivitiesAllowed: @MainActor () -> Bool
 
-    private weak var controller: T3ConnectController?
-    private var settings: FeatureSettings?
-    private var needsRegistration = false
-    private var registrationTask: Task<Void, Never>?
-    private var observerTasks: [Task<Void, Never>] = []
-    private var pushToStartTask: Task<Void, Never>?
-    private var activityUpdatesTask: Task<Void, Never>?
-    private var activityTokenTasks: [String: Task<Void, Never>] = [:]
-    private var pendingActivityTokens: Set<String> = []
-    private var retryTask: Task<Void, Never>?
-    private var observedAccountID: String?
+    @ObservationIgnored private weak var controller: (any PlatformCloudDeliveryRegistering)?
+    @ObservationIgnored private var settings: FeatureSettings?
+    @ObservationIgnored private var needsRegistration = false
+    @ObservationIgnored private var registrationTask: Task<Void, Never>?
+    @ObservationIgnored private var observerTasks: [Task<Void, Never>] = []
+    @ObservationIgnored private var pushToStartTask: Task<Void, Never>?
+    @ObservationIgnored private var activityUpdatesTask: Task<Void, Never>?
+    @ObservationIgnored private var activityTokenTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var pendingActivityTokens: Set<String> = []
+    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var observedAccountID: String?
 
     private let deviceFingerprintKey = "swift-ios.cloud-delivery-device.v1"
     private let deviceRegisteredAtKey = "swift-ios.cloud-delivery-device-date.v1"
@@ -114,11 +123,17 @@ final class PlatformCloudDeliveryCoordinator {
     init(
         defaults: UserDefaults = .standard,
         tokenSink: PlatformPersistedDeviceTokenSink? = nil,
-        deviceID: String? = nil
+        deviceID: String? = nil,
+        registrationController: (any PlatformCloudDeliveryRegistering)? = nil,
+        systemVersion: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion,
+        liveActivitiesAllowed: @escaping @MainActor () -> Bool = { ActivityAuthorizationInfo().areActivitiesEnabled }
     ) {
+        self.controller = registrationController
         self.defaults = defaults
         self.tokenSink = tokenSink ?? .shared
         self.deviceID = deviceID ?? PlatformInstallationIdentity.value()
+        self.systemVersion = systemVersion
+        self.liveActivitiesAllowed = liveActivitiesAllowed
     }
 
     deinit {
@@ -133,11 +148,11 @@ final class PlatformCloudDeliveryCoordinator {
     func install(controller: T3ConnectController) {
         self.controller = controller
         guard observerTasks.isEmpty else {
-            handleAccountChange(to: controller.account?.id)
+            handleAccountChange(to: controller.cloudDeliveryAccountID)
             requestRegistration()
             return
         }
-        observedAccountID = controller.account?.id
+        observedAccountID = controller.cloudDeliveryAccountID
 
         for name in [Notification.Name.platformDeviceTokenChanged, .platformLiveActivityChanged] {
             observerTasks.append(Task { @MainActor [weak self] in
@@ -156,7 +171,7 @@ final class PlatformCloudDeliveryCoordinator {
                 guard let controller = self.controller,
                       let notificationController = notification.object as? T3ConnectController,
                       notificationController === controller else { continue }
-                handleAccountChange(to: controller.account?.id)
+                handleAccountChange(to: controller.cloudDeliveryAccountID)
                 refreshActivityTokenObservers()
                 requestRegistration()
             }
@@ -190,6 +205,97 @@ final class PlatformCloudDeliveryCoordinator {
         requestRegistration()
     }
 
+    func retryRegistration() async {
+        clearSuccessfulRegistrationCache()
+        requestRegistration()
+        await registrationTask?.value
+    }
+
+    /// Saves the local choice before remote work. The caller uses an unstructured
+    /// task so leaving Settings does not cancel the write or host enrollment.
+    /// Keep setup results separate from automatic device registration: a healthy
+    /// device record does not mean every selected host was configured.
+    func applyLiveActivityPreference(
+        savePreference: @MainActor () async throws -> FeatureSettings,
+        setUpRemote: (@MainActor () async throws -> Void)?
+    ) async {
+        guard !isSettingUpLiveActivities else { return }
+        isSettingUpLiveActivities = true
+        liveActivitySetupStatus = .registering
+        retryTask?.cancel()
+        retryTask = nil
+        do {
+            settings = try await savePreference()
+            needsRegistration = true
+            await registrationTask?.value
+            retryTask?.cancel()
+            retryTask = nil
+            if let setUpRemote {
+                try await setUpRemote()
+                if liveActivitySetupStatus == .registering { liveActivitySetupStatus = .registered }
+            } else {
+                liveActivitySetupStatus = .unavailable("Remote setup is unavailable for this connection.")
+            }
+        } catch {
+            liveActivitySetupStatus = .failed(error.localizedDescription)
+        }
+        clearSuccessfulRegistrationCache()
+        isSettingUpLiveActivities = false
+        if needsRegistration {
+            requestRegistration()
+            await registrationTask?.value
+        } else {
+            scheduleRetry(after: healingInterval)
+        }
+    }
+
+    /// Resolves saved host credentials only when remote setup is available.
+    /// Signing in and automatic token registration never call this method.
+    func setUpLiveActivityUpdates(
+        controller: (any PlatformLiveActivitySettingUp)?,
+        environments: @MainActor () async throws -> [T3ConnectLocalEnvironment],
+        settings: FeatureSettings, enabled: Bool, previousEnabled: Bool
+    ) async throws {
+        guard isSettingUpLiveActivities else {
+            throw T3ConnectRelayError.invalidConfiguration("Save the local preference before remote setup.")
+        }
+        guard let controller else {
+            liveActivitySetupStatus = .unavailable("This runtime requires its matching T3 Connect account.")
+            return
+        }
+        if let installed = self.controller, installed !== controller {
+            throw T3ConnectRelayError.invalidConfiguration("The T3 Connect account changed. Retry setup.")
+        }
+        guard systemVersion.majorVersion >= 18 else {
+            liveActivitySetupStatus = .unavailable("Remote delivery requires iOS 18 or later.")
+            return
+        }
+        if let reason = controller.unavailableReason {
+            liveActivitySetupStatus = .unavailable(reason)
+            return
+        }
+        guard controller.cloudDeliveryAccountID != nil else {
+            liveActivitySetupStatus = .signedOut
+            return
+        }
+        guard !enabled || liveActivitiesAllowed() else {
+            throw T3ConnectRelayError.invalidConfiguration("Enable Live Activities in iOS Settings, then retry setup.")
+        }
+        self.controller = controller
+        self.settings = settings
+        registrationStatus = .registering
+        try await controller.setUpLiveActivityUpdates(
+            environments: try await environments(), enabled: enabled, previousEnabled: previousEnabled,
+            deviceID: deviceID,
+            makeDeviceRegistration: { [self] value in
+                var proposed = self.settings ?? settings
+                proposed.liveActivitiesEnabled = value
+                return currentRegistration(settings: proposed)
+            }
+        )
+        registrationStatus = .registered
+    }
+
     private func refreshActivityTokenObservers() {
         let activities = Activity<LiveActivityAttributes>.activities
         let currentIDs = Set(activities.map(\.id))
@@ -216,10 +322,10 @@ final class PlatformCloudDeliveryCoordinator {
         retryTask?.cancel()
         retryTask = nil
         needsRegistration = true
-        guard registrationTask == nil else { return }
+        guard registrationTask == nil, !isSettingUpLiveActivities else { return }
         registrationTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            while needsRegistration, !Task.isCancelled {
+            while needsRegistration, !Task.isCancelled, !isSettingUpLiveActivities {
                 needsRegistration = false
                 await registerCurrentState()
                 await Task.yield()
@@ -232,10 +338,21 @@ final class PlatformCloudDeliveryCoordinator {
     private func registerCurrentState() async {
         guard let controller, let settings else { return }
         let registration = currentRegistration(settings: settings)
-        guard registration.iosMajorVersion >= 18 else { return }
+        guard registration.iosMajorVersion >= 18 else {
+            registrationStatus = .unavailable("Remote delivery requires iOS 18 or later.")
+            return
+        }
+        if let reason = controller.unavailableReason {
+            registrationStatus = .unavailable(reason)
+            return
+        }
+        guard controller.cloudDeliveryAccountID != nil else {
+            registrationStatus = .signedOut
+            return
+        }
         controller.rememberRegisteredDevice(id: deviceID)
 
-        let accountBeforeRequest = controller.account?.id
+        let accountBeforeRequest = controller.cloudDeliveryAccountID
         let fingerprint = Self.fingerprint(
             registration,
             accountID: accountBeforeRequest
@@ -248,20 +365,21 @@ final class PlatformCloudDeliveryCoordinator {
 
         do {
             if !canReuseRegistration {
+                registrationStatus = .registering
                 try await controller.registerDevice(registration)
                 guard accountBeforeRequest == nil
-                    || controller.account?.id == accountBeforeRequest else {
+                    || controller.cloudDeliveryAccountID == accountBeforeRequest else {
                     needsRegistration = true
                     return
                 }
                 defaults.set(
-                    Self.fingerprint(registration, accountID: controller.account?.id),
+                    Self.fingerprint(registration, accountID: controller.cloudDeliveryAccountID),
                     forKey: deviceFingerprintKey
                 )
                 defaults.set(Date.now, forKey: deviceRegisteredAtKey)
             }
 
-            guard let accountID = controller.account?.id else { return }
+            guard let accountID = controller.cloudDeliveryAccountID else { return }
             let now = Date.now.timeIntervalSince1970
             var completed = (defaults.dictionary(forKey: activityFingerprintKey) ?? [:])
                 .compactMapValues { ($0 as? NSNumber)?.doubleValue }
@@ -281,7 +399,7 @@ final class PlatformCloudDeliveryCoordinator {
                         activityPushToken: token
                     )
                 )
-                guard controller.account?.id == accountID else {
+                guard controller.cloudDeliveryAccountID == accountID else {
                     needsRegistration = true
                     return
                 }
@@ -293,21 +411,18 @@ final class PlatformCloudDeliveryCoordinator {
                 Dictionary(uniqueKeysWithValues: bounded.map { ($0.key, $0.value) }),
                 forKey: activityFingerprintKey
             )
+            registrationStatus = .registered
             scheduleRetry(after: healingInterval)
         } catch is CancellationError {
             return
-        } catch is T3ConnectAuthError {
-            return
-        } catch let error as T3ConnectRelayError {
-            guard case .invalidConfiguration = error else {
-                scheduleRetry(after: 15)
+        } catch {
+            guard controller.cloudDeliveryAccountID == accountBeforeRequest else {
+                registrationStatus = controller.cloudDeliveryAccountID == nil ? .signedOut : .idle
+                needsRegistration = controller.cloudDeliveryAccountID != nil
                 return
             }
-        } catch {
-            // Signed-out and offline states are expected. The next account,
-            // network, foreground, or token event retries without noisy UI.
+            registrationStatus = .failed(error.localizedDescription)
             scheduleRetry(after: 15)
-            return
         }
     }
 
@@ -331,6 +446,7 @@ final class PlatformCloudDeliveryCoordinator {
     private func handleAccountChange(to accountID: String?) {
         guard observedAccountID != accountID else { return }
         clearSuccessfulRegistrationCache()
+        registrationStatus = accountID == nil ? .signedOut : .idle
         pendingActivityTokens.removeAll()
         PlatformAgentAwarenessCoordinator.shared.resetAndResynchronizeLiveActivity()
         observedAccountID = accountID
@@ -350,11 +466,11 @@ final class PlatformCloudDeliveryCoordinator {
             && PlatformNotificationService.shared.enabled
             && tokenSink.currentToken != nil
         effectiveSettings.liveActivitiesEnabled = settings.liveActivitiesEnabled
-            && ActivityAuthorizationInfo().areActivitiesEnabled
+            && liveActivitiesAllowed()
         return PlatformCloudDeliveryRegistrationFactory.registration(
             deviceID: deviceID,
             deviceName: UIDevice.current.name,
-            systemVersion: ProcessInfo.processInfo.operatingSystemVersion,
+            systemVersion: systemVersion,
             appVersion: version,
             bundleID: Bundle.main.bundleIdentifier,
             pushToken: tokenSink.currentToken,

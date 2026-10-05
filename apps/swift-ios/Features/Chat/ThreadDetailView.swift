@@ -13,11 +13,29 @@ public struct ThreadDetailView: View {
     let thread: FeatureThread
     let submitMessage: (FeatureMessageSubmission) async -> Bool
     let onNavigateBack: () -> Void
+    let onOpenThread: (String) -> Void
+    let onNewTaskFromThread: (FeatureThread) -> Void
+    let initialDestination: FeatureThreadDestination?
+    let initialDestinationID: UUID?
+    let onToolDestinationChange: (FeatureThreadDestination?) -> Void
+    let rootNavigationDismissalID: UUID?
+    let onRootNavigationDismissed: (UUID) -> Void
     private let draftStore: FeatureComposerDraftStore
 
     @State private var draft = ""
     @State private var composerContext: OrchestrationMessageContext?
     @State private var selection: FeatureSelection?
+    @State private var draftRuntimeMode: FeatureRuntimeMode?
+    @State private var draftInteractionMode: FeatureInteractionMode?
+    @State private var draftWorkspace: FeatureComposerWorkspaceDraft?
+    @State private var isTransferringDraft = false
+    @State private var queuedEdit: FeatureQueuedRunEdit?
+    @State private var ordinaryDraftBeforeQueueEdit: FeatureComposerDraft?
+    @State private var didRestoreQueuedEdit = false
+    @State private var recoveryError: String?
+    @State private var isUpdatingRecovery = false
+    @State private var pendingDiscardRecoveryID: String?
+    @State private var customSnooze: FeatureCustomSnoozeSelection?
     @State private var attachments: [FeatureDraftAttachment] = []
     @State private var isSending = false
     @State private var confirmsRestart = false
@@ -38,15 +56,26 @@ public struct ThreadDetailView: View {
     @State private var draftSaveTask: Task<Void, Never>?
     @State private var draftSaveError: String?
     @State private var toolSurface: FeatureThreadToolSurface?
+    @State private var pendingWorkspaceAction: (@MainActor () -> Void)?
+    @State private var rootNavigationDismissal = FeatureRootNavigationDismissal()
     @State private var branchPullRequest: FeaturePullRequest?
     @State private var showsLinkPullRequest = false
     @State private var pullRequestURL = ""
     @State private var pullRequestError: String?
     @State private var linkedMediaPreview: FeatureLinkedMediaPreview?
     @State private var linkedMediaPreviewError: String?
+    @State private var scriptLaunchError: String?
+    @State private var remoteDeviceCount = 0
     @State private var showsThreadQueue = false
     @State private var isUpdatingQueue = false
     @State private var queueActionError: String?
+    @State private var usageLimitsReport: FeatureEnvironmentUsageLimits?
+    @State private var showsAgents = false
+    @State private var isUpdatingWorkflow = false
+    @State private var workflowError: String?
+    @State private var workflowTask: Task<Void, Never>?
+    @StateObject private var v2TimelineState = FeatureV2TimelineState()
+    @State private var visitCoordinator = FeatureThreadVisitCoordinator()
     // Plain state, not `FocusState`: the composer's UIKit text view owns
     // focus and mirrors it through this binding, because SwiftUI drops
     // writes to a `FocusState` no `.focused()` view registers with.
@@ -57,16 +86,337 @@ public struct ThreadDetailView: View {
         thread: FeatureThread,
         submitMessage: @escaping (FeatureMessageSubmission) async -> Bool,
         onNavigateBack: @escaping () -> Void = {},
+        onOpenThread: @escaping (String) -> Void = { _ in },
+        onNewTaskFromThread: @escaping (FeatureThread) -> Void = { _ in },
+        initialDestination: FeatureThreadDestination? = nil,
+        initialDestinationID: UUID? = nil,
+        onToolDestinationChange: @escaping (FeatureThreadDestination?) -> Void = { _ in },
+        rootNavigationDismissalID: UUID? = nil,
+        onRootNavigationDismissed: @escaping (UUID) -> Void = { _ in },
         draftStore: FeatureComposerDraftStore = .shared
     ) {
         self.model = model
         self.thread = thread
         self.submitMessage = submitMessage
         self.onNavigateBack = onNavigateBack
+        self.onOpenThread = onOpenThread
+        self.onNewTaskFromThread = onNewTaskFromThread
+        self.initialDestination = initialDestination
+        self.initialDestinationID = initialDestinationID
+        self.onToolDestinationChange = onToolDestinationChange
+        self.rootNavigationDismissalID = rootNavigationDismissalID
+        self.onRootNavigationDismissed = onRootNavigationDismissed
         self.draftStore = draftStore
     }
 
     private var threadContent: some View {
+        observedThreadContent
+        .featureKeyboardScope(
+            id: "thread:\(thread.id)",
+            isActive: scenePhase == .active && toolSurface == nil && !showsAgents
+                && !showsThreadQueue && customSnooze == nil && linkedMediaPreview == nil,
+            enabledCommands: [.files, .terminal, .review, .copyThreadReference],
+            onCommand: performThreadKeyboardCommand
+        )
+        .sheet(item: sheetToolSurface, onDismiss: toolDidDismiss) { surface in
+            toolView(surface)
+                .onAppear { rootNavigationDismissal.presentationDidAppear() }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .fullScreenCover(isPresented: deviceToolPresented, onDismiss: toolDidDismiss) {
+            toolView(.devices)
+                .onAppear { rootNavigationDismissal.presentationDidAppear() }
+        }
+    }
+
+    private var sheetToolSurface: Binding<FeatureThreadToolSurface?> {
+        Binding(
+            get: { toolSurface == .devices ? nil : toolSurface },
+            set: { if toolSurface != .devices { toolSurface = $0 } }
+        )
+    }
+
+    private var deviceToolPresented: Binding<Bool> {
+        Binding(
+            get: { toolSurface == .devices },
+            set: { if !$0, toolSurface == .devices { toolSurface = nil } }
+        )
+    }
+
+    private func toolDidDismiss() {
+        // Replacing a sheet item can dismiss the previous tool while the next
+        // one is opening. Restore composer focus only after the final tool closes.
+        guard toolSurface == nil else { return }
+        let action = pendingWorkspaceAction
+        pendingWorkspaceAction = nil
+        if rootNavigationDismissal.requestID == nil { action?() }
+        threadPresentationDidDismiss()
+    }
+
+    private var transcriptPresentationDismissal: FeatureThreadPresentationDismissal {
+        FeatureThreadPresentationDismissal(requestID: rootNavigationDismissalID) { id, presented in
+            rootNavigationDismissal.childPresentationChanged(id, isPresented: presented)
+            finishRootNavigationDismissalIfReady()
+        }
+    }
+
+    private func dismissPresentationsForRootNavigation() {
+        guard let id = rootNavigationDismissalID else { return }
+        rootNavigationDismissal.request(id, hasPresentation:
+            toolSurface != nil || customSnooze != nil || showsAgents || showsThreadQueue
+                || linkedMediaPreview != nil)
+        pendingWorkspaceAction = nil
+        toolSurface = nil
+        customSnooze = nil
+        showsAgents = false
+        showsThreadQueue = false
+        linkedMediaPreview = nil
+        confirmsRestart = false
+        pendingRewindMessageID = nil
+        pendingDiscardRecoveryID = nil
+        showsLinkPullRequest = false
+        pullRequestError = nil
+        workflowError = nil
+        scriptLaunchError = nil
+        linkedMediaPreviewError = nil
+        feedbackAlertMessage = nil
+        sendFailed = false
+        finishRootNavigationDismissalIfReady()
+    }
+
+    private func threadPresentationDidDismiss() {
+        rootNavigationDismissal.presentationDidDismiss()
+        finishRootNavigationDismissalIfReady()
+    }
+
+    private func finishRootNavigationDismissalIfReady() {
+        guard let id = rootNavigationDismissal.takeReadyRequest() else { return }
+        onRootNavigationDismissed(id)
+    }
+
+    private func presentTool(_ surface: FeatureThreadToolSurface) {
+        if let active = toolSurface, (active == .devices) != (surface == .devices) {
+            pendingWorkspaceAction = { toolSurface = surface }
+            toolSurface = nil
+        } else {
+            toolSurface = surface
+        }
+    }
+
+    private func toolView(_ surface: FeatureThreadToolSurface) -> some View {
+            NavigationStack {
+                Group {
+                    switch surface {
+                    case .files:
+                        FeatureFilesView(
+                            client: model.client,
+                            threadID: thread.id,
+                            workspaceRoot: markdownImageContext?.workspaceRoot
+                        )
+                    case let .file(path, line):
+                        FeatureFilesView(
+                            client: model.client,
+                            threadID: thread.id,
+                            initialPath: path,
+                            initialLine: line,
+                            workspaceRoot: markdownImageContext?.workspaceRoot
+                        )
+                    case .review:
+                        FeatureReviewView(
+                            client: model.client,
+                            threadID: thread.id,
+                            onAppendComment: { record in
+                                guard canTransferDraft, didRestoreQueuedEdit, queuedEdit == nil else {
+                                    throw FeatureThreadRecoveryError("Finish the current composer action before adding a review comment.")
+                                }
+                                let context = try FeatureComposerContext.merge(
+                                    ComposerContextReferences.referenced(composerContext, text: draft), .init(records: [record])
+                                )
+                                let text = ComposerContextReferences.ensureReferences(draft, records: [record])
+                                let pendingSave = draftSaveTask
+                                pendingSave?.cancel()
+                                draftSaveTask = nil
+                                isTransferringDraft = true
+                                defer { isTransferringDraft = false }
+                                await pendingSave?.value
+                                var updated = composerDraft
+                                updated.text = text
+                                updated.context = context
+                                try await draftStore.setDraft(updated, for: draftKey)
+                                applyComposerDraft(updated)
+                                pendingWorkspaceAction = { composerFocused = true }
+                            }
+                        )
+                    case let .sourceControl(destination):
+                        FeatureSourceControlView(client: model.client, threadID: thread.id, initialDestination: destination)
+                    case .devices:
+                        if let client = model.client as? any FeatureRemoteDeviceManaging {
+                            FeatureRemoteDevicesView(threadID: thread.id, client: client)
+                        } else {
+                            ContentUnavailableView("Devices unavailable", systemImage: "iphone")
+                        }
+                    case let .terminal(sessionID):
+                        FeatureTerminalView(client: model.client, threadID: thread.id, initialTerminalID: sessionID) { record in
+                            guard didRestoreDraft, !isTransferringDraft, !isRewinding, !isUpdatingQueue else {
+                                throw FeatureThreadRecoveryError("Wait for the composer to finish restoring your message.")
+                            }
+                            composerContext = try FeatureComposerContext.merge(
+                                ComposerContextReferences.referenced(composerContext, text: draft), .init(records: [record])
+                            )
+                            draft = ComposerContextReferences.ensureReferences(draft, records: [record])
+                            persistDraftImmediately()
+                            composerFocused = true
+                        }
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") {
+                            toolSurface = nil
+                        }
+                    }
+                }
+            }
+            .t3CodeSizing(steps: codeSizeSteps)
+            .featureKeyboardScope(
+                id: "thread-tool:\(thread.id)",
+                isActive: scenePhase == .active,
+                enabledCommands: [.files, .terminal, .review, .copyThreadReference, .back],
+                isTerminalActive: surface.isTerminal,
+                beforeRootAction: { action in
+                    pendingWorkspaceAction = action
+                    toolSurface = nil
+                },
+                onCommand: performThreadKeyboardCommand
+            )
+    }
+
+    private var observedThreadContent: some View {
+        loadedThreadContent
+        .onChange(of: thread.id) { v2TimelineState.reset() }
+        .onChange(of: draft) { scheduleDraftSave() }
+        .onChange(of: selection) { scheduleDraftSave() }
+        .onChange(of: draftRuntimeMode) { scheduleDraftSave() }
+        .onChange(of: draftInteractionMode) { scheduleDraftSave() }
+        .onChange(of: selection) { usageLimitsReport = nil }
+        .onChange(of: currentThread.modelID) { usageLimitsReport = nil }
+        .onChange(of: currentThread.inboxFacts?.latestRunID) { usageLimitsReport = nil }
+        .onChange(of: model.recoveredRewindDrafts[thread.id]) { _, recovered in
+            if recovered != nil { restoreRewindDraft() }
+        }
+        .onChange(of: threadConnectionState) { _, state in
+            if state == .connected,
+               case .failed = model.detailLoadStates[thread.id],
+               !isLoading {
+                reloadThread()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            updateVisibleThread()
+            if phase != .active {
+                persistDraftBeforeLeaving()
+            }
+        }
+        .onDisappear {
+            workflowTask?.cancel()
+            clearVisibleThread()
+            onToolDestinationChange(nil)
+            model.releaseThread(thread.id)
+            persistDraftBeforeLeaving()
+        }
+    }
+
+    private var loadedThreadContent: some View {
+        baseThreadContent
+        .task(id: thread.id) {
+            isLoading = true
+            _ = await model.detail(for: thread.id, force: true)
+            isLoading = false
+        }
+        .task(id: thread.id) {
+            // A cached thread can already show its composer while the server
+            // is catching up. Local drafts must not wait for that request.
+            await model.checkRewindRecovery(for: currentThread)
+            guard !didRestoreDraft else { return }
+            await restoreDraft(from: composerDraft, key: draftKey)
+        }
+        .task(id: FeatureThreadToolRequest(destination: initialDestination, requestID: initialDestinationID)) {
+            if let initialDestination { presentTool(FeatureThreadToolSurface(initialDestination)) }
+        }
+        .task(id: didRestoreDraft) {
+            await restoreQueuedEditIfNeeded()
+        }
+        .onChange(of: detail?.execution) { _, execution in
+            guard let edit = currentQueuedEdit, let execution,
+                  !edit.isStillQueued(in: execution), !isUpdatingQueue, !isTransferringDraft,
+                  refreshPresentation == nil else { return }
+            recoverStartedQueueEdit()
+        }
+        .onChange(of: refreshPresentation) { _, presentation in
+            if presentation == nil { recoverStartedQueueEdit() }
+        }
+        .onChange(of: isPreparingInput) { _, preparing in
+            if !preparing {
+                Task { await restoreQueuedEditIfNeeded() }
+                recoverStartedQueueEdit()
+            }
+        }
+        .onChange(of: isTransferringDraft) { _, transferring in
+            if !transferring, !didRestoreQueuedEdit, queueActionError == nil {
+                Task { await restoreQueuedEditIfNeeded() }
+            }
+        }
+        .onChange(of: isRewinding) { _, rewinding in
+            if !rewinding { Task { await restoreQueuedEditIfNeeded() } }
+        }
+        .onChange(of: isUpdatingQueue) { _, updating in
+            if !updating { Task { await restoreQueuedEditIfNeeded() } }
+        }
+        .onChange(of: toolSurface) { _, surface in
+            onToolDestinationChange(surface?.destination)
+        }
+        .onAppear { updateVisibleThread() }
+        .task(id: pullRequestObservationID) {
+            await observeThreadPullRequest()
+        }
+        .task(id: scenePhase == .active ? FeatureThreadVisitRequest(
+            observation: FeatureThreadVisitObservation(thread: currentThread), connection: threadConnectionState
+        ) : nil) {
+            guard scenePhase == .active, threadConnectionState == .connected,
+                  let visitor = model.client as? any FeatureThreadVisiting else { return }
+            await visitCoordinator.visit(FeatureThreadVisitObservation(thread: currentThread), using: visitor)
+        }
+        .task(id: workspaceCatalogID) {
+            if let environmentID = currentThread.environmentID, let cwd = workspaceCatalogPath,
+               let instanceID = selection?.providerID ?? currentSelection?.providerID {
+                await model.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd, instanceID: instanceID)
+            }
+        }
+        .task(id: FeatureThreadDeviceObservation(
+            threadID: currentThread.id, connection: threadConnectionState,
+            foreground: scenePhase != .background
+        )) {
+            remoteDeviceCount = 0
+            guard scenePhase != .background, threadConnectionState == .connected,
+                  let devices = model.client as? any FeatureRemoteDeviceManaging else { return }
+            do {
+                let states = try await devices.remoteDeviceStates(threadID: currentThread.id)
+                for try await state in states {
+                    guard !Task.isCancelled else { return }
+                    remoteDeviceCount = state.previews.count
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                remoteDeviceCount = 0
+            }
+        }
+        .environment(\.providerSetupContext, currentThread.environmentID.map {
+            ProviderSetupContext(model: model, environmentID: $0)
+        })
+    }
+
+    private var baseThreadContent: some View {
         Group {
             if let detail {
                 timeline(detail)
@@ -106,104 +456,51 @@ public struct ThreadDetailView: View {
                 threadActionsMenu
             }
         }
-        .task(id: thread.id) {
-            isLoading = true
-            _ = await model.detail(for: thread.id, force: true)
-            isLoading = false
-        }
-        .task(id: thread.id) {
-            // A cached thread can already show its composer while the server
-            // is catching up. Local drafts must not wait for that request.
-            await model.checkRewindRecovery(for: currentThread)
-            guard !didRestoreDraft else { return }
-            await restoreDraft(from: composerDraft, key: draftKey)
-        }
-        .task(id: pullRequestObservationID) {
-            await observeThreadPullRequest()
-        }
-        .task(id: workspaceCatalogID) {
-            if let environmentID = currentThread.environmentID, let cwd = workspaceCatalogPath,
-               let instanceID = selection?.providerID ?? currentSelection?.providerID {
-                await model.refreshWorkspaceProviders(environmentID: environmentID, cwd: cwd, instanceID: instanceID)
-            }
-        }
-        .environment(\.providerSetupContext, currentThread.environmentID.map {
-            ProviderSetupContext(model: model, environmentID: $0)
-        })
-        .onChange(of: draft) { scheduleDraftSave() }
-        .onChange(of: selection) { scheduleDraftSave() }
-        .onChange(of: model.recoveredRewindDrafts[thread.id]) { _, recovered in
-            if recovered != nil { restoreRewindDraft() }
-        }
-        .onChange(of: threadConnectionState) { _, state in
-            if state == .connected,
-               case .failed = model.detailLoadStates[thread.id],
-               !isLoading {
-                reloadThread()
-            }
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase != .active {
-                persistDraftBeforeLeaving()
-            }
-        }
-        .onDisappear {
-            model.releaseThread(thread.id)
-            persistDraftBeforeLeaving()
-        }
-        .sheet(item: $toolSurface) { surface in
-            NavigationStack {
-                Group {
-                    switch surface {
-                    case .files:
-                        FeatureFilesView(
-                            client: model.client,
-                            threadID: thread.id,
-                            workspaceRoot: markdownImageContext?.workspaceRoot
-                        )
-                    case let .file(path):
-                        FeatureFilesView(
-                            client: model.client,
-                            threadID: thread.id,
-                            initialPath: path,
-                            workspaceRoot: markdownImageContext?.workspaceRoot
-                        )
-                    case .review:
-                        FeatureReviewView(
-                            client: model.client,
-                            threadID: thread.id,
-                            sendMessage: submitMessage
-                        )
-                    case .sourceControl:
-                        FeatureSourceControlView(client: model.client, threadID: thread.id)
-                    case .terminal:
-                        FeatureTerminalView(client: model.client, threadID: thread.id) { record in
-                            composerContext = try FeatureComposerContext.merge(
-                                ComposerContextReferences.referenced(composerContext, text: draft), .init(records: [record])
-                            )
-                            draft = ComposerContextReferences.ensureReferences(draft, records: [record])
-                            persistDraftImmediately()
-                            composerFocused = true
-                        }
-                    }
-                }
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Done") {
-                            toolSurface = nil
-                        }
-                    }
-                }
-            }
-            .presentationDetents([.large])
-            .presentationDragIndicator(.visible)
-            .t3CodeSizing(steps: codeSizeSteps)
-        }
     }
 
     public var body: some View {
         threadContent
-        .sheet(isPresented: $showsThreadQueue) {
+        .confirmationDialog("Delete unsent message?", isPresented: Binding(
+            get: { pendingDiscardRecoveryID != nil },
+            set: { if !$0 { pendingDiscardRecoveryID = nil } }
+        ), titleVisibility: .visible, presenting: model.submissionRecoveryDrafts.first {
+            $0.id == pendingDiscardRecoveryID
+        }) { recovery in
+            Button("Delete", role: .destructive) {
+                pendingDiscardRecoveryID = nil
+                Task { await model.discardSubmissionRecovery(id: recovery.id) }
+            }
+            Button("Cancel", role: .cancel) { pendingDiscardRecoveryID = nil }
+        } message: { _ in
+            Text("This message has not been sent. Its saved text and files will be removed.")
+        }
+        .sheet(item: $customSnooze, onDismiss: threadPresentationDidDismiss) { selection in
+            FeatureCustomSnoozeSheet(selection: selection) { id, until in
+                Task { await model.setSnoozed(id, until: until) }
+            }
+            .onAppear { rootNavigationDismissal.presentationDidAppear() }
+        }
+        .sheet(isPresented: $showsAgents, onDismiss: threadPresentationDidDismiss) {
+            NavigationStack {
+                FeatureThreadAgentsView(roster: detail?.workflows?.agentRoster, onOpenThread: openRelatedThread)
+                    .onAppear { rootNavigationDismissal.presentationDidAppear() }
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showsAgents = false }
+                        }
+                    }
+            }
+            .preferredColorScheme(.dark)
+        }
+        .alert("Could not open thread", isPresented: Binding(
+            get: { workflowError != nil }, set: { if !$0 { workflowError = nil } }
+        )) { Button("OK") { workflowError = nil } }
+        message: { Text(workflowError ?? "") }
+        .alert("Script could not start", isPresented: Binding(
+            get: { scriptLaunchError != nil }, set: { if !$0 { scriptLaunchError = nil } }
+        )) { Button("OK") { scriptLaunchError = nil } }
+        message: { Text(scriptLaunchError ?? "") }
+        .sheet(isPresented: $showsThreadQueue, onDismiss: threadPresentationDidDismiss) {
             NavigationStack {
                 if let execution = detail?.execution {
                     FeatureThreadQueueView(
@@ -211,8 +508,10 @@ public struct ThreadDetailView: View {
                         controlsAvailable: queueControlsAvailable && execution.canManageQueue,
                         isUpdating: isUpdatingQueue,
                         error: queueActionError,
-                        performAction: updateThreadQueue
+                        performAction: updateThreadQueue,
+                        onEdit: beginQueuedEdit
                     )
+                    .onAppear { rootNavigationDismissal.presentationDidAppear() }
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
                             Button("Done") { showsThreadQueue = false }
@@ -283,13 +582,18 @@ public struct ThreadDetailView: View {
             }
         }
         .environment(\.openURL, transcriptOpenURL)
-        .fullScreenCover(item: $linkedMediaPreview) { preview in
+        .environment(\.featureThreadPresentationDismissal, transcriptPresentationDismissal)
+        .onChange(of: rootNavigationDismissalID, initial: true) { _, _ in
+            dismissPresentationsForRootNavigation()
+        }
+        .fullScreenCover(item: $linkedMediaPreview, onDismiss: threadPresentationDidDismiss) { preview in
             NavigationStack {
                 FeatureNativeMediaPreviewView(
                     source: preview.source,
                     kind: preview.kind,
                     fileName: preview.fileName
                 )
+                .onAppear { rootNavigationDismissal.presentationDidAppear() }
                 .navigationTitle(preview.fileName)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -330,7 +634,8 @@ public struct ThreadDetailView: View {
     }
 
     private func canRewind(_ messageID: String) -> Bool {
-        !isSending && !isRewinding && !isPreparingInput && didRestoreDraft
+        !isSending && !isRewinding && !isPreparingInput && !isTransferringDraft
+            && queuedEdit == nil && didRestoreDraft && didRestoreQueuedEdit
             && model.canRewindConversation(threadID: thread.id, messageID: messageID)
     }
 
@@ -351,15 +656,11 @@ public struct ThreadDetailView: View {
 
     private func restoreRewindDraft() {
         guard let recovered = model.consumeRewindDraft(threadID: thread.id) else { return }
-        draft = recovered.text
-        attachments = recovered.attachments
-        selection = recovered.selection
-        composerContext = recovered.context
-        didRestoreDraft = true
+        applyComposerDraft(recovered)
     }
 
     private func recoverSavedRewind() {
-        guard !isRewinding && !isSending && !isPreparingInput else { return }
+        guard canTransferDraft else { return }
         isPreparingRewind = true
         let pendingSave = draftSaveTask
         pendingSave?.cancel()
@@ -482,6 +783,14 @@ public struct ThreadDetailView: View {
     private var threadActionsMenu: some View {
         Menu {
             Section("Thread") {
+                if detail?.workflows?.agentRoster != nil {
+                    Button("Agents", systemImage: "person.2") { showsAgents = true }
+                }
+                if let workflows = detail?.workflows {
+                    FeatureThreadMergeBackButton(workflows: workflows, isBusy: isUpdatingWorkflow) {
+                        performWorkflow { client in try await client.mergeBackThread(threadID: thread.id) }
+                    }
+                }
                 if let pullRequest = currentPullRequest {
                     Button {
                         parentOpenURL(pullRequest.url)
@@ -523,25 +832,22 @@ public struct ThreadDetailView: View {
                     .disabled(currentThread.isRegeneratingTitle)
                 }
                 Menu {
-                    if !FeatureRuntimeMode.allCases.contains(currentThread.runtimeMode) {
+                    if !runtimeModeChoices.contains(effectiveRuntimeMode) {
                         Section("Current") {
                             Button {} label: {
                                 Label(
-                                    runtimeModeLabel(currentThread.runtimeMode),
+                                    runtimeModeLabel(effectiveRuntimeMode),
                                     systemImage: "checkmark"
                                 )
                             }
                             .disabled(true)
                         }
                     }
-                    ForEach(FeatureRuntimeMode.allCases, id: \.self) { mode in
+                    ForEach(runtimeModeChoices, id: \.self) { mode in
                         Button {
-                            guard currentThread.runtimeMode != mode else {
-                                return
-                            }
-                            Task { await model.setRuntimeMode(thread.id, mode: mode) }
+                            draftRuntimeMode = mode
                         } label: {
-                            if currentThread.runtimeMode == mode {
+                            if effectiveRuntimeMode == mode {
                                 Label(runtimeModeLabel(mode), systemImage: "checkmark")
                             } else {
                                 Text(runtimeModeLabel(mode))
@@ -551,7 +857,24 @@ public struct ThreadDetailView: View {
                 } label: {
                     Label("Permissions", systemImage: "checkmark.shield")
                 }
-                .disabled(isSending)
+                .disabled(isSending || isTransferringDraft || queuedEdit != nil)
+                if currentThread.canToggleSnooze, !currentThread.isArchived {
+                    if currentThread.isEffectivelySnoozed(at: .now) {
+                        Button("Wake", systemImage: "sun.max") {
+                            Task { await model.setSnoozed(thread.id, until: nil) }
+                        }
+                    } else {
+                        Menu("Snooze", systemImage: "clock") {
+                            ForEach(DailyUXSnoozePresets.resolve(now: .now)) { preset in
+                                Button(preset.label) {
+                                    Task { await model.setSnoozed(thread.id, until: preset.until) }
+                                }
+                            }
+                            Button("Custom…") { customSnooze = FeatureCustomSnoozeSelection(thread: currentThread) }
+                        }
+                        .disabled(!currentThread.canSnoozeNow(at: .now))
+                    }
+                }
                 if currentThread.canTogglePin, !currentThread.isArchived {
                     Button {
                         Task {
@@ -612,17 +935,30 @@ public struct ThreadDetailView: View {
                 }
             }
             Section("Workspace") {
+                if let branch = currentThread.branch, !branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button(currentThread.worktreePath == nil ? "New task on this branch" : "New task in this worktree",
+                           systemImage: "plus") {
+                        onNewTaskFromThread(currentThread)
+                    }
+                }
                 Button { toolSurface = .files } label: {
                     Label("Files", systemImage: "folder")
                 }
                 Button { toolSurface = .review } label: {
                     Label("Review changes", systemImage: "doc.text.magnifyingglass")
                 }
-                Button { toolSurface = .sourceControl } label: {
+                Button { toolSurface = .sourceControl(.git) } label: {
                     Label("Source control", systemImage: "arrow.triangle.branch")
                 }
-                Button { toolSurface = .terminal } label: {
+                Button { toolSurface = .terminal(nil) } label: {
                     Label("Terminal", systemImage: "terminal")
+                }
+                FeatureProjectScriptsMenu(client: model.client, threadID: thread.id,
+                    onError: { scriptLaunchError = $0 }) {
+                    toolSurface = .terminal($0)
+                }
+                if remoteDeviceCount > 0 {
+                    Button("Devices (\(remoteDeviceCount))", systemImage: "iphone") { toolSurface = .devices }
                 }
             }
             Section {
@@ -757,7 +1093,7 @@ public struct ThreadDetailView: View {
     private var queueControlsAvailable: Bool {
         model.client is any FeatureThreadQueueManaging
             && threadConnectionState == .connected && refreshPresentation == nil
-            && !isSending && !isRewinding && !isRestarting
+            && !isSending && !isRewinding && !isRestarting && !isTransferringDraft && !isUpdatingRecovery
     }
 
     private var messageDeliveries: [FeatureMessageDelivery] {
@@ -823,17 +1159,23 @@ public struct ThreadDetailView: View {
                 .background(Color.black)
                 .accessibilityIdentifier("thread-queue-open")
             }
-            if let queueActionError {
-                HStack {
-                    Text(queueActionError)
-                        .foregroundStyle(T3Colors.danger)
-                    Spacer(minLength: 4)
+        }
+        if let queueActionError {
+            HStack {
+                Text(queueActionError)
+                    .foregroundStyle(T3Colors.danger)
+                Spacer(minLength: 4)
+                if !didRestoreQueuedEdit {
+                    Button("Retry") { Task { await restoreQueuedEditIfNeeded() } }
+                        .disabled(!canTransferDraft)
+                        .frame(minHeight: T3Metrics.minimumTapTarget)
+                } else {
                     Button("Dismiss") { self.queueActionError = nil }
                         .frame(minHeight: T3Metrics.minimumTapTarget)
                 }
-                .font(T3Typography.supporting)
-                .padding(.horizontal, 18)
             }
+            .font(T3Typography.supporting)
+            .padding(.horizontal, 18)
         }
     }
 
@@ -917,6 +1259,7 @@ public struct ThreadDetailView: View {
             } else {
                 FeatureTranscriptCollectionView(
                     threadID: thread.id,
+                    environmentID: currentThread.environmentID,
                     messages: timelineMessages(detail.messages),
                     openURL: transcriptOpenURL,
                     imageContext: markdownImageContext,
@@ -928,7 +1271,16 @@ public struct ThreadDetailView: View {
                         )
                     },
                     skills: threadProviderSkills,
+                    v2Inspection: v2InspectionContext,
+                    workflows: detail.workflows ?? .unavailable,
+                    isWorkflowBusy: isUpdatingWorkflow,
+                    onFork: { source in
+                        performWorkflow { client in try await client.forkThread(threadID: thread.id, source: source) }
+                    },
+                    onOpenThread: openRelatedThread,
+                    presentationDismissal: transcriptPresentationDismissal,
                     renderUpdate: timelineRenderUpdate,
+                    expandedTurnFoldIDs: expandedTurnFoldIDs,
                     dynamicTypeSize: dynamicTypeSize,
                     codeSizeSteps: codeSizeSteps,
                     isWorking: isWorking,
@@ -943,7 +1295,9 @@ public struct ThreadDetailView: View {
                     },
                     onDismissKeyboard: dismissKeyboard,
                     canEditMessage: canRewind,
-                    onEditMessage: { pendingRewindMessageID = $0 }
+                    onEditMessage: { pendingRewindMessageID = $0 },
+                    canEditPendingMessage: canEditPendingMessage,
+                    onEditPendingMessage: editPendingMessage
                 )
             }
         }
@@ -951,6 +1305,38 @@ public struct ThreadDetailView: View {
             VStack(spacing: 0) {
                 refreshStatus
                 threadQueueControls
+                submissionRecoveryControls
+                if let recovery = detail.recovery?.usageLimit {
+                    FeatureUsageLimitRecoveryView(recovery: recovery,
+                        controlsAvailable: recoveryControlsAvailable,
+                        performAction: updateThreadRecovery)
+                        .padding(.horizontal, 18)
+                }
+                if let recoveryError {
+                    Text(recoveryError).font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.danger).padding(.horizontal, 18)
+                }
+                if let edit = currentQueuedEdit {
+                    FeatureQueuedRunEditBanner(edit: Binding(
+                        get: { currentQueuedEdit ?? edit },
+                        set: { updated in
+                            queuedEdit = updated
+                            applyComposerDraft(updated.draft)
+                            scheduleDraftSave()
+                        }), isSaving: isUpdatingQueue || isTransferringDraft,
+                        cancel: cancelQueuedEdit)
+                        .padding(.horizontal, 18)
+                    if let execution = detail.execution, !edit.isStillQueued(in: execution) {
+                        Button("Recover queued edit", action: recoverStartedQueueEdit)
+                            .disabled(isTransferringDraft || isUpdatingQueue)
+                            .frame(minHeight: T3Metrics.minimumTapTarget)
+                    }
+                }
+                if let report = usageLimitsReport {
+                    FeatureThreadUsageLimitsView(client: model.client, report: report) {
+                        usageLimitsReport = nil
+                    }
+                }
                 if isRewinding {
                     Text("Rewinding conversation")
                         .font(T3Typography.supporting)
@@ -970,12 +1356,14 @@ public struct ThreadDetailView: View {
                         Text("A prompt is saved from an unconfirmed rewind. Reload the thread to check its history.")
                             .font(T3Typography.supporting)
                         Button("Recover saved prompt", action: recoverSavedRewind)
-                            .disabled(isSending || isPreparingInput || !didRestoreDraft)
+                            .disabled(!canTransferDraft)
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 8)
                 }
                 if detail.execution?.isReadOnly == true {
+                    FeatureThreadOpenParentButton(workflows: detail.workflows ?? .unavailable,
+                        onOpenThread: openRelatedThread)
                     Text("Read-only conversation")
                         .font(T3Typography.supporting)
                         .foregroundStyle(T3Colors.textSecondary)
@@ -986,9 +1374,9 @@ public struct ThreadDetailView: View {
                         text: $draft,
                         selection: $selection,
                         attachments: attachmentBinding,
-                        draftOwnerID: "thread:\(currentThread.id)",
+                        draftOwnerID: queuedEdit.map { "queue:\($0.runID)" } ?? "thread:\(currentThread.id)",
                         environmentID: currentThread.environmentID,
-                        draftStorageKey: draftKey,
+                        draftStorageKey: activeDraftKey,
                         environmentIsConnected: threadConnectionState == .connected,
                         attachmentUploads: model.attachmentUploads,
                         attachmentPreferences: currentThread.environmentID.flatMap {
@@ -997,9 +1385,9 @@ public struct ThreadDetailView: View {
                         providers: threadProviders,
                         threadSelection: currentSelection,
                         materializesDefaultSelection: false,
-                        isSending: isSending || isRewinding || !didRestoreDraft || isUpdatingQueue,
-                        isWorking: detail.execution.map { $0.canInterrupt && queueControlsAvailable }
-                            ?? (detail.thread.state == .working || detail.thread.state == .queued || isCompacting),
+                        isSending: isSending || isRewinding || !didRestoreDraft || isUpdatingQueue || isTransferringDraft,
+                        isWorking: queuedEdit == nil && (detail.execution.map { $0.canInterrupt && queueControlsAvailable }
+                            ?? (detail.thread.state == .working || detail.thread.state == .queued || isCompacting)),
                         focused: $composerFocused,
                         onSend: { send() },
                         onStop: stopThreadWork,
@@ -1030,10 +1418,20 @@ public struct ThreadDetailView: View {
                         context: contextBinding,
                         onInputPreparationChange: { isPreparingInput = $0 },
                         contextAttachmentResolver: model.client as? any FeatureContextAttachmentResolving,
-                        messageDeliveries: messageDeliveries,
-                        onSendWithDelivery: { send(delivery: $0) }
+                        messageDeliveries: queuedEdit == nil ? messageDeliveries : [],
+                        onSendWithDelivery: model.client is any FeatureMessageDeliveryManaging
+                            ? { send(delivery: $0) } : nil,
+                        allowProviderSwitch: detail.allowsProviderSwitch == true,
+                        followUpBehavior: model.snapshot.settings.followUpBehavior,
+                        interactionMode: effectiveInteractionMode,
+                        onInteractionModeChange: queuedEdit == nil ? { draftInteractionMode = $0 } : nil,
+                        isSendEnabled: canSubmitComposer,
+                        composerEnterBehavior: model.snapshot.settings.composerEnterBehavior,
+                        retainedAttachmentCount: queuedEdit?.existingAttachments.count ?? 0,
+                        submitLabel: queuedEdit == nil ? nil : "Save message",
+                        isModelSelectionEnabled: queuedEdit == nil
                     )
-                    .disabled(isRewinding)
+                    .disabled(isRewinding || isTransferringDraft || isUpdatingQueue)
                 }
             }
             .background(T3Colors.background)
@@ -1064,6 +1462,15 @@ public struct ThreadDetailView: View {
                 }
             }
         )
+    }
+
+    private var effectiveRuntimeMode: FeatureRuntimeMode { draftRuntimeMode ?? currentThread.runtimeMode }
+    private var effectiveInteractionMode: FeatureInteractionMode {
+        FeatureComposerModePolicy.interactionMode(draftInteractionMode ?? currentThread.interactionMode,
+            provider: threadProviders.first { $0.id == (selection ?? currentSelection)?.providerID })
+    }
+    private var runtimeModeChoices: [FeatureRuntimeMode] {
+        FeatureComposerModePolicy.runtimeModes(for: selection ?? currentSelection, providers: threadProviders)
     }
 
     private var threadProviders: [FeatureProvider] {
@@ -1106,7 +1513,16 @@ public struct ThreadDetailView: View {
         )
     }
 
+    private var expandedTurnFoldIDs: Set<String>? {
+        guard v2InspectionContext != nil else { return nil }
+        return Set(v2TimelineState.expandedIDs.filter { $0.hasPrefix("v2-fold:") })
+    }
+
     private func timelineMessages(_ messages: [FeatureMessage]) -> [FeatureMessage] {
+        if let expandedTurnFoldIDs {
+            // Folds are display-only. The model retains source order and original action targets.
+            return FeatureV2TurnFolding.messages(messages, expandedIDs: expandedTurnFoldIDs) + feedbackMessages
+        }
         guard !feedbackMessages.isEmpty else { return messages }
         return (messages + feedbackMessages).sorted {
             if $0.createdAt == $1.createdAt {
@@ -1140,6 +1556,7 @@ public struct ThreadDetailView: View {
               let prompt = components.queryItems?.first?.value?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !prompt.isEmpty, prompt.count <= 4_096 else { return false }
+        guard didRestoreDraft, !isTransferringDraft, !isRewinding, !isUpdatingQueue else { return true }
         if draft == prompt || draft.hasSuffix(" \(prompt)") || draft.hasSuffix("\n\(prompt)") {
             composerFocused = true
             return true
@@ -1163,11 +1580,14 @@ public struct ThreadDetailView: View {
             return
         }
         let requestedThreadID = currentThread.id
+        let requestedWorkspaceRoot = markdownImageContext?.workspaceRoot
         Task {
             do {
-                let resolved = try await resolver.mediaAssetURL(
+                let resolved = try await resolver.previewAssetURL(
                     threadID: requestedThreadID,
-                    path: path
+                    path: path,
+                    kind: kind,
+                    workspaceRoot: requestedWorkspaceRoot
                 )
                 guard !Task.isCancelled, currentThread.id == requestedThreadID else { return }
                 linkedMediaPreview = FeatureLinkedMediaPreview(
@@ -1195,12 +1615,83 @@ public struct ThreadDetailView: View {
         )
     }
 
-    private func send(delivery: FeatureMessageDelivery = .auto) {
-        guard !isSending, !isUpdatingQueue, !isRewinding, didRestoreDraft else { return }
+    private var v2InspectionContext: FeatureV2ItemInspectionContext? {
+        guard let client = model.client as? any FeatureV2ItemInspecting,
+              detail?.workflows?.isAvailable == true else { return nil }
+        return FeatureV2ItemInspectionContext(threadID: thread.id, client: client,
+            state: v2TimelineState, providers: threadProviders,
+            onOpenThread: { wireID in
+                guard let environmentID = currentThread.environmentID else { return }
+                openRelatedThread(FeatureScopedID.thread(environmentID: environmentID, wireID: wireID))
+            },
+            retryableRunIDs: recoveryControlsAvailable && !isUpdatingRecovery
+                ? detail?.execution?.failedWorkspaceRunIDs ?? [] : [],
+            onRetryWorkspacePreparation: { runID in
+                Task {
+                    do { try await updateThreadRecovery(.retryWorkspacePreparation(runID: runID)) }
+                    catch { recoveryError = error.localizedDescription }
+                }
+            })
+    }
+
+    private func openRelatedThread(_ id: String) {
+        guard !isUpdatingWorkflow else { return }
+        isUpdatingWorkflow = true
+        workflowTask = Task {
+            defer { isUpdatingWorkflow = false }
+            do {
+                try await model.prepareRelatedThread(id: id, from: thread.id)
+                try Task.checkCancellation()
+                showsAgents = false
+                onOpenThread(id)
+            } catch is CancellationError {} catch { workflowError = error.localizedDescription }
+        }
+    }
+
+    private func performWorkflow(_ action: @escaping @MainActor (any FeatureThreadWorkflowClient) async throws -> String) {
+        guard !isUpdatingWorkflow, let client = model.client as? any FeatureThreadWorkflowClient else { return }
+        isUpdatingWorkflow = true
+        workflowTask = Task {
+            defer { isUpdatingWorkflow = false }
+            do {
+                let id = try await action(client)
+                try Task.checkCancellation()
+                try await model.prepareRelatedThread(id: id, from: thread.id)
+                try Task.checkCancellation()
+                onOpenThread(id)
+            } catch is CancellationError {} catch { workflowError = error.localizedDescription }
+        }
+    }
+
+    private func send(delivery requestedDelivery: FeatureMessageDelivery? = nil) {
+        guard !isSending, !isUpdatingQueue, !isRewinding, !isTransferringDraft,
+              didRestoreDraft, didRestoreQueuedEdit else { return }
+        if queuedEdit != nil {
+            saveQueuedEdit()
+            return
+        }
+        if let selection, ThreadComposerModelSelectionPolicy.explicitSelection(
+            selection, inherited: currentSelection, providers: threadProviders,
+            allowProviderSwitch: detail?.allowsProviderSwitch == true
+        ) == nil {
+            draftSaveError = "This model cannot be used in this thread right now. Your draft is unchanged."
+            return
+        }
+        let delivery = requestedDelivery ?? (model.client is any FeatureMessageDeliveryManaging
+            ? FeatureComposerSendPresentation.resolve(
+                isWorking: detail?.execution?.activeRun != nil || currentThread.state == .working,
+                canSteer: messageDeliveries.contains(.steer),
+                followUpBehavior: model.snapshot.settings.followUpBehavior,
+                supportsExplicitDelivery: messageDeliveries.contains(.queue)
+            ).delivery : .auto)
         guard detail?.execution?.isReadOnly != true else { return }
-        guard delivery == .auto || messageDeliveries.contains(delivery) else { return }
+        guard delivery == .auto || (delivery == .queue && model.client is any FeatureMessageDeliveryManaging)
+            || messageDeliveries.contains(delivery) else { return }
         let message = draft
         let pendingContext = composerContext
+        let pendingSelection = selection ?? currentSelection
+        let pendingRuntimeMode = effectiveRuntimeMode
+        let pendingInteractionMode = effectiveInteractionMode
         let pendingAttachments = currentThread.environmentID.map {
             model.attachmentUploads.attachmentsForSend(
                 draftKey: draftKey,
@@ -1210,6 +1701,15 @@ public struct ThreadDetailView: View {
         } ?? attachments
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !pendingAttachments.isEmpty else {
+            return
+        }
+        if FeatureThreadUsageLimits.isCommand(message, hasAttachments: !pendingAttachments.isEmpty),
+           let providerID = selection?.providerID ?? currentSelection?.providerID,
+           let source = model.client as? any FeatureThreadUsageLimitsProviding,
+           let report = source.threadUsageLimits(threadID: thread.id, providerID: providerID) {
+            usageLimitsReport = report
+            draft = ""
+            composerContext = nil
             return
         }
         if pendingAttachments.isEmpty,
@@ -1239,9 +1739,11 @@ public struct ThreadDetailView: View {
                 FeatureMessageSubmission(
                     threadID: thread.id,
                     text: message,
-                    selection: selection,
+                    selection: pendingSelection,
                     attachments: pendingAttachments,
                     context: pendingContext,
+                    runtimeMode: pendingRuntimeMode,
+                    interactionMode: pendingInteractionMode,
                     delivery: delivery
                 )
             )
@@ -1251,7 +1753,7 @@ public struct ThreadDetailView: View {
                 draftSaveTask = nil
                 await trailingSave?.value
                 let followUpDraft = composerDraft
-                if followUpDraft.text.isEmpty && followUpDraft.attachments.isEmpty {
+                if followUpDraft.isEmpty {
                     try? await draftStore.removeDraft(for: draftKey)
                 } else {
                     try? await draftStore.setDraft(followUpDraft, for: draftKey)
@@ -1362,6 +1864,309 @@ public struct ThreadDetailView: View {
         feedbackRevision &+= 1
     }
 
+    private var activeDraftKey: String {
+        queuedEdit == nil ? draftKey : FeatureComposerDraftStore.queuedRunEditKey(for: draftKey)
+    }
+
+    private var canSubmitComposer: Bool {
+        guard didRestoreQueuedEdit else { return false }
+        guard let edit = currentQueuedEdit else { return true }
+        guard queueControlsAvailable, edit.validationMessage == nil,
+              let execution = detail?.execution else { return false }
+        return edit.isStillQueued(in: execution)
+    }
+
+    private var currentQueuedEdit: FeatureQueuedRunEdit? {
+        guard var edit = queuedEdit else { return nil }
+        edit.draft = composerDraft
+        return edit
+    }
+
+    private func applyComposerDraft(_ saved: FeatureComposerDraft) {
+        draft = saved.text
+        attachments = saved.attachments
+        composerContext = saved.context
+        selection = saved.selection
+        draftWorkspace = saved.workspace
+        draftRuntimeMode = saved.runtimeMode
+        draftInteractionMode = saved.interactionMode
+        missingFileRecoverySnapshot = nil
+        didRestoreDraft = true
+    }
+
+    private var canTransferDraft: Bool {
+        didRestoreDraft && !isSending && !isRewinding && !isPreparingInput
+            && !isUpdatingQueue && !isTransferringDraft && queuedEdit == nil
+    }
+
+    private func canEditPendingMessage(_ messageID: String) -> Bool {
+        canTransferDraft && model.canEditPendingSubmission(threadID: thread.id, messageID: messageID)
+    }
+
+    private func editPendingMessage(_ messageID: String) {
+        guard canEditPendingMessage(messageID) else { return }
+        transferSubmissionDraft { saved in
+            await model.editPendingSubmission(threadID: thread.id, messageID: messageID, draft: saved)
+        }
+    }
+
+    @ViewBuilder
+    private var submissionRecoveryControls: some View {
+        ForEach(model.submissionRecoveryDrafts.filter { $0.threadID == thread.id && !$0.isNewTask }) { recovery in
+            VStack(alignment: .leading, spacing: 4) {
+                Text(recovery.reason ?? "This message could not be sent.")
+                    .font(T3Typography.supporting).foregroundStyle(T3Colors.danger)
+                HStack(spacing: 20) {
+                    Button("Edit message") {
+                        transferSubmissionDraft { saved in
+                            await model.recoverSubmission(id: recovery.id, draftKey: draftKey, draft: saved)
+                        }
+                    }
+                    Button("Discard", role: .destructive) {
+                        pendingDiscardRecoveryID = recovery.id
+                    }
+                }
+                .disabled(!canTransferDraft || model.recoveringSubmissionIDs.contains(recovery.id))
+                .frame(minHeight: T3Metrics.minimumTapTarget)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 18)
+        }
+    }
+
+    private func transferSubmissionDraft(
+        _ transfer: @escaping @MainActor (FeatureComposerDraft) async -> FeatureComposerDraft?
+    ) {
+        guard canTransferDraft else { return }
+        isTransferringDraft = true
+        let saved = composerDraft
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        Task {
+            defer { isTransferringDraft = false }
+            await pendingSave?.value
+            if let recovered = await transfer(saved) {
+                applyComposerDraft(recovered)
+                draftSaveError = nil
+                syncComposerAttachments()
+                composerFocused = true
+            } else {
+                draftSaveError = model.errorMessage ?? "The message could not be restored. Try again."
+            }
+        }
+    }
+
+    private func syncComposerAttachments() {
+        guard let environmentID = currentThread.environmentID else { return }
+        model.attachmentUploads.syncOwner(draftKey: activeDraftKey,
+            environmentID: environmentID, attachments: attachments)
+    }
+
+    @MainActor
+    private func beginQueuedEdit(_ entry: FeatureThreadExecution.QueuedEntry) async {
+        guard canTransferDraft, queueControlsAvailable, let execution = detail?.execution,
+              execution.queuedEntries.contains(where: { $0.id == entry.id && $0.messageID == entry.messageID }),
+              entry.hasMessage else { return }
+        isTransferringDraft = true
+        let normal = composerDraft
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        await pendingSave?.value
+        do {
+            try await draftStore.setDraft(normal, for: draftKey)
+            let edit = FeatureQueuedRunEdit(entry: entry)
+            try await draftStore.saveQueuedRunEdit(edit, for: draftKey)
+            ordinaryDraftBeforeQueueEdit = normal
+            queuedEdit = edit
+            applyComposerDraft(edit.draft)
+            didRestoreQueuedEdit = true
+            showsThreadQueue = false
+            queueActionError = nil
+            syncComposerAttachments()
+            composerFocused = true
+        } catch {
+            queueActionError = error.localizedDescription
+        }
+        isTransferringDraft = false
+        if let edit = currentQueuedEdit, let execution = detail?.execution,
+           !edit.isStillQueued(in: execution) {
+            recoverStartedQueueEdit()
+        }
+    }
+
+    @MainActor
+    private func restoreQueuedEditIfNeeded() async {
+        guard canTransferDraft, !didRestoreQueuedEdit else { return }
+        isTransferringDraft = true
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        await pendingSave?.value
+        do {
+            if let edit = try await draftStore.queuedRunEdit(for: draftKey) {
+                let normal = composerDraft
+                try await draftStore.setDraft(normal, for: draftKey)
+                ordinaryDraftBeforeQueueEdit = normal
+                queuedEdit = edit
+                applyComposerDraft(edit.draft)
+                syncComposerAttachments()
+            }
+            didRestoreQueuedEdit = true
+            queueActionError = nil
+        } catch {
+            queueActionError = "Could not restore queued edit. \(error.localizedDescription)"
+        }
+        isTransferringDraft = false
+        if let edit = currentQueuedEdit, let execution = detail?.execution,
+           !edit.isStillQueued(in: execution) {
+            recoverStartedQueueEdit()
+        }
+    }
+
+    private func cancelQueuedEdit() {
+        guard queuedEdit != nil, !isUpdatingQueue, !isTransferringDraft, !isPreparingInput else { return }
+        isTransferringDraft = true
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        Task {
+            defer { isTransferringDraft = false }
+            await pendingSave?.value
+            do { try await finishQueuedEdit() }
+            catch { queueActionError = error.localizedDescription }
+        }
+    }
+
+    @MainActor
+    private func finishQueuedEdit(restoring recovered: FeatureComposerDraft? = nil) async throws {
+        let normal: FeatureComposerDraft
+        if let recovered { normal = recovered }
+        else { normal = try await draftStore.draft(for: draftKey) ?? ordinaryDraftBeforeQueueEdit ?? .init() }
+        // Recovery already moved the draft and removed the edit in one write.
+        if recovered == nil { try await draftStore.removeQueuedRunEdit(for: draftKey) }
+        model.attachmentUploads.removeOwner(draftKey: activeDraftKey)
+        queuedEdit = nil
+        ordinaryDraftBeforeQueueEdit = nil
+        applyComposerDraft(normal)
+        queueActionError = nil
+        draftSaveError = nil
+        syncComposerAttachments()
+        composerFocused = true
+    }
+
+    private func saveQueuedEdit() {
+        guard let edit = currentQueuedEdit, !isPreparingInput, queueControlsAvailable,
+              !isUpdatingQueue, let client = model.client as? any FeatureThreadQueueManaging else { return }
+        if let validation = edit.validationMessage {
+            queueActionError = validation
+            return
+        }
+        guard let execution = detail?.execution, edit.isStillQueued(in: execution) else {
+            recoverStartedQueueEdit()
+            return
+        }
+        isUpdatingQueue = true
+        queueActionError = nil
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        Task {
+            await pendingSave?.value
+            do {
+                try await draftStore.saveQueuedRunEdit(edit, for: draftKey)
+                try await client.updateThreadQueue(threadID: thread.id, action: .replace(edit))
+                try await finishQueuedEdit()
+            } catch {
+                queueActionError = error.localizedDescription
+                _ = await model.detail(for: thread.id, force: true, fresh: true)
+            }
+            isUpdatingQueue = false
+            if let edit = currentQueuedEdit, let execution = detail?.execution,
+               !edit.isStillQueued(in: execution), refreshPresentation == nil {
+                recoverStartedQueueEdit()
+            }
+        }
+    }
+
+    /// Another device can start the run while this composer is open. Retain
+    /// the edit until its server files and new files are saved as a normal draft.
+    private func recoverStartedQueueEdit() {
+        guard let edit = currentQueuedEdit, let execution = detail?.execution,
+              !edit.isStillQueued(in: execution), !isUpdatingQueue, !isTransferringDraft,
+              !isPreparingInput, refreshPresentation == nil,
+              let client = model.client as? any FeatureThreadRecoveryClient else { return }
+        isTransferringDraft = true
+        let pendingSave = draftSaveTask
+        pendingSave?.cancel()
+        draftSaveTask = nil
+        Task {
+            defer { isTransferringDraft = false }
+            await pendingSave?.value
+            do {
+                // Freeze upload-reference writes along with text edits during the transfer.
+                model.attachmentUploads.removeOwner(draftKey: activeDraftKey)
+                try await draftStore.saveQueuedRunEdit(edit, for: draftKey)
+                guard let savedEdit = try await draftStore.queuedRunEdit(for: draftKey) else {
+                    throw FeatureThreadRecoveryError("The saved edit is unavailable. Try again.")
+                }
+                let recovery = try await client.queuedRunEditRecoveryDraft(threadID: thread.id, edit: savedEdit)
+                let restored = try await draftStore.recoverQueuedRunEdit(savedEdit, recovery: recovery, for: draftKey)
+                try await finishQueuedEdit(restoring: restored)
+                queueActionError = "The queued message already started or was removed. Your edit is in the composer."
+            } catch {
+                queueActionError = "Your queued edit is still saved. \(error.localizedDescription)"
+                syncComposerAttachments()
+            }
+        }
+    }
+
+    private var recoveryControlsAvailable: Bool {
+        model.client is any FeatureThreadRecoveryClient && threadConnectionState == .connected
+            && refreshPresentation == nil && detail?.execution?.canManageQueue == true
+            && !isSending && !isTransferringDraft && !isRewinding && !isRestarting
+            && !isUpdatingRecovery && !isUpdatingQueue
+    }
+
+    @MainActor
+    private func updateThreadRecovery(_ action: FeatureThreadRecoveryAction) async throws {
+        guard recoveryControlsAvailable, let client = model.client as? any FeatureThreadRecoveryClient else {
+            throw FeatureThreadRecoveryError("Recovery is unavailable. Reconnect and try again.")
+        }
+        isUpdatingRecovery = true
+        recoveryError = nil
+        defer { isUpdatingRecovery = false }
+        try await client.updateThreadRecovery(threadID: thread.id, action: action)
+    }
+
+    private func performThreadKeyboardCommand(_ command: FeatureKeyboardCommand) {
+        switch command {
+        case .files: presentTool(.files)
+        case .terminal: presentTool(.terminal(nil))
+        case .review: presentTool(.review)
+        case .back: toolSurface = nil
+        case .copyThreadReference:
+            UIPasteboard.general.string = currentPullRequest?.url.absoluteString
+                ?? currentThread.wireID ?? currentThread.id
+        default: break
+        }
+    }
+
+    private func updateVisibleThread() {
+        guard let environmentID = currentThread.environmentID, let wireID = currentThread.wireID else { return }
+        if scenePhase == .active {
+            PlatformVisibleThreadTracker.shared.setVisibleThread(environmentID: environmentID, wireID: wireID)
+        } else {
+            PlatformVisibleThreadTracker.shared.clear(environmentID: environmentID, wireID: wireID)
+        }
+    }
+
+    private func clearVisibleThread() {
+        guard let environmentID = currentThread.environmentID, let wireID = currentThread.wireID else { return }
+        PlatformVisibleThreadTracker.shared.clear(environmentID: environmentID, wireID: wireID)
+    }
+
     private var draftKey: String {
         FeatureComposerDraftStore.threadKey(currentThread)
     }
@@ -1392,7 +2197,12 @@ public struct ThreadDetailView: View {
             return
         }
         draftRestoreBaseline = baseline
-        let saved = try? await draftStore.draft(for: key)
+        let saved: FeatureComposerDraft?
+        do { saved = try await draftStore.draft(for: key) }
+        catch {
+            draftSaveError = "Could not restore draft. \(error.localizedDescription)"
+            return
+        }
         guard !Task.isCancelled else { return }
         if model.recoveredRewindDrafts[thread.id] != nil {
             restoreRewindDraft()
@@ -1400,7 +2210,7 @@ public struct ThreadDetailView: View {
         }
 
         let liveDraft = composerDraft
-        var restored: FeatureComposerDraft
+        let restored: FeatureComposerDraft
         var recoveredMissingFiles = false
         do {
             restored = try FeatureComposerDraftRestoration.merge(saved: saved, baseline: baseline, current: liveDraft,
@@ -1409,16 +2219,9 @@ public struct ThreadDetailView: View {
             draftSaveError = error.localizedDescription
             return
         }
-        restored.selection = ThreadComposerModelSelectionPolicy.explicitSelection(
-            restored.selection,
-            inherited: currentSelection,
-            providers: threadProviders
-        )
-        draft = restored.text
-        composerContext = restored.context
-        attachments = restored.attachments
-        selection = restored.selection
-        didRestoreDraft = true
+        // A saved handoff remains intentional while live capability discovery catches up.
+        // The picker and dispatch boundary validate new choices against current capabilities.
+        applyComposerDraft(restored)
         missingFileRecoverySnapshot = recoveredMissingFiles ? composerDraft : nil
         draftSaveError = recoveredMissingFiles ? FeatureComposerDraftRestoration.missingFilesWarning : nil
 
@@ -1436,61 +2239,39 @@ public struct ThreadDetailView: View {
     }
 
     private func scheduleDraftSave() {
-        guard didRestoreDraft, !isRewinding else { return }
+        persistComposerDraft(debounced: true)
+    }
+
+    private func persistDraftImmediately() {
+        persistComposerDraft(debounced: false)
+    }
+
+    private func persistComposerDraft(debounced: Bool) {
+        guard didRestoreDraft, !isRewinding, !isTransferringDraft, !isUpdatingQueue else { return }
         guard !FeatureComposerDraftRestoration.keepsSavedRecovery(missingFileRecoverySnapshot, current: composerDraft) else { return }
         missingFileRecoverySnapshot = nil
         let previousSave = draftSaveTask
         previousSave?.cancel()
         let snapshot = composerDraft
+        let edit = currentQueuedEdit
         let key = draftKey
+        let uploadKey = activeDraftKey
         let environmentID = currentThread.environmentID
         draftSaveTask = Task {
             await previousSave?.value
             do {
-                try await Task.sleep(for: .milliseconds(220))
+                if debounced { try await Task.sleep(for: .milliseconds(220)) }
                 try Task.checkCancellation()
-                try await draftStore.setDraft(snapshot, for: key)
+                if let edit { try await draftStore.saveQueuedRunEdit(edit, for: key) }
+                else { try await draftStore.setDraft(snapshot, for: key) }
                 guard !Task.isCancelled else { return }
                 draftSaveError = nil
                 if let environmentID {
-                    model.attachmentUploads.syncOwner(
-                        draftKey: key,
-                        environmentID: environmentID,
-                        attachments: snapshot.attachments
-                    )
+                    model.attachmentUploads.syncOwner(draftKey: uploadKey,
+                        environmentID: environmentID, attachments: snapshot.attachments)
                 }
             } catch is CancellationError {
                 return
-            } catch {
-                guard !Task.isCancelled else { return }
-                draftSaveError = "Could not save draft. \(error.localizedDescription)"
-            }
-        }
-    }
-
-    private func persistDraftImmediately() {
-        guard didRestoreDraft, !isRewinding else { return }
-        guard !FeatureComposerDraftRestoration.keepsSavedRecovery(missingFileRecoverySnapshot, current: composerDraft) else { return }
-        missingFileRecoverySnapshot = nil
-        let previousSave = draftSaveTask
-        previousSave?.cancel()
-        let snapshot = composerDraft
-        let key = draftKey
-        let environmentID = currentThread.environmentID
-        draftSaveTask = Task {
-            do {
-                await previousSave?.value
-                try Task.checkCancellation()
-                try await draftStore.setDraft(snapshot, for: key)
-                guard !Task.isCancelled else { return }
-                draftSaveError = nil
-                if let environmentID {
-                    model.attachmentUploads.syncOwner(
-                        draftKey: key,
-                        environmentID: environmentID,
-                        attachments: snapshot.attachments
-                    )
-                }
             } catch {
                 guard !Task.isCancelled else { return }
                 draftSaveError = "Could not save draft. \(error.localizedDescription)"
@@ -1512,12 +2293,15 @@ public struct ThreadDetailView: View {
         OpenURLAction { url in
             if handleArtifactTemplateURL(url) { return .handled }
             if handleTypedMediaPreviewURL(url) { return .handled }
+            if PlatformInAppLinkRouter.route(for: url, in: model.snapshot) != nil {
+                parentOpenURL(url)
+                return .handled
+            }
             if case let .workspaceFile(hostPath) = MarkdownImageSource.classify(
                 url.absoluteString, workspaceRoot: markdownImageContext?.workspaceRoot
             ) {
                 let kind = FeatureFilePreviewKind.infer(path: hostPath)
-                let suffix = URL(fileURLWithPath: hostPath).pathExtension.lowercased()
-                if kind == .image || kind == .video || kind == .pdf || ["html", "htm"].contains(suffix) {
+                if kind.opensLinkedMediaPreview {
                     resolveHostMedia(path: hostPath, kind: kind)
                     return .handled
                 }
@@ -1539,7 +2323,7 @@ public struct ThreadDetailView: View {
                 if url.isFileURL {
                     let path = url.path
                     let kind = FeatureFilePreviewKind.infer(path: path)
-                    if kind == .image || kind == .video {
+                    if kind.opensLinkedMediaPreview {
                         resolveHostMedia(path: path, kind: kind)
                         return .handled
                     }
@@ -1549,11 +2333,11 @@ public struct ThreadDetailView: View {
                 return .handled
             }
             let kind = FeatureFilePreviewKind.infer(path: path)
-            if kind == .image || kind == .video {
+            if kind.opensLinkedMediaPreview {
                 resolveHostMedia(path: path, kind: kind)
                 return .handled
             }
-            toolSurface = .file(path)
+            toolSurface = .file(path, line: nil)
             return .handled
         }
     }
@@ -1563,7 +2347,10 @@ public struct ThreadDetailView: View {
             text: draft,
             attachments: attachments,
             selection: selection,
-            context: composerContext
+            workspace: draftWorkspace,
+            context: composerContext,
+            runtimeMode: draftRuntimeMode,
+            interactionMode: draftInteractionMode
         )
     }
 
@@ -1642,21 +2429,57 @@ private struct FeatureThreadOpeningView: View {
     }
 }
 
-private enum FeatureThreadToolSurface: Identifiable {
-    case files
-    case file(String)
-    case review
-    case sourceControl
-    case terminal
+private struct FeatureThreadDeviceObservation: Hashable {
+    let threadID: String
+    let connection: FeatureConnection.State?
+    let foreground: Bool
+}
 
-    var id: String {
-        switch self {
-        case .files: "files"
-        case let .file(path): "file:\(path)"
-        case .review: "review"
-        case .sourceControl: "sourceControl"
-        case .terminal: "terminal"
+private struct FeatureThreadVisitRequest: Hashable {
+    let observation: FeatureThreadVisitObservation
+    let connection: FeatureConnection.State?
+}
+
+private struct FeatureThreadToolRequest: Hashable {
+    let destination: FeatureThreadDestination?
+    let requestID: UUID?
+}
+
+private enum FeatureThreadToolSurface: Identifiable, Equatable {
+    case files
+    case file(String, line: Int?)
+    case review
+    case sourceControl(FeatureThreadDestination)
+    case terminal(String?)
+    case devices
+
+    init(_ destination: FeatureThreadDestination) {
+        switch destination {
+        case let .files(path?, line): self = .file(path, line: line)
+        case .files: self = .files
+        case let .terminal(sessionID): self = .terminal(sessionID)
+        case .review: self = .review
+        case .devices: self = .devices
+        case .git, .gitCommit, .gitBranches: self = .sourceControl(destination)
         }
+    }
+
+    var destination: FeatureThreadDestination {
+        switch self {
+        case .files: .files(path: nil, line: nil)
+        case let .file(path, line): .files(path: path, line: line)
+        case .review: .review
+        case let .sourceControl(destination): destination
+        case let .terminal(sessionID): .terminal(sessionID: sessionID)
+        case .devices: .devices
+        }
+    }
+
+    var id: FeatureThreadDestination { destination }
+
+    var isTerminal: Bool {
+        if case .terminal = self { return true }
+        return false
     }
 }
 
@@ -1686,6 +2509,8 @@ enum FeatureComposerDraftRestoration {
     static func keepsSavedRecovery(_ snapshot: FeatureComposerDraft?, current: FeatureComposerDraft) -> Bool {
         guard let snapshot else { return false }
         return snapshot.text == current.text && snapshot.context == current.context
+            && snapshot.runtimeMode == current.runtimeMode
+            && snapshot.interactionMode == current.interactionMode
             && snapshot.attachments.count == current.attachments.count
             && zip(snapshot.attachments, current.attachments).allSatisfy { saved, live in
                 var saved = saved
@@ -1730,7 +2555,11 @@ enum FeatureComposerDraftRestoration {
                 baseline: baseline.workspace,
                 current: current.workspace
             ),
-            context: current.context == baseline.context ? saved?.context : current.context
+            context: current.context == baseline.context ? saved?.context : current.context,
+            runtimeMode: current.runtimeMode == baseline.runtimeMode
+                ? saved?.runtimeMode : current.runtimeMode,
+            interactionMode: current.interactionMode == baseline.interactionMode
+                ? saved?.interactionMode : current.interactionMode
         )
         restored.context = ComposerContextReferences.referenced(restored.context, text: restored.text)
         var missing: [ComposerContextRecord] = []
@@ -1820,12 +2649,20 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     }
 
     let threadID: String
+    let environmentID: String?
     let messages: [FeatureMessage]
     let openURL: OpenURLAction
     let imageContext: MarkdownImageContext?
     let attachmentContext: FeatureAttachmentContext?
     let skills: [FeatureProviderSkill]
+    let v2Inspection: FeatureV2ItemInspectionContext?
+    let workflows: FeatureThreadWorkflows
+    let isWorkflowBusy: Bool
+    let onFork: (FeatureThreadWorkflowSource) -> Void
+    let onOpenThread: (String) -> Void
+    let presentationDismissal: FeatureThreadPresentationDismissal
     let renderUpdate: FeatureDetailRenderUpdate?
+    let expandedTurnFoldIDs: Set<String>?
     let dynamicTypeSize: DynamicTypeSize
     let codeSizeSteps: Int
     let isWorking: Bool
@@ -1839,6 +2676,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     let onDismissKeyboard: () -> Void
     let canEditMessage: (String) -> Bool
     let onEditMessage: (String) -> Void
+    let canEditPendingMessage: (String) -> Bool
+    let onEditPendingMessage: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1864,13 +2703,25 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         context.coordinator.currentOpenURL = openURL
         context.coordinator.canEditMessage = canEditMessage
         context.coordinator.onEditMessage = onEditMessage
+        context.coordinator.canEditPendingMessage = canEditPendingMessage
+        context.coordinator.onEditPendingMessage = onEditPendingMessage
+        context.coordinator.inspectionChanged = context.coordinator.currentV2Inspection?.retryableRunIDs != v2Inspection?.retryableRunIDs
+            || context.coordinator.currentV2Inspection?.providers != v2Inspection?.providers
+        context.coordinator.currentV2Inspection = v2Inspection
+        context.coordinator.onFork = onFork
+        context.coordinator.onOpenThread = onOpenThread
         context.coordinator.update(
             threadID: threadID,
+            environmentID: environmentID,
             messages: messages,
             imageContext: imageContext,
             attachmentContext: attachmentContext,
             skills: skills,
+            workflows: workflows,
+            isWorkflowBusy: isWorkflowBusy,
+            presentationDismissal: presentationDismissal,
             renderUpdate: renderUpdate,
+            expandedTurnFoldIDs: expandedTurnFoldIDs,
             dynamicTypeSize: dynamicTypeSize,
             codeSizeSteps: codeSizeSteps,
             isWorking: isWorking,
@@ -1922,13 +2773,25 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var messagesByID: [String: FeatureMessage] = [:]
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
+        private var currentEnvironmentID: String?
         var currentOpenURL: OpenURLAction?
         var canEditMessage: ((String) -> Bool)?
         var onEditMessage: ((String) -> Void)?
+        var canEditPendingMessage: ((String) -> Bool)?
+        var onEditPendingMessage: ((String) -> Void)?
+        var currentV2Inspection: FeatureV2ItemInspectionContext?
+        var inspectionChanged = false
+        var onFork: ((FeatureThreadWorkflowSource) -> Void)?
+        var onOpenThread: ((String) -> Void)?
+        private var currentWorkflows: FeatureThreadWorkflows = .unavailable
+        private var currentIsWorkflowBusy = false
+        private var workflowState = FeatureTranscriptWorkflowState()
+        private var currentPresentationDismissal = FeatureThreadPresentationDismissal()
         private var currentImageContext: MarkdownImageContext?
         private var currentAttachmentContext: FeatureAttachmentContext?
         private var currentSkills: [FeatureProviderSkill] = []
         private var currentDetailRevision: UInt64?
+        private var currentExpandedTurnFoldIDs: Set<String>?
         private var currentDynamicTypeSize: DynamicTypeSize?
         private var currentCodeSizeSteps = 0
         private var currentIsWorking = false
@@ -1953,14 +2816,21 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         ) -> UIContextMenuConfiguration? {
             guard let messageID = dataSource?.itemIdentifier(for: indexPath),
                   messagesByID[messageID]?.role == .user,
-                  canEditMessage?(messageID) == true else { return nil }
+                  canEditMessage?(messageID) == true || canEditPendingMessage?(messageID) == true else { return nil }
             return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
-                UIMenu(children: [UIAction(
-                    title: "Edit from here", image: UIImage(systemName: "arrow.uturn.backward")
-                ) { [weak self] _ in
-                    guard self?.canEditMessage?(messageID) == true else { return }
-                    self?.onEditMessage?(messageID)
-                }])
+                var actions: [UIAction] = []
+                if self?.canEditPendingMessage?(messageID) == true {
+                    actions.append(UIAction(title: "Edit pending message", image: UIImage(systemName: "pencil")) { [weak self] _ in
+                        guard self?.canEditPendingMessage?(messageID) == true else { return }
+                        self?.onEditPendingMessage?(messageID)
+                    })
+                } else if self?.canEditMessage?(messageID) == true {
+                    actions.append(UIAction(title: "Edit from here", image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in
+                        guard self?.canEditMessage?(messageID) == true else { return }
+                        self?.onEditMessage?(messageID)
+                    })
+                }
+                return UIMenu(children: actions)
             }
         }
 
@@ -1999,13 +2869,27 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 }
 
                 cell.contentConfiguration = UIHostingConfiguration {
-                    FeatureMessageView(
-                        message: message,
-                        imageContext: self?.currentImageContext,
-                        attachmentContext: self?.currentAttachmentContext,
-                        skills: self?.currentSkills ?? []
-                    )
+                    VStack(alignment: .leading, spacing: 0) {
+                        FeatureMessageView(
+                            message: message,
+                            imageContext: self?.currentImageContext,
+                            attachmentContext: self?.currentAttachmentContext,
+                            skills: self?.currentSkills ?? [],
+                            v2Inspection: self?.currentV2Inspection,
+                            environmentID: self?.currentEnvironmentID,
+                            agents: self?.currentWorkflows.agents ?? [],
+                            onOpenThread: { self?.onOpenThread?($0) }
+                        )
+                        FeatureThreadForkButton(source: message.v2FoldID == nil ? message.v2Timeline?.workflowSource : nil,
+                            workflows: self?.currentWorkflows ?? .unavailable,
+                            isBusy: self?.currentIsWorkflowBusy == true,
+                            onFork: { self?.onFork?($0) })
+                    }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .environment(
+                            \.featureThreadPresentationDismissal,
+                            self?.currentPresentationDismissal ?? FeatureThreadPresentationDismissal()
+                        )
                         .environment(\.t3CodeSizeSteps, self?.currentCodeSizeSteps ?? 0)
                         .environment(
                             \.openURL,
@@ -2032,11 +2916,16 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
         func update(
             threadID: String,
+            environmentID: String?,
             messages: [FeatureMessage],
             imageContext: MarkdownImageContext?,
             attachmentContext: FeatureAttachmentContext?,
             skills: [FeatureProviderSkill],
+            workflows: FeatureThreadWorkflows,
+            isWorkflowBusy: Bool,
+            presentationDismissal: FeatureThreadPresentationDismissal,
             renderUpdate: FeatureDetailRenderUpdate?,
+            expandedTurnFoldIDs: Set<String>?,
             dynamicTypeSize: DynamicTypeSize,
             codeSizeSteps: Int,
             isWorking: Bool,
@@ -2058,9 +2947,21 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let imageContextChanged = currentImageContext != imageContext
                 || currentAttachmentContext != attachmentContext
             let skillsChanged = currentSkills != skills
+            let inspectionContextChanged = currentEnvironmentID != environmentID || inspectionChanged
+            inspectionChanged = false
+            let workflowChangedIDs = workflowState.update(
+                messages: messages, workflows: workflows,
+                environmentID: environmentID, isWorkflowBusy: isWorkflowBusy
+            )
+            // Keep future cell configurations current even when no displayed row changed.
+            currentWorkflows = workflows
+            currentIsWorkflowBusy = isWorkflowBusy
+            let presentationDismissalChanged = currentPresentationDismissal.requestID != presentationDismissal.requestID
+            currentPresentationDismissal = presentationDismissal
             let typeSizeChanged = currentDynamicTypeSize != dynamicTypeSize
                 || currentCodeSizeSteps != codeSizeSteps
             let revisionChanged = currentDetailRevision != renderUpdate?.revision
+            let turnFoldsChanged = currentExpandedTurnFoldIDs != expandedTurnFoldIDs
             let workingChanged = currentIsWorking != isWorking
             let workingDetailChanged = currentIsCompacting != isCompacting
                 || currentActiveSubagentCount != activeSubagentCount
@@ -2069,23 +2970,38 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
                 || currentIsLoadingEarlier != isLoadingEarlier
             guard threadChanged || imageContextChanged || skillsChanged || typeSizeChanged
-                || revisionChanged || workingChanged
+                || inspectionContextChanged || !workflowChangedIDs.isEmpty
+                || presentationDismissalChanged
+                || revisionChanged || turnFoldsChanged || workingChanged
                 || workingDetailChanged || loadEarlierChanged else { return }
 
-            let incremental = !threadChanged
-                ? incrementalState(messages: messages, renderUpdate: renderUpdate)
+            let incremental = !threadChanged && !turnFoldsChanged
+                ? incrementalState(messages: messages, renderUpdate: renderUpdate,
+                                   verifyDisplayOrder: expandedTurnFoldIDs != nil)
                 : nil
             let state = incremental ?? fullState(messages: messages)
             let newIDs = state.ids
             let idsChanged = state.idsChanged
-            let changedIDs = typeSizeChanged || imageContextChanged || skillsChanged
+            let contentChangedIDs = typeSizeChanged || imageContextChanged || skillsChanged || inspectionContextChanged
                 ? newIDs
                 : state.changedIDs
+            var changedIDs = workflowChangedIDs.isEmpty
+                ? contentChangedIDs
+                : Array(Set(contentChangedIDs).union(workflowChangedIDs))
+            if presentationDismissalChanged {
+                let currentIDs = Set(newIDs)
+                let visibleIDs = collectionView.indexPathsForVisibleItems.compactMap {
+                    dataSource.itemIdentifier(for: $0)
+                }.filter { currentIDs.contains($0) }
+                changedIDs = Array(Set(changedIDs).union(visibleIDs))
+            }
 
             currentImageContext = imageContext
             currentAttachmentContext = attachmentContext
             currentSkills = skills
+            currentEnvironmentID = environmentID
             currentDetailRevision = renderUpdate?.revision
+            currentExpandedTurnFoldIDs = expandedTurnFoldIDs
             currentDynamicTypeSize = dynamicTypeSize
             currentCodeSizeSteps = codeSizeSteps
             currentIsWorking = isWorking
@@ -2101,7 +3017,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             if threadChanged {
                 cancelAllMarkdownPrefetches()
             } else {
-                var invalidatedIDs = Set(changedIDs)
+                // Agent progress and fork controls do not change parsed markdown.
+                var invalidatedIDs = Set(contentChangedIDs)
                 if idsChanged, !state.isAppendOnly {
                     invalidatedIDs.formUnion(Set(orderedIDs).subtracting(newIDs))
                 }
@@ -2117,10 +3034,10 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 && Array(newIDs.suffix(previousIDs.count)) == previousIDs
             // Self-sizing cells can grow before the next layout restores the
             // bottom offset. Keep following until an actual drag releases it.
-            let shouldFollowBottom = isInitialLoad || wasNearBottom
-                || (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor == true
+            let shouldFollowBottom = isInitialLoad || (!turnFoldsChanged && (wasNearBottom
+                || (collectionView as? BottomAnchoredTranscriptCollectionView)?.maintainsBottomAnchor == true))
             let prependAnchor = !shouldFollowBottom
-                && (prependedMessages || (loadEarlierChanged && !canLoadEarlier))
+                && (prependedMessages || turnFoldsChanged || (loadEarlierChanged && !canLoadEarlier))
                 ? visibleAnchor(in: collectionView, dataSource: dataSource)
                 : nil
 
@@ -2272,7 +3189,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
         private func incrementalState(
             messages: [FeatureMessage],
-            renderUpdate: FeatureDetailRenderUpdate?
+            renderUpdate: FeatureDetailRenderUpdate?,
+            verifyDisplayOrder: Bool
         ) -> MessageState? {
             guard let currentDetailRevision,
                   let renderUpdate,
@@ -2283,6 +3201,9 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             }
 
             let appendedIDs = delta.appendedMessageIDs
+            // Authoritative deltas refer to unfolded rows. Reuse them only when
+            // their exact ID order also describes the displayed collection.
+            if verifyDisplayOrder, messages.map(\.id) != orderedIDs + appendedIDs { return nil }
             guard Set(appendedIDs).count == appendedIDs.count,
                   appendedIDs.allSatisfy({ messagesByID[$0] == nil }) else {
                 return nil
@@ -3080,8 +4001,15 @@ struct FeatureMessageView: View {
     var imageContext: MarkdownImageContext? = nil
     var attachmentContext: FeatureAttachmentContext? = nil
     var skills: [FeatureProviderSkill] = []
+    var v2Inspection: FeatureV2ItemInspectionContext? = nil
+    var environmentID: String? = nil
+    var agents: [FeatureThreadAgent] = []
+    var onOpenThread: ((String) -> Void)? = nil
     @SwiftUI.Environment(\.openURL) private var openURL
+    @SwiftUI.Environment(\.featureThreadPresentationDismissal) private var presentationDismissal
+    @State private var presentationID = UUID()
     @State private var previewedContext: ComposerContextRecord?
+    @State private var contextAttachmentPresented = false
     @State private var contextUnavailable = false
 
     var body: some View {
@@ -3102,13 +4030,32 @@ struct FeatureMessageView: View {
                 }
                 return .handled
             })
-            .sheet(item: $previewedContext) { record in
+            .onChange(of: previewedContext != nil) { _, presented in
+                if presented { presentationDismissal.onPresentationChange(presentationID, true) }
+            }
+            .onChange(of: presentationDismissal.requestID) { _, id in
+                if id != nil {
+                    if !contextAttachmentPresented { previewedContext = nil }
+                    contextUnavailable = false
+                }
+            }
+            .sheet(item: $previewedContext, onDismiss: {
+                presentationDismissal.onPresentationChange(presentationID, false)
+            }) { record in
                 NavigationStack {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 12) {
                             if let binding = record.attachment,
                                let attachment = message.attachments.first(where: { $0.id == binding.attachmentId }) {
                                 FeatureMessageAttachmentsView(attachments: [attachment], context: attachmentContext)
+                                    .environment(\.featureThreadPresentationDismissal,
+                                        FeatureThreadPresentationDismissal(requestID: presentationDismissal.requestID) { id, presented in
+                                            contextAttachmentPresented = presented
+                                            presentationDismissal.onPresentationChange(id, presented)
+                                            if !presented, presentationDismissal.requestID != nil {
+                                                previewedContext = nil
+                                            }
+                                        })
                             } else {
                                 Text(ComposerContextReferences.providerPayload(record))
                                     .font(T3Typography.tool)
@@ -3151,8 +4098,15 @@ struct FeatureMessageView: View {
 
     private var clipboardSource: ComposerContextClipboardFragment.Source? {
         attachmentContext?.environmentID.map {
-            .init(environmentId: $0, threadId: attachmentContext?.wireThreadID, messageId: message.id)
+            .init(environmentId: $0, threadId: message.v2Timeline?.sourceThreadID ?? attachmentContext?.wireThreadID,
+                  messageId: message.v2Timeline?.messageID ?? message.id)
         }
+    }
+
+    private var transcriptAgent: FeatureThreadAgent? {
+        guard let environmentID, let items = message.v2WorkItems,
+              items.count == 1, let item = items.first else { return nil }
+        return item.threadAgent(environmentID: environmentID, agents: agents)
     }
 
     @ViewBuilder private var messageBody: some View {
@@ -3161,6 +4115,9 @@ struct FeatureMessageView: View {
             HStack {
                 Spacer(minLength: 44)
                 VStack(alignment: .leading, spacing: 10) {
+                    if let source = message.v2Timeline, FeatureV2MessageAttribution.hasContent(source) {
+                        FeatureV2MessageAttribution(source: source, onOpenThread: v2Inspection?.onOpenThread)
+                    }
                     FeatureMessageAttachmentsView(attachments: message.attachments, context: attachmentContext)
                     if !message.text.isEmpty {
                         MarkdownMessageView(
@@ -3172,6 +4129,11 @@ struct FeatureMessageView: View {
                             messageContext: message.context,
                             copyText: message.text
                         )
+                    }
+                    if message.v2Timeline != nil {
+                        Text(message.createdAt, format: .dateTime.hour().minute())
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.textTertiary)
                     }
                     if message.state == .queued {
                         Label("Queued. Sends when connected.", systemImage: "clock")
@@ -3217,12 +4179,38 @@ struct FeatureMessageView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityIdentifier("message-\(message.id)")
+            if let source = message.v2Timeline, source.itemType == "assistant_message",
+               message.state != .streaming, source.status == "completed" {
+                Text(NativeTimestampParser.parse(source.updatedAt) ?? message.createdAt, format: .dateTime.hour().minute())
+                    .font(T3Typography.supporting)
+                    .foregroundStyle(T3Colors.textTertiary)
+            }
         case .tool:
-            FeatureWorkLogView(message: message, imageContext: imageContext)
-                .id(message.id)
+            if let agent = transcriptAgent, let onOpenThread {
+                FeatureThreadAgentRow(agent: agent, onOpenThread: onOpenThread)
+                if let item = message.v2WorkItems?.first, let v2Inspection {
+                    FeatureV2ItemInspector(item: item, context: v2Inspection,
+                        imageContext: imageContext, attachmentContext: attachmentContext, title: "Details")
+                        .id(message.id)
+                } else {
+                    FeatureWorkLogView(message: message, imageContext: imageContext)
+                        .id(message.id)
+                }
+            } else if message.v2WorkItems != nil, let v2Inspection {
+                FeatureV2WorkLogView(message: message, context: v2Inspection,
+                    imageContext: imageContext, attachmentContext: attachmentContext)
+                    .id(message.id)
+            } else {
+                FeatureWorkLogView(message: message, imageContext: imageContext)
+                    .id(message.id)
+            }
         case .system:
-            systemMessage
-                .accessibilityIdentifier("message-\(message.id)")
+            if let foldID = message.v2FoldID, let v2Inspection {
+                FeatureV2TurnFoldButton(id: foldID, label: message.text, state: v2Inspection.state)
+            } else {
+                systemMessage
+                    .accessibilityIdentifier("message-\(message.id)")
+            }
         }
     }
 
@@ -3357,9 +4345,11 @@ enum FeatureWorkLogMedia {
     }
 }
 
-private struct FeatureMessageAttachmentsView: View {
+struct FeatureMessageAttachmentsView: View {
     let attachments: [FeatureMessageAttachment]
     let context: FeatureAttachmentContext?
+    @SwiftUI.Environment(\.featureThreadPresentationDismissal) private var presentationDismissal
+    @State private var presentationID = UUID()
     @State private var previewedAttachment: FeatureMessageAttachment?
 
     var body: some View {
@@ -3376,8 +4366,16 @@ private struct FeatureMessageAttachmentsView: View {
                     .id("\(context?.threadID ?? ""):attachment:\(attachment.id)")
                 }
             }
-            .fullScreenCover(item: $previewedAttachment) { attachment in
-                FeatureAttachmentPreview(attachment: attachment)
+            .onChange(of: previewedAttachment != nil) { _, presented in
+                if presented { presentationDismissal.onPresentationChange(presentationID, true) }
+            }
+            .onChange(of: presentationDismissal.requestID) { _, id in
+                if id != nil { previewedAttachment = nil }
+            }
+            .fullScreenCover(item: $previewedAttachment, onDismiss: {
+                presentationDismissal.onPresentationChange(presentationID, false)
+            }) { attachment in
+                FeatureAttachmentPreview(attachment: attachment, context: context)
             }
         }
     }
@@ -3499,6 +4497,12 @@ private struct FeatureMessageAttachmentView: View {
 private struct FeatureAttachmentPreview: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
     let attachment: FeatureMessageAttachment
+    let context: FeatureAttachmentContext?
+
+    private var resolveURL: (@MainActor () async throws -> URL)? {
+        guard attachment.previewData == nil, let context else { return nil }
+        return { try await context.resolver.attachmentAssetURL(threadID: context.threadID, attachment: attachment) }
+    }
 
     var body: some View {
         NavigationStack {
@@ -3510,7 +4514,9 @@ private struct FeatureAttachmentPreview: View {
                     fileName: attachment.name,
                     mimeType: attachment.mimeType
                 ),
-                fileName: attachment.name
+                fileName: attachment.name,
+                mimeType: attachment.mimeType,
+                resolveURL: resolveURL
             )
             .navigationTitle(attachment.name)
             .navigationBarTitleDisplayMode(.inline)
@@ -3534,16 +4540,21 @@ private struct FeatureLinkedMediaPreview: Identifiable {
     static func previewKind(for url: URL) -> FeatureFilePreviewKind? {
         let kind = FeatureFilePreviewKind.infer(path: url.path)
         return switch kind {
-        case .image, .pdf, .video, .document: kind
+        case .image, .pdf, .video, .audio, .browser, .document: kind
         case .markdown, .source, .plainText: nil
         }
     }
 
     static func previewKind(fileName: String, mimeType: String) -> FeatureFilePreviewKind {
-        if mimeType.hasPrefix("image/") { return .image }
-        if mimeType.hasPrefix("video/") { return .video }
-        if mimeType == "application/pdf" { return .pdf }
-        let inferred = FeatureFilePreviewKind.infer(path: fileName)
-        return inferred == .plainText ? .document : inferred
+        switch FeatureAttachmentContentKind.infer(name: fileName, mimeType: mimeType) {
+        case .image: return .image
+        case .video: return .video
+        case .audio: return .audio
+        case .pdf: return .pdf
+        case .html: return .browser
+        case .markdown: return .markdown
+        case .text: return .plainText
+        case .native: return .document
+        }
     }
 }

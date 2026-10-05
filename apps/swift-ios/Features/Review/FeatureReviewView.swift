@@ -5,10 +5,10 @@ public struct FeatureReviewView: View {
     @SwiftUI.Environment(\.scenePhase) private var scenePhase
     let client: any FeatureClient
     let threadID: String
-    /// Comments are ordinary turns. They go through the same queue as the
-    /// composer so an offline comment is kept and retried, not dropped.
-    let sendMessage: (FeatureMessageSubmission) async -> Bool
+    /// The composer owns draft persistence, model selection, modes, and delivery.
+    let onAppendComment: (ComposerContextRecord) async throws -> Void
 
+    @State private var selectedTarget: FeatureReviewTarget?
     @State private var review: FeatureReview?
     @State private var isLoading = true
     @State private var errorMessage: String?
@@ -17,11 +17,13 @@ public struct FeatureReviewView: View {
     public init(
         client: any FeatureClient,
         threadID: String,
-        sendMessage: @escaping (FeatureMessageSubmission) async -> Bool
+        initialTarget: FeatureReviewTarget? = nil,
+        onAppendComment: @escaping (ComposerContextRecord) async throws -> Void
     ) {
         self.client = client
         self.threadID = threadID
-        self.sendMessage = sendMessage
+        _selectedTarget = State(initialValue: initialTarget)
+        self.onAppendComment = onAppendComment
     }
 
     public var body: some View {
@@ -61,6 +63,30 @@ public struct FeatureReviewView: View {
 
     private func reviewList(_ review: FeatureReview) -> some View {
         List {
+            if let sources = review.sources, !sources.isEmpty {
+                Section {
+                    Menu {
+                        ForEach(sources) { source in
+                            Button {
+                                Task { await load(target: source.target) }
+                            } label: {
+                                if source.id == review.selectedSourceID {
+                                    Label(source.title, systemImage: "checkmark")
+                                } else {
+                                    Text(source.title)
+                                }
+                            }
+                        }
+                    } label: {
+                        LabeledContent("Compare", value: review.title)
+                    }
+                    .disabled(isLoading)
+                    if isLoading { ProgressView("Loading changes…") }
+                }
+            }
+            if let historyError = review.historyError {
+                Text(historyError).font(T3Typography.supporting).foregroundStyle(.orange)
+            }
             if let errorMessage {
                 Section {
                     FeatureRefreshFailureRow(message: errorMessage) {
@@ -97,7 +123,7 @@ public struct FeatureReviewView: View {
                     ContentUnavailableView(
                         "No changes",
                         systemImage: "checkmark.circle",
-                        description: Text("The working tree is clean.")
+                        description: Text("This source has no changes.")
                     )
                     .listRowBackground(Color.clear)
                 }
@@ -107,8 +133,9 @@ public struct FeatureReviewView: View {
                             client: client,
                             threadID: threadID,
                             file: file,
-                            sendMessage: sendMessage
+                            onAppendComment: onAppendComment
                         )
+                        .id(file.id)
                     } label: {
                         FeatureReviewFileRow(file: file)
                     }
@@ -120,16 +147,40 @@ public struct FeatureReviewView: View {
         .refreshable { await load() }
     }
 
-    private func load() async {
+    private func load(target: FeatureReviewTarget? = nil) async {
         let generation = loadGeneration.begin()
         isLoading = true
         defer {
             if loadGeneration.accepts(generation) { isLoading = false }
         }
         do {
-            let loaded = try await client.loadReview(threadID: threadID)
+            var sources = review?.sources
+            var historyError = review?.historyError
+            let loaded: FeatureReview
+            if let target {
+                loaded = try await client.loadReview(threadID: threadID, target: target)
+            } else {
+                let catalog = try await client.loadReview(threadID: threadID)
+                sources = catalog.sources
+                historyError = catalog.historyError
+                let source = sources?.first { $0.id == review?.selectedSourceID }
+                    ?? sources?.first { $0.target == selectedTarget }
+                if let source, source.id != catalog.selectedSourceID {
+                    loaded = try await client.loadReview(threadID: threadID, target: source.target)
+                } else {
+                    loaded = catalog
+                }
+            }
             guard loadGeneration.accepts(generation) else { return }
-            review = loaded
+            var next = loaded
+            next.sources = sources ?? loaded.sources
+            next.historyError = historyError
+            if let source = next.sources?.first(where: { $0.id == next.selectedSourceID }) {
+                next.title = source.title
+                for index in next.files.indices { next.files[index].sourceTitle = source.title }
+                selectedTarget = source.target
+            }
+            review = next
             errorMessage = nil
         } catch is CancellationError {
             return
@@ -138,6 +189,7 @@ public struct FeatureReviewView: View {
             errorMessage = error.localizedDescription
         }
     }
+
 }
 
 private struct FeatureReviewFileRow: View {
@@ -219,13 +271,14 @@ private struct FeatureDiffView: View {
     let client: any FeatureClient
     let threadID: String
     let file: FeatureReviewFile
-    let sendMessage: (FeatureMessageSubmission) async -> Bool
+    let onAppendComment: (ComposerContextRecord) async throws -> Void
 
     @State private var hydration: FeatureDiffHydration
     @State private var selectedLine: FeatureReviewLineSelection?
+    @State private var rangeAnchor: FeatureReviewLineSelection?
     @State private var isCommenting = false
     @State private var comment = ""
-    @State private var isSending = false
+    @State private var isAppending = false
     @State private var commentError: String?
     @FocusState private var isCommentFocused: Bool
 
@@ -233,12 +286,12 @@ private struct FeatureDiffView: View {
         client: any FeatureClient,
         threadID: String,
         file: FeatureReviewFile,
-        sendMessage: @escaping (FeatureMessageSubmission) async -> Bool
+        onAppendComment: @escaping (ComposerContextRecord) async throws -> Void
     ) {
         self.client = client
         self.threadID = threadID
         self.file = file
-        self.sendMessage = sendMessage
+        self.onAppendComment = onAppendComment
         _hydration = State(initialValue: FeatureDiffHydration(lines: file.lines))
     }
 
@@ -269,12 +322,24 @@ private struct FeatureDiffView: View {
                             ForEach(hydration.lines) { line in
                                 FeatureDiffLineRow(
                                     line: line,
-                                    isSelected: selection(for: line) == selectedLine,
+                                    isSelected: selectedLine?.contains(selection(for: line)) == true,
                                     minimumWidth: proxy.size.width
                                 ) {
-                                    guard let selection = selection(for: line) else { return }
-                                    selectedLine = selection
+                                    guard !isAppending, let selection = selection(for: line) else { return }
+                                    if let anchor = rangeAnchor {
+                                        guard let range = anchor.extending(to: selection) else { return }
+                                        selectedLine = range
+                                        rangeAnchor = nil
+                                    } else {
+                                        selectedLine = selection
+                                    }
                                     openCommentComposer()
+                                } startRange: {
+                                    guard !isAppending, let selection = selection(for: line) else { return }
+                                    rangeAnchor = selection
+                                    selectedLine = selection
+                                    isCommenting = false
+                                    isCommentFocused = false
                                 }
                             }
                         }
@@ -290,15 +355,34 @@ private struct FeatureDiffView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
+                    rangeAnchor = nil
                     selectedLine = nil
                     openCommentComposer()
                 } label: {
                     Image(systemName: "text.bubble")
                 }
                 .accessibilityLabel("Add file review comment")
+                .disabled(isAppending)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
+            if let rangeAnchor {
+                HStack {
+                    Text("Tap the last \(rangeAnchor.side.rawValue) line")
+                    Spacer()
+                    Button("Comment") {
+                        self.rangeAnchor = nil
+                        openCommentComposer()
+                    }
+                    Button("Cancel") {
+                        self.rangeAnchor = nil
+                        selectedLine = nil
+                    }
+                }
+                .font(T3Typography.supporting)
+                .padding()
+                .background(T3Colors.surface)
+            }
             if isCommenting {
                 commentComposer
             }
@@ -331,6 +415,7 @@ private struct FeatureDiffView: View {
                 Spacer(minLength: 8)
                 Button {
                     isCommenting = false
+                    selectedLine = nil
                     isCommentFocused = false
                     commentError = nil
                 } label: {
@@ -340,6 +425,7 @@ private struct FeatureDiffView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(T3Colors.textSecondary)
                 .accessibilityLabel("Close review comment")
+                .disabled(isAppending)
             }
 
             TextField(
@@ -350,6 +436,7 @@ private struct FeatureDiffView: View {
             .font(T3Typography.composer)
             .lineLimit(2 ... 6)
             .focused($isCommentFocused)
+            .disabled(isAppending)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(T3Colors.input)
@@ -379,16 +466,16 @@ private struct FeatureDiffView: View {
                 .disabled(trimmedComment.isEmpty)
 
                 Button {
-                    sendComment()
+                    appendComment()
                 } label: {
                     HStack(spacing: 7) {
-                        if isSending {
+                        if isAppending {
                             ProgressView()
                                 .controlSize(.small)
                         } else {
-                            Image(systemName: "arrow.up")
+                            Image(systemName: "plus")
                         }
-                        Text("Send to agent")
+                        Text("Add to draft")
                     }
                     .frame(maxWidth: .infinity, minHeight: 42)
                 }
@@ -396,7 +483,7 @@ private struct FeatureDiffView: View {
                 .foregroundStyle(.white)
                 .background(T3Colors.accent)
                 .clipShape(RoundedRectangle(cornerRadius: 9))
-                .disabled(trimmedComment.isEmpty || isSending)
+                .disabled(trimmedComment.isEmpty || isAppending)
             }
             .font(T3Typography.control)
         }
@@ -416,15 +503,22 @@ private struct FeatureDiffView: View {
     }
 
     private var reviewDraft: FeatureReviewCommentDraft {
-        FeatureReviewCommentDraft(filePath: file.path, line: selectedLine, body: comment)
+        FeatureReviewCommentDraft(
+            filePath: file.path, line: selectedLine, body: comment,
+            sourceID: file.sourceID ?? file.sourceKind ?? "working-tree",
+            sourceTitle: file.sourceTitle ?? "Working changes"
+        )
     }
 
     private var commentLocation: String {
         guard let selectedLine else { return file.path }
-        return "\(file.path) · \(selectedLine.side.rawValue) line \(selectedLine.line)"
+        return "\(file.path) · \(selectedLine.label)"
     }
 
     private func selection(for line: FeatureDiffLine) -> FeatureReviewLineSelection? {
+        if (rangeAnchor?.side ?? selectedLine?.side) == .old, let oldLine = line.oldLine {
+            return FeatureReviewLineSelection(side: .old, line: oldLine)
+        }
         if let newLine = line.newLine {
             return FeatureReviewLineSelection(side: .new, line: newLine)
         }
@@ -458,25 +552,27 @@ private struct FeatureDiffView: View {
         }
     }
 
-    private func sendComment() {
-        guard !trimmedComment.isEmpty, !isSending else { return }
+    private func appendComment() {
+        guard !trimmedComment.isEmpty, !isAppending else { return }
+        // A record is the entire draft addition, so never silently truncate the comment.
+        guard comment.utf16.count <= 16_000 else {
+            commentError = "Review comments must be at most 16,000 characters."
+            return
+        }
         let record = reviewDraft.contextRecord(lines: hydration.lines)
-        let prompt = reviewDraft.submissionText(contextRecord: record)
-        isSending = true
+        isAppending = true
         commentError = nil
         Task {
-            let sent = await sendMessage(
-                FeatureMessageSubmission(threadID: threadID, text: prompt, selection: nil, context: .init(records: [record]))
-            )
-            if sent {
+            defer { isAppending = false }
+            do {
+                try await onAppendComment(record)
                 comment = ""
                 selectedLine = nil
                 isCommenting = false
                 isCommentFocused = false
-            } else {
-                commentError = "Could not send the comment."
+            } catch {
+                commentError = error.localizedDescription
             }
-            isSending = false
         }
     }
 }
@@ -486,6 +582,7 @@ private struct FeatureDiffLineRow: View {
     let isSelected: Bool
     let minimumWidth: CGFloat
     let select: () -> Void
+    let startRange: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -524,6 +621,8 @@ private struct FeatureDiffLineRow: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
+        .onLongPressGesture(perform: startRange)
+        .accessibilityAction(named: "Start line range", startRange)
         .accessibilityAction(named: "Add review comment", select)
     }
 

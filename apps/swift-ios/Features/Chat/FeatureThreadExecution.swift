@@ -8,6 +8,8 @@ public enum FeatureThreadQueueAction: Sendable, Equatable {
     case resume
     /// Omitting attachments and context from the command preserves both on the server.
     case edit(runID: String, text: String)
+    /// Replaces text, attachments and context using the original message identity.
+    case replace(FeatureQueuedRunEdit)
     case interrupt(runID: String, holdQueue: Bool)
 }
 
@@ -51,12 +53,13 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
         public let startedAt: String?
         public let completedAt: String?
         public let workStartedAt: String?
+        public let workspacePreparation: JSONValue?
 
         public var activityStartedAt: String { workStartedAt ?? startedAt ?? requestedAt }
 
         private enum CodingKeys: String, CodingKey {
             case id, ordinal, status, queuePosition, queueHeld, requestedAt, startedAt, completedAt
-            case workStartedAt
+            case workStartedAt, workspacePreparation
             case userMessageID = "userMessageId"
             case providerThreadID = "providerThreadId"
             case activeAttemptID = "activeAttemptId"
@@ -69,6 +72,18 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
         public let name: String
         public let mimeType: String
         public let sizeBytes: Int
+        public var type: String? = nil
+        public var source: JSONValue? = nil
+
+        public var wireValue: JSONValue {
+            var value: [String: JSONValue] = [
+                "id": .string(id), "name": .string(name), "mimeType": .string(mimeType),
+                "sizeBytes": .number(Double(sizeBytes)),
+                "type": .string(type ?? (mimeType.hasPrefix("image/") ? "image" : "file")),
+            ]
+            value["source"] = source
+            return .object(value)
+        }
     }
 
     public struct QueuedEntry: Identifiable, Sendable, Equatable, Codable {
@@ -76,6 +91,7 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
         public let text: String
         public let attachments: [Attachment]
         public let hasMessage: Bool
+        public var context: OrchestrationMessageContext? = nil
 
         public var id: String { run.id }
         public var messageID: String { run.userMessageID }
@@ -92,6 +108,8 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
     public let canSteer: Bool
     public let canRestart: Bool
     public let canInterrupt: Bool
+    /// A timeline error must also have the workspace failure code before showing Retry.
+    public var failedWorkspaceRunIDs: Set<String>? = nil
 
     /// Reads the full V2 projection after transport decoding. Unknown fields are ignored.
     public init(projection raw: JSONValue) throws {
@@ -114,6 +132,9 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
             })
         }
         let projection = try JSONValue.object(fields).decode(Projection.self)
+        failedWorkspaceRunIDs = Set(projection.runs.filter {
+            $0.status == .failed && $0.workspacePreparation != nil
+        }.map(\.id))
         // Submission order also includes queued runs. Select live work independently,
         // as threadExecution.ts does, including preparation before startedAt exists.
         activeRun = projection.runs.filter { $0.status.isActive }.max { $0.ordinal < $1.ordinal }
@@ -140,7 +161,8 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
                 run: run,
                 text: message?.text ?? "Queued message",
                 attachments: message?.attachments ?? [],
-                hasMessage: message != nil
+                hasMessage: message != nil,
+                context: message?.context
             )
         }
         // Automatic deliveries are hidden from the list, but can still hold the queue.
@@ -197,6 +219,11 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
         case let .edit(runID, text):
             return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && queuedEntries.contains { $0.id == runID && $0.hasMessage }
+        case let .replace(edit):
+            return edit.validationMessage == nil && queuedEntries.contains {
+                $0.id == edit.runID && $0.messageID == edit.messageID && $0.hasMessage
+                    && Set(edit.existingAttachments.map(\.id)).isSubset(of: Set($0.attachments.map(\.id)))
+            }
         case let .reorder(runID, beforeRunID):
             return canReorder && queuedEntries.contains { $0.id == runID }
                 && runID != beforeRunID
@@ -209,6 +236,10 @@ public struct FeatureThreadExecution: Sendable, Equatable, Codable {
         case let .interrupt(runID, _):
             return canInterrupt && interruptibleRun?.id == runID
         }
+    }
+
+    public func canRetryWorkspacePreparation(runID: String) -> Bool {
+        canManageQueue && failedWorkspaceRunIDs?.contains(runID) == true
     }
 }
 
@@ -276,6 +307,7 @@ private extension FeatureThreadExecution {
         let id: String
         let text: String
         let attachments: [Attachment]
+        let context: OrchestrationMessageContext?
         let delegatedCompletion: JSONValue?
         let notification: JSONValue?
     }

@@ -4,7 +4,11 @@ on:
   pull_request:
     paths:
       - "apps/swift-ios/**"
+      - "apps/mobile/src/features/devices/device-stream.browser.ts"
+      - "apps/mobile/src/features/devices/device-stream-document.ts"
+      - "packages/client-runtime/**"
       - "packages/contracts/**"
+      - "packages/shared/**"
       - "scripts/generate-swift-wire-fixtures.ts"
       - "scripts/package.json"
       - ".github/workflows/swift-ios.yml"
@@ -16,7 +20,11 @@ on:
       - main
     paths:
       - "apps/swift-ios/**"
+      - "apps/mobile/src/features/devices/device-stream.browser.ts"
+      - "apps/mobile/src/features/devices/device-stream-document.ts"
+      - "packages/client-runtime/**"
       - "packages/contracts/**"
+      - "packages/shared/**"
       - "scripts/generate-swift-wire-fixtures.ts"
       - "scripts/package.json"
       - ".github/workflows/swift-ios.yml"
@@ -49,7 +57,9 @@ jobs:
           cache: true
           run-install: |
             args:
+              - --filter=@t3tools/monorepo
               - --filter=@t3tools/scripts...
+              - --filter=@t3tools/client-runtime...
 
       - name: Verify generated wire fixtures
         run: node scripts/generate-swift-wire-fixtures.ts --check

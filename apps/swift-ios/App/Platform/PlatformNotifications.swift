@@ -1,5 +1,6 @@
 @preconcurrency import UserNotifications
 import UIKit
+import Observation
 
 extension Notification.Name {
     static let platformRouteReceived = Notification.Name("T3PlatformRouteReceived")
@@ -11,9 +12,9 @@ enum PlatformNotificationPayload {
 
     static func route(from userInfo: [AnyHashable: Any]) -> PlatformRoute? {
         for key in routeKeys {
-            if let value = value(named: key, in: userInfo),
-               let route = try? PlatformDeepLinkParser.parse(value) {
-                return route
+            if let value = value(named: key, in: userInfo) {
+                let link = value.hasPrefix("/threads/") ? "\(PlatformRoute.nativeScheme):/\(value)" : value
+                if let route = try? PlatformDeepLinkParser.parse(link) { return route }
             }
         }
 
@@ -88,6 +89,7 @@ final class PlatformPersistedDeviceTokenSink: PlatformDeviceTokenSink {
 }
 
 @MainActor
+@Observable
 final class PlatformNotificationService: NSObject, UNUserNotificationCenterDelegate {
     static let shared = PlatformNotificationService()
 
@@ -98,6 +100,9 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
     private let updateRemoteRegistration: @MainActor (Bool) -> Void
     private var preferenceRevision: UInt64 = 0
     private(set) var enabled = false
+    private(set) var remoteRegistrationError: String?
+    private(set) var hasRemoteToken = false
+    private(set) var permissionStatus: UNAuthorizationStatus = .notDetermined
 
     init(
         center: UNUserNotificationCenter = .current(),
@@ -124,6 +129,7 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
             }
         }
         super.init()
+        hasRemoteToken = (self.tokenSink as? PlatformPersistedDeviceTokenSink)?.currentToken != nil
     }
 
     func installDelegate() {
@@ -139,6 +145,8 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
 
         guard enabled else {
             self.enabled = false
+            hasRemoteToken = false
+            remoteRegistrationError = nil
             updateRemoteRegistration(false)
             tokenSink.invalidated()
             return false
@@ -146,6 +154,7 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
 
         let status = await authorizationStatus()
         guard preferenceRevision == revision else { return nil }
+        permissionStatus = status
         let authorized = isAuthorized(status)
         self.enabled = authorized
         if authorized {
@@ -176,11 +185,19 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
         }
 
         guard preferenceRevision == revision else { return nil }
+        permissionStatus = authorized ? .authorized : (status == .notDetermined ? .denied : status)
         enabled = authorized
         if authorized {
             updateRemoteRegistration(true)
         }
         return authorized
+    }
+
+    func refreshPermissionStatus() async {
+        let revision = preferenceRevision
+        let status = await authorizationStatus()
+        guard revision == preferenceRevision else { return }
+        permissionStatus = status
     }
 
     func schedule(_ signal: PlatformThreadSignal) async {
@@ -214,11 +231,14 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
 
     func didRegisterForRemoteNotifications(deviceToken: Data) {
         guard enabled else { return }
+        hasRemoteToken = true
+        remoteRegistrationError = nil
         tokenSink.registered(token: deviceToken.map { String(format: "%02x", $0) }.joined())
     }
 
     func didFailToRegisterForRemoteNotifications(_ error: Error) {
         guard enabled else { return }
+        remoteRegistrationError = error.localizedDescription
         tokenSink.registrationFailed(error)
     }
 
@@ -246,7 +266,17 @@ final class PlatformNotificationService: NSObject, UNUserNotificationCenterDeleg
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        await MainActor.run { enabled ? [.banner, .sound] : [] }
+        let route = PlatformNotificationPayload.route(from: notification.request.content.userInfo)
+        return await MainActor.run {
+            foregroundPresentationOptions(for: route)
+        }
+    }
+
+    func foregroundPresentationOptions(
+        for route: PlatformRoute?, tracker: PlatformVisibleThreadTracker = .shared
+    ) -> UNNotificationPresentationOptions {
+        guard enabled, !tracker.suppresses(route) else { return [] }
+        return [.banner, .list, .sound]
     }
 
     private func notificationTitle(for kind: PlatformFeedbackKind) -> String {

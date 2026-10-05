@@ -360,7 +360,7 @@ struct UsageLimitsView: View {
     }
 }
 
-private struct UsageLimitsAccountView: View {
+struct UsageLimitsAccountView: View {
     let driver: String
     let instanceID: String
     let label: String
@@ -485,7 +485,7 @@ private struct UsageLimitWindowView: View {
     }
 }
 
-private struct UsageResetCreditsView: View {
+struct UsageResetCreditsView: View {
     let client: any FeatureClient
     let environmentID: String
     let input: ProviderConsumeResetCreditInput?

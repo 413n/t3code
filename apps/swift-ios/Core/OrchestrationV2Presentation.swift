@@ -95,7 +95,10 @@ public enum OrchestrationV2Presentation {
             hasPendingApprovals: shell.pendingRuntimeRequest?.isApproval == true,
             hasPendingUserInput: shell.pendingRuntimeRequest?.isUserInput == true,
             hasActionableProposedPlan: shell.hasActionableProposedPlan,
-            backgroundLiveness: backgroundLiveness(shell.pendingBackgroundTasks)
+            backgroundLiveness: backgroundLiveness(shell.pendingBackgroundTasks),
+            latestUserAuthoredMessageAt: shell.raw["latestUserAuthoredMessageAt"]?.stringValue,
+            latestUserAuthoredMessageAtIsPresent: shell.raw["latestUserAuthoredMessageAt"] != nil,
+            v2Lifecycle: OrchestrationV2ThreadLifecycle(shell: shell)
         )
     }
 
@@ -112,8 +115,46 @@ public enum OrchestrationV2Presentation {
         let displayRun = active ?? latest
         let providerSubagent = t.creationSource == "provider" && t.lineage.relationshipToParent == "subagent"
             ? p.nodes.last { $0.kind == "root_turn" && $0.runId == nil } : nil
-        let messages = rows.compactMap(\.message)
-        var activities = rows.flatMap(\.activities)
+        // Cached display rows may predate a history prepend. Positions always
+        // come from the current projection, never cached rows or timestamps.
+        let positions = Dictionary(p.visibleTurnItems.map { ($0.id, $0.position) }, uniquingKeysWith: { _, last in last })
+        let foldedAnswers = Set(rows.flatMap(\.activities).compactMap { activity -> String? in
+            guard let source = activity.v2Timeline, source.itemType == "user_input_request",
+                  case .object? = activity.v2Item?["questionAnswer"],
+                  let requestID = activity.v2Item?["requestId"]?.stringValue else { return nil }
+            return "\(source.sourceThreadID.utf8.count):\(source.sourceThreadID)async-answer:\(requestID)"
+        })
+        let visibleRows = rows.filter { row in
+            guard let message = row.message, message.role == "user",
+                  let source = message.v2Timeline, let messageID = source.messageID else { return true }
+            return !foldedAnswers.contains("\(source.sourceThreadID.utf8.count):\(source.sourceThreadID)\(messageID)")
+        }
+        let runs = Dictionary(p.runs.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        func updatedMetadata(_ source: OrchestrationV2TimelineMetadata?) -> OrchestrationV2TimelineMetadata? {
+            guard var source else { return nil }
+            source.position = positions[source.projectedID] ?? source.position
+            if source.sourceThreadID == t.id, let runID = source.runID, let run = runs[runID] {
+                source.runStatus = run.status
+                source.runStartedAt = run.workStartedAt ?? run.startedAt
+                source.runCompletedAt = run.completedAt
+            }
+            return source
+        }
+        let messages = visibleRows.compactMap(\.message).map { message in
+            var message = message
+            message.v2Timeline = updatedMetadata(message.v2Timeline)
+            return message
+        }
+        var activities = visibleRows.flatMap(\.activities).map { activity in
+            var activity = activity
+            activity.v2Timeline = updatedMetadata(activity.v2Timeline)
+            return activity
+        }
+        let timeline = visibleRows.compactMap { row -> OrchestrationV2TimelineRow? in
+            guard let identity = row.message?.v2Timeline ?? row.activities.first?.v2Timeline else { return nil }
+            return OrchestrationV2TimelineRow(projectedID: identity.projectedID,
+                messageID: row.message?.id, activityIDs: row.activities.map(\.id))
+        }
         appendControlActivities(p, to: &activities)
         let latestTurn = displayRun.map { run in
             OrchestrationLatestTurn(
@@ -140,7 +181,7 @@ public enum OrchestrationV2Presentation {
         }.sorted { $0.checkpointTurnCount < $1.checkpointTurnCount }
         let failure = rootFailure(displayRun, items: p.turnItems)
         let lastError = providerSession?.lastError ?? failure?.message
-        let native = OrchestrationThread(
+        var native = OrchestrationThread(
             relationshipToParent: t.lineage.relationshipToParent,
             id: t.id, projectId: t.projectId, title: t.title, modelSelection: t.modelSelection,
             runtimeMode: t.runtimeMode, interactionMode: t.interactionMode, branch: t.branch,
@@ -154,14 +195,9 @@ public enum OrchestrationV2Presentation {
             messages: messages, activities: activities, checkpoints: checkpoints,
             session: session(thread: t, status: providerSubagent?.status ?? displayRun?.status ?? "idle", activeRunID: active?.id,
                              lastError: lastError, updatedAt: p.updatedAt),
-            orchestrationV2Control: .object([
-                "thread": t.raw, "runs": .array(p.runs.map(\.raw)),
-                "messages": .array(p.messages.map(\.raw)), "nodes": .array(p.nodes.map(\.raw)),
-                "attempts": .array(p.attempts.map(\.raw)), "providerThreads": .array(p.providerThreads.map(\.raw)),
-                "providerTurns": .array(p.providerTurns.map(\.raw)), "providerSessions": .array(p.providerSessions.map(\.raw)),
-                "backgroundTurnItems": .array(p.turnItems.compactMap { backgroundControlItem($0.raw) }),
-            ])
+            orchestrationV2Control: controlState(p)
         )
+        native.v2Timeline = timeline
         var snapshot = OrchestrationThreadDetailSnapshot(
             snapshotSequence: sequence, thread: native,
             page: OrchestrationThreadDetailPage(beforeCursor: historyCursor, hasMore: hasMoreHistory,
@@ -171,9 +207,60 @@ public enum OrchestrationV2Presentation {
         return snapshot
     }
 
+    private static func controlState(_ p: OrchestrationV2ThreadProjection) -> JSONValue {
+        let recoveryItems: [JSONValue] = p.turnItems.filter {
+            $0.threadId == p.thread.id && $0.type == "error"
+        }.map { item in
+            .object(item.raw.v2Object.filter {
+                ["id", "threadId", "type", "status", "runId", "nodeId", "ordinal", "updatedAt", "failure"].contains($0.key)
+            })
+        }
+        let assistantItems: [JSONValue] = p.visibleTurnItems.filter { $0.item.type == "assistant_message" }.map { row in
+            let item: JSONValue = .object([
+                "id": .string(row.item.id), "threadId": .string(row.item.threadId),
+                "runId": row.item.runId.map(JSONValue.string) ?? .null,
+                "type": .string(row.item.type), "status": .string(row.item.status),
+                "providerThreadId": row.item.providerThreadId.map(JSONValue.string) ?? .null,
+            ])
+            return .object(["sourceThreadId": .string(row.sourceThreadId),
+                "sourceItemId": .string(row.sourceItemId), "item": item])
+        }
+        return .object([
+            "thread": p.thread.raw, "runs": .array(p.runs.map(\.raw)),
+            "lifecycle": (try? JSONValue.encode(OrchestrationV2ThreadLifecycle(projection: p))) ?? .null,
+            "recoveryTurnItems": .array(recoveryItems),
+            "messages": .array(p.messages.map(\.raw)), "nodes": .array(p.nodes.map(\.raw)),
+            "attempts": .array(p.attempts.map(\.raw)), "providerThreads": .array(p.providerThreads.map(\.raw)),
+            "subagents": .array(p.subagents.map(\.raw)), "visibleTurnItems": .array(assistantItems),
+            "providerTurns": .array(p.providerTurns.map(\.raw)), "providerSessions": .array(p.providerSessions.map(\.raw)),
+            "backgroundTurnItems": .array(p.turnItems.compactMap { backgroundControlItem($0.raw) }),
+        ])
+    }
+
     static func displayRow(_ row: OrchestrationV2ProjectedTurnItem, projection p: OrchestrationV2ThreadProjection) -> OrchestrationV2DisplayRow {
         let item = row.item
         let raw = item.raw
+        if ["todo_list", "checkpoint", "run_interrupt_request"].contains(item.type)
+            || (item.type == "command_execution" && raw["input"]?.stringValue == "Preparing workspace")
+            || (item.type == "error" && item.status == "cancelled"
+                && raw["failure"]?["code"]?.stringValue == "workspace_preparation_failed") { return OrchestrationV2DisplayRow() }
+        var source = OrchestrationV2TimelineMetadata(row)
+        if let nodeID = item.nodeId {
+            var nodeID: String? = nodeID
+            var visited: Set<String> = []
+            while let current = nodeID, visited.insert(current).inserted {
+                if let attempt = p.attempts.first(where: { $0.rootNodeId == current && $0.runId == item.runId }) {
+                    source.attemptID = attempt.id
+                    break
+                }
+                guard let node = p.nodes.first(where: { $0.id == current }) else { break }
+                if let attempt = p.attempts.first(where: { $0.rootNodeId == node.rootNodeId && $0.runId == item.runId }) {
+                    source.attemptID = attempt.id
+                    break
+                }
+                nodeID = node.parentNodeId
+            }
+        }
         let createdAt = item.startedAt ?? item.updatedAt
         // Source-scoped inherited IDs do not collide with a fork's local items.
         let itemID = row.isLocal ? item.id : "v2-inherited:\(row.id)"
@@ -181,21 +268,25 @@ public enum OrchestrationV2Presentation {
         var result = OrchestrationV2DisplayRow()
         func message(_ id: String, role: String, text: String, streaming: Bool = false,
                      attachments: [ChatAttachment]? = nil, context: OrchestrationMessageContext? = nil) -> OrchestrationMessage {
-            OrchestrationMessage(id: row.isLocal ? id : "v2-inherited:\(row.sourceThreadId.utf8.count):\(row.sourceThreadId)\(id)",
+            OrchestrationMessage(v2Timeline: source, id: row.isLocal ? id : "v2-inherited:\(row.sourceThreadId.utf8.count):\(row.sourceThreadId)\(id)",
                                  role: role, text: text, attachments: attachments, turnId: turnID,
                                  streaming: row.isLocal && streaming, createdAt: createdAt,
                                  updatedAt: item.updatedAt, context: context)
         }
         func activity(_ kind: String, _ summary: String, tone: String = "info", fields: [String: JSONValue] = [:],
-                      idSuffix: String? = nil, occurredAt: String? = nil) -> OrchestrationActivity {
+                      idSuffix: String? = nil, occurredAt: String? = nil,
+                      inspection: JSONValue? = nil) -> OrchestrationActivity {
             var payload = raw.v2Object
             fields.forEach { payload[$0.key] = $0.value }
+            if !row.isLocal, let requestID = payload["requestId"]?.stringValue {
+                payload["requestId"] = .string("v2-inherited:\(row.id):\(requestID)")
+            }
             payload["v2ItemId"] = .string(item.id)
             payload["v2Visibility"] = .string(row.visibility)
-            return OrchestrationActivity(id: "v2:\(itemID):\(idSuffix ?? (kind.hasPrefix("task.") ? "task" : "activity"))", tone: tone, kind: kind, summary: summary,
+            return OrchestrationActivity(v2Timeline: source, v2Item: inspection ?? raw, id: "v2:\(itemID):\(idSuffix ?? (kind.hasPrefix("task.") ? "task" : "activity"))", tone: tone, kind: kind, summary: summary,
                                          payload: .object(payload), turnId: turnID, sequence: item.ordinal, createdAt: occurredAt ?? createdAt)
         }
-        func tool(_ title: String, detail: String, extra: [String: JSONValue] = [:], status: String? = nil) -> OrchestrationActivity {
+        func tool(_ title: String, detail: String, extra: [String: JSONValue] = [:], status: String? = nil, inspection: JSONValue? = nil) -> OrchestrationActivity {
             let status = status ?? item.status
             let active = row.isLocal && ["pending", "running", "waiting"].contains(status)
             var fields = extra
@@ -205,7 +296,7 @@ public enum OrchestrationV2Presentation {
             fields["itemType"] = .string(item.type == "dynamic_tool" ? "dynamic_tool_call" : item.type)
             fields["status"] = .string(active ? "inProgress" : status)
             return activity("tool.updated",
-                            item.title ?? title, tone: status == "failed" ? "error" : "info", fields: fields)
+                            item.title ?? title, tone: status == "failed" ? "error" : "info", fields: fields, inspection: inspection)
         }
         switch item.content {
         case let .userMessage(id, intent, text, attachments, context):
@@ -216,7 +307,7 @@ public enum OrchestrationV2Presentation {
         case let .assistantMessage(id, text, streaming, attachments):
             result.message = message(id, role: "assistant", text: text, streaming: streaming, attachments: attachments)
         case let .reasoning(text, streaming):
-            result.message = message("v2-reasoning:\(itemID)", role: "reasoning", text: text, streaming: streaming)
+            result.activities = [tool(streaming ? "Thinking" : "Thought", detail: text)]
         case let .proposedPlan(_, markdown, streaming):
             result.message = message("v2-plan:\(itemID)", role: "assistant", text: markdown, streaming: streaming)
         case let .todoList(_, steps, explanation):
@@ -229,12 +320,22 @@ public enum OrchestrationV2Presentation {
             let answer = raw["questionAnswer"]
             // Older V2 servers saved answers on the resolved request only.
             let answers = answer?["answers"] ?? (request?.status == "resolved" ? request?.answers : nil)
-            let pending = answers == nil && request?.status == "pending" && request?.responseCapability.type != "not_resumable"
+            let pending = answers == nil && request?.status == "pending"
             var fields: [String: JSONValue] = ["requestId": .string(requestID), "questions": .array(questions.map(\.raw))]
             if responseMode == "message" || request?.responseCapability.type == "message" { fields["responseMode"] = .string("message") }
-            if row.isLocal {
-                result.activities = [activity(pending ? "user-input.requested" : "user-input.resolved", item.title ?? "Input requested", fields: fields)]
+            fields["responseCapability"] = request?.raw["responseCapability"] ?? raw["responseCapability"]
+            var inspection = raw.v2Object
+            inspection["responseCapability"] = fields["responseCapability"]
+            inspection["requestStatus"] = request.map { .string($0.status) }
+            if inspection["questionAnswer"] == nil, let answers {
+                inspection["questionAnswer"] = .object([
+                    "requestId": .string(requestID), "answers": answers,
+                    "attachmentsByQuestionId": .object([:]),
+                    "questionTextById": .object(Dictionary(questions.map { ($0.id, JSONValue.string($0.question)) }, uniquingKeysWith: { _, last in last })),
+                ])
             }
+            result.activities = [activity(row.isLocal && pending ? "user-input.requested" : "user-input.resolved",
+                item.title ?? "Input requested", fields: fields, inspection: .object(inspection))]
             if case .object? = answers {
                 // NativeQuestionAnswerHistory reads these fields at the payload
                 // root. Inherited answers are history, never request controls.
@@ -247,13 +348,21 @@ public enum OrchestrationV2Presentation {
                     idSuffix: "answer", occurredAt: item.completedAt ?? request?.resolvedAt ?? item.updatedAt))
             }
         case let .approval(requestID, requestKind, prompt):
-            guard row.isLocal else { break }
-            let request = p.runtimeRequests.first { $0.id == requestID }
-            let pending = request?.status == "pending" && request?.responseCapability.type != "not_resumable"
-            result.activities = [activity(pending ? "approval.requested" : "approval.resolved", item.title ?? "Approval requested", fields: [
+            let request = row.isLocal ? p.runtimeRequests.first { $0.id == requestID } : nil
+            let pending = request?.status == "pending"
+            var fields: [String: JSONValue] = [
                 "requestId": .string(requestID), "requestKind": .string(requestKind),
                 "requestType": .string(requestKind), "detail": .string(prompt ?? item.title ?? "Approval requested"),
-            ])]
+            ]
+            for key in ["appName", "options", "responseCapability"] {
+                fields[key] = request?.raw[key] ?? raw[key]
+            }
+            var inspection = raw.v2Object
+            for key in ["appName", "options", "responseCapability"] { inspection[key] = fields[key] }
+            inspection["requestStatus"] = request.map { .string($0.status) }
+            inspection["decision"] = request?.decision.map(JSONValue.string)
+            result.activities = [activity(pending ? "approval.requested" : "approval.resolved",
+                item.title ?? "Approval requested", fields: fields, inspection: .object(inspection))]
         case let .fileChange(fileName):
             result.activities = [tool("Edit \(fileName)", detail: raw["diffStr"]?.stringValue ?? fileName)]
         case let .command(input, output, exitCode):
@@ -268,12 +377,27 @@ public enum OrchestrationV2Presentation {
         case let .interruptRequest(text), let .interruptResult(text), let .systemNotice(text):
             result.message = message("v2-notice:\(itemID)", role: "system", text: text)
         case let .failure(failure):
-            result.activities = [activity("provider.turn.failed", failure.message, tone: "error", fields: ["message": .string(failure.message)])]
+            result.activities = [activity(item.status == "failed" ? "provider.turn.failed" : "provider.turn.status",
+                failure.message, tone: item.status == "failed" ? "error" : "info", fields: ["message": .string(failure.message)])]
         case let .compaction(summary):
             result.activities = [activity("context-compaction", summary ?? "Context compacted", fields: ["status": .string(item.status)])]
         case let .handoff(id, summary):
             let handoff = p.contextHandoffs.first { $0.id == id }
-            result.message = message("v2-handoff:\(itemID)", role: "system", text: summary ?? handoff?.summaryText ?? "Provider changed")
+            var inspection = raw.v2Object
+            let sourceRuns = row.sourceThreadId == p.thread.id ? p.runs : []
+            let handoffRun = sourceRuns.first { $0.id == item.runId }
+            if raw["fromModelSelections"]?.v2Array?.isEmpty != false {
+                inspection["fromModelSelections"] = .array((raw["fromProviderInstanceIds"]?.v2Array ?? []).compactMap { value in
+                    guard let instanceID = value.stringValue else { return nil }
+                    let previous = sourceRuns.filter { $0.providerInstanceId == instanceID && $0.ordinal < (handoffRun?.ordinal ?? Int.max) }
+                        .max { $0.ordinal < $1.ordinal }
+                    return .object(["instanceId": .string(instanceID), "model": previous.map { .string($0.modelSelection.model) } ?? .null])
+                })
+            }
+            if inspection["toModel"] == nil, handoffRun?.providerInstanceId == raw["toProviderInstanceId"]?.stringValue {
+                inspection["toModel"] = handoffRun.map { .string($0.modelSelection.model) }
+            }
+            result.activities = [activity("context-handoff", summary ?? handoff?.summaryText ?? "Provider changed", inspection: .object(inspection))]
         case let .fork(target):
             result.message = message("v2-fork:\(itemID)", role: "system", text: item.title ?? "Forked conversation: \(target)")
         case let .threadCreated(target, _, model):
@@ -281,20 +405,26 @@ public enum OrchestrationV2Presentation {
         case let .subagent(id, childID, prompt, progress, output):
             // Control-plane subagents below provide the latest status even if this
             // turn item was outside the bounded history window.
-            let agent = p.subagents.first { $0.id == id }
+            let agent = row.isLocal ? p.subagents.first { $0.id == id } : nil
             var fields: [String: JSONValue] = ["taskId": .string(row.isLocal ? id : itemID), "agentKind": .string("agent"),
                                               "status": .string(row.isLocal ? (agent?.status ?? item.status) : "completed"),
                                               "detail": .string(agent?.progress ?? progress ?? agent?.result ?? output ?? prompt)]
             if let childID { fields["childThreadId"] = .string(childID) }
+            var inspection = raw.v2Object
+            if let agent {
+                for key in ["status", "progress", "result", "title", "model", "driver", "providerInstanceId", "childThreadId", "startedAt", "completedAt"] {
+                    if let value = agent.raw[key], value != .null { inspection[key] = value }
+                }
+            }
             result.activities = [activity("task.updated", item.title ?? agent?.title ?? "Subagent", fields: fields),
-                                 tool(item.title ?? "Subagent", detail: agent?.result ?? output ?? agent?.progress ?? progress ?? prompt, status: agent?.status)]
+                                 tool(item.title ?? "Subagent", detail: agent?.result ?? output ?? agent?.progress ?? progress ?? prompt, status: agent?.status, inspection: .object(inspection))]
         case let .tool(name, input, output):
             var extra: [String: JSONValue] = ["input": input, "output": output ?? .null]
             let imagePath = raw["viewedImagePath"]?.stringValue
             if imagePath != nil { extra["requestKind"] = .string("file-read") }
             result.activities = [tool(name ?? "Tool", detail: imagePath ?? displayText(output) ?? displayText(input) ?? "", extra: extra)]
         case let .notification(summary, detail, _):
-            result.message = message("v2-notification:\(itemID)", role: "system", text: [summary, detail].compactMap { $0 }.joined(separator: "\n"))
+            result.activities = [activity("notification", summary, fields: ["detail": .string(detail ?? summary)])]
         }
         return result
     }

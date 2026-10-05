@@ -1349,7 +1349,9 @@ struct FeatureRootModelTests {
 
         #expect(client.cancelTurnCallCount == 1)
         #expect(try await store.submissions().isEmpty)
-        #expect(model.snapshot.threads == [acknowledged])
+        var expected = acknowledged
+        expected.hasPendingLocalMessages = false
+        #expect(model.snapshot.threads == [expected])
     }
 
     @Test
@@ -4322,5 +4324,184 @@ private final class DeliveryFeatureClientStub: FeatureClientStub, FeatureMessage
             threadID: threadID, text: text, selection: selection, runtimeMode: runtimeMode,
             attachments: attachments, identity: identity, context: context
         )
+    }
+}
+
+@MainActor
+@Suite("Outbox recovery actions")
+struct FeatureOutboxRecoveryRootTests {
+    @Test(arguments: [false, true])
+    func discardRecoveryHandlesMissingFilesAndPreservesImportedDraftFiles(imported: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = directory.appendingPathComponent("attachments")
+        let file = try ManagedAttachmentFileStore(rootURL: root).writeOwnedFile(
+            data: Data([1]), attachmentID: UUID(), originalFileName: "saved.txt"
+        )
+        let outbox = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"), attachmentStorageRootURL: root)
+        let drafts = FeatureComposerDraftStore(fileURL: directory.appendingPathComponent("drafts.json"), attachmentStorageRootURL: root)
+        let submission = FeatureQueuedSubmission(
+            environmentID: "environment", identity: .init(threadID: "wire-thread"), threadID: "thread",
+            text: "Saved prompt", selection: nil, runtimeMode: .automatic, interactionMode: .standard,
+            attachments: [.init(ownedFile: file, name: "saved.txt", mimeType: "text/plain")]
+        )
+        try await outbox.enqueue(submission)
+        let recovery = try #require(await outbox.recover(id: submission.id, reason: nil))
+        if imported {
+            // Simulate a crash after importing but before clearing recovery.
+            _ = try await drafts.restoreSubmission(recovery, for: "draft")
+        } else {
+            try FileManager.default.removeItem(at: file.url)
+        }
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(environments: [.init(
+            id: "environment", name: "Computer", endpoint: "https://example.test", connectionState: .disconnected
+        )])
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: outbox, draftStore: drafts)
+        await model.start()
+        #expect(model.submissionRecoveryDrafts.count == 1)
+        #expect(await model.discardSubmissionRecovery(id: submission.id))
+        #expect(model.submissionRecoveryDrafts.isEmpty)
+        #expect(try await outbox.recoveryDrafts().isEmpty)
+        #expect(FileManager.default.fileExists(atPath: file.url.path) == imported)
+        #expect(try await drafts.draft(for: "draft")?.text == (imported ? "Saved prompt" : nil))
+        await model.disconnect()
+    }
+
+    @Test
+    func pendingEditWaitsForInitialDispatchAndTransfersBeforeRemovingDelivery() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outbox = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let draftURL = directory.appendingPathComponent("drafts.json")
+        let drafts = FeatureComposerDraftStore(fileURL: draftURL)
+        let thread = FeatureThread(
+            id: "thread", wireID: "wire-thread", projectID: "project", environmentID: "environment", title: "Offline"
+        )
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            environments: [.init(
+                id: "environment", name: "Computer", endpoint: "https://example.test", connectionState: .disconnected
+            )], threads: [thread]
+        )
+        client.threadDetail = FeatureThreadDetail(thread: thread)
+        let started = AsyncStream<Void>.makeStream()
+        var response: CheckedContinuation<Void, any Error>?
+        client.beforeSendMessageReturn = {
+            try await withCheckedThrowingContinuation { continuation in
+                response = continuation
+                started.continuation.yield()
+            }
+        }
+        let model = FeatureRootModel(client: client, outboxStore: outbox, draftStore: drafts)
+        await model.reload()
+        _ = await model.detail(for: thread.id)
+        let send = Task { await model.sendMessage(.init(threadID: thread.id, text: "Pending prompt", selection: nil)) }
+        _ = await started.stream.first { _ in true }
+        let pending = try #require(await outbox.submissions().first)
+        #expect(model.snapshot.threads.first?.hasPendingLocalMessages == true)
+        #expect(model.details[thread.id]?.thread.hasPendingLocalMessages == true)
+        #expect(!model.canEditPendingSubmission(threadID: thread.id, messageID: pending.identity.messageID))
+        #expect(await model.editPendingSubmission(
+            threadID: thread.id, messageID: pending.identity.messageID, draft: .init(text: "New edits")
+        ) == nil)
+        #expect(try await outbox.submissions().count == 1)
+
+        response?.resume(throwing: URLError(.notConnectedToInternet))
+        #expect(await send.value)
+        #expect(model.canEditPendingSubmission(threadID: thread.id, messageID: pending.identity.messageID))
+        let edited = await model.editPendingSubmission(
+            threadID: thread.id, messageID: pending.identity.messageID, draft: .init(text: "New edits")
+        )
+        #expect(edited?.text == "New edits\n\nPending prompt")
+        #expect(try await FeatureComposerDraftStore(fileURL: draftURL).draft(
+            for: FeatureComposerDraftStore.threadKey(thread)
+        ) == edited)
+        #expect(try await outbox.submissions().isEmpty)
+        #expect(try await outbox.recoveryDrafts().isEmpty)
+        #expect(model.details[thread.id]?.messages.isEmpty == true)
+        #expect(model.snapshot.threads.first?.hasPendingLocalMessages == false)
+        #expect(model.details[thread.id]?.thread.hasPendingLocalMessages == false)
+        #expect(client.sendMessageCallCount == 1)
+        await model.disconnect()
+    }
+
+    @Test(arguments: [false, true])
+    func laterRejectionCreatesRecoveryAndActiveDrainCannotBeTakenBack(newTask: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outboxURL = directory.appendingPathComponent("outbox.json")
+        let outbox = FeatureOutboxStore(fileURL: outboxURL)
+        let drafts = FeatureComposerDraftStore(fileURL: directory.appendingPathComponent("drafts.json"))
+        let thread = FeatureThread(id: "thread", projectID: "project", environmentID: "environment", title: "Existing")
+        let rejected = FeatureQueuedSubmission(
+            environmentID: "environment",
+            identity: .init(threadID: newTask ? "new-thread" : thread.id, createdAt: Date(timeIntervalSince1970: 1)),
+            threadID: newTask ? "new-thread" : thread.id,
+            text: "Recover the rejected request", selection: nil,
+            runtimeMode: .approvalRequired, interactionMode: .plan, attachments: [],
+            creation: newTask ? .init(
+                projectID: "project", projectName: "Project", workspaceMode: .worktree,
+                branch: "main", worktreePath: nil, startFromOrigin: true
+            ) : nil
+        )
+        let sentinel = FeatureQueuedSubmission(
+            environmentID: "environment",
+            identity: .init(threadID: thread.id, createdAt: Date(timeIntervalSince1970: 2)),
+            threadID: thread.id, text: "Next queued request", selection: nil,
+            runtimeMode: .automatic, interactionMode: .standard, attachments: []
+        )
+        try await outbox.enqueue(rejected)
+        try await outbox.enqueue(sentinel)
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            environments: [.init(
+                id: "environment", name: "Computer", endpoint: "https://example.test", connectionState: .connected
+            )],
+            projects: [.init(id: "project", environmentID: "environment", name: "Project", path: "/project")],
+            threads: [thread]
+        )
+        client.startTaskError = FeatureCapabilityUnavailable("Creation rejected")
+        let started = AsyncStream<Void>.makeStream()
+        var response: CheckedContinuation<Void, any Error>?
+        client.beforeSendMessageReturn = {
+            if client.sentIdentities.last?.messageID == rejected.identity.messageID {
+                throw FeatureCapabilityUnavailable("Message rejected")
+            }
+            try await withCheckedThrowingContinuation { continuation in
+                response = continuation
+                started.continuation.yield()
+            }
+        }
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: outbox, draftStore: drafts)
+        await model.start()
+        // Entry into the next request proves recovery of the earlier rejection
+        // completed. No timers or polling are needed.
+        _ = await started.stream.first { _ in true }
+        let recovery = try #require(model.submissionRecoveryDrafts.first)
+        #expect(recovery.submission == rejected)
+        #expect(recovery.reason != nil)
+        #expect(!model.canEditPendingSubmission(threadID: thread.id, messageID: sentinel.identity.messageID))
+        #expect(await model.editPendingSubmission(
+            threadID: thread.id, messageID: sentinel.identity.messageID, draft: .init()
+        ) == nil)
+        #expect(try await outbox.submissions() == [sentinel])
+        let relaunched = FeatureOutboxStore(fileURL: outboxURL)
+        #expect(try await relaunched.recoveryDrafts() == [recovery])
+        if newTask {
+            #expect(!model.snapshot.threads.contains { $0.id == rejected.threadID })
+            #expect(recovery.projectID == "project")
+            #expect(recovery.draftKey(in: model.snapshot) == "environment:environment:new-task:project")
+        }
+
+        let restored = await model.recoverSubmission(id: recovery.id, draftKey: recovery.draftKey(in: model.snapshot))
+        #expect(restored?.text == rejected.text)
+        #expect(restored?.runtimeMode == rejected.runtimeMode)
+        #expect(restored?.interactionMode == .plan)
+        #expect(model.submissionRecoveryDrafts.isEmpty)
+        response?.resume(throwing: URLError(.notConnectedToInternet))
+        await model.disconnect()
     }
 }

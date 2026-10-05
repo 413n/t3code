@@ -1,5 +1,42 @@
 import SwiftUI
 
+struct DefaultRuntimeModePicker: View {
+    @Binding var selection: RuntimeMode
+
+    var body: some View {
+        Picker("Default permissions", selection: $selection) {
+            Text("Supervised").tag(RuntimeMode.approvalRequired)
+            Text("Auto-accept edits").tag(RuntimeMode.autoAcceptEdits)
+            Text("Auto").tag(RuntimeMode.auto)
+            Text("Full access").tag(RuntimeMode.fullAccess)
+        }
+    }
+}
+
+/// Save complete text values so editing does not send a write for every key.
+struct BranchNamingTextSetting: View {
+    let title: String
+    let value: String
+    var multiline = false
+    let save: (String) -> Void
+    @State private var draft = ""
+
+    private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        TextField(title, text: $draft, axis: multiline ? .vertical : .horizontal)
+            .lineLimit(multiline ? 3...6 : 1...1)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .accessibilityLabel(title)
+            .onAppear { draft = value }
+            .onChange(of: value) { _, updated in draft = updated }
+        if trimmed != value {
+            Button("Save \(title.lowercased())") { save(trimmed) }
+        }
+    }
+}
+
 struct ResponseStreamingPicker: View {
     let title: String
     @Binding var selection: ResponseStreamingMode
@@ -117,13 +154,25 @@ struct ProjectPreferencesView: View {
                     }
                     .accessibilityIdentifier("project-default-model")
                 }
+                if settings?.supportsDefaultRuntimeMode == true {
+                    projectSetting(.defaultRuntimeMode) {
+                        DefaultRuntimeModePicker(selection: Binding(
+                            get: { effective.defaultRuntimeMode },
+                            set: { save(.defaultRuntimeMode, value: .string($0.rawValue)) }
+                        ))
+                        .accessibilityIdentifier("project-default-runtime")
+                    }
+                }
                 projectSetting(.defaultThreadEnvMode) {
                     Picker("New threads", selection: Binding(
                         get: { effective.defaultThreadEnvMode },
-                        set: { save(.defaultThreadEnvMode, value: .string($0.rawValue)) }
+                        set: { save(.defaultThreadEnvMode, value: $0.map { .string($0.rawValue) }) }
                     )) {
-                        Text("Local workspace").tag(ServerThreadEnvironmentMode.local)
-                        Text("New worktree").tag(ServerThreadEnvironmentMode.worktree)
+                        if effective.defaultThreadEnvMode == nil {
+                            Text("Project configuration").tag(nil as ServerThreadEnvironmentMode?)
+                        }
+                        Text("Local workspace").tag(ServerThreadEnvironmentMode.local as ServerThreadEnvironmentMode?)
+                        Text("New worktree").tag(ServerThreadEnvironmentMode.worktree as ServerThreadEnvironmentMode?)
                     }
                     .accessibilityIdentifier("project-default-workspace")
                 }
@@ -176,7 +225,38 @@ struct ProjectPreferencesView: View {
                     }
                 }
                 projectSetting(.defaultAutoPull) {
-                    Toggle("Pull before new threads", isOn: booleanBinding(.defaultAutoPull, value: effective.defaultAutoPull))
+                    Toggle("Automatically pull default branch", isOn: booleanBinding(.defaultAutoPull, value: effective.defaultAutoPull))
+                }
+                if let mode = effective.branchNamingMode, settings?.branchNamingMode != nil {
+                    projectSetting(.branchNamingMode) {
+                        Picker("Branch naming", selection: Binding(
+                            get: { mode },
+                            set: { save(.branchNamingMode, value: .string($0.rawValue)) }
+                        )) {
+                            ForEach(BranchNamingMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
+                        .accessibilityIdentifier("project-branch-naming")
+                    }
+                    if mode == .static, let prefix = effective.branchNamePrefix, settings?.branchNamePrefix != nil {
+                        projectSetting(.branchNamePrefix) {
+                            BranchNamingTextSetting(title: "Branch prefix", value: prefix) {
+                                save(.branchNamePrefix, value: .string($0))
+                            }
+                        }
+                    }
+                    if mode == .custom, let instructions = effective.branchNameInstructions, settings?.branchNameInstructions != nil {
+                        projectSetting(.branchNameInstructions) {
+                            BranchNamingTextSetting(title: "Branch naming instructions", value: instructions, multiline: true) {
+                                save(.branchNameInstructions, value: .string($0))
+                            }
+                        }
+                    }
+                }
+                if let browserAccess = effective.enableAgentBrowserAccess, settings?.enableAgentBrowserAccess != nil {
+                    projectSetting(.enableAgentBrowserAccess) {
+                        Toggle("Agent browser access", isOn: booleanBinding(.enableAgentBrowserAccess, value: browserAccess))
+                            .accessibilityIdentifier("project-agent-browser-access")
+                    }
                 }
                 if settings?.responseStreamingMode != nil {
                     projectSetting(.responseStreamingMode) {

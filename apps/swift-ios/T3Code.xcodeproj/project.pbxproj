@@ -48,6 +48,13 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		BE0000000000000000000002 /* Exceptions for "Features" folder in "T3Code" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				RemoteDevices/generate-stream.mjs,
+			);
+			target = A50000000000000000000001 /* T3Code */;
+		};
 		BE0000000000000000000001 /* Exceptions for "Resources" folder in "T3Code" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
@@ -70,6 +77,9 @@
 		};
 		A10000000000000000000003 /* Features */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				BE0000000000000000000002 /* Exceptions for "Features" folder in "T3Code" target */,
+			);
 			path = Features;
 			sourceTree = "<group>";
 		};
@@ -244,6 +254,7 @@
 				A70000000000000000000001 /* Sources */,
 				A20000000000000000000001 /* Frameworks */,
 				A80000000000000000000001 /* Resources */,
+				D70000000000000000000001 /* Bundle Device Stream */,
 				CE0000000000000000000001 /* Embed App Extensions */,
 			);
 			buildRules = (
@@ -435,6 +446,21 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		D70000000000000000000001 /* Bundle Device Stream */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ();
+			name = "Bundle Device Stream";
+			outputPaths = ("$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/T3DeviceStream.js", );
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nexport PATH=\"$PATH:$HOME/.vite-plus/bin:${VOLTA_HOME:-$HOME/.volta}/bin:${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims:${ASDF_DATA_DIR:-$HOME/.asdf}/shims:${FNM_DIR:-$HOME/Library/Application Support/fnm}/aliases/default/bin:$HOME/.local/share/fnm/aliases/default/bin:$HOME/.fnm/aliases/default/bin:${NVM_DIR:-$HOME/.nvm}/current/bin:/opt/homebrew/bin:/usr/local/bin\"\nDEVICE_STREAM_NODE=\"${NODE_BINARY:-node}\"\nif ! command -v \"$DEVICE_STREAM_NODE\" >/dev/null 2>&1 || ! \"$DEVICE_STREAM_NODE\" --version >/dev/null 2>&1; then\n  echo \"error: Bundle Device Stream requires Node.js. Install the version in package.json or set the NODE_BINARY build setting to its executable path (for example, from command -v node in your terminal).\" >&2\n  exit 1\nfi\n\"$DEVICE_STREAM_NODE\" \"$SRCROOT/Features/RemoteDevices/generate-stream.mjs\" \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		A70000000000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -620,12 +646,13 @@
 		AB0000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				APS_ENVIRONMENT = development;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIconDev;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Shared/T3Code.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 56;
+				CURRENT_PROJECT_VERSION = 57;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -677,12 +704,13 @@
 		AB0000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				APS_ENVIRONMENT = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Shared/T3Code.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 56;
+				CURRENT_PROJECT_VERSION = 57;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "T3 Code SwiftUI";
@@ -772,7 +800,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Widgets/T3CodeWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 56;
+				CURRENT_PROJECT_VERSION = 57;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Widgets/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -803,7 +831,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Widgets/T3CodeWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 56;
+				CURRENT_PROJECT_VERSION = 57;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Widgets/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -836,7 +864,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Share/T3CodeShare.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 56;
+				CURRENT_PROJECT_VERSION = 57;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Share/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -867,7 +895,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Share/T3CodeShare.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 56;
+				CURRENT_PROJECT_VERSION = 57;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Share/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;

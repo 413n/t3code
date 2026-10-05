@@ -211,6 +211,32 @@ struct UsageLimitsPresentationTests {
         }
     }
 
+    @Test
+    func threadCommandKeepsOnlySelectedDriverAndOwningEnvironment() throws {
+        let codex = try provider(id: "codex")
+        let claude = try provider(id: "claude", driver: "claudeAgent")
+        let environment = FeatureEnvironmentUsageLimits(environmentID: "owning-host", label: "Host",
+            providers: [codex, claude], sources: [
+                .init(id: "hub", label: "Hub", checkedAt: checkedAt, accounts: [
+                    account(id: "codex-hub", email: nil),
+                    account(id: "claude-hub", driver: "claudeAgent", email: nil),
+                ]),
+                .init(id: "failed-hub", label: "Failed", checkedAt: checkedAt, accounts: [], error: "Offline"),
+            ])
+        let report = try #require(FeatureThreadUsageLimits.report(environment, providerID: "claude"))
+        #expect(report.id == "owning-host")
+        #expect(report.providers.map(\.instanceId) == ["claude"])
+        #expect(report.sources.first?.accounts.map(\.id) == ["claude-hub"])
+        #expect(report.sources.last?.error == "Offline")
+        #expect(FeatureThreadUsageLimits.report(environment, providerID: "missing") == nil)
+        let unsupported = FeatureEnvironmentUsageLimits(environmentID: "other", label: "Other",
+            providers: [try provider(limits: nil)])
+        #expect(FeatureThreadUsageLimits.report(unsupported, providerID: "provider") == nil)
+        #expect(FeatureThreadUsageLimits.isCommand(" /usage-limits ", hasAttachments: false))
+        #expect(!FeatureThreadUsageLimits.isCommand("/usage-limits", hasAttachments: true))
+        #expect(!FeatureThreadUsageLimits.isCommand("/usage-limits details", hasAttachments: false))
+    }
+
     private var checkedAt: String { "2026-09-05T12:00:00Z" }
 
     private func limits() -> ServerProviderUsageLimits {
@@ -225,6 +251,7 @@ struct UsageLimitsPresentationTests {
 
     private func provider(
         id: String = "provider",
+        driver: String = "codex",
         email: String? = nil,
         enabled: Bool = true,
         installed: Bool = true,
@@ -235,7 +262,7 @@ struct UsageLimitsPresentationTests {
     ) throws -> ServerProviderSnapshot {
         let value = JSONValue.object([
             "instanceId": .string(id),
-            "driver": .string("codex"),
+            "driver": .string(driver),
             "enabled": .bool(enabled),
             "installed": .bool(installed),
             "status": .string("ready"),

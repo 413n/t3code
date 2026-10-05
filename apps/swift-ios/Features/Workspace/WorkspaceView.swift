@@ -4,6 +4,7 @@ import UIKit
 struct FeatureWorkspaceNavigationRequest: Equatable, Sendable {
     enum Destination: Equatable, Sendable {
         case thread(id: String)
+        case threadDestination(id: String, destination: FeatureThreadDestination)
         case project(id: String)
         case newTask(projectID: String?)
         case usageLimits
@@ -44,27 +45,48 @@ public struct WorkspaceView: View {
     private let submitMessage: (FeatureMessageSubmission) async -> Bool
 
     @State private var threadSelection = WorkspaceThreadSelection()
+    @State private var requestedThreadDestination: FeatureThreadDestination?
+    @State private var requestedThreadDestinationID: UUID?
+    @State private var activeToolDestination: FeatureThreadDestination?
     @State private var selectedProjectID: String?
     @State private var searchText = ""
     @State private var isSearching = false
+    @State private var contentSearch = FeatureThreadContentSearch()
+    @State private var paletteSearch = FeatureThreadContentSearch()
+    @State private var paletteQuery = ""
+    @State private var keyboardDispatcher = FeatureKeyboardDispatcher()
+    @State private var columnVisibility = NavigationSplitViewVisibility.automatic
     @AppStorage("t3.swiftui.home.snoozedExpanded") private var isSnoozedExpanded = false
+    @AppStorage("t3.swiftui.home.workingExpanded") private var isWorkingExpanded = false
     @AppStorage("t3.swiftui.home.settledExpanded") private var isSettledExpanded = true
     @AppStorage("t3.swiftui.home.archiveExpanded") private var isArchiveExpanded = false
     @State private var settledLimit = 10
     private struct NewTaskPresentation: Identifiable {
         let id = UUID()
         let projectID: String?
+        var managedClone: FeatureProjectCloneIdentity? = nil
+        var sourceThread: FeatureThread? = nil
+        var recoveryID: String? = nil
     }
     @State private var newTaskPresentation: NewTaskPresentation?
+    @State private var pendingWorkspaceAction: (@MainActor () -> Void)?
+    @State private var workspacePresentationIsVisible = false
+    @State private var pendingNavigationRequest: FeatureWorkspaceNavigationRequest?
+    @State private var consumedNavigationRequestID: UUID?
+    @State private var rootNavigationDismissalID: UUID?
     @State private var showingAddProject = false
     @State private var createdProjectID: String?
+    @State private var createdManagedClone: FeatureProjectCloneIdentity?
     @State private var showingEnvironments = false
     @State private var showingSettings = false
+    @State private var settingsDestination: FeatureSettingsDestination?
     @State private var showingThreadArrangement = false
     @State private var settingsProject: FeatureProject?
     @State private var showingUsageLimits = false
     @State private var renamingThread: FeatureThread?
     @State private var deletingThread: FeatureThread?
+    @State private var pendingDiscardRecoveryID: String?
+    @State private var customSnoozeSelection: FeatureCustomSnoozeSelection?
     @State private var renameTitle = ""
     @State private var sidebarBoundaryNow = Date.now
     @State private var preferredCompactColumn = NavigationSplitViewColumn.sidebar
@@ -86,7 +108,7 @@ public struct WorkspaceView: View {
     }
 
     public var body: some View {
-        NavigationSplitView(preferredCompactColumn: $preferredCompactColumn) {
+        NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $preferredCompactColumn) {
             sidebar
                 .navigationSplitViewColumnWidth(
                     min: T3Metrics.minimumSidebarWidth,
@@ -97,7 +119,7 @@ public struct WorkspaceView: View {
             detail
         }
         .navigationSplitViewStyle(.balanced)
-        .sheet(item: $newTaskPresentation) { presentation in
+        .sheet(item: $newTaskPresentation, onDismiss: finishWorkspaceDismissal) { presentation in
             NewThreadView(
                 model: model,
                 submit: submitNewTask,
@@ -106,21 +128,45 @@ public struct WorkspaceView: View {
                     newTaskPresentation = nil
                 },
                 onCreateProject: openProjectCreation,
-                initialProjectID: presentation.projectID
+                beforeRootAction: dismissNewTaskBeforeRootAction,
+                initialProjectID: presentation.projectID,
+                initialManagedClone: presentation.managedClone,
+                initialWorkspaceThread: presentation.sourceThread,
+                initialRecoveryID: presentation.recoveryID
             )
+            .onAppear { workspacePresentationIsVisible = true }
+        }
+        .sheet(item: $customSnoozeSelection, onDismiss: finishWorkspaceDismissal) { selection in
+            FeatureCustomSnoozeSheet(selection: selection) { id, until in
+                Task { await model.setSnoozed(id, until: until) }
+            }
+            .onAppear { workspacePresentationIsVisible = true }
         }
         .sheet(isPresented: $showingAddProject, onDismiss: {
+            workspacePresentationIsVisible = false
+            if pendingWorkspaceAction != nil {
+                createdProjectID = nil
+                createdManagedClone = nil
+                finishWorkspaceDismissal()
+                return
+            }
             if let id = createdProjectID {
                 createdProjectID = nil
-                openNewTaskOrProjectCreation(initialProjectID: id)
+                openNewTaskOrProjectCreation(initialProjectID: id, managedClone: createdManagedClone)
             }
+            createdManagedClone = nil
         }) {
-            AddProjectView(model: model, onNewProjectCreated: { createdProjectID = $0 })
+            AddProjectView(model: model, onNewProjectCreated: { projectID, clone in
+                createdProjectID = projectID
+                createdManagedClone = clone
+            })
+            .onAppear { workspacePresentationIsVisible = true }
         }
-        .sheet(item: $settingsProject) { project in
+        .sheet(item: $settingsProject, onDismiss: finishWorkspaceDismissal) { project in
             ProjectPreferencesSheet(model: model, projectID: project.id)
+                .onAppear { workspacePresentationIsVisible = true }
         }
-        .sheet(isPresented: $showingEnvironments) {
+        .sheet(isPresented: $showingEnvironments, onDismiss: finishWorkspaceDismissal) {
             NavigationStack {
                 ConnectionsView(model: model)
                     .toolbar {
@@ -130,10 +176,13 @@ public struct WorkspaceView: View {
                     }
             }
             .presentationDragIndicator(.visible)
-            .onAppear { model.setConnectionManagementPresented(true) }
+            .onAppear {
+                workspacePresentationIsVisible = true
+                model.setConnectionManagementPresented(true)
+            }
             .onDisappear { model.setConnectionManagementPresented(false) }
         }
-        .sheet(isPresented: $showingUsageLimits) {
+        .sheet(isPresented: $showingUsageLimits, onDismiss: finishWorkspaceDismissal) {
             NavigationStack {
                 UsageView(client: model.client, initiallyShowsLimits: true)
                     .toolbar {
@@ -143,12 +192,15 @@ public struct WorkspaceView: View {
                     }
             }
             .preferredColorScheme(.dark)
+            .onAppear { workspacePresentationIsVisible = true }
         }
-        .sheet(isPresented: $showingSettings) {
-            SettingsView(model: model)
+        .sheet(isPresented: $showingSettings, onDismiss: finishWorkspaceDismissal) {
+            SettingsView(model: model, initialDestination: settingsDestination)
+                .onAppear { workspacePresentationIsVisible = true }
         }
-        .sheet(isPresented: $showingThreadArrangement) {
+        .sheet(isPresented: $showingThreadArrangement, onDismiss: finishWorkspaceDismissal) {
             ThreadArrangementView(model: model)
+                .onAppear { workspacePresentationIsVisible = true }
         }
         .alert(
             "Rename thread",
@@ -183,8 +235,25 @@ public struct WorkspaceView: View {
         } message: { thread in
             Text("\"\(thread.title)\" and its terminal history will be permanently deleted.")
         }
+        .confirmationDialog("Delete unsent message?", isPresented: Binding(
+            get: { pendingDiscardRecoveryID != nil },
+            set: { if !$0 { pendingDiscardRecoveryID = nil } }
+        ), titleVisibility: .visible, presenting: model.submissionRecoveryDrafts.first {
+            $0.id == pendingDiscardRecoveryID
+        }) { recovery in
+            Button("Delete", role: .destructive) {
+                pendingDiscardRecoveryID = nil
+                Task { await model.discardSubmissionRecovery(id: recovery.id) }
+            }
+            Button("Cancel", role: .cancel) { pendingDiscardRecoveryID = nil }
+        } message: { _ in
+            Text("This message has not been sent. Its saved text and files will be removed.")
+        }
         .onChange(of: selectedThreadIsAvailable) { _, isAvailable in
-            if !isAvailable { closeSelectedThread() }
+            if !isAvailable {
+                closeSelectedThread()
+                if let id = rootNavigationDismissalID { finishThreadNavigationDismissal(id) }
+            }
         }
         .onChange(of: selectedThreadID) { _, newValue in
             preferredCompactColumn = newValue == nil ? .sidebar : .detail
@@ -210,12 +279,31 @@ public struct WorkspaceView: View {
                 return
             }
         }
+        .task(id: paletteSearchRequest) {
+            await paletteSearch.search(paletteSearchRequest, using: model.client as? any FeatureThreadContentSearching)
+        }
+        .featureKeyboardCommands(
+            dispatcher: keyboardDispatcher,
+            context: keyboardContext,
+            paletteContent: { commandPaletteContent },
+            onPaletteQueryChange: { paletteQuery = $0 },
+            onCommand: handleKeyboardCommand
+        )
+        .task(id: contentSearchRequest) {
+            await contentSearch.search(
+                contentSearchRequest,
+                using: model.client as? any FeatureThreadContentSearching
+            )
+        }
     }
 
     private var sidebar: some View {
         ZStack(alignment: .bottomTrailing) {
             VStack(spacing: 0) {
                 homeBar
+                if !model.submissionRecoveryDrafts.isEmpty {
+                    submissionRecoveryRows
+                }
                 if isSearching {
                     searchBar
                         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -234,19 +322,70 @@ public struct WorkspaceView: View {
         }
     }
 
-    private var threadList: some View {
-        let presentation = homePresentationCache.presentation(
+    private var submissionRecoveryRows: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(model.submissionRecoveryDrafts) { recovery in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(recovery.reason ?? "This message was not sent.")
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.textSecondary)
+                            .lineLimit(2)
+                        HStack(spacing: 20) {
+                            Button(recovery.isNewTask ? "Edit task" : "Edit message") {
+                            if recovery.isNewTask || !model.snapshot.threads.contains(where: { $0.id == recovery.threadID }) {
+                                newTaskPresentation = NewTaskPresentation(projectID: recovery.projectID,
+                                    recoveryID: recovery.id)
+                            } else {
+                                openThread(recovery.threadID)
+                            }
+                            }
+                            Button("Discard", role: .destructive) {
+                                pendingDiscardRecoveryID = recovery.id
+                            }
+                        }
+                        .font(T3Typography.control)
+                        .disabled(model.recoveringSubmissionIDs.contains(recovery.id))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 8)
+        }
+        .frame(maxHeight: 140)
+    }
+
+    private var homePresentation: HomePresentation {
+        let searchRequest = contentSearchRequest
+        return homePresentationCache.presentation(
             snapshot: model.snapshot,
             revision: model.homePresentationRevision,
             rowRevision: model.threadRowRevision,
             query: searchText,
             projectID: selectedProjectID,
             now: sidebarBoundaryNow,
+            inboxReturns: model.inboxReturns,
+            contentMatches: contentSearch.matches(for: searchRequest),
+            searchEnvironmentIDs: searchRequest.environmentIDs,
             pullRequestsByThreadID: model.pullRequestsByThreadID
         )
 
+    }
+
+    private var threadList: some View {
+        let searchRequest = contentSearchRequest
+        let presentation = homePresentation
         return VStack(spacing: 0) {
             projectFilter
+            if contentSearch.isSearching, searchRequest.canSearchContent {
+                Text("Searching conversations…")
+                    .font(T3Typography.homeMetadata)
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 4)
+            }
             HomeThreadCollectionView(
                 presentation: presentation,
                 projectFaviconClient: model.client,
@@ -254,11 +393,13 @@ public struct WorkspaceView: View {
                 selectedThreadID: threadSelection.highlightedID,
                 forceRichRows: dynamicTypeSize.isAccessibilitySize,
                 hapticsEnabled: model.snapshot.settings.hapticsEnabled,
+                isWorkingExpanded: isWorkingExpanded,
                 isSnoozedExpanded: isSnoozedExpanded,
                 isSettledExpanded: isSettledExpanded,
                 isArchiveExpanded: isArchiveExpanded,
                 settledLimit: settledLimit,
                 onOpen: openThread,
+                onToggleWorking: { isWorkingExpanded.toggle() },
                 onToggleSnoozed: { isSnoozedExpanded.toggle() },
                 onToggleSettled: { isSettledExpanded.toggle() },
                 onToggleArchive: { isArchiveExpanded.toggle() },
@@ -279,6 +420,10 @@ public struct WorkspaceView: View {
                 onSnooze: { thread, until in
                     Task { await model.setSnoozed(thread.id, until: until) }
                 },
+                onCustomSnooze: { thread in
+                    customSnoozeSelection = FeatureCustomSnoozeSelection(thread: thread)
+                },
+                onNewTaskOnBranch: openNewTaskOnBranch,
                 onAutoSettle: { thread, enabled in
                     Task { await model.setAutoSettle(thread.id, enabled: enabled) }
                 },
@@ -309,7 +454,14 @@ public struct WorkspaceView: View {
                 model: model,
                 thread: thread,
                 submitMessage: submitMessage,
-                onNavigateBack: closeSelectedThread
+                onNavigateBack: closeSelectedThread,
+                onOpenThread: openThread,
+                onNewTaskFromThread: openNewTaskOnBranch,
+                initialDestination: requestedThreadDestination,
+                initialDestinationID: requestedThreadDestinationID,
+                onToolDestinationChange: { activeToolDestination = $0 },
+                rootNavigationDismissalID: rootNavigationDismissalID,
+                onRootNavigationDismissed: finishThreadNavigationDismissal
             )
             .id(id)
         } else {
@@ -360,7 +512,7 @@ public struct WorkspaceView: View {
             .accessibilityLabel(isSearching ? "Close search" : "Search tasks")
             .accessibilityIdentifier("sidebar-search-button")
 
-            Button { showingSettings = true } label: {
+            Button { settingsDestination = nil; showingSettings = true } label: {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 17, weight: .medium))
                     .frame(width: 40, height: T3Metrics.minimumTapTarget)
@@ -565,8 +717,111 @@ public struct WorkspaceView: View {
         .accessibilityElement(children: .contain)
     }
 
+    private var renderedThreads: [FeatureThread] {
+        let presentation = homePresentation
+        if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return presentation.searchResults
+        }
+        return presentation.pinned + presentation.active
+            + presentation.working.filter { isWorkingExpanded || $0.id == threadSelection.highlightedID }
+            + (isSnoozedExpanded ? presentation.snoozed : [])
+            + (isSettledExpanded ? Array(presentation.settled.prefix(settledLimit)) : [])
+            + (isArchiveExpanded ? presentation.archived : [])
+    }
+
+    private var keyboardContext: FeatureKeyboardContext {
+        var enabled: Set<FeatureKeyboardCommand> = [.commandPalette, .newTask, .focusSearch, .toggleSidebar]
+        if selectedThreadID != nil || isSearching { enabled.insert(.back) }
+        for number in 1...min(9, max(1, renderedThreads.count)) where number <= renderedThreads.count {
+            enabled.insert(.threadJump(number))
+        }
+        // Thread and tool scopes provide their actions through this same dispatcher.
+        return FeatureKeyboardContext(enabledCommands: enabled,
+            isTerminalActive: activeToolDestination.map { if case .terminal = $0 { true } else { false } } ?? false)
+    }
+
+    private var paletteSearchRequest: FeatureThreadSearchRequest {
+        FeatureThreadSearchRequest(query: paletteQuery, snapshot: model.snapshot, projectID: selectedProjectID)
+    }
+
+    private var commandPaletteContent: FeatureCommandPaletteContent {
+        var items: [FeatureCommandPaletteItem] = [
+            .init(id: "settings", title: "Settings", run: { settingsDestination = nil; showingSettings = true }),
+            .init(id: "appearance", title: "Appearance", run: {
+                settingsDestination = .appearance; showingSettings = true
+            }),
+            .init(id: "scheduledTasks", title: "Scheduled Tasks", run: {
+                settingsDestination = .scheduledTasks; showingSettings = true
+            }),
+            .init(id: "projects", title: "Project Settings", run: {
+                settingsDestination = .projects; showingSettings = true
+            }),
+            .init(id: "connections", title: "Computers", searchTerms: ["environments", "connections"],
+                  run: { showingEnvironments = true }),
+            .init(id: "addProject", title: "Add Project", run: openProjectCreation),
+            .init(id: "usage", title: "Usage Limits", run: { showingUsageLimits = true }),
+            .init(id: "archive", title: "Archived Threads", run: {
+                searchText = ""
+                isArchiveExpanded = true
+                closeSelectedThread()
+            }),
+        ]
+        items += creationProjects.map { project in
+            FeatureCommandPaletteItem(id: "project:" + project.id, kind: .project,
+                title: project.name, detail: projectMenuTitle(project), searchTerms: [project.path]) {
+                openNewTaskOrProjectCreation(initialProjectID: project.id)
+            }
+        }
+        let request = paletteSearchRequest
+        let environments = Set(request.environmentIDs)
+        let matches = paletteSearch.matches(for: request)
+        let snippets = Dictionary(matches.map { ($0.threadID, $0.snippet) }, uniquingKeysWith: { first, _ in first })
+        items += model.snapshot.threads.filter { thread in
+            !thread.isArchived && (selectedProjectID == nil || thread.projectID == selectedProjectID)
+                && (thread.environmentID.map(environments.contains) ?? true)
+        }.sorted { $0.updatedAt > $1.updatedAt }.map { thread in
+            FeatureCommandPaletteItem(id: thread.id, kind: .thread, title: thread.title,
+                detail: snippets[thread.id] ?? thread.environmentName,
+                searchTerms: [thread.branch ?? "", thread.preview ?? "", thread.projectID]) { openThread(thread.id) }
+        }
+        return FeatureCommandPaletteContent(items: items, matchedThreadIDs: Set(matches.map(\.threadID)),
+            isSearching: paletteSearch.isSearching)
+    }
+
+    private func handleKeyboardCommand(_ command: FeatureKeyboardCommand) {
+        switch command {
+        case .newTask:
+            openNewTaskOrProjectCreation()
+        case .focusSearch:
+            isSearching = true
+            columnVisibility = .all
+            preferredCompactColumn = .sidebar
+            isSearchFocused = true
+        case .back:
+            if isSearching {
+                isSearching = false
+                isSearchFocused = false
+                searchText = ""
+            } else { closeSelectedThread() }
+        case .toggleSidebar:
+            columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+            preferredCompactColumn = preferredCompactColumn == .sidebar ? .detail : .sidebar
+        case let .threadJump(number):
+            guard renderedThreads.indices.contains(number - 1) else { return }
+            openThread(renderedThreads[number - 1].id)
+        case .commandPalette, .cycleHost, .files, .terminal, .review, .copyThreadReference:
+            break // Active screen scopes own these commands.
+        }
+    }
+
     private var selectedProject: FeatureProject? {
         model.snapshot.projects.first { $0.id == selectedProjectID }
+    }
+
+    private var contentSearchRequest: FeatureThreadSearchRequest {
+        FeatureThreadSearchRequest(
+            query: searchText, snapshot: model.snapshot, projectID: selectedProjectID
+        )
     }
 
     private var creationProjects: [FeatureProject] {
@@ -613,50 +868,92 @@ public struct WorkspaceView: View {
     }
 
     private func openThread(_ id: String) {
+        requestedThreadDestination = nil
+        requestedThreadDestinationID = nil
+        activeToolDestination = nil
         threadSelection.open(id)
         preferredCompactColumn = .detail
     }
 
     private func closeSelectedThread() {
+        requestedThreadDestination = nil
+        requestedThreadDestinationID = nil
+        activeToolDestination = nil
         threadSelection.close()
         preferredCompactColumn = .sidebar
     }
 
     @MainActor
     private func openProjectCreation() {
-        newTaskPresentation = nil
-        showingAddProject = true
+        dismissNewTaskBeforeRootAction { showingAddProject = true }
     }
 
     private func openNewTaskOrProjectCreation() {
         openNewTaskOrProjectCreation(initialProjectID: selectedProjectID)
     }
 
-    private func openNewTaskOrProjectCreation(initialProjectID: String?) {
+    private func openNewTaskOnBranch(_ thread: FeatureThread) {
+        guard thread.branch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else { return }
+        isSearchFocused = false
+        newTaskPresentation = NewTaskPresentation(projectID: thread.projectID, sourceThread: thread)
+    }
+
+    private func openNewTaskOrProjectCreation(initialProjectID: String?, managedClone: FeatureProjectCloneIdentity? = nil) {
         switch DailyUXCreationContext.newTaskDestination(in: model.snapshot) {
         case .newTask:
-            newTaskPresentation = NewTaskPresentation(projectID: initialProjectID)
+            newTaskPresentation = NewTaskPresentation(projectID: initialProjectID, managedClone: managedClone)
         case .addProject:
             showingAddProject = true
         }
     }
 
     private func consumeNavigationRequest() {
-        guard let navigationRequest else { return }
+        guard let navigationRequest,
+              navigationRequest.id != pendingNavigationRequest?.id,
+              navigationRequest.id != consumedNavigationRequestID else { return }
+        pendingNavigationRequest = nil
+        rootNavigationDismissalID = nil
+        // Cold-start routes stay with the caller until their target exists.
         switch navigationRequest.destination {
-        case .usageLimits:
-            dismissTransientPresentations()
-            Task { @MainActor in
-                await Task.yield()
-                showingUsageLimits = true
-            }
-        case let .thread(id):
+        case let .thread(id), let .threadDestination(id, _):
             guard model.snapshot.threads.contains(where: { $0.id == id }) else { return }
-            dismissTransientPresentations()
-            openThread(id)
         case let .project(id):
             guard model.snapshot.projects.contains(where: { $0.id == id }) else { return }
-            dismissTransientPresentations()
+        case .usageLimits, .newTask:
+            break
+        }
+        pendingNavigationRequest = navigationRequest
+        keyboardDispatcher.afterDismissingPalette {
+            guard pendingNavigationRequest?.id == navigationRequest.id else { return }
+            dismissTransientPresentations {
+                guard pendingNavigationRequest?.id == navigationRequest.id else { return }
+                if selectedThreadID != nil && selectedThreadIsAvailable {
+                    rootNavigationDismissalID = navigationRequest.id
+                } else {
+                    applyNavigationRequest(navigationRequest)
+                }
+            }
+        }
+    }
+
+    private func finishThreadNavigationDismissal(_ id: UUID) {
+        guard rootNavigationDismissalID == id,
+              let request = pendingNavigationRequest, request.id == id else { return }
+        rootNavigationDismissalID = nil
+        applyNavigationRequest(request)
+    }
+
+    private func applyNavigationRequest(_ navigationRequest: FeatureWorkspaceNavigationRequest) {
+        switch navigationRequest.destination {
+        case .usageLimits:
+            showingUsageLimits = true
+        case let .thread(id):
+            openThread(id)
+        case let .threadDestination(id, destination):
+            openThread(id)
+            requestedThreadDestination = destination
+            requestedThreadDestinationID = navigationRequest.id
+        case let .project(id):
             selectedProjectID = id
             closeSelectedThread()
         case let .newTask(projectID):
@@ -664,24 +961,46 @@ public struct WorkspaceView: View {
                model.snapshot.projects.contains(where: { $0.id == projectID }) {
                 selectedProjectID = projectID
             }
-            dismissTransientPresentations()
-            Task { @MainActor in
-                await Task.yield()
-                openNewTaskOrProjectCreation(initialProjectID: projectID)
-            }
+            openNewTaskOrProjectCreation(initialProjectID: projectID)
         }
+        pendingNavigationRequest = nil
+        consumedNavigationRequestID = navigationRequest.id
         onNavigationRequestConsumed(navigationRequest.id)
     }
 
-    private func dismissTransientPresentations() {
+    private func dismissNewTaskBeforeRootAction(_ action: @escaping @MainActor () -> Void) {
+        guard newTaskPresentation != nil || workspacePresentationIsVisible || pendingWorkspaceAction != nil else {
+            action()
+            return
+        }
+        pendingWorkspaceAction = action
+        newTaskPresentation = nil
+    }
+
+    private func finishWorkspaceDismissal() {
+        workspacePresentationIsVisible = false
+        let action = pendingWorkspaceAction
+        pendingWorkspaceAction = nil
+        action?()
+    }
+
+    private func dismissTransientPresentations(before action: @escaping @MainActor () -> Void) {
+        let needsDismissal = workspacePresentationIsVisible || pendingWorkspaceAction != nil || settingsProject != nil
+            || newTaskPresentation != nil || customSnoozeSelection != nil || showingAddProject
+            || showingEnvironments || showingSettings || showingUsageLimits || showingThreadArrangement
+        if needsDismissal { pendingWorkspaceAction = action }
         settingsProject = nil
         newTaskPresentation = nil
+        customSnoozeSelection = nil
         showingAddProject = false
         showingEnvironments = false
         showingSettings = false
         showingUsageLimits = false
         showingThreadArrangement = false
         renamingThread = nil
+        deletingThread = nil
+        pendingDiscardRecoveryID = nil
+        if !needsDismissal { action() }
     }
 
     private func projectMenuTitle(_ project: FeatureProject) -> String {
@@ -698,6 +1017,7 @@ public struct WorkspaceView: View {
 struct HomePresentation {
     let pinned: [FeatureThread]
     let active: [FeatureThread]
+    let working: [FeatureThread]
     let snoozed: [FeatureThread]
     let settled: [FeatureThread]
     let archived: [FeatureThread]
@@ -707,6 +1027,7 @@ struct HomePresentation {
     private init(
         pinned: [FeatureThread],
         active: [FeatureThread],
+        working: [FeatureThread],
         snoozed: [FeatureThread],
         settled: [FeatureThread],
         archived: [FeatureThread],
@@ -715,6 +1036,7 @@ struct HomePresentation {
     ) {
         self.pinned = pinned
         self.active = active
+        self.working = working
         self.snoozed = snoozed
         self.settled = settled
         self.archived = archived
@@ -726,7 +1048,7 @@ struct HomePresentation {
     /// instead of the grouping and sorting passes in `init(snapshot:)`.
     func refreshingRows(from snapshot: FeatureSnapshot) -> HomePresentation {
         let byID = snapshot.threads.reduce(into: [String: FeatureThread]()) { $0[$1.id] = $1 }
-        let contextChanged = (pinned + active + snoozed + settled + archived).contains { previous in
+        let contextChanged = (pinned + active + working + snoozed + settled + archived).contains { previous in
             guard let next = byID[previous.id] else { return false }
             return previous.providerID != next.providerID
                 || previous.sessionProviderID != next.sessionProviderID
@@ -740,6 +1062,7 @@ struct HomePresentation {
         return HomePresentation(
             pinned: refresh(pinned),
             active: refresh(active),
+            working: refresh(working),
             snoozed: refresh(snoozed),
             settled: refresh(settled),
             archived: refresh(archived),
@@ -753,6 +1076,9 @@ struct HomePresentation {
         query: String,
         projectID: String?,
         now: Date,
+        inboxReturns: FeatureInboxReturnTracker = .init(),
+        contentMatches: [FeatureThreadContentMatch] = [],
+        searchEnvironmentIDs: [String]? = nil,
         pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation] = [:]
     ) {
         let index = DailyUXSidebarIndex(
@@ -760,6 +1086,7 @@ struct HomePresentation {
             query: "",
             projectID: projectID,
             now: now,
+            inboxReturns: inboxReturns,
             pullRequestsByThreadID: pullRequestsByThreadID
         )
         let archived = snapshot.threads
@@ -773,18 +1100,37 @@ struct HomePresentation {
 
         pinned = index.pinned
         active = index.active
+        working = index.working
         snoozed = index.snoozed
         settled = index.settled
         self.archived = archived
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        searchResults = normalizedQuery.isEmpty
-            ? []
-            : DailyUXSidebarIndex.matchingThreads(
-                index.pinned + index.active + index.snoozed + index.settled + archived,
-                snapshot: snapshot,
-                query: normalizedQuery
-            )
-        rowContexts = HomeThreadRowContext.index(snapshot: snapshot)
+        var contexts = HomeThreadRowContext.index(snapshot: snapshot)
+        if normalizedQuery.isEmpty {
+            searchResults = []
+        } else {
+            let selected = searchEnvironmentIDs.map(Set.init)
+            let candidates = (index.pinned + index.active + index.working + index.snoozed + index.settled + archived)
+                .filter { thread in
+                    guard let selected else { return true }
+                    let environmentID = thread.environmentID ?? contexts[thread.id]?.projectEnvironmentID
+                    return environmentID.map(selected.contains) ?? false
+                }
+            let localIDs = Set(DailyUXSidebarIndex.matchingThreads(
+                candidates, snapshot: snapshot, query: normalizedQuery
+            ).map(\.id))
+            let byThreadID = contentMatches.reduce(into: [String: FeatureThreadContentMatch]()) {
+                if $0[$1.threadID] == nil { $0[$1.threadID] = $1 }
+            }
+            searchResults = candidates.filter { thread in
+                if let match = byThreadID[thread.id], match.projectID == thread.projectID {
+                    contexts[thread.id]?.searchSnippet = match.snippet
+                    return true
+                }
+                return localIDs.contains(thread.id)
+            }
+        }
+        rowContexts = contexts
     }
 }
 
@@ -799,6 +1145,10 @@ final class HomePresentationCache {
         let query: String
         let projectID: String?
         let now: Date
+        let workingShelfEnabled: Bool
+        let inboxReturnRevision: UInt64
+        let contentMatches: [FeatureThreadContentMatch]
+        let searchEnvironmentIDs: [String]?
     }
 
     private var cachedKey: Key?
@@ -812,13 +1162,20 @@ final class HomePresentationCache {
         query: String,
         projectID: String?,
         now: Date,
+        inboxReturns: FeatureInboxReturnTracker = .init(),
+        contentMatches: [FeatureThreadContentMatch] = [],
+        searchEnvironmentIDs: [String]? = nil,
         pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation]
     ) -> HomePresentation {
         let key = Key(
             revision: revision,
             query: query,
             projectID: projectID,
-            now: now
+            now: now,
+            workingShelfEnabled: snapshot.settings.workingShelfEnabled,
+            inboxReturnRevision: inboxReturns.revision,
+            contentMatches: contentMatches,
+            searchEnvironmentIDs: searchEnvironmentIDs
         )
         if cachedKey == key, let cachedPresentation {
             if cachedRowRevision == rowRevision {
@@ -838,6 +1195,9 @@ final class HomePresentationCache {
             query: query,
             projectID: projectID,
             now: max(now, .now),
+            inboxReturns: inboxReturns,
+            contentMatches: contentMatches,
+            searchEnvironmentIDs: searchEnvironmentIDs,
             pullRequestsByThreadID: pullRequestsByThreadID
         )
         cachedKey = key
@@ -873,6 +1233,7 @@ struct HomeShelfHeader: View {
 }
 
 struct HomeThreadRowContext: Equatable {
+    var searchSnippet: String? = nil
     var projectRevision: String? = nil
     var projectIcon: ProjectIconOverride? = nil
     let projectName: String
@@ -1174,6 +1535,14 @@ struct FeatureThreadRow: View {
                 .opacity(titleOpacity)
                 .lineLimit(allowsMultilineTitle ? 2 : 1)
                 .padding(.top, 4)
+
+            if let snippet = context.searchSnippet, !snippet.isEmpty {
+                Text(snippet)
+                    .font(T3Typography.homeMetadata)
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .lineLimit(2)
+                    .padding(.top, 4)
+            }
 
             HStack(spacing: 6) {
                 Image(systemName: "arrow.triangle.branch")

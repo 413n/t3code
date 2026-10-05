@@ -10,11 +10,13 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let selectedThreadID: String?
     let forceRichRows: Bool
     let hapticsEnabled: Bool
+    var isWorkingExpanded: Bool = false
     let isSnoozedExpanded: Bool
     let isSettledExpanded: Bool
     let isArchiveExpanded: Bool
     let settledLimit: Int
     let onOpen: (String) -> Void
+    var onToggleWorking: () -> Void = {}
     let onToggleSnoozed: () -> Void
     let onToggleSettled: () -> Void
     let onToggleArchive: () -> Void
@@ -24,6 +26,8 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let onArchive: (FeatureThread, Bool) -> Void
     let onSettle: (FeatureThread, Bool, @escaping (Bool) -> Void) -> Void
     let onSnooze: (FeatureThread, Date?) -> Void
+    var onCustomSnooze: (FeatureThread) -> Void = { _ in }
+    var onNewTaskOnBranch: (FeatureThread) -> Void = { _ in }
     var onAutoSettle: (FeatureThread, Bool) -> Void = { _, _ in }
     let onPin: (FeatureThread, Bool) -> Void
     let onArrange: () -> Void
@@ -509,6 +513,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 status += " for \(duration)"
             }
             var values = [status, "Project \(context.projectName)"]
+            if let snippet = context.searchSnippet, !snippet.isEmpty {
+                values.append(snippet)
+            }
             if let pullRequest = pullRequestsByThreadID[thread.id] {
                 values.append(pullRequest.accessibilityLabel)
             }
@@ -560,6 +567,12 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 coordinator.parent.onRename(thread)
             }]
 
+            if let title = Self.newTaskOnBranchTitle(thread) {
+                actions.append(accessibilityAction(title, systemImage: "square.and.pencil") { coordinator in
+                    coordinator.parent.onNewTaskOnBranch(thread)
+                })
+            }
+
             if thread.supportsTitleRegeneration == true, !thread.isRegeneratingTitle {
                 actions.append(accessibilityAction("Regenerate title", systemImage: "sparkles") { coordinator in
                     coordinator.parent.onRegenerateTitle(thread)
@@ -608,6 +621,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                             accessibilityAction("Snooze: \(preset.label)", systemImage: "clock") { coordinator in
                                 coordinator.parent.onSnooze(thread, preset.until)
                             }
+                        })
+                        actions.append(accessibilityAction("Custom snooze", systemImage: "calendar") { coordinator in
+                            coordinator.parent.onCustomSnooze(thread)
                         })
                     }
                 }
@@ -673,6 +689,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
 
         private func toggle(_ shelf: HomeShelf) {
             switch shelf {
+            case .working: parent.onToggleWorking()
             case .snoozed: parent.onToggleSnoozed()
             case .settled: parent.onToggleSettled()
             case .archived: parent.onToggleArchive()
@@ -690,6 +707,13 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             }
 
             var titleActions: [UIMenuElement] = [rename]
+            if let title = Self.newTaskOnBranchTitle(thread) {
+                titleActions.append(UIAction(
+                    title: title, image: UIImage(systemName: "square.and.pencil")
+                ) { [weak self] _ in
+                    self?.parent.onNewTaskOnBranch(thread)
+                })
+            }
             if thread.supportsTitleRegeneration == true {
                 let regenerate = UIAction(
                     title: thread.isRegeneratingTitle ? "Regenerating title…" : "Regenerate title",
@@ -766,11 +790,14 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                         )
                     } else {
                         let presets = DailyUXSnoozePresets.resolve(now: .now)
-                        let children = presets.map { preset in
+                        var children = presets.map { preset in
                             UIAction(title: preset.label) { [weak self] _ in
                                 self?.parent.onSnooze(thread, preset.until)
                             }
                         }
+                        children.append(UIAction(title: "Custom…", image: UIImage(systemName: "calendar")) { [weak self] _ in
+                            self?.parent.onCustomSnooze(thread)
+                        })
                         if !thread.canSnoozeNow(at: .now) {
                             children.forEach { $0.attributes = .disabled }
                         }
@@ -808,6 +835,12 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             sections.append(UIMenu(options: .displayInline, children: [archive]))
             sections.append(UIMenu(options: .displayInline, children: [delete]))
             return sections
+        }
+
+        private static func newTaskOnBranchTitle(_ thread: FeatureThread) -> String? {
+            guard let branch = thread.branch?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !branch.isEmpty else { return nil }
+            return thread.worktreePath == nil ? "New task on this branch" : "New task in this worktree"
         }
 
         /// Working rows show a live per-second duration, so they need a 1 Hz
@@ -885,7 +918,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
         if !presentation.pinned.isEmpty, !presentation.active.isEmpty {
             items.append(.pinnedDivider)
         }
-        if presentation.active.isEmpty, presentation.pinned.isEmpty {
+        if presentation.active.isEmpty, presentation.pinned.isEmpty, presentation.working.isEmpty {
             items.append(.empty(.active))
         } else {
             items.append(contentsOf: presentation.active.map {
@@ -898,6 +931,23 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                     .active
                 )
             })
+        }
+
+        if !presentation.working.isEmpty {
+            items.append(.shelfHeader(.working, presentation.working.count, isWorkingExpanded))
+            // Keep the selected row reachable in split view while collapsed.
+            items.append(contentsOf: presentation.working
+                .filter { isWorkingExpanded || $0.id == selectedThreadID }
+                .map {
+                    .thread(
+                        $0,
+                        presentation.rowContexts[$0.id] ?? .fallback,
+                        .rich,
+                        false,
+                        forceRichRows,
+                        .working
+                    )
+                })
         }
 
         if !presentation.snoozed.isEmpty {
@@ -1088,6 +1138,7 @@ private final class HomeCollectionCell: UICollectionViewListCell {
 
 enum HomeShelf: String, Hashable {
     case active
+    case working
     case snoozed
     case settled
     case archived

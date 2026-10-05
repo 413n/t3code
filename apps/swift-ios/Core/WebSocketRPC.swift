@@ -96,7 +96,15 @@ public enum RPCError: LocalizedError, Sendable {
     case disconnected
     case responseTimedOut
     case remote(String)
+    case remoteDefect(String)
     case protocolViolation(String)
+
+    var remoteMessage: String? {
+        switch self {
+        case let .remote(message), let .remoteDefect(message): message
+        default: nil
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -104,7 +112,7 @@ public enum RPCError: LocalizedError, Sendable {
             "The live command connection is unavailable."
         case .disconnected: "The environment disconnected."
         case .responseTimedOut: "The environment did not answer the command in time."
-        case let .remote(message): message
+        case let .remote(message), let .remoteDefect(message): message
         case let .protocolViolation(message): message
         }
     }
@@ -841,11 +849,9 @@ public actor WebSocketRPCClient {
             guard let subscriptionID = subscriptionByRequestID.removeValue(forKey: requestID),
                   let subscription = subscriptions.removeValue(forKey: subscriptionID)
             else { return }
-            if exit.cause?.contains(where: { $0._tag == "Die" }) == true {
-                subscription.finish(RPCError.protocolViolation("The server could not complete the live request."))
-            } else {
-                subscription.finish(exit._tag == "Success" ? nil : remoteError(exit))
-            }
+            // Unknown RPC tags are Effect Die defects, including subscriptions.
+            // Keep their message so callers can select an older-server fallback.
+            subscription.finish(exit._tag == "Success" ? nil : remoteError(exit))
         case "Defect", "ClientProtocolError":
             throw RPCError.protocolViolation("The server reported an RPC protocol error.")
         default:
@@ -1069,11 +1075,13 @@ public actor WebSocketRPCClient {
     }
 
     private func remoteError(_ exit: RPCResponseEnvelope.Exit) -> RPCError {
-        let value = exit.cause?.first?.error
-        let message = value?["message"]?.stringValue
+        let cause = exit.cause?.first
+        let value = cause?.error ?? cause?.defect
+        let message = value?.stringValue
+            ?? value?["message"]?.stringValue
             ?? value?["detail"]?.stringValue
             ?? "The environment rejected the RPC request."
-        return .remote(message)
+        return cause?._tag == "Die" ? .remoteDefect(message) : .remote(message)
     }
 
     private func allocateRequestID() -> Int {

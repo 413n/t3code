@@ -366,7 +366,7 @@ struct DailyUXNewTaskTests {
 
         #expect(request.trimmedPrompt == "Build it")
         #expect(request.runtimeMode == .approvalRequired)
-        #expect(request.interactionMode == .standard)
+        #expect(request.interactionMode == .plan)
         #expect(request.workspaceMode == .local)
         #expect(request.branch == nil)
         #expect(request.worktreePath == nil)
@@ -428,9 +428,9 @@ struct DailyUXNewTaskTests {
     }
 
     @Test
-    func mobileModeChoicesOnlyExposeSupportedValues() {
-        #expect(FeatureRuntimeMode.allCases == [.automatic, .fullAccess])
-        #expect(FeatureInteractionMode.allCases == [.standard])
+    func mobileModeChoicesPreserveAllServerModes() {
+        #expect(FeatureRuntimeMode.allCases == [.approvalRequired, .autoAcceptEdits, .automatic, .fullAccess])
+        #expect(FeatureInteractionMode.allCases == [.standard, .plan])
     }
 
     @Test

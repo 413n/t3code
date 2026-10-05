@@ -52,6 +52,22 @@ actor OrchestrationV2Client {
         return try OrchestrationV2Presentation.shellSnapshot(json)
     }
 
+    /// Tool output can be withheld from timeline snapshots. Fetch one item only
+    /// when its inspector opens, without replacing the loaded transcript.
+    func turnItem(threadID: String, itemID: String, revision: String?) async throws -> OrchestrationV2TurnItem? {
+        let epoch = generation
+        var payload: [String: JSONValue] = ["threadId": .string(threadID), "itemId": .string(itemID)]
+        if let revision { payload["revision"] = .string(revision) }
+        let result = try await rpc.request("orchestration.getTurnItem", payload: .object(payload), as: JSONValue.self)
+        guard generation == epoch else { throw RPCError.disconnected }
+        guard let raw = result["item"], raw != .null else { return nil }
+        let item = try OrchestrationV2TurnItem(json: raw)
+        guard item.threadId == threadID, item.id == itemID else {
+            throw RPCError.protocolViolation("The tool result belongs to a different item.")
+        }
+        return item
+    }
+
     func readModel() async throws -> OrchestrationReadModel {
         let shell = try await shellSnapshot()
         var threads: [OrchestrationThread] = []

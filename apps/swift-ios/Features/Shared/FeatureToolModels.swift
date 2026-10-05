@@ -129,6 +129,8 @@ public enum FeatureFilePreviewKind: Sendable, Equatable {
     case image
     case pdf
     case video
+    case audio
+    case browser
     case document
     case markdown
     case source
@@ -139,6 +141,8 @@ public enum FeatureFilePreviewKind: Sendable, Equatable {
         if imageExtensions.contains(fileExtension) { return .image }
         if fileExtension == "pdf" { return .pdf }
         if videoExtensions.contains(fileExtension) { return .video }
+        if audioExtensions.contains(fileExtension) { return .audio }
+        if ["html", "htm", "svg"].contains(fileExtension) { return .browser }
         if documentExtensions.contains(fileExtension) { return .document }
         if language?.lowercased() == "markdown" || ["md", "mdx"].contains(fileExtension) {
             return .markdown
@@ -153,6 +157,10 @@ public enum FeatureFilePreviewKind: Sendable, Equatable {
 
     private static let videoExtensions: Set<String> = [
         "m4v", "mov", "mp4", "mpeg", "mpg", "webm",
+    ]
+
+    private static let audioExtensions: Set<String> = [
+        "aac", "aif", "aiff", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav",
     ]
 
     private static let documentExtensions: Set<String> = [
@@ -582,10 +590,27 @@ public enum FeatureReviewLineSide: String, Sendable, Equatable, Hashable, Codabl
 public struct FeatureReviewLineSelection: Sendable, Equatable, Hashable, Codable {
     public var side: FeatureReviewLineSide
     public var line: Int
+    public var endLine: Int?
 
-    public init(side: FeatureReviewLineSide, line: Int) {
+    public init(side: FeatureReviewLineSide, line: Int, endLine: Int? = nil) {
         self.side = side
-        self.line = line
+        self.line = min(line, endLine ?? line)
+        self.endLine = endLine.map { max(line, $0) }
+    }
+
+    public var lastLine: Int { endLine ?? line }
+    public var label: String {
+        lastLine == line ? "\(side.rawValue) line \(line)" : "\(side.rawValue) lines \(line)–\(lastLine)"
+    }
+
+    public func extending(to other: Self) -> Self? {
+        guard side == other.side else { return nil }
+        return Self(side: side, line: line, endLine: other.line)
+    }
+
+    public func contains(_ other: Self?) -> Bool {
+        guard let other, side == other.side else { return false }
+        return (line...lastLine).contains(other.line)
     }
 }
 
@@ -593,15 +618,22 @@ public struct FeatureReviewCommentDraft: Sendable, Equatable, Hashable {
     public var filePath: String
     public var line: FeatureReviewLineSelection?
     public var body: String
+    public var sourceID: String
+    public var sourceTitle: String
 
-    public init(filePath: String, line: FeatureReviewLineSelection? = nil, body: String) {
+    public init(
+        filePath: String, line: FeatureReviewLineSelection? = nil, body: String,
+        sourceID: String = "working-tree", sourceTitle: String = "Working changes"
+    ) {
         self.filePath = filePath
         self.line = line
         self.body = body
+        self.sourceID = sourceID
+        self.sourceTitle = sourceTitle
     }
 
     public var prompt: String {
-        let location = line.map { " at \($0.side.rawValue) line \($0.line)" } ?? ""
+        let location = line.map { " at \($0.label)" } ?? ""
         return """
         Address this review comment in `\(filePath)`\(location):
 
@@ -613,55 +645,65 @@ public struct FeatureReviewCommentDraft: Sendable, Equatable, Hashable {
 
     public func submissionText(contextRecord: ComposerContextRecord) -> String {
         let reference = ComposerContextReferences.format(contextRecord)
-        // The record has a smaller bound than a message. Keep the full comment
-        // in ordinary text when it does not fit instead of discarding instructions.
         return body.utf16.count > 16_000
             ? prompt + "\n\n" + reference
             : "Address this review comment: " + reference
     }
 
     public func contextRecord(lines: [FeatureDiffLine]) -> ComposerContextRecord {
-        let range = line.map { "\($0.side.rawValue) line \($0.line)" } ?? "File"
-        let selectedIndex = line.flatMap { selected in
-            lines.firstIndex {
-                selected.side == .new ? $0.newLine == selected.line : $0.oldLine == selected.line
-            }
-        } ?? 0
+        let range = line?.label ?? "File"
+        let selectedIndices = lines.indices.filter { index in
+            guard let line else { return false }
+            let number = line.side == .new ? lines[index].newLine : lines[index].oldLine
+            return number.map { (line.line...line.lastLine).contains($0) } ?? false
+        }
+        let startIndex = selectedIndices.first ?? 0
+        let endIndex = selectedIndices.last ?? startIndex
         func formatted(_ index: Int) -> String {
-            let line = lines[index]
-            let prefix = switch line.kind {
+            let row = lines[index]
+            let prefix = switch row.kind {
             case .addition: "+"
             case .deletion: "-"
             case .context: " "
             case .hunk: ""
             }
-            return prefix + line.text
+            return prefix + row.text
         }
-        // Build outward from the selected row so a large file never clips away
-        // the code the comment is about. Indices still refer to the full diff.
-        var lower = min(selectedIndex, max(0, lines.count - 1))
-        var upper = min(lines.count, lower + 1)
-        let selectedText = lines.isEmpty ? "" : ComposerContextReferences.boundedPrefix(formatted(lower), maximumUTF16: 32_000)
-        var remaining = 32_000 - selectedText.utf16.count
+        // Include the selection before spending the context budget on nearby rows.
+        var lower = min(startIndex, max(0, lines.count - 1))
+        var upper = min(lines.count, endIndex + 1)
+        var remaining = 32_000
+        var selectedText: [String] = []
+        for index in lower..<upper where remaining > 0 {
+            let text = ComposerContextReferences.boundedPrefix(formatted(index), maximumUTF16: remaining)
+            selectedText.append(text)
+            remaining -= text.utf16.count + 1
+        }
+        var before: [String] = []
+        var after: [String] = []
         while remaining > 0, lower > 0 || upper < lines.count {
             var added = false
             if lower > 0, formatted(lower - 1).utf16.count + 1 <= remaining {
                 lower -= 1
-                remaining -= formatted(lower).utf16.count + 1
+                let text = formatted(lower)
+                before.append(text)
+                remaining -= text.utf16.count + 1
                 added = true
             }
             if upper < lines.count, formatted(upper).utf16.count + 1 <= remaining {
-                remaining -= formatted(upper).utf16.count + 1
+                let text = formatted(upper)
+                after.append(text)
+                remaining -= text.utf16.count + 1
                 upper += 1
                 added = true
             }
             if !added { break }
         }
         return ComposerContextRecord(label: "\(filePath) \(range)", payload: .reviewComment(.init(
-            sectionId: "working-tree", sectionTitle: "Working changes", filePath: filePath,
-            startIndex: selectedIndex, endIndex: selectedIndex,
+            sectionId: sourceID, sectionTitle: sourceTitle, filePath: filePath,
+            startIndex: startIndex, endIndex: endIndex,
             rangeLabel: range, text: ComposerContextReferences.boundedPrefix(body, maximumUTF16: 16_000),
-            diff: (lower..<upper).map { $0 == selectedIndex ? selectedText : formatted($0) }.joined(separator: "\n"),
+            diff: (Array(before.reversed()) + selectedText + after).joined(separator: "\n"),
             fenceLanguage: "diff", pullRequest: nil
         )))
     }
@@ -676,13 +718,16 @@ public enum FeatureReviewChangeKind: String, Sendable, Codable {
 }
 
 public struct FeatureReviewFile: Identifiable, Sendable, Equatable, Hashable, Codable {
-    public var id: String { path }
+    public var id: String { [sourceID ?? sourceKind ?? "", sourceBaseReference ?? "", sourceHeadReference ?? "", sourceDiffHash ?? "", path].joined(separator: "\u{1F}") }
     public var path: String
     public var previousPath: String?
     public var change: FeatureReviewChangeKind
     public var additions: Int
     public var deletions: Int
     public var lines: [FeatureDiffLine]
+    public var sourceDiffHash: String?
+    public var sourceID: String?
+    public var sourceTitle: String?
     public var sourceKind: String?
     public var sourceBaseReference: String?
     public var sourceHeadReference: String?
@@ -694,6 +739,9 @@ public struct FeatureReviewFile: Identifiable, Sendable, Equatable, Hashable, Co
         additions: Int,
         deletions: Int,
         lines: [FeatureDiffLine] = [],
+        sourceDiffHash: String? = nil,
+        sourceID: String? = nil,
+        sourceTitle: String? = nil,
         sourceKind: String? = nil,
         sourceBaseReference: String? = nil,
         sourceHeadReference: String? = nil
@@ -704,6 +752,9 @@ public struct FeatureReviewFile: Identifiable, Sendable, Equatable, Hashable, Co
         self.additions = additions
         self.deletions = deletions
         self.lines = lines
+        self.sourceDiffHash = sourceDiffHash
+        self.sourceID = sourceID
+        self.sourceTitle = sourceTitle
         self.sourceKind = sourceKind
         self.sourceBaseReference = sourceBaseReference
         self.sourceHeadReference = sourceHeadReference
@@ -877,6 +928,10 @@ enum FeatureFullDiffHydrator {
 }
 
 public struct FeatureReview: Sendable, Equatable, Codable {
+    /// Nil on a source-only response; keep the catalog already shown by the view.
+    public var sources: [FeatureReviewSource]?
+    public var selectedSourceID: String?
+    public var historyError: String?
     public var title: String
     public var baseReference: String?
     public var files: [FeatureReviewFile]
@@ -886,8 +941,14 @@ public struct FeatureReview: Sendable, Equatable, Codable {
         title: String = "Working tree",
         baseReference: String? = nil,
         files: [FeatureReviewFile] = [],
-        isTruncated: Bool = false
+        isTruncated: Bool = false,
+        sources: [FeatureReviewSource]? = nil,
+        selectedSourceID: String? = nil,
+        historyError: String? = nil
     ) {
+        self.historyError = historyError
+        self.sources = sources
+        self.selectedSourceID = selectedSourceID
         self.title = title
         self.baseReference = baseReference
         self.files = files
@@ -955,6 +1016,10 @@ public struct FeatureSourceControlStatus: Sendable, Equatable, Codable {
     public var isRepository: Bool
     public var branch: String?
     public var upstream: String?
+    public var hasPrimaryRemote: Bool?
+    public var isDefaultBranch: Bool?
+    public var hasUpstream: Bool?
+    public var aheadOfDefaultCount: Int?
     public var aheadCount: Int
     public var behindCount: Int
     /// `false` while the remote half of a streamed status is still pending, so
@@ -973,7 +1038,11 @@ public struct FeatureSourceControlStatus: Sendable, Equatable, Codable {
         isRemoteKnown: Bool = true,
         files: [FeatureSourceControlFile] = [],
         pullRequest: FeaturePullRequest? = nil,
-        isBusy: Bool = false
+        isBusy: Bool = false,
+        hasPrimaryRemote: Bool? = nil,
+        isDefaultBranch: Bool? = nil,
+        hasUpstream: Bool? = nil,
+        aheadOfDefaultCount: Int? = nil
     ) {
         self.isRepository = isRepository
         self.branch = branch
@@ -984,23 +1053,31 @@ public struct FeatureSourceControlStatus: Sendable, Equatable, Codable {
         self.files = files
         self.pullRequest = pullRequest
         self.isBusy = isBusy
+        self.hasPrimaryRemote = hasPrimaryRemote
+        self.isDefaultBranch = isDefaultBranch
+        self.hasUpstream = hasUpstream
+        self.aheadOfDefaultCount = aheadOfDefaultCount
     }
 
     public var availableActions: [FeatureSourceControlAction] {
         guard isRepository, !isBusy else { return [] }
         var actions: [FeatureSourceControlAction] = []
+        // Optional facts preserve old feature clients; native status supplies all of them.
+        let hasRemote = hasPrimaryRemote != false
+        let canPublish = hasRemote && (hasPrimaryRemote == nil || branch != nil)
+            && (hasPrimaryRemote == nil || behindCount == 0)
+        let hasOpenPR = pullRequest.map { $0.state.lowercased() == "open" } ?? false
         if !files.isEmpty {
             actions.append(.commit)
-            actions.append(.commitAndPush)
-            if isRemoteKnown, pullRequest == nil {
-                actions.append(.commitPushAndCreatePullRequest)
-            }
+            if canPublish, isRemoteKnown { actions.append(.commitAndPush) }
+            if canPublish, isRemoteKnown, !hasOpenPR { actions.append(.commitPushAndCreatePullRequest) }
         }
-        if aheadCount > 0 { actions.append(.push) }
-        if behindCount > 0 { actions.append(.pull) }
-        // Withheld until the remote half lands: offering it against an unknown
-        // remote can propose a second PR for a branch that already has one.
-        if isRemoteKnown, pullRequest == nil { actions.append(.createPullRequest) }
+        if canPublish, isRemoteKnown, aheadCount > 0 { actions.append(.push) }
+        if hasRemote, isRemoteKnown, behindCount > 0 { actions.append(.pull) }
+        if canPublish, isRemoteKnown, !hasOpenPR,
+           hasPrimaryRemote == nil || (files.isEmpty && aheadCount > 0) {
+            actions.append(.createPullRequest)
+        }
         return actions
     }
 }

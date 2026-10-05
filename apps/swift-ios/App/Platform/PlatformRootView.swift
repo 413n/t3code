@@ -321,6 +321,17 @@ struct PlatformRootView: View {
             PlatformHapticEngine.shared.selection(
                 enabled: model.snapshot.settings.hapticsEnabled
             )
+        case let .threadDestination(environmentID, threadID, destination):
+            guard await enableEnvironmentIfNeeded(environmentID),
+                  let thread = PlatformRouteResolver.thread(
+                      in: model.snapshot, environmentID: environmentID, id: threadID
+                  ) else {
+                if model.errorMessage == nil { model.errorMessage = "That thread is not available on this device." }
+                return
+            }
+            navigationRequest = FeatureWorkspaceNavigationRequest(
+                destination: .threadDestination(id: thread.id, destination: destination)
+            )
         case let .project(environmentID, projectID):
             guard await enableEnvironmentIfNeeded(environmentID),
                   let project = PlatformRouteResolver.project(

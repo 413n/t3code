@@ -26,7 +26,7 @@ public struct AddProjectView: View {
 
     @SwiftUI.Environment(\.dismiss) private var dismiss
     @Bindable var model: FeatureRootModel
-    private let onNewProjectCreated: @MainActor (String) -> Void
+    private let onNewProjectCreated: @MainActor (String, FeatureProjectCloneIdentity?) -> Void
 
     @State private var selectedEnvironmentID: String?
     @State private var mode = ProjectMode.newProject
@@ -40,6 +40,9 @@ public struct AddProjectView: View {
     @State private var resolvedRepository: SourceControlRepositoryInfo?
     @State private var didEditDestination = false
     @State private var pendingCloneRegistration: PendingCloneRegistration?
+    @State private var pendingManagedClone: FeaturePendingManagedProjectClone?
+    @State private var cloneController = FeatureProjectCloneController()
+    @State private var cloneSubscriptionRevision = 0
 
     @State private var browsePath = "~/"
     @State private var browseResult: FilesystemBrowseResult?
@@ -57,7 +60,7 @@ public struct AddProjectView: View {
     @State private var cloneRequestID: UUID?
     @FocusState private var focusedField: Field?
 
-    public init(model: FeatureRootModel, onNewProjectCreated: @escaping @MainActor (String) -> Void = { _ in }) {
+    public init(model: FeatureRootModel, onNewProjectCreated: @escaping @MainActor (String, FeatureProjectCloneIdentity?) -> Void = { _, _ in }) {
         self.model = model
         self.onNewProjectCreated = onNewProjectCreated
     }
@@ -74,6 +77,18 @@ public struct AddProjectView: View {
                             if createdNewProject == nil { modePicker }
                             if let errorMessage {
                                 errorBanner(errorMessage)
+                            }
+                            if let cloneClient = model.client as? any FeatureManagedProjectCloning {
+                                ForEach(cloneController.clones.filter { $0.environmentID == environment.id && $0.snapshot.phase != .done }) { clone in
+                                    FeatureProjectCloneStatusView(clone: clone, controller: cloneController, client: cloneClient) {
+                                        if pendingManagedClone?.input.projectId == clone.snapshot.projectId {
+                                            pendingManagedClone = nil
+                                        }
+                                    }
+                                }
+                                if cloneController.errorMessage != nil {
+                                    Button("Refresh clone progress") { cloneSubscriptionRevision += 1 }
+                                }
                             }
                             switch mode {
                             case .newProject:
@@ -118,6 +133,7 @@ public struct AddProjectView: View {
         .onChange(of: source) {
             resolvedRepository = nil
             pendingCloneRegistration = nil
+            pendingManagedClone = nil
             cloneRequestID = nil
             updateSuggestedDestination()
             errorMessage = nil
@@ -125,6 +141,7 @@ public struct AddProjectView: View {
         .onChange(of: repositoryInput) {
             resolvedRepository = nil
             pendingCloneRegistration = nil
+            pendingManagedClone = nil
             cloneRequestID = nil
             updateSuggestedDestination()
             errorMessage = nil
@@ -134,6 +151,10 @@ public struct AddProjectView: View {
             resetEnvironmentState()
             await loadDirectory(browsePath, updateSelection: false)
             await loadDiscovery()
+        }
+        .task(id: "\(selectedEnvironmentID ?? ""): \(cloneSubscriptionRevision)") {
+            guard let environmentID = selectedEnvironmentID else { return }
+            await cloneController.observe(environmentID: environmentID, client: model.client as? any FeatureManagedProjectCloning)
         }
     }
 
@@ -333,7 +354,7 @@ public struct AddProjectView: View {
                         browseAction: nil
                     )
                 }
-                primaryAction(label: "Clone and add", icon: "arrow.down.circle") {
+                primaryAction(label: acceptedManagedCloneResult == nil ? "Clone and add" : "Open project", icon: "arrow.down.circle") {
                     await cloneProject(environment)
                 }
             }
@@ -573,6 +594,7 @@ public struct AddProjectView: View {
                 didEditDestination = true
                 destinationPath = value
                 pendingCloneRegistration = nil
+                pendingManagedClone = nil
                 cloneRequestID = nil
             }
         )
@@ -583,6 +605,12 @@ public struct AddProjectView: View {
     }
 
     private func selectEnvironmentIfNeeded() {
+        // Keep an uncertain clone start on its original host through reconnects.
+        if let pending = pendingManagedClone,
+           selectedEnvironmentID == pending.environmentID,
+           model.snapshot.environments.contains(where: { $0.id == pending.environmentID && $0.isEnabled }) {
+            return
+        }
         if let selectedEnvironmentID,
            environments.contains(where: {
                $0.id == selectedEnvironmentID && canCreateProject(in: $0)
@@ -605,6 +633,7 @@ public struct AddProjectView: View {
         source = .url
         resolvedRepository = nil
         pendingCloneRegistration = nil
+        pendingManagedClone = nil
         cloneRequestID = nil
         didEditDestination = false
         localPath = "~/"
@@ -756,7 +785,7 @@ public struct AddProjectView: View {
                 errorMessage = "The project was created. It will appear when this connection catches up."
                 return
             }
-            onNewProjectCreated(id)
+            onNewProjectCreated(id, nil)
             dismiss()
         } catch {
             errorMessage = createdNewProject == nil
@@ -852,6 +881,7 @@ public struct AddProjectView: View {
     }
 
     private func cloneProject(_ environment: FeatureEnvironment) async {
+        guard !isSubmitting else { return }
         let remoteURL = resolvedRepository.map(ProjectCreationPath.defaultCloneURL)
             ?? ProjectCreationPath.normalizedCloneURL(repositoryInput)
         guard !remoteURL.isEmpty else {
@@ -873,7 +903,12 @@ public struct AddProjectView: View {
             errorMessage = "Use a path that matches \(environment.name)’s filesystem."
             return
         }
-        if let existing = existingProject(
+        let currentManagedClone = pendingManagedClone.flatMap { pending in
+            pending.environmentID == environment.id && pending.input.remoteUrl == remoteURL
+                && pending.input.destinationPath == validatedDestination ? pending : nil
+        }
+        let acceptedResult = currentManagedClone?.acceptedResult(clones: cloneController.clones, projects: model.snapshot.projects)
+        if acceptedResult == nil, let existing = existingProject(
             environmentID: environment.id,
             path: validatedDestination
         ) {
@@ -896,6 +931,29 @@ public struct AddProjectView: View {
             }
         }
         do {
+            if let result = acceptedResult {
+                pendingManagedClone?.result = result
+                await openManagedClone(result, requestID: requestID, environmentID: environment.id,
+                    remoteURL: remoteURL, destinationPath: validatedDestination)
+                return
+            }
+            if let cloneClient = model.client as? any FeatureManagedProjectCloning,
+               try await cloneClient.supportsManagedProjectClones(environmentID: environment.id) {
+                let pending = currentManagedClone
+                    ?? FeaturePendingManagedProjectClone(environmentID: environment.id, input: ProjectCloneStartInput(
+                        projectId: UUID().uuidString,
+                        title: ProjectCreationPath.lastPathComponent(validatedDestination),
+                        createdAt: Date().formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true)),
+                        remoteUrl: remoteURL, destinationPath: validatedDestination
+                    ))
+                pendingManagedClone = pending
+                let result = try await cloneClient.startManagedProjectClone(environmentID: environment.id, input: pending.input)
+                guard cloneRequestIsCurrent(requestID, environmentID: environment.id, remoteURL: remoteURL, destinationPath: validatedDestination) else { return }
+                pendingManagedClone?.result = result
+                await openManagedClone(result, requestID: requestID, environmentID: environment.id,
+                    remoteURL: remoteURL, destinationPath: validatedDestination)
+                return
+            }
             let clonedPath: String
             if let pending = pendingCloneRegistration,
                pending.environmentID == environment.id,
@@ -957,12 +1015,42 @@ public struct AddProjectView: View {
             ) else {
                 return
             }
-            if pendingCloneRegistration != nil {
+            if let result = acceptedManagedCloneResult {
+                pendingManagedClone?.result = result
+                await openManagedClone(result, requestID: requestID, environmentID: environment.id,
+                    remoteURL: remoteURL, destinationPath: validatedDestination)
+            } else if pendingCloneRegistration != nil {
                 errorMessage = "Repository cloned. Try again to finish adding the project."
             } else {
                 errorMessage = projectErrorMessage(error)
             }
         }
+    }
+
+    private var acceptedManagedCloneResult: ProjectCloneStartResult? {
+        guard let pending = pendingManagedClone,
+              pending.environmentID == selectedEnvironmentID,
+              pending.input.remoteUrl == (resolvedRepository.map(ProjectCreationPath.defaultCloneURL)
+                ?? ProjectCreationPath.normalizedCloneURL(repositoryInput)),
+              pending.input.destinationPath == destinationPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return nil }
+        return pending.acceptedResult(clones: cloneController.clones, projects: model.snapshot.projects)
+    }
+
+    private func openManagedClone(
+        _ result: ProjectCloneStartResult, requestID: UUID, environmentID: String,
+        remoteURL: String, destinationPath: String
+    ) async {
+        await model.reloadAfterConnection()
+        guard cloneRequestIsCurrent(requestID, environmentID: environmentID,
+            remoteURL: remoteURL, destinationPath: destinationPath) else { return }
+        let projectID = FeatureScopedID.project(environmentID: environmentID, wireID: result.projectId)
+        guard model.snapshot.projects.contains(where: { $0.id == projectID }) else {
+            errorMessage = "The clone has started. Open the project when this connection catches up."
+            return
+        }
+        onNewProjectCreated(projectID, FeatureProjectCloneIdentity(environmentID: environmentID, projectID: result.projectId))
+        dismiss()
     }
 
     private func cloneRequestIsCurrent(
@@ -971,7 +1059,7 @@ public struct AddProjectView: View {
         remoteURL: String,
         destinationPath: String
     ) -> Bool {
-        let currentRemoteURL = resolvedRepository?.sshUrl
+        let currentRemoteURL = resolvedRepository.map(ProjectCreationPath.defaultCloneURL)
             ?? ProjectCreationPath.normalizedCloneURL(repositoryInput)
         return cloneRequestID == requestID
             && selectedEnvironmentID == environmentID
@@ -997,6 +1085,7 @@ public struct AddProjectView: View {
         switch source {
         case .url: "link"
         case .github: "chevron.left.forwardslash.chevron.right"
+        case .forgejo: "arrow.triangle.branch"
         case .gitlab: "shippingbox"
         case .bitbucket: "shippingbox.fill"
         case .azureDevOps: "point.3.connected.trianglepath.dotted"

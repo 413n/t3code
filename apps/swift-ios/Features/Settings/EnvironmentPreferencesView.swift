@@ -29,6 +29,77 @@ struct EnvironmentPreferencesView: View {
                 Text("Enable both environments to share PR data through the same GitHub account. Write access permits PR changes. Credentials stay on each environment.")
             }
             if let settings {
+                if settings.supportsDefaultRuntimeMode {
+                    Section("New threads") {
+                        DefaultRuntimeModePicker(selection: Binding(
+                            get: { settings.defaultRuntimeMode },
+                            set: { save(.defaultRuntimeMode($0)) }
+                        ))
+                        .accessibilityIdentifier("environment-default-runtime")
+                    }
+                }
+                Section("Source control") {
+                    Toggle("Automatically pull default branch", isOn: Binding(
+                        get: { settings.defaultAutoPull },
+                        set: { save(.defaultAutoPull($0)) }
+                    ))
+                    .accessibilityIdentifier("environment-default-auto-pull")
+                    if let branchNamingMode = settings.branchNamingMode {
+                        Picker("Branch naming", selection: Binding(
+                            get: { branchNamingMode },
+                            set: { save(.branchNamingMode($0)) }
+                        )) {
+                            ForEach(BranchNamingMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
+                        .accessibilityIdentifier("environment-branch-naming")
+                        if branchNamingMode == .static, let prefix = settings.branchNamePrefix {
+                            BranchNamingTextSetting(title: "Branch prefix", value: prefix) {
+                                save(.branchNamePrefix($0))
+                            }
+                        }
+                        if branchNamingMode == .custom, let instructions = settings.branchNameInstructions {
+                            BranchNamingTextSetting(title: "Branch naming instructions", value: instructions, multiline: true) {
+                                save(.branchNameInstructions($0))
+                            }
+                        }
+                    }
+                }
+                if let browserAccess = settings.enableAgentBrowserAccess {
+                    Section("Agent behavior") {
+                        Toggle("Agent browser access", isOn: Binding(
+                            get: { browserAccess },
+                            set: { save(.enableAgentBrowserAccess($0)) }
+                        ))
+                        .accessibilityIdentifier("environment-agent-browser-access")
+                    }
+                }
+                if let updateChecks = settings.enableProviderUpdateChecks {
+                    Section("Updates") {
+                        Toggle("Check provider updates", isOn: Binding(
+                            get: { updateChecks },
+                            set: { save(.enableProviderUpdateChecks($0)) }
+                        ))
+                        .accessibilityIdentifier("environment-provider-update-checks")
+                    }
+                }
+                if settings.autoResumeLimitedThreads != nil || settings.snoozeLimitedThreads != nil {
+                    Section("Usage limits") {
+                        if let autoResume = settings.autoResumeLimitedThreads {
+                            Toggle("Auto-resume limited threads", isOn: Binding(
+                                get: { autoResume },
+                                set: { save(.autoResumeLimitedThreads($0)) }
+                            ))
+                            .accessibilityIdentifier("environment-auto-resume-limited-threads")
+                        }
+                        if let snooze = settings.snoozeLimitedThreads {
+                            Toggle("Snooze limited threads", isOn: Binding(
+                                get: { snooze },
+                                set: { save(.snoozeLimitedThreads($0)) }
+                            ))
+                            .accessibilityIdentifier("environment-snooze-limited-threads")
+                        }
+                    }
+                }
                 if settings.storageCleanup != nil {
                     Section("Automatic storage cleanup") {
                         StorageCleanupControls(rules: settings.storageCleanupRules, includesLogs: true) { key, value in
@@ -83,12 +154,14 @@ struct EnvironmentPreferencesView: View {
                 if model.snapshot.preferencesByEnvironment?[environmentID]?.automaticSettlement != nil {
                     Section {
                         Picker("New threads", selection: Binding(
-                            get: { settings.defaultThreadEnvMode.rawValue },
-                            set: { save(.defaultThreadEnvMode($0 == "worktree" ? .worktree : .local)) }
+                            get: { settings.defaultThreadEnvMode },
+                            set: { save(.defaultThreadEnvMode($0)) }
                         )) {
-                            Text("Local workspace").tag("local")
-                            Text("New worktree").tag("worktree")
+                            Text("Inherit from project").tag(nil as ServerThreadEnvironmentMode?)
+                            Text("Local workspace").tag(ServerThreadEnvironmentMode.local as ServerThreadEnvironmentMode?)
+                            Text("New worktree").tag(ServerThreadEnvironmentMode.worktree as ServerThreadEnvironmentMode?)
                         }
+                        .accessibilityIdentifier("environment-default-workspace")
                         Toggle("Start worktrees from origin", isOn: Binding(
                             get: { settings.newWorktreesStartFromOrigin },
                             set: { save(.newWorktreesStartFromOrigin($0)) }

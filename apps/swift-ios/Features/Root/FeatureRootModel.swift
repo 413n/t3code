@@ -47,6 +47,7 @@ public final class FeatureRootModel {
     }
 
     public private(set) var snapshot = FeatureSnapshot()
+    @ObservationIgnored private(set) var inboxReturns = FeatureInboxReturnTracker()
     /// Why the last `startTask` returned nil, for the sheet that made the request.
     public private(set) var lastTaskStartError: String?
     private(set) var pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation] = [:]
@@ -89,6 +90,11 @@ public final class FeatureRootModel {
         client: client,
         draftStore: draftStore
     )
+    public private(set) var submissionRecoveryDrafts: [FeatureSubmissionRecoveryDraft] = []
+    public private(set) var recoveringSubmissionIDs: Set<String> = []
+    private var dispatchingSubmissionIDs: Set<String> = []
+    private var editingPendingSubmissionIDs: Set<String> = []
+    private var pendingRecoveryReasons: [String: String] = [:]
     private var pendingSubmissionsByID: [String: FeatureQueuedSubmission] = [:]
     private var activeSubmissionCounts: [String: Int] = [:]
     private var pendingThreadsByID: [String: FeatureThread] = [:]
@@ -410,7 +416,8 @@ public final class FeatureRootModel {
                 workspaceMode: request.workspaceMode,
                 branch: request.branch,
                 worktreePath: request.worktreePath,
-                startFromOrigin: request.startFromOrigin
+                startFromOrigin: request.startFromOrigin,
+                draftKey: FeatureComposerDraftStore.newTaskKey(project: project, in: snapshot)
             ),
             context: request.context
         )
@@ -424,8 +431,8 @@ public final class FeatureRootModel {
                 projectID: request.projectID,
                 prompt: prompt,
                 selection: request.selection,
-                runtimeMode: request.runtimeMode,
-                interactionMode: request.interactionMode.mobileNormalized,
+                runtimeMode: queued.runtimeMode,
+                interactionMode: queued.interactionMode,
                 workspaceMode: request.workspaceMode,
                 branch: request.branch,
                 worktreePath: request.worktreePath,
@@ -594,7 +601,8 @@ public final class FeatureRootModel {
             connectedEnvironmentIDs: Set(snapshot.environments.filter {
                 $0.isEnabled && $0.connectionState == .connected
             }.map(\.id)),
-            now: .now
+            now: .now,
+            workingShelfEnabled: snapshot.settings.workingShelfEnabled
         )
     }
 
@@ -636,6 +644,7 @@ public final class FeatureRootModel {
         section: FeatureThreadOrderSection,
         orderedIDs: [String]
     ) async -> Bool {
+        guard section != .active || !snapshot.settings.workingShelfEnabled else { return false }
         let environment = currentEnvironmentIdentity
         do {
             let assignments = try await client.reorderThread(
@@ -795,6 +804,17 @@ public final class FeatureRootModel {
         }
     }
 
+    func prepareRelatedThread(id: String, from threadID: String) async throws {
+        guard let navigator = client as? any FeatureThreadNavigating else {
+            throw FeatureCapabilityUnavailable("Related threads")
+        }
+        let environment = currentEnvironmentIdentity
+        let detail = try await navigator.loadRelatedThread(id: id, from: threadID)
+        guard environment == currentEnvironmentIdentity else { throw CancellationError() }
+        store(detail)
+        upsert(detail.thread)
+    }
+
     public func loadEarlierTurns(for id: String) async {
         guard details[id]?.page?.hasMore == true,
               details[id]?.page?.isLoading != true else { return }
@@ -843,8 +863,8 @@ public final class FeatureRootModel {
             threadID: submission.threadID,
             text: trimmed,
             selection: submission.selection,
-            runtimeMode: thread.runtimeMode,
-            interactionMode: thread.interactionMode,
+            runtimeMode: submission.runtimeMode ?? thread.runtimeMode,
+            interactionMode: submission.interactionMode ?? thread.interactionMode,
             attachments: uploads,
             context: submission.context,
             delivery: submission.delivery
@@ -887,6 +907,7 @@ public final class FeatureRootModel {
                 text: trimmed,
                 selection: submission.selection,
                 runtimeMode: queued.runtimeMode,
+                interactionMode: queued.interactionMode,
                 attachments: uploads,
                 identity: identity,
                 context: submission.context,
@@ -910,6 +931,96 @@ public final class FeatureRootModel {
             if discarded, !Self.isBenignCancellation(error) {
                 errorMessage = error.localizedDescription
             }
+            return false
+        }
+    }
+
+    public func canEditPendingSubmission(threadID: String, messageID: String) -> Bool {
+        guard let submission = pendingSubmissionsByID.values.first(where: {
+            $0.threadID == threadID && $0.identity.messageID == messageID && $0.creation == nil
+        }),
+              activeSubmissionCounts[threadID, default: 0] == 0,
+              !dispatchingSubmissionIDs.contains(submission.id),
+              !editingPendingSubmissionIDs.contains(submission.id),
+              !pendingCompletionSubmissionIDs.contains(submission.id),
+              !pendingDiscardSubmissionIDs.contains(submission.id),
+              pendingRecoveryReasons[submission.id] == nil else { return false }
+        let detail = details[threadID]
+        return detail?.messages.contains(where: { $0.id == messageID && $0.state != .queued }) != true
+            && detail?.execution?.queuedEntries.contains(where: { $0.messageID == messageID }) != true
+    }
+
+    /// Take delivery ownership before the first suspension. The drain checks
+    /// this claim, and an already active send cannot be taken back.
+    public func editPendingSubmission(
+        threadID: String, messageID: String, draft: FeatureComposerDraft
+    ) async -> FeatureComposerDraft? {
+        guard canEditPendingSubmission(threadID: threadID, messageID: messageID),
+              let submission = pendingSubmissionsByID.values.first(where: {
+                  $0.threadID == threadID && $0.identity.messageID == messageID
+              }),
+              let thread = details[threadID]?.thread ?? snapshot.threads.first(where: { $0.id == threadID }) else {
+            return nil
+        }
+        editingPendingSubmissionIDs.insert(submission.id)
+        defer {
+            editingPendingSubmissionIDs.remove(submission.id)
+            scheduleOutboxDrain()
+        }
+        guard await recoverQueuedSubmission(submission, reason: nil) else { return nil }
+        return await recoverSubmission(
+            id: submission.id, draftKey: FeatureComposerDraftStore.threadKey(thread), draft: draft
+        )
+    }
+
+    /// Views flush their live draft and suspend editing while awaiting this
+    /// transfer. A failed merge leaves the recovery action available.
+    public func recoverSubmission(
+        id: String, draftKey: String, draft: FeatureComposerDraft? = nil, environmentID: String? = nil
+    ) async -> FeatureComposerDraft? {
+        guard let recovery = submissionRecoveryDrafts.first(where: { $0.id == id }),
+              recoveringSubmissionIDs.insert(id).inserted else { return nil }
+        defer { recoveringSubmissionIDs.remove(id) }
+        do {
+            if let draft { try await draftStore.setDraft(draft, for: draftKey) }
+            let result = try await draftStore.restoreSubmission(recovery, for: draftKey)
+            let restored = result.draft
+            if let warning = result.warning { errorMessage = warning }
+            attachmentUploads.syncOwner(
+                draftKey: draftKey, environmentID: environmentID ?? recovery.environmentID,
+                attachments: restored.attachments
+            )
+            // The import ledger makes this safe to retry if cleanup fails or
+            // the app exits between the composer write and this removal.
+            do {
+                try await outboxStore.removeRecovery(id: id)
+                submissionRecoveryDrafts.removeAll { $0.id == id }
+                attachmentUploads.removeOutboxOwner(ownerID: "recovery:" + id)
+            } catch {
+                errorMessage = [result.warning,
+                    "The draft was restored, but its recovery copy could not be cleared: \(error.localizedDescription)"
+                ].compactMap { $0 }.joined(separator: "\n")
+            }
+            return restored
+        } catch {
+            errorMessage = "Could not restore this message: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    @discardableResult
+    public func discardSubmissionRecovery(id: String) async -> Bool {
+        guard submissionRecoveryDrafts.contains(where: { $0.id == id }),
+              recoveringSubmissionIDs.insert(id).inserted else { return false }
+        defer { recoveringSubmissionIDs.remove(id) }
+        do {
+            let retainedFiles = try await draftStore.ownedAttachmentFileNames()
+            try await outboxStore.discardRecovery(id: id, preservingOwnedFileNames: retainedFiles)
+            submissionRecoveryDrafts.removeAll { $0.id == id }
+            attachmentUploads.removeOutboxOwner(ownerID: "recovery:" + id)
+            return true
+        } catch {
+            errorMessage = "Could not discard this saved message: \(error.localizedDescription)"
             return false
         }
     }
@@ -1114,6 +1225,7 @@ public final class FeatureRootModel {
     @discardableResult
     public func saveSettings(_ settings: FeatureSettings) async -> Bool {
         snapshot.settings = settings
+        observeInboxReturns()
         settingsChangeRevision &+= 1
         let revision = settingsChangeRevision
         let saved = await perform {
@@ -1121,6 +1233,7 @@ public final class FeatureRootModel {
         }
         if !saved, settingsChangeRevision == revision {
             snapshot.settings = lastPersistedSettings
+            observeInboxReturns()
         }
         return saved
     }
@@ -1177,6 +1290,7 @@ public final class FeatureRootModel {
         change(&updated)
         guard updated != previous else { return true }
         snapshot.settings = updated
+        observeInboxReturns()
         settingsChangeRevision &+= 1
         let revision = settingsChangeRevision
 
@@ -1186,6 +1300,7 @@ public final class FeatureRootModel {
         } catch {
             guard settingsChangeRevision == revision else { return false }
             snapshot.settings = lastPersistedSettings
+            observeInboxReturns()
             if !Self.isBenignCancellation(error) {
                 errorMessage = error.localizedDescription
             }
@@ -1295,8 +1410,32 @@ public final class FeatureRootModel {
         }
     }
 
+    private func applyingLocalMessageVisibility(_ thread: FeatureThread) -> FeatureThread {
+        var thread = thread
+        let hasPending = pendingSubmissionsByID.values.contains {
+            $0.threadID == thread.id && !pendingCompletionSubmissionIDs.contains($0.id)
+        }
+        // Leave untouched server rows unchanged; clear a previously set local flag.
+        thread.hasPendingLocalMessages = hasPending ? true : thread.hasPendingLocalMessages.map { _ in false }
+        return thread
+    }
+
+    private func refreshPendingMessageVisibility() {
+        for thread in snapshot.threads {
+            let next = applyingLocalMessageVisibility(thread)
+            if next.hasPendingLocalMessages != thread.hasPendingLocalMessages { upsert(next) }
+        }
+        for id in Array(details.keys) {
+            guard let thread = details[id]?.thread else { continue }
+            let next = applyingLocalMessageVisibility(thread)
+            if next.hasPendingLocalMessages != thread.hasPendingLocalMessages {
+                mutateDetail(id: id) { $0.thread.hasPendingLocalMessages = next.hasPendingLocalMessages }
+            }
+        }
+    }
+
     private func upsert(_ thread: FeatureThread) {
-        let thread = retainingPendingSettlement(in: thread)
+        let thread = applyingLocalMessageVisibility(retainingPendingSettlement(in: thread))
         discardStalePullRequest(for: thread)
         var metadataChanged = false
         var orderChanged = false
@@ -1321,6 +1460,7 @@ public final class FeatureRootModel {
             threadRowRevision &+= 1
         }
         if orderChanged {
+            observeInboxReturns()
             homePresentationRevision &+= 1
         }
         let detailChanged = mutateDetail(
@@ -1339,6 +1479,7 @@ public final class FeatureRootModel {
         guard let index = snapshot.threads.firstIndex(where: { $0.id == id }) else { return }
         let projectID = snapshot.threads[index].projectID
         snapshot.threads.remove(at: index)
+        observeInboxReturns()
         pullRequestsByThreadID.removeValue(forKey: id)
         pullRequestObservationIdentities.removeValue(forKey: id)
         adjustProjectCount(id: projectID, by: -1)
@@ -1367,14 +1508,14 @@ public final class FeatureRootModel {
             lastPersistedSettings = value.settings
         }
         for index in value.threads.indices {
-            value.threads[index] = retainingPendingSettlement(in: value.threads[index])
+            value.threads[index] = applyingLocalMessageVisibility(retainingPendingSettlement(in: value.threads[index]))
         }
         let authoritativeThreadIDs = Set(value.threads.map(\.id))
         for id in authoritativeThreadIDs {
             pendingThreadsByID.removeValue(forKey: id)
         }
         for pending in pendingThreadsByID.values where !authoritativeThreadIDs.contains(pending.id) {
-            value.threads.append(pending)
+            value.threads.append(applyingLocalMessageVisibility(pending))
             if let index = value.projects.firstIndex(where: { $0.id == pending.projectID }) {
                 value.projects[index].threadCount += 1
             }
@@ -1427,9 +1568,16 @@ public final class FeatureRootModel {
             threadRowRevision &+= 1
         }
         snapshot = value
+        observeInboxReturns()
         if value.connection.state == .connected
             || value.environments.contains(where: { $0.connectionState == .connected }) {
             scheduleOutboxDrain()
+        }
+    }
+
+    private func observeInboxReturns() {
+        if inboxReturns.observe(snapshot.settings.workingShelfEnabled ? snapshot.threads : nil) {
+            homePresentationRevision &+= 1
         }
     }
 
@@ -1452,6 +1600,7 @@ public final class FeatureRootModel {
             mutation(&snapshot.threads[index])
             if snapshot.threads[index] != previous {
                 metadataChanged = true
+                observeInboxReturns()
                 threadRowRevision &+= 1
                 homePresentationRevision &+= 1
             }
@@ -1473,7 +1622,7 @@ public final class FeatureRootModel {
         invalidatesInFlightLoad: Bool = true
     ) {
         var incoming = retainingLocalAttachmentPreviews(in: incoming)
-        incoming.thread = retainingPendingSettlement(in: incoming.thread)
+        incoming.thread = applyingLocalMessageVisibility(retainingPendingSettlement(in: incoming.thread))
         let id = incoming.thread.id
         acknowledgeDeliveredMessages(incoming)
         let prepared = addingPendingMessages(to: incoming)
@@ -1487,7 +1636,10 @@ public final class FeatureRootModel {
                 activeSubagentCount: prepared.activeSubagentCount,
                 backgroundWorkIsActive: prepared.backgroundWorkIsActive,
                 isCompacting: prepared.isCompacting == true,
-                execution: prepared.execution
+                execution: prepared.execution,
+                workflows: prepared.workflows,
+                allowsProviderSwitch: prepared.allowsProviderSwitch,
+                recovery: prepared.recovery
             )
         } ?? prepared
         guard details[id] != next else { return }
@@ -1501,7 +1653,7 @@ public final class FeatureRootModel {
 
     private func store(_ incoming: FeatureThreadDetail, delta: FeatureDetailDelta) {
         var incoming = retainingLocalAttachmentPreviews(in: incoming)
-        incoming.thread = retainingPendingSettlement(in: incoming.thread)
+        incoming.thread = applyingLocalMessageVisibility(retainingPendingSettlement(in: incoming.thread))
         let id = incoming.thread.id
         acknowledgeDeliveredMessages(incoming)
         let next = addingPendingMessages(to: incoming)
@@ -1623,9 +1775,14 @@ public final class FeatureRootModel {
     }
 
     private func restoreOutbox() async {
+        defer { refreshPendingMessageVisibility() }
         let submissions: [FeatureQueuedSubmission]
         do {
             submissions = try await outboxStore.submissions()
+            submissionRecoveryDrafts = try await outboxStore.recoveryDrafts()
+            for recovery in submissionRecoveryDrafts {
+                setAttachmentRecoveryOwnership(for: recovery)
+            }
         } catch {
             errorMessage = "Could not restore queued messages: \(error.localizedDescription)"
             return
@@ -1645,7 +1802,7 @@ public final class FeatureRootModel {
                     $0.id == creation.projectID && $0.environmentID == submission.environmentID
                 }) else {
                     if isEnvironmentConnected(submission.environmentID) {
-                        await discardRestoredSubmission(submission)
+                        await recoverRestoredSubmission(submission)
                     } else {
                         pendingSubmissionsByID[submission.id] = submission
                     }
@@ -1660,7 +1817,7 @@ public final class FeatureRootModel {
                 if pendingThreadsByID[submission.threadID] != nil {
                     pendingSubmissionsByID[submission.id] = submission
                 } else if isEnvironmentConnected(submission.environmentID) {
-                    await discardRestoredSubmission(submission)
+                    await recoverRestoredSubmission(submission)
                 } else {
                     pendingSubmissionsByID[submission.id] = submission
                 }
@@ -1673,15 +1830,22 @@ public final class FeatureRootModel {
         }
     }
 
-    private func discardRestoredSubmission(_ submission: FeatureQueuedSubmission) async {
+    private func recoverRestoredSubmission(_ submission: FeatureQueuedSubmission) async {
         pendingSubmissionsByID[submission.id] = submission
-        await discardQueuedSubmission(submission)
+        await recoverQueuedSubmission(submission, reason: unavailableSubmissionReason(submission))
+    }
+
+    private func unavailableSubmissionReason(_ submission: FeatureQueuedSubmission) -> String {
+        submission.creation == nil
+            ? "The conversation is no longer available. Your message is saved for recovery."
+            : "The project is no longer available. Your task is saved for recovery."
     }
 
     private func enqueue(_ submission: FeatureQueuedSubmission) async -> Bool {
         do {
             try await outboxStore.enqueue(submission)
             pendingSubmissionsByID[submission.id] = submission
+            refreshPendingMessageVisibility()
             setAttachmentOutboxOwnership(true, for: submission)
             return true
         } catch {
@@ -1831,6 +1995,7 @@ public final class FeatureRootModel {
     private func scheduleQueuedSubmissionCompletion(_ submission: FeatureQueuedSubmission) {
         guard pendingCompletionSubmissionIDs.insert(submission.id).inserted else { return }
         pendingDiscardSubmissionIDs.remove(submission.id)
+        refreshPendingMessageVisibility()
         Task { @MainActor [weak self] in
             guard let self else { return }
             if !(await self.completeQueuedSubmission(submission)) {
@@ -1843,6 +2008,7 @@ public final class FeatureRootModel {
     private func completeQueuedSubmission(_ submission: FeatureQueuedSubmission) async -> Bool {
         pendingCompletionSubmissionIDs.insert(submission.id)
         pendingDiscardSubmissionIDs.remove(submission.id)
+        refreshPendingMessageVisibility()
         // Server acceptance is independent of clearing its local durable copy.
         markQueuedMessageDelivered(submission)
         do {
@@ -1853,6 +2019,7 @@ public final class FeatureRootModel {
         }
         pendingCompletionSubmissionIDs.remove(submission.id)
         pendingSubmissionsByID.removeValue(forKey: submission.id)
+        refreshPendingMessageVisibility()
         setAttachmentOutboxOwnership(false, for: submission)
         pendingThreadsByID.removeValue(forKey: submission.threadID)
         outboxRetryAttempt = 0
@@ -1895,6 +2062,7 @@ public final class FeatureRootModel {
         }
         pendingDiscardSubmissionIDs.remove(submission.id)
         pendingSubmissionsByID.removeValue(forKey: submission.id)
+        refreshPendingMessageVisibility()
         setAttachmentOutboxOwnership(false, for: submission)
         let wasPendingCreation = pendingThreadsByID.removeValue(forKey: submission.threadID) != nil
         if wasPendingCreation {
@@ -1906,6 +2074,45 @@ public final class FeatureRootModel {
             }
         }
         return true
+    }
+
+    @discardableResult
+    private func recoverQueuedSubmission(_ submission: FeatureQueuedSubmission, reason: String?) async -> Bool {
+        if let reason { pendingRecoveryReasons[submission.id] = reason }
+        do {
+            guard let recovery = try await outboxStore.recover(id: submission.id, reason: reason) else {
+                return false
+            }
+            setAttachmentRecoveryOwnership(for: recovery)
+            if !submissionRecoveryDrafts.contains(where: { $0.id == recovery.id }) {
+                submissionRecoveryDrafts.append(recovery)
+            }
+            pendingSubmissionsByID.removeValue(forKey: submission.id)
+            refreshPendingMessageVisibility()
+            pendingRecoveryReasons.removeValue(forKey: submission.id)
+            setAttachmentOutboxOwnership(false, for: submission)
+            if pendingThreadsByID.removeValue(forKey: submission.threadID) != nil {
+                removeThread(id: submission.threadID)
+                removeDetail(id: submission.threadID)
+            } else {
+                mutateDetail(id: submission.threadID) {
+                    $0.messages.removeAll { $0.id == submission.identity.messageID && $0.state == .queued }
+                }
+            }
+            if let reason { errorMessage = reason }
+            return true
+        } catch {
+            errorMessage = "Could not save the recovery draft. The queued message is kept: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func setAttachmentRecoveryOwnership(for recovery: FeatureSubmissionRecoveryDraft) {
+        attachmentUploads.syncOutboxOwner(
+            ownerID: "recovery:" + recovery.id,
+            environmentID: recovery.environmentID,
+            attachmentIDs: recovery.submission.attachments.map(\.id)
+        )
     }
 
     private func setAttachmentOutboxOwnership(
@@ -1924,10 +2131,16 @@ public final class FeatureRootModel {
     }
 
     private func removePendingSubmissions(environmentID: String) {
+        defer { refreshPendingMessageVisibility() }
+        for recovery in submissionRecoveryDrafts where recovery.environmentID == environmentID {
+            attachmentUploads.removeOutboxOwner(ownerID: "recovery:" + recovery.id)
+        }
+        submissionRecoveryDrafts.removeAll { $0.environmentID == environmentID }
         let removed = pendingSubmissionsByID.values.filter {
             $0.environmentID == environmentID
         }
         for submission in removed {
+            pendingRecoveryReasons.removeValue(forKey: submission.id)
             pendingCompletionSubmissionIDs.remove(submission.id)
             pendingDiscardSubmissionIDs.remove(submission.id)
             pendingSubmissionsByID.removeValue(forKey: submission.id)
@@ -1992,6 +2205,11 @@ public final class FeatureRootModel {
         var needsRetry = false
         for submission in submissions where pendingSubmissionsByID[submission.id] != nil {
             guard !Task.isCancelled, outboxGeneration == generation else { return false }
+            if editingPendingSubmissionIDs.contains(submission.id)
+                || activeSubmissionCounts[submission.threadID, default: 0] > 0 {
+                needsRetry = true
+                continue
+            }
             if pendingCompletionSubmissionIDs.contains(submission.id) {
                 if !(await completeQueuedSubmission(submission)) {
                     needsRetry = true
@@ -2002,6 +2220,10 @@ public final class FeatureRootModel {
                 if !(await discardQueuedSubmission(submission)) {
                     needsRetry = true
                 }
+                continue
+            }
+            if let reason = pendingRecoveryReasons[submission.id] {
+                if !(await recoverQueuedSubmission(submission, reason: reason)) { needsRetry = true }
                 continue
             }
             var policySnapshot = snapshot
@@ -2018,7 +2240,7 @@ public final class FeatureRootModel {
                 )
             ) {
             case .discard:
-                if !(await discardQueuedSubmission(submission)) {
+                if !(await recoverQueuedSubmission(submission, reason: unavailableSubmissionReason(submission))) {
                     needsRetry = true
                 }
             case .wait:
@@ -2026,6 +2248,8 @@ public final class FeatureRootModel {
                 // Avoid a permanent timer while the owning device is offline.
                 continue
             case .send:
+                dispatchingSubmissionIDs.insert(submission.id)
+                defer { dispatchingSubmissionIDs.remove(submission.id) }
                 do {
                     guard pendingSubmissionsByID[submission.id] != nil,
                           snapshot.environments.contains(where: {
@@ -2033,6 +2257,7 @@ public final class FeatureRootModel {
                           }) else {
                         continue
                     }
+                    let uploads = try submission.validatedUploads()
                     if let creation = submission.creation {
                         let thread = try await client.createThreadAndSend(
                             projectID: creation.projectID,
@@ -2044,7 +2269,7 @@ public final class FeatureRootModel {
                             branch: creation.branch,
                             worktreePath: creation.worktreePath,
                             startFromOrigin: creation.startFromOrigin,
-                            attachments: submission.uploads,
+                            attachments: uploads,
                             identity: submission.identity,
                             context: submission.context
                         )
@@ -2064,7 +2289,8 @@ public final class FeatureRootModel {
                             text: submission.text,
                             selection: submission.selection,
                             runtimeMode: submission.runtimeMode,
-                            attachments: submission.uploads,
+                            interactionMode: submission.interactionMode,
+                            attachments: uploads,
                             identity: submission.identity,
                             context: submission.context,
                             delivery: submission.delivery
@@ -2083,10 +2309,8 @@ public final class FeatureRootModel {
                     ) {
                         needsRetry = true
                     } else {
-                        if !(await discardQueuedSubmission(submission)) {
+                        if !(await recoverQueuedSubmission(submission, reason: error.localizedDescription)) {
                             needsRetry = true
-                        } else {
-                            errorMessage = error.localizedDescription
                         }
                     }
                 }
@@ -2103,8 +2327,8 @@ public final class FeatureRootModel {
     }
 
     /// Only transport failures keep a submission queued. A server that
-    /// answered and rejected the command is final, so the message is dropped
-    /// and the error shown. Matching on error text queued permanent failures
+    /// answered and rejected the command is final, so input moves to recovery
+    /// and the error is shown. Matching on error text queued permanent failures
     /// (a provider "connection refused", a validation error mentioning
     /// "network") and retried them forever.
     static func shouldQueue(
@@ -2116,7 +2340,7 @@ public final class FeatureRootModel {
         if let rpcError = error as? RPCError {
             switch rpcError {
             case .responseTimedOut, .connectionUnavailable, .disconnected: return true
-            case .remote, .protocolViolation: break
+            case .remote, .remoteDefect, .protocolViolation: break
             }
         }
         if let httpError = error as? HTTPError {

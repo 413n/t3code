@@ -1,6 +1,7 @@
 import SwiftUI
 
 public struct ProviderModelPicker: View {
+    @SwiftUI.Environment(\.featureThreadPresentationDismissal) private var presentationDismissal
     public enum Style {
         case row
         case compact
@@ -13,10 +14,13 @@ public struct ProviderModelPicker: View {
     let isLoading: Bool
     let threadSelection: FeatureSelection?
     let materializesDefaultSelection: Bool
+    let allowProviderSwitch: Bool
     private let onPresentationChange: ((Bool) -> Void)?
     private let onRefresh: (@MainActor () async throws -> Void)?
 
     @State private var isPresented = false
+    @State private var presentationID = UUID()
+    @State private var sheetContentAppeared = false
     @State private var preservesSelectionDuringRefresh = false
 
     public init(
@@ -26,6 +30,7 @@ public struct ProviderModelPicker: View {
         isLoading: Bool = false,
         threadSelection: FeatureSelection? = nil,
         materializesDefaultSelection: Bool = true,
+        allowProviderSwitch: Bool = false,
         onRefresh: (@MainActor () async throws -> Void)? = nil,
         onPresentationChange: ((Bool) -> Void)? = nil
     ) {
@@ -36,12 +41,14 @@ public struct ProviderModelPicker: View {
         self.isLoading = isLoading
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
+        self.allowProviderSwitch = allowProviderSwitch
         self.onRefresh = onRefresh
         self.onPresentationChange = onPresentationChange
     }
 
     public var body: some View {
         Button {
+            guard presentationDismissal.requestID == nil else { return }
             onPresentationChange?(true)
             isPresented = true
         } label: {
@@ -87,13 +94,18 @@ public struct ProviderModelPicker: View {
         .accessibilityLabel("Choose model")
         .accessibilityValue(selectionLabel)
         .accessibilityIdentifier("model-picker")
-        .sheet(isPresented: $isPresented, onDismiss: { onPresentationChange?(false) }) {
+        .sheet(isPresented: $isPresented, onDismiss: {
+            sheetContentAppeared = false
+            onPresentationChange?(false)
+            presentationDismissal.onPresentationChange(presentationID, false)
+        }) {
             ModelPickerSheet(
                 providers: normalizedProviders,
                 selection: $selection,
                 isLoading: isLoading,
                 threadSelection: threadSelection,
                 materializesDefaultSelection: materializesDefaultSelection,
+                allowProviderSwitch: allowProviderSwitch,
                 onRefresh: onRefresh.map { refresh in
                     {
                         preservesSelectionDuringRefresh = true
@@ -102,6 +114,18 @@ public struct ProviderModelPicker: View {
                     }
                 }
             )
+            .onAppear {
+                sheetContentAppeared = true
+                presentationDismissal.onPresentationChange(presentationID, true)
+                if presentationDismissal.requestID != nil { isPresented = false }
+            }
+        }
+        .onChange(of: presentationDismissal.requestID, initial: true) { _, requestID in
+            guard requestID != nil else { return }
+            isPresented = false
+            // A request can cancel the sheet before SwiftUI creates its content.
+            // Only visible content registers with the thread dismissal token.
+            if !sheetContentAppeared { onPresentationChange?(false) }
         }
         .onAppear(perform: materializeSelection)
         .onChange(of: providers) {
@@ -128,7 +152,8 @@ public struct ProviderModelPicker: View {
         return ThreadComposerModelSelectionPolicy.resolvedSelection(
             explicit: selection,
             inherited: threadSelection,
-            providers: normalizedProviders
+            providers: normalizedProviders,
+            allowProviderSwitch: allowProviderSwitch
         )
     }
 
@@ -136,11 +161,7 @@ public struct ProviderModelPicker: View {
         guard !normalizedProviders.isEmpty else { return }
         let resolved = materializesDefaultSelection
             ? ProviderModelSelectionResolver.materialized(selection, in: normalizedProviders)
-            : ThreadComposerModelSelectionPolicy.explicitSelection(
-                selection,
-                inherited: threadSelection,
-                providers: normalizedProviders
-            )
+            : ThreadComposerModelSelectionPolicy.preservedSelection(selection, providers: normalizedProviders)
         guard selection != resolved else { return }
         selection = resolved
     }
@@ -168,6 +189,7 @@ public struct ProviderModelPicker: View {
     }
 
     private var unavailableSelectionLabel: String {
+        if let resolvedSelection { return resolvedSelection.modelID }
         if isLoading { return "Loading models" }
         if normalizedProviders.isEmpty { return "No providers" }
         if !normalizedProviders.contains(where: \.isAvailable) { return "Providers offline" }
@@ -203,6 +225,7 @@ private struct ModelPickerSheet: View {
     let isLoading: Bool
     let threadSelection: FeatureSelection?
     let materializesDefaultSelection: Bool
+    let allowProviderSwitch: Bool
     let onRefresh: (@MainActor () async throws -> Void)?
 
     @AppStorage("swift-ios.model-picker.favorites") private var favoriteStorage = ""
@@ -224,6 +247,7 @@ private struct ModelPickerSheet: View {
         isLoading: Bool,
         threadSelection: FeatureSelection?,
         materializesDefaultSelection: Bool,
+        allowProviderSwitch: Bool,
         onRefresh: (@MainActor () async throws -> Void)?
     ) {
         self.providers = providers
@@ -231,12 +255,14 @@ private struct ModelPickerSheet: View {
         self.isLoading = isLoading
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
+        self.allowProviderSwitch = allowProviderSwitch
         self.onRefresh = onRefresh
         let initialSelection = Self.effectiveSelection(
             explicit: selection.wrappedValue,
             inherited: threadSelection,
             providers: providers,
-            materializesDefaultSelection: materializesDefaultSelection
+            materializesDefaultSelection: materializesDefaultSelection,
+            allowProviderSwitch: allowProviderSwitch
         )
         _draftSelection = State(initialValue: initialSelection)
         _draftBaseSelection = State(initialValue: initialSelection)
@@ -777,7 +803,7 @@ private struct ModelPickerSheet: View {
         ThreadComposerModelSelectionPolicy.pickerProviders(
             providers,
             inherited: threadSelection,
-            allowsProviderChange: materializesDefaultSelection
+            allowsProviderChange: allowProviderSwitch
         )
     }
 
@@ -790,7 +816,8 @@ private struct ModelPickerSheet: View {
             explicit: selection,
             inherited: threadSelection,
             providers: providers,
-            materializesDefaultSelection: materializesDefaultSelection
+            materializesDefaultSelection: materializesDefaultSelection,
+            allowProviderSwitch: allowProviderSwitch
         )
     }
 
@@ -821,7 +848,7 @@ private struct ModelPickerSheet: View {
             draftSelection,
             providers: providers,
             inheriting: threadSelection,
-            allowsProviderChange: materializesDefaultSelection
+            allowsProviderChange: allowProviderSwitch
         ) else {
             replaceDraft(with: committedSelection)
             return
@@ -846,7 +873,7 @@ private struct ModelPickerSheet: View {
             draft: draftSelection,
             providers: providers,
             inheriting: threadSelection,
-            allowsProviderChange: materializesDefaultSelection
+            allowsProviderChange: allowProviderSwitch
         ) else {
             replaceDraft(with: committed)
             return
@@ -895,7 +922,7 @@ private struct ModelPickerSheet: View {
 
     private func isLocked(_ option: DailyUXModelOption) -> Bool {
         guard let threadSelection else { return false }
-        if option.provider.id != threadSelection.providerID { return true }
+        if option.provider.id != threadSelection.providerID { return !allowProviderSwitch }
         return modelChangesAreLocked && option.model.id != threadSelection.modelID
     }
 
@@ -913,7 +940,8 @@ private struct ModelPickerSheet: View {
         explicit: FeatureSelection?,
         inherited: FeatureSelection?,
         providers: [FeatureProvider],
-        materializesDefaultSelection: Bool
+        materializesDefaultSelection: Bool,
+        allowProviderSwitch: Bool
     ) -> FeatureSelection? {
         if materializesDefaultSelection {
             return ProviderModelSelectionResolver.materialized(explicit, in: providers)
@@ -921,7 +949,8 @@ private struct ModelPickerSheet: View {
         return ThreadComposerModelSelectionPolicy.resolvedSelection(
             explicit: explicit,
             inherited: inherited,
-            providers: providers
+            providers: providers,
+            allowProviderSwitch: allowProviderSwitch
         )
     }
 }
@@ -963,11 +992,11 @@ enum ProviderModelDraftPolicy {
         if !allowsProviderChange {
             guard let inherited else { return nil }
             guard validated.providerID == inherited.providerID else { return nil }
-            let inheritedProvider = providers.first { $0.id == inherited.providerID }
-            if inheritedProvider?.requiresNewThreadForModelChange == true,
-               validated.modelID != inherited.modelID {
-                return nil
-            }
+        }
+        if let inherited, validated.providerID == inherited.providerID,
+           providers.first(where: { $0.id == inherited.providerID })?.requiresNewThreadForModelChange == true,
+           validated.modelID != inherited.modelID {
+            return nil
         }
         return validated
     }
@@ -1123,22 +1152,29 @@ enum ThreadComposerModelSelectionPolicy {
     static func resolvedSelection(
         explicit: FeatureSelection?,
         inherited: FeatureSelection?,
-        providers: [FeatureProvider]
+        providers: [FeatureProvider],
+        allowProviderSwitch: Bool = false
     ) -> FeatureSelection? {
-        explicitSelection(explicit, inherited: inherited, providers: providers)
-            ?? preservedSelection(inherited, providers: providers)
+        // A saved override is user input. A temporary capability change may
+        // block sending it, but must not replace its display or stored value.
+        preservedSelection(explicit ?? inherited, providers: providers)
     }
 
     static func explicitSelection(
         _ explicit: FeatureSelection?,
         inherited: FeatureSelection?,
-        providers: [FeatureProvider]
+        providers: [FeatureProvider],
+        allowProviderSwitch: Bool = false
     ) -> FeatureSelection? {
-        guard let explicit, let inherited else { return nil }
-        guard explicit.providerID == inherited.providerID else { return nil }
-        let inheritedProvider = providers.first { $0.id == inherited.providerID }
-        if inheritedProvider?.requiresNewThreadForModelChange == true,
-           explicit.modelID != inherited.modelID {
+        guard let explicit else { return nil }
+        if let inherited {
+            guard allowProviderSwitch || explicit.providerID == inherited.providerID else { return nil }
+            if explicit.providerID == inherited.providerID,
+               providers.first(where: { $0.id == inherited.providerID })?.requiresNewThreadForModelChange == true,
+               explicit.modelID != inherited.modelID {
+                return nil
+            }
+        } else if !allowProviderSwitch {
             return nil
         }
 
@@ -1150,7 +1186,7 @@ enum ThreadComposerModelSelectionPolicy {
             ?? explicit
     }
 
-    private static func preservedSelection(
+    static func preservedSelection(
         _ selection: FeatureSelection?,
         providers: [FeatureProvider]
     ) -> FeatureSelection? {

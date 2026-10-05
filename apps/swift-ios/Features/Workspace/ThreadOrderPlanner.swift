@@ -10,10 +10,14 @@ enum ThreadOrderPlanner {
 
     /// Whether the thread's environment accepts `thread.pin.reorder` /
     /// `thread.active.reorder` writes for this section.
-    static func isWritable(_ thread: FeatureThread, section: FeatureThreadOrderSection) -> Bool {
+    static func isWritable(
+        _ thread: FeatureThread,
+        section: FeatureThreadOrderSection,
+        workingShelfEnabled: Bool = false
+    ) -> Bool {
         switch section {
         case .pinned: thread.supportsPinReorder == true
-        case .active: thread.supportsActiveReorder == true
+        case .active: !workingShelfEnabled && thread.supportsActiveReorder == true
         }
     }
 
@@ -112,12 +116,14 @@ enum ThreadOrderPlanner {
         all: [FeatureThread],
         section: FeatureThreadOrderSection,
         connectedEnvironmentIDs: Set<String>,
-        movedID: String
+        movedID: String,
+        workingShelfEnabled: Bool = false
     ) -> [FeatureThreadOrderAssignment]? {
         let writableIDs = writableIDs(
             in: ordered,
             section: section,
-            connectedEnvironmentIDs: connectedEnvironmentIDs
+            connectedEnvironmentIDs: connectedEnvironmentIDs,
+            workingShelfEnabled: workingShelfEnabled
         )
         guard writableIDs.contains(movedID) else { return nil }
         let assignments = planReorder(
@@ -145,12 +151,13 @@ enum ThreadOrderPlanner {
     private static func writableIDs(
         in ordered: [FeatureThread],
         section: FeatureThreadOrderSection,
-        connectedEnvironmentIDs: Set<String>
+        connectedEnvironmentIDs: Set<String>,
+        workingShelfEnabled: Bool
     ) -> Set<String> {
         Set(
             ordered
                 .filter {
-                    isWritable($0, section: section)
+                    isWritable($0, section: section, workingShelfEnabled: workingShelfEnabled)
                         && connectedEnvironmentIDs.contains($0.environmentID ?? "")
                 }
                 .map(\.id)

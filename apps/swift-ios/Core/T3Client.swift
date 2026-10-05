@@ -23,8 +23,8 @@ enum MobileClientMetadata {
 
 public actor T3Client {
     public let environment: Environment
-    private let api: EnvironmentAPI
-    private let rpc: WebSocketRPCClient
+    let api: EnvironmentAPI
+    let rpc: WebSocketRPCClient
     private let orchestrationConnection: OrchestrationConnection
     private let orchestrationV2: OrchestrationV2Client
     private var orchestrationGeneration: Int?
@@ -202,6 +202,22 @@ public actor T3Client {
         )
     }
 
+    public func searchThreadContent(query: String) async throws -> ThreadContentSearchResult {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (2...200).contains(query.utf16.count) else { return .init(matches: []) }
+        let selection = try await selectedOrchestration()
+        guard selection.version == .v2 else { return .init(matches: []) }
+        let result = try await rpc.request(
+            "orchestration.searchThreads",
+            payload: .object(["query": .string(query), "limit": .number(50)]),
+            as: ThreadContentSearchResult.self
+        )
+        guard try await selectedOrchestration().generation == selection.generation else {
+            throw RPCError.disconnected
+        }
+        return result
+    }
+
     public func threadSnapshot(
         id: String,
         turnLimit: Int? = nil,
@@ -237,6 +253,18 @@ public actor T3Client {
         }
         guard try await selectedOrchestration().generation == selection.generation else { throw RPCError.disconnected }
         return snapshot
+    }
+
+    public func orchestrationTurnItem(
+        threadID: String, itemID: String, revision: String? = nil
+    ) async throws -> OrchestrationV2TurnItem? {
+        let selection = try await selectedOrchestration()
+        guard selection.version == .v2 else {
+            throw RPCError.protocolViolation("This server does not support V2 tool details.")
+        }
+        let item = try await orchestrationV2.turnItem(threadID: threadID, itemID: itemID, revision: revision)
+        guard try await selectedOrchestration().generation == selection.generation else { throw RPCError.disconnected }
+        return item
     }
 
     public func serverConfig() async throws -> ServerConfigSnapshot {
@@ -647,7 +675,7 @@ public actor T3Client {
     }
 
     private func isUnsupportedServerConfigSubscription(_ error: any Error) -> Bool {
-        guard case let RPCError.remote(message) = error else { return false }
+        guard let message = (error as? RPCError)?.remoteMessage else { return false }
         let value = message.lowercased()
         guard value.contains(RPCMethod.subscribeServerConfig.rawValue.lowercased()) else {
             return false
@@ -1105,6 +1133,40 @@ public actor T3Client {
         )
     }
 
+    // MARK: Scheduled tasks (shared by V1 and V2)
+
+    public func listScheduledTasks() async throws -> ScheduledTaskListResult {
+        try await rpc.request("scheduledTasks.list", as: ScheduledTaskListResult.self)
+    }
+
+    public func scheduledTaskUpdates() async -> AsyncThrowingStream<ScheduledTaskListResult, Error> {
+        await rpc.subscribe("scheduledTasks.subscribe", as: ScheduledTaskListResult.self)
+    }
+
+    public func upsertScheduledTask(_ input: ScheduledTaskUpsertInput) async throws -> ScheduledTask {
+        let result = try await rpc.request("scheduledTasks.upsert", payload: try JSONValue.encode(input),
+                                           as: ScheduledTaskMutationResult.self)
+        return result.task
+    }
+
+    public func setScheduledTaskEnabled(id: String, enabled: Bool) async throws -> ScheduledTask {
+        let result = try await rpc.request("scheduledTasks.setEnabled", payload: .object([
+            "id": .string(id), "enabled": .bool(enabled),
+        ]), as: ScheduledTaskMutationResult.self)
+        return result.task
+    }
+
+    public func deleteScheduledTask(id: String) async throws {
+        let _: ScheduledTaskDeleteResult = try await rpc.request("scheduledTasks.delete",
+            payload: .object(["id": .string(id)]), as: ScheduledTaskDeleteResult.self)
+    }
+
+    public func runScheduledTaskNow(id: String) async throws -> ScheduledTask {
+        let result = try await rpc.request("scheduledTasks.runNow", payload: .object(["id": .string(id)]),
+                                           as: ScheduledTaskMutationResult.self)
+        return result.task
+    }
+
     // MARK: Workspace files
 
     public func listProjectEntries(
@@ -1539,6 +1601,7 @@ public actor T3Client {
         commitMessage: String? = nil,
         featureBranch: Bool? = nil,
         filePaths: [String]? = nil,
+        threadID: String? = nil,
         actionID: String = UUID().uuidString
     ) async throws -> AsyncThrowingStream<GitActionProgressEvent, Error> {
         var payload: [String: JSONValue] = [
@@ -1546,6 +1609,7 @@ public actor T3Client {
             "cwd": .string(cwd),
             "action": .string(action.rawValue),
         ]
+        if let threadID { payload["threadId"] = .string(threadID) }
         if let commitMessage { payload["commitMessage"] = .string(commitMessage) }
         if let featureBranch { payload["featureBranch"] = .bool(featureBranch) }
         if let filePaths { payload["filePaths"] = .array(filePaths.map(JSONValue.string)) }
@@ -1603,6 +1667,18 @@ public actor T3Client {
         )
     }
 
+    public func startProjectClone(_ input: ProjectCloneStartInput) async throws -> ProjectCloneStartResult {
+        try await rpc.request("projectClone.start", payload: try JSONValue.encode(input), as: ProjectCloneStartResult.self)
+    }
+
+    public func projectCloneEvents() async -> AsyncThrowingStream<[ProjectCloneSnapshot], Error> {
+        await rpc.subscribe("subscribeProjectClones", payload: .object([:]), as: [ProjectCloneSnapshot].self)
+    }
+
+    public func projectCloneAction(projectID: String, action: ProjectCloneAction) async throws -> ProjectCloneActionResult {
+        try await rpc.request(action.rawValue, payload: .object(["projectId": .string(projectID)]), as: ProjectCloneActionResult.self)
+    }
+
     public func publishRepository(
         cwd: String,
         provider: SourceControlProviderKind,
@@ -1627,6 +1703,31 @@ public actor T3Client {
     }
 
     // MARK: Review
+
+    /// V1 and V2 use the same diff RPC names, routed by the negotiated socket
+    /// protocol. Retain that selection for the whole query and reject stale replies.
+    public func reviewCheckpointDiff(
+        threadID: String, fromTurnCount: Int?, toTurnCount: Int
+    ) async throws -> ReviewCheckpointDiff {
+        let query = try ReviewCheckpointDiffQuery(
+            threadID: threadID, fromTurnCount: fromTurnCount, toTurnCount: toTurnCount
+        )
+        let selection = try await selectedOrchestration()
+        let result = try await rpc.request(query.method, payload: query.payload, as: ReviewCheckpointDiff.self)
+        guard try await selectedOrchestration().generation == selection.generation else { throw RPCError.disconnected }
+        try query.validate(result)
+        return result
+    }
+
+    public func updateSourceControlWorkspace(
+        threadID: String, branch: String?, worktreePath: String?
+    ) async throws {
+        // `dispatch` translates this legacy metadata command for V2 and retains
+        // V1's command shape on hosts using the older protocol.
+        _ = try await dispatch(SourceControlWorkspaceCommand.make(
+            threadID: threadID, branch: branch, worktreePath: worktreePath
+        ))
+    }
 
     public func reviewDiffPreview(
         cwd: String,
@@ -2112,7 +2213,11 @@ public actor EnvironmentRuntime {
     /// environment used for new projects and threads.
     public func client(for environment: Environment) async -> T3Client {
         if let existing = clients[environment.id] {
-            if existing.environment == environment {
+            // Labels are local catalog metadata. Renaming must not interrupt a
+            // live socket or replace the client on the next catalog refresh.
+            var connectionEnvironment = environment
+            connectionEnvironment.label = existing.environment.label
+            if existing.environment == connectionEnvironment {
                 return existing
             }
             // Publish the replacement before disconnecting the stale client.

@@ -508,6 +508,7 @@ private struct ConnectionDetailView: View {
     @State private var showingRemoval = false
     @State private var isUpdatingAutomaticSettlement = false
     @State private var showingPairAgain = false
+    @State private var showingEditConnection = false
     @State private var orchestrationPreference: OrchestrationProtocolPreference?
     @State private var detectedProtocolVersion: Int?
     @State private var isUpdatingOrchestration = false
@@ -549,6 +550,10 @@ private struct ConnectionDetailView: View {
                     }
                     Text(environment.endpoint)
                         .textSelection(.enabled)
+                    if environment.source == .direct,
+                       model.client is any FeatureSavedConnectionEditing {
+                        Button("Edit connection") { showingEditConnection = true }
+                    }
                     LabeledContent("Projects", value: "\(projectCount)")
                     if environment.canCustomizeIcon == true || automaticSettlement != nil {
                         NavigationLink("Preferences") {
@@ -627,6 +632,14 @@ private struct ConnectionDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(removalMessage)
+        }
+        .sheet(isPresented: $showingEditConnection) {
+            if let environment,
+               let editor = model.client as? any FeatureSavedConnectionEditing {
+                SavedConnectionEditView(environment: environment, editor: editor) { result in
+                    if result == .updatedEndpoint { await model.reloadAfterConnection() }
+                }
+            }
         }
         .sheet(isPresented: $showingPairAgain) {
             ConnectionOnboardingView(
@@ -808,5 +821,69 @@ private extension ConnectionHubStatus {
         case .offline, .needsPairing: T3Colors.danger
         case .online: T3Colors.success
         }
+    }
+}
+
+private struct SavedConnectionEditView: View {
+    @SwiftUI.Environment(\.dismiss) private var dismiss
+    let environment: FeatureEnvironment
+    let editor: any FeatureSavedConnectionEditing
+    let onSaved: @MainActor (FeatureSavedConnectionEditResult) async -> Void
+    @State private var label: String
+    @State private var endpoint: String
+    @State private var saving = false
+    @State private var errorMessage: String?
+
+    init(environment: FeatureEnvironment, editor: any FeatureSavedConnectionEditing,
+         onSaved: @escaping @MainActor (FeatureSavedConnectionEditResult) async -> Void) {
+        self.environment = environment
+        self.editor = editor
+        self.onSaved = onSaved
+        _label = State(initialValue: environment.name)
+        _endpoint = State(initialValue: environment.endpoint)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name", text: $label)
+                TextField("Server address", text: $endpoint)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                if let errorMessage {
+                    Text(errorMessage).foregroundStyle(T3Colors.danger)
+                }
+            }
+            .disabled(saving)
+            .scrollContentBackground(.hidden)
+            .background(T3Colors.background)
+            .navigationTitle("Edit connection")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }.disabled(saving)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "Saving…" : "Save") {
+                        saving = true
+                        errorMessage = nil
+                        Task { @MainActor in
+                            defer { saving = false }
+                            do {
+                                let result = try await editor.editSavedConnection(
+                                    environmentID: environment.id, label: label, endpoint: endpoint
+                                )
+                                await onSaved(result)
+                                dismiss()
+                            } catch { errorMessage = error.localizedDescription }
+                        }
+                    }
+                    .disabled(saving || label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .interactiveDismissDisabled(saving)
     }
 }

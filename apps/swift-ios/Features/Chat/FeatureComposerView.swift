@@ -27,14 +27,67 @@ struct FeatureComposerUploadStatus {
     }
 }
 
+/// Moves the same three toolbar groups between one and two rows without
+/// replacing the stateful picker views.
+private struct FeatureComposerFooterLayout: Layout {
+    private let spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let frames = frames(width: proposal.width, subviews: subviews)
+        return CGSize(
+            width: proposal.width ?? frames.map(\.maxX).max() ?? 0,
+            height: frames.map(\.maxY).max() ?? 0
+        )
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (subview, frame) in zip(subviews, frames(width: bounds.width, subviews: subviews)) {
+            subview.place(
+                at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(frame.size)
+            )
+        }
+    }
+
+    private func frames(width proposedWidth: CGFloat?, subviews: Subviews) -> [CGRect] {
+        guard subviews.count == 3 else { return [] }
+        let ideal = subviews.map { $0.sizeThatFits(.unspecified) }
+        let rowWidth = ideal.reduce(0) { $0 + $1.width } + spacing * 2
+        let width = max(0, proposedWidth ?? rowWidth)
+        if rowWidth <= width {
+            let height = ideal.map(\.height).max() ?? 0
+            return zip(ideal, [0, ideal[0].width + spacing, width - ideal[2].width]).map { size, x in
+                CGRect(x: x, y: (height - size.height) / 2, width: size.width, height: size.height)
+            }
+        }
+
+        let configuration = subviews[1].sizeThatFits(ProposedViewSize(width: width, height: nil))
+        let bottomHeight = max(ideal[0].height, ideal[2].height)
+        return [
+            CGRect(x: 0, y: configuration.height + (bottomHeight - ideal[0].height) / 2,
+                   width: ideal[0].width, height: ideal[0].height),
+            CGRect(origin: .zero, size: configuration),
+            CGRect(x: max(0, width - ideal[2].width),
+                   y: configuration.height + (bottomHeight - ideal[2].height) / 2,
+                   width: ideal[2].width, height: ideal[2].height),
+        ]
+    }
+}
+
 struct FeatureComposerView: View {
     @SwiftUI.Environment(\.scenePhase) private var scenePhase
     @SwiftUI.Environment(\.isEnabled) private var isEnabled
+    @SwiftUI.Environment(\.featureThreadPresentationDismissal) private var presentationDismissal
     @State private var isManuallyExpanded = false
     @State private var isAttachmentFlowActive = false
     @State private var isModelPickerPresented = false
     @State private var isTraitsPickerPresented = false
     @State private var restoresFocusAfterModelPickerDismissal = false
+    @State private var modelPickerFocusTask: Task<Void, Never>?
+    @State private var traitsPresentationID = UUID()
+    @State private var commandPresentationID = UUID()
+    @State private var commandMenuDismissed = false
     @State private var attachmentPreparation = FeatureAttachmentPreparationState()
     @State private var pathEntries: [FeatureComposerPathEntry] = []
     @State private var isPathSearchLoading = false
@@ -68,7 +121,16 @@ struct FeatureComposerView: View {
     private let onInputPreparationChange: ((Bool) -> Void)?
     private let threadSelection: FeatureSelection?
     private let materializesDefaultSelection: Bool
+    private let allowProviderSwitch: Bool
+    private let followUpBehavior: FeatureFollowUpBehavior
+    private let interactionMode: FeatureInteractionMode
+    private let onInteractionModeChange: ((FeatureInteractionMode) -> Void)?
     private let isSending: Bool
+    private let isSendEnabled: Bool
+    private let composerEnterBehavior: FeatureComposerEnterBehavior
+    private let retainedAttachmentCount: Int
+    private let submitLabel: String?
+    private let isModelSelectionEnabled: Bool
     private let isWorking: Bool
     @Binding private var focused: Bool
     private let contextUsage: Double?
@@ -123,7 +185,16 @@ struct FeatureComposerView: View {
         onInputPreparationChange: ((Bool) -> Void)? = nil,
         contextAttachmentResolver: (any FeatureContextAttachmentResolving)? = nil,
         messageDeliveries: [FeatureMessageDelivery] = [],
-        onSendWithDelivery: ((FeatureMessageDelivery) -> Void)? = nil
+        onSendWithDelivery: ((FeatureMessageDelivery) -> Void)? = nil,
+        allowProviderSwitch: Bool = false,
+        followUpBehavior: FeatureFollowUpBehavior = .queue,
+        interactionMode: FeatureInteractionMode = .standard,
+        onInteractionModeChange: ((FeatureInteractionMode) -> Void)? = nil,
+        isSendEnabled: Bool = true,
+        composerEnterBehavior: FeatureComposerEnterBehavior = .send,
+        retainedAttachmentCount: Int = 0,
+        submitLabel: String? = nil,
+        isModelSelectionEnabled: Bool = true
     ) {
         _text = text
         _selection = selection
@@ -143,7 +214,16 @@ struct FeatureComposerView: View {
         self.providers = providers
         self.threadSelection = threadSelection
         self.materializesDefaultSelection = materializesDefaultSelection
+        self.allowProviderSwitch = allowProviderSwitch
+        self.followUpBehavior = followUpBehavior
+        self.interactionMode = interactionMode
+        self.onInteractionModeChange = onInteractionModeChange
         self.isSending = isSending
+        self.isSendEnabled = isSendEnabled
+        self.composerEnterBehavior = composerEnterBehavior
+        self.retainedAttachmentCount = max(0, retainedAttachmentCount)
+        self.submitLabel = submitLabel
+        self.isModelSelectionEnabled = isModelSelectionEnabled
         self.isWorking = isWorking
         _focused = focused
         self.onSend = onSend
@@ -185,6 +265,12 @@ struct FeatureComposerView: View {
                             forItemCount: commandMenuItems.count
                         ) + 12)
                     )
+                    .onAppear {
+                        presentationDismissal.onPresentationChange(commandPresentationID, true)
+                    }
+                    .onDisappear {
+                        presentationDismissal.onPresentationChange(commandPresentationID, false)
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -203,10 +289,11 @@ struct FeatureComposerView: View {
                 .ignoresSafeArea()
             }
             .onChange(of: focused) {
+                if focused { commandMenuDismissed = false }
                 if FeatureComposerCollapsePolicy.shouldCollapse(
                     isFocused: focused,
                     textIsEmpty: textIsEmpty,
-                    attachmentsAreEmpty: attachments.isEmpty,
+                    attachmentsAreEmpty: totalAttachmentCount == 0,
                     isAttachmentFlowActive: isAttachmentFlowActive
                         || isModelPickerPresented
                         || isTraitsPickerPresented,
@@ -222,12 +309,14 @@ struct FeatureComposerView: View {
                 synchronizeVoiceDraft(ownerChanged: false)
             }
             .onDisappear {
+                modelPickerFocusTask?.cancel()
                 voiceInputController.cancel()
                 pastedTextTask?.cancel()
                 pastedTextGeneration = UUID()
                 contextImportTask?.cancel()
             }
             .onChange(of: text) { previous, _ in
+                commandMenuDismissed = false
                 textRevision &+= 1
                 synchronizeVoiceDraft(ownerChanged: false)
                 removeUnlinkedContextAttachments(previousText: previous)
@@ -245,6 +334,16 @@ struct FeatureComposerView: View {
                 contextImportTask?.cancel()
                 pastedTextTask?.cancel()
                 pastedTextGeneration = UUID()
+            }
+            .onChange(of: presentationDismissal.requestID, initial: true) { _, requestID in
+                guard requestID != nil else { return }
+                modelPickerFocusTask?.cancel()
+                restoresFocusAfterModelPickerDismissal = false
+                isTraitsPickerPresented = false
+                commandMenuDismissed = true
+                focused = false
+                imageIntakeErrorMessage = nil
+                pastedTextErrorMessage = nil
             }
             .onChange(of: voiceInputController.pendingCommit?.id) {
                 applyPendingVoiceCommit()
@@ -386,8 +485,7 @@ struct FeatureComposerView: View {
                     .padding(.horizontal, 13)
             }
 
-            // Return is always editing input. Sending is deliberately
-            // button-only, which is UITextView's native return behavior.
+            // Software Return edits text; hardware shortcuts use the same guarded send path as the button.
             ZStack(alignment: .topLeading) {
                 FeatureComposerTextInput(
                     text: $text,
@@ -405,7 +503,11 @@ struct FeatureComposerView: View {
                     onPasteTextError: { pastedTextErrorMessage = $0 },
                     draftOwnerID: draftOwnerID,
                     onCopyContext: copyContext,
-                    onPasteContext: pasteContext
+                    onPasteContext: pasteContext,
+                    composerEnterBehavior: composerEnterBehavior,
+                    hardwareSubmitTitle: primarySubmitTitle,
+                    hardwareAlternateSubmitTitle: alternateSubmitTitle,
+                    onHardwareSubmit: performHardwareSubmit
                 )
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
@@ -425,8 +527,8 @@ struct FeatureComposerView: View {
             .layoutPriority(1)
             .clipped()
 
-            if let attachmentBlocker {
-                Label(attachmentBlocker, systemImage: "exclamationmark.circle")
+            if let blocker = modelSelectionBlocker ?? attachmentBlocker {
+                Label(blocker, systemImage: "exclamationmark.circle")
                     .font(T3Typography.supporting)
                     .foregroundStyle(T3Colors.warning)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -494,60 +596,103 @@ struct FeatureComposerView: View {
     }
 
     private var standardComposerFooter: some View {
-        HStack(spacing: 2) {
-            if FeatureComposerKeyboardDismissPolicy.showsDismissControl(
-                isFocused: focused,
-                isEnabled: showsKeyboardDismissControl,
-                canDismiss: onDismissKeyboard != nil
-            ) {
-                dismissKeyboardButton
+        FeatureComposerFooterLayout {
+            HStack(spacing: 8) {
+                composerIntakeControls
             }
-
-            FeatureImageAttachmentPicker(
-                attachments: $attachments,
-                preparationState: $attachmentPreparation,
-                isFlowActive: $isAttachmentFlowActive,
-                draftOwnerID: draftOwnerID,
-                environmentID: environmentID,
-                imagesAllowed: imagesAllowed,
-                maximumFileBytes: attachmentPreferences.maxFileAttachmentBytes
-            )
-
-            ProviderModelPicker(
-                providers: providers,
-                selection: $selection,
-                style: .compact,
-                threadSelection: threadSelection,
-                materializesDefaultSelection: materializesDefaultSelection,
-                onRefresh: onRefreshModels,
-                onPresentationChange: handleModelPickerPresentation
-            )
-            .frame(maxWidth: 220, alignment: .leading)
-            .layoutPriority(1)
-
-            if let traitsControl {
-                traitsPicker(traitsControl)
-                    .frame(minWidth: 28, maxWidth: 148, alignment: .trailing)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .layoutPriority(2)
+            HStack(spacing: 8) {
+                composerConfigurationControls
             }
-
-            Spacer(minLength: 0)
-
-            if voiceInputController.isSupported {
-                voiceInputButton
+            HStack(spacing: 8) {
+                composerSubmitControls
             }
-
-            if let contextUsage {
-                FeatureContextMeter(usage: contextUsage)
-            }
-
-            submitButton
-                .padding(.leading, 4)
         }
         .padding(.horizontal, 7)
         .padding(.top, 2)
         .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var composerIntakeControls: some View {
+        if showsKeyboardDismissControl, onDismissKeyboard != nil {
+            dismissKeyboardButton
+                .opacity(focused ? 1 : 0)
+                .allowsHitTesting(focused)
+                .accessibilityHidden(!focused)
+        }
+
+        FeatureImageAttachmentPicker(
+            attachments: $attachments,
+            preparationState: $attachmentPreparation,
+            isFlowActive: $isAttachmentFlowActive,
+            draftOwnerID: draftOwnerID,
+            environmentID: environmentID,
+            imagesAllowed: imagesAllowed,
+            maximumFileBytes: attachmentPreferences.maxFileAttachmentBytes,
+            maximumCount: max(0, FeatureImageAttachmentLimits.maximumCount - retainedAttachmentCount)
+        )
+
+    }
+
+    @ViewBuilder
+    private var composerConfigurationControls: some View {
+        ProviderModelPicker(
+            providers: providers,
+            selection: $selection,
+            style: .compact,
+            threadSelection: threadSelection,
+            materializesDefaultSelection: materializesDefaultSelection,
+            allowProviderSwitch: allowProviderSwitch,
+            onRefresh: onRefreshModels,
+            onPresentationChange: handleModelPickerPresentation
+        )
+        .frame(maxWidth: 220, alignment: .leading)
+        .layoutPriority(1)
+        .disabled(!isModelSelectionEnabled)
+
+        if allowsInteractionMode {
+            Menu {
+                ForEach(FeatureInteractionMode.allCases, id: \.self) { mode in
+                    Button { onInteractionModeChange?(mode) } label: {
+                        if interactionMode == mode {
+                            Label(mode.label, systemImage: "checkmark")
+                        } else {
+                            Text(mode.label)
+                        }
+                    }
+                }
+            } label: {
+                Text(interactionMode.label)
+                    .font(T3Typography.supporting)
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .frame(minHeight: T3Metrics.minimumTapTarget)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .accessibilityLabel("Interaction mode")
+            .accessibilityValue(interactionMode.label)
+        }
+        if let traitsControl {
+            traitsPicker(traitsControl)
+                .disabled(!isModelSelectionEnabled)
+                .frame(minWidth: 28, maxWidth: 148, alignment: .trailing)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(2)
+        }
+
+    }
+
+    @ViewBuilder
+    private var composerSubmitControls: some View {
+        if voiceInputController.isSupported {
+            voiceInputButton
+        }
+
+        if let contextUsage {
+            FeatureContextMeter(usage: contextUsage)
+        }
+
+        submitButton
+            .padding(.leading, 4)
     }
 
     private var dismissKeyboardButton: some View {
@@ -663,6 +808,8 @@ struct FeatureComposerView: View {
     /// flatten away.
     private func traitsPicker(_ control: FeatureComposerTraitsControl) -> some View {
         Button {
+            guard presentationDismissal.requestID == nil else { return }
+            isManuallyExpanded = true
             isTraitsPickerPresented.toggle()
         } label: {
             traitsPickerLabel(control)
@@ -683,6 +830,13 @@ struct FeatureComposerView: View {
                 isTraitsPickerPresented = false
             }
             .presentationCompactAdaptation(.popover)
+            .onAppear {
+                presentationDismissal.onPresentationChange(traitsPresentationID, true)
+                if presentationDismissal.requestID != nil { isTraitsPickerPresented = false }
+            }
+            .onDisappear {
+                presentationDismissal.onPresentationChange(traitsPresentationID, false)
+            }
         }
         .accessibilityLabel("Model traits")
         .accessibilityValue(control.triggerLabel)
@@ -729,7 +883,7 @@ struct FeatureComposerView: View {
                     Button("Queue") { onSendWithDelivery(.queue) }
                 }
                 if messageDeliveries.contains(.steer) {
-                    Button("Steer") { onSendWithDelivery(.steer) }
+                    Button("Steer") { onSendWithDelivery(.auto) }
                 }
                 if messageDeliveries.contains(.restart) {
                     Button("Restart") { onSendWithDelivery(.restart) }
@@ -745,14 +899,33 @@ struct FeatureComposerView: View {
 
     private var submitSymbol: String {
         if isSending { return "ellipsis" }
-        return showsStop ? "stop.fill" : "arrow.up"
+        return showsStop ? "stop.fill" : sendPresentation.symbol
     }
 
     private var submitAccessibilityLabel: String {
         if isSending { return "Sending message" }
         if showsStop { return "Stop agent" }
-        if !messageDeliveries.isEmpty { return "Send message" }
-        return isWorking ? "Queue message" : "Send message"
+        return primarySubmitTitle
+    }
+
+    private var primarySubmitTitle: String {
+        submitLabel ?? "\(sendPresentation.label) message"
+    }
+
+    private var alternateSubmitTitle: String {
+        guard onSendWithDelivery != nil, let label = sendPresentation.alternateLabel else {
+            return primarySubmitTitle
+        }
+        return "\(label) message"
+    }
+
+    private var sendPresentation: FeatureComposerSendPresentation {
+        FeatureComposerSendPresentation.resolve(
+            isWorking: isWorking || !messageDeliveries.isEmpty,
+            canSteer: messageDeliveries.contains(.steer),
+            followUpBehavior: followUpBehavior,
+            supportsExplicitDelivery: messageDeliveries.contains(.queue)
+        )
     }
 
     private var composerShape: RoundedRectangle {
@@ -763,15 +936,22 @@ struct FeatureComposerView: View {
         forceExpanded
             || isManuallyExpanded
             || focused
+            || isAttachmentFlowActive
+            || isModelPickerPresented
+            || isTraitsPickerPresented
             || !textIsEmpty
-            || !attachments.isEmpty
+            || totalAttachmentCount > 0
             || attachmentPreparation.isPreparing
             || voiceInputController.isBusy
             || voiceInputController.phase == .error
     }
 
     private var showsStop: Bool {
-        isWorking && textIsEmpty && attachments.isEmpty
+        isWorking && textIsEmpty && totalAttachmentCount == 0
+    }
+
+    private var totalAttachmentCount: Int {
+        attachments.count + retainedAttachmentCount
     }
 
     private var submitDisabled: Bool {
@@ -783,7 +963,7 @@ struct FeatureComposerView: View {
     }
 
     private var canSend: Bool {
-        guard composerTrigger?.kind != .model else { return false }
+        guard isSendEnabled, modelSelectionBlocker == nil, composerTrigger?.kind != .model else { return false }
         return FeatureComposerSubmissionEligibility.canSend(
             text: text,
             attachmentCount: attachments.count,
@@ -792,8 +972,9 @@ struct FeatureComposerView: View {
             containsImages: attachments.contains { $0.mimeType.hasPrefix("image/") },
             containsFiles: attachments.contains { !$0.mimeType.hasPrefix("image/") },
             isSending: isSending,
-            preparationState: attachmentPreparation
-        ) && !uploadStatus.blocksSend
+            preparationState: attachmentPreparation,
+            retainedAttachmentCount: retainedAttachmentCount
+        ) && attachmentBlocker == nil && !uploadStatus.blocksSend
     }
 
     private var imagesAllowed: Bool {
@@ -803,15 +984,24 @@ struct FeatureComposerView: View {
         )
     }
 
+    private var modelSelectionBlocker: String? {
+        guard !materializesDefaultSelection, let selection else { return nil }
+        guard ThreadComposerModelSelectionPolicy.explicitSelection(
+            selection, inherited: threadSelection, providers: providers, allowProviderSwitch: allowProviderSwitch
+        ) == nil else { return nil }
+        return selection.providerID != threadSelection?.providerID
+            ? "This provider cannot take over the conversation yet."
+            : "Start a new thread to use this model."
+    }
+
     private var attachmentBlocker: String? {
-        if attachments.contains(where: { !$0.mimeType.hasPrefix("image/") }),
-           attachmentPreferences.maxFileAttachmentBytes == nil {
-            return "This environment does not accept file attachments"
+        guard totalAttachmentCount <= FeatureImageAttachmentLimits.maximumCount else {
+            return "You can attach up to 100 files."
         }
-        if attachments.contains(where: { $0.mimeType.hasPrefix("image/") }), !imagesAllowed {
-            return "Choose a model that accepts images"
-        }
-        return nil
+        return FeatureComposerAttachmentEligibility.validationMessage(
+            attachments: attachments, imagesAllowed: imagesAllowed,
+            maximumFileBytes: attachmentPreferences.maxFileAttachmentBytes
+        )
     }
 
     private var applicableUploadStates: [(UUID, FeatureAttachmentUploadState?)] {
@@ -866,12 +1056,28 @@ struct FeatureComposerView: View {
         .accessibilityIdentifier("attachment-upload-status")
     }
 
+    private var resolvedSelection: FeatureSelection? {
+        if materializesDefaultSelection {
+            return ProviderModelSelectionResolver.materialized(selection, in: providers)
+        }
+        return ThreadComposerModelSelectionPolicy.resolvedSelection(
+            explicit: selection, inherited: threadSelection, providers: providers,
+            allowProviderSwitch: allowProviderSwitch
+        )
+    }
+
+    private var allowsInteractionMode: Bool {
+        onInteractionModeChange != nil && providers.first {
+            $0.id == resolvedSelection?.providerID
+        }?.showInteractionModeToggle != false
+    }
+
     private var traitsControl: FeatureComposerTraitsControl? {
         FeatureComposerTraitsControl.resolve(
-            explicit: selection,
-            inherited: threadSelection,
+            explicit: nil,
+            inherited: resolvedSelection,
             providers: providers,
-            materializesDefaultSelection: materializesDefaultSelection
+            materializesDefaultSelection: false
         )
     }
 
@@ -901,12 +1107,22 @@ struct FeatureComposerView: View {
             currentSelection: selection,
             threadSelection: threadSelection,
             powerFeatures: powerFeatures,
-            pathEntries: pathEntries
-        )
+            pathEntries: pathEntries,
+            allowProviderSwitch: allowProviderSwitch,
+            allowInteractionMode: allowsInteractionMode
+        ).filter { item in
+            if isModelSelectionEnabled { return true }
+            switch item {
+            case .modelCommand, .model: return false
+            default: return true
+            }
+        }
     }
 
     private var showsCommandMenu: Bool {
         isExpanded
+            && !commandMenuDismissed
+            && presentationDismissal.requestID == nil
             && !voiceInputController.isBusy
             && pendingApprovals.isEmpty
             && pendingUserInputs.isEmpty
@@ -966,8 +1182,14 @@ struct FeatureComposerView: View {
         do {
             switch item {
             case .modelCommand:
+                guard isModelSelectionEnabled else { return }
                 replacement = "/model "
+            case let .interactionMode(mode):
+                guard allowsInteractionMode else { return }
+                onInteractionModeChange?(mode)
+                replacement = ""
             case let .model(nextSelection, _, _):
+                guard isModelSelectionEnabled else { return }
                 selection = nextSelection
                 replacement = ""
             case let .providerCommand(command):
@@ -1013,7 +1235,20 @@ struct FeatureComposerView: View {
             onStop()
         } else if FeatureComposerSubmissionPolicy.allowsSend(for: .explicitButton),
                   canSend {
-            onSend()
+            if let onSendWithDelivery {
+                onSendWithDelivery(sendPresentation.delivery)
+            } else {
+                onSend()
+            }
+        }
+    }
+
+    private func performHardwareSubmit(alternate: Bool) {
+        guard isEnabled, !showsStop, canSend, !submitDisabled else { return }
+        if alternate, let delivery = sendPresentation.alternateDelivery, let onSendWithDelivery {
+            onSendWithDelivery(delivery)
+        } else {
+            performPrimaryAction()
         }
     }
 
@@ -1058,6 +1293,7 @@ struct FeatureComposerView: View {
     }
 
     private func handleModelPickerPresentation(_ isPresented: Bool) {
+        modelPickerFocusTask?.cancel()
         if isPresented {
             restoresFocusAfterModelPickerDismissal = focused
             isManuallyExpanded = true
@@ -1066,10 +1302,15 @@ struct FeatureComposerView: View {
         }
 
         isModelPickerPresented = false
-        guard restoresFocusAfterModelPickerDismissal else { return }
+        guard restoresFocusAfterModelPickerDismissal,
+              presentationDismissal.requestID == nil else {
+            restoresFocusAfterModelPickerDismissal = false
+            return
+        }
         restoresFocusAfterModelPickerDismissal = false
-        Task { @MainActor in
+        modelPickerFocusTask = Task { @MainActor in
             await Task.yield()
+            guard !Task.isCancelled, presentationDismissal.requestID == nil else { return }
             focused = true
         }
     }
@@ -1082,7 +1323,7 @@ struct FeatureComposerView: View {
 
         guard let plan = FeatureComposerImageIntakePlan.forProviders(
             providerCount: providers.count,
-            attachmentCount: attachments.count,
+            attachmentCount: totalAttachmentCount,
             pendingCount: attachmentPreparation.pendingItemCount
         ) else {
             imageIntakeErrorMessage = "You can attach up to 100 files."
@@ -1112,6 +1353,9 @@ struct FeatureComposerView: View {
                             ordinal: plan.firstOrdinal + offset
                         )
                     }.value
+                    guard totalAttachmentCount < FeatureImageAttachmentLimits.maximumCount else {
+                        throw FileAttachmentError.tooMany(maximum: FeatureImageAttachmentLimits.maximumCount)
+                    }
                     attachments.append(attachment)
                 } catch {
                     imageIntakeErrorMessage = error.localizedDescription
@@ -1123,7 +1367,7 @@ struct FeatureComposerView: View {
     private var maximumPastedTextBytes: Int? {
         FeaturePastedText.maximumAttachmentBytes(
             advertisedMaximum: attachmentPreferences.maxFileAttachmentBytes,
-            attachmentCount: attachments.count,
+            attachmentCount: totalAttachmentCount,
             pendingCount: attachmentPreparation.pendingItemCount
         )
     }
@@ -1167,7 +1411,7 @@ struct FeatureComposerView: View {
                     !removedIDs.contains($0.id.uuidString.lowercased())
                 }.count
                 let result = try await importer.importContent(
-                    content, attachmentCount: remainingAttachmentCount + attachmentPreparation.pendingItemCount,
+                    content, attachmentCount: remainingAttachmentCount + retainedAttachmentCount + attachmentPreparation.pendingItemCount,
                     contextCount: remainingContext?.records.count ?? 0,
                     imagesAllowed: imagesAllowed,
                     maximumFileBytes: attachmentPreferences.maxFileAttachmentBytes
@@ -1192,6 +1436,10 @@ struct FeatureComposerView: View {
                     text: originalText, selection: range, context: originalContext,
                     attachments: originalAttachments, imported: result
                 )
+                guard edit.attachments.count + retainedAttachmentCount + attachmentPreparation.pendingItemCount
+                    <= FeatureImageAttachmentLimits.maximumCount else {
+                    throw FileAttachmentError.tooMany(maximum: FeatureImageAttachmentLimits.maximumCount)
+                }
                 context = edit.context
                 text = edit.text
                 textSelectionRequest = FeatureComposerTextSelectionRequest(location: edit.cursor)
@@ -1264,7 +1512,7 @@ struct FeatureComposerView: View {
                     }
                 }
                 guard !Task.isCancelled, pastedTextGeneration == generation else { return }
-                guard attachments.count + attachmentPreparation.pendingItemCount <= FeatureImageAttachmentLimits.maximumCount,
+                guard totalAttachmentCount + attachmentPreparation.pendingItemCount <= FeatureImageAttachmentLimits.maximumCount,
                       commitSelection() else {
                     pastedTextErrorMessage = "The draft changed while the file was prepared. Paste again to add it."
                     return
@@ -1420,15 +1668,18 @@ enum FeatureComposerSubmissionEligibility {
         containsImages: Bool = true,
         containsFiles: Bool = false,
         isSending: Bool,
-        preparationState: FeatureAttachmentPreparationState
+        preparationState: FeatureAttachmentPreparationState,
+        retainedAttachmentCount: Int = 0
     ) -> Bool {
         let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasAttachments = attachmentCount > 0
+        let totalAttachmentCount = attachmentCount + max(0, retainedAttachmentCount)
+        let hasNewAttachments = attachmentCount > 0
         return !isSending
             && !preparationState.isPreparing
-            && (hasText || hasAttachments)
-            && (!hasAttachments || !containsImages || imagesAllowed)
-            && (!hasAttachments || !containsFiles || filesAllowed)
+            && totalAttachmentCount <= FeatureImageAttachmentLimits.maximumCount
+            && (hasText || totalAttachmentCount > 0)
+            && (!hasNewAttachments || !containsImages || imagesAllowed)
+            && (!hasNewAttachments || !containsFiles || filesAllowed)
     }
 }
 

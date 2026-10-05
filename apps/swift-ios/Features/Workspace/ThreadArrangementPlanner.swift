@@ -82,9 +82,13 @@ enum ThreadArrangementPlanner {
     static func canEnter(
         _ thread: FeatureThread,
         section: FeatureThreadOrderSection,
-        now: Date
+        now: Date,
+        workingShelfEnabled: Bool = false
     ) -> Bool {
-        guard !thread.isArchived, ThreadOrderPlanner.isWritable(thread, section: section) else {
+        guard !thread.isArchived, !thread.isSubagent,
+              ThreadOrderPlanner.isWritable(
+                thread, section: section, workingShelfEnabled: workingShelfEnabled
+              ) else {
             return false
         }
         if thread.isEffectivelySettled(), thread.supportsSettlement != true { return false }
@@ -102,10 +106,11 @@ enum ThreadArrangementPlanner {
         destination: ThreadArrangementDestination,
         threads: [FeatureThread],
         connectedEnvironmentIDs: Set<String>,
-        now: Date
+        now: Date,
+        workingShelfEnabled: Bool = false
     ) -> Plan? {
         guard let moved = threads.first(where: { $0.id == id }),
-              !moved.isArchived,
+              !moved.isArchived, !moved.isSubagent,
               connectedEnvironmentIDs.contains(moved.environmentID ?? "") else { return nil }
         if destination.section == .settled {
             guard moved.supportsSettlement == true, !moved.isEffectivelySettled(),
@@ -113,7 +118,8 @@ enum ThreadArrangementPlanner {
             return Plan(section: nil, orderedIDs: [], assignments: [])
         }
         guard let section = destination.section.orderSection,
-              canEnter(moved, section: section, now: now) else { return nil }
+              canEnter(moved, section: section, now: now, workingShelfEnabled: workingShelfEnabled)
+        else { return nil }
         let current = DailyUXSidebarIndex.orderedSection(threads, section: section, now: now)
         var ordered = current.filter { $0.id != id }
         let index: Int
@@ -130,7 +136,8 @@ enum ThreadArrangementPlanner {
                 all: threads,
                 section: section,
                 connectedEnvironmentIDs: connectedEnvironmentIDs,
-                movedID: id
+                movedID: id,
+                workingShelfEnabled: workingShelfEnabled
               ) else { return nil }
         return Plan(section: section, orderedIDs: ordered.map(\.id), assignments: assignments)
     }

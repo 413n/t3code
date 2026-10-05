@@ -228,7 +228,7 @@ final class NativeRetryIdentityTests: XCTestCase {
         let client = NativeFeatureClient(runtime: runtime, settingsStore: settings)
         let initial = try await client.initialSnapshot()
         XCTAssertEqual(initial.threads.first?.runtimeMode, .approvalRequired)
-        XCTAssertEqual(initial.threads.first?.interactionMode, .standard)
+        XCTAssertEqual(initial.threads.first?.interactionMode, .plan)
         await connection.waitUntilConnected()
 
         let turnIdentity = FeatureSubmissionIdentity(
@@ -299,11 +299,11 @@ final class NativeRetryIdentityTests: XCTestCase {
         XCTAssertNotEqual(initialBootstrap["threadId"], retriedBootstrap["threadId"])
         for command in turnCommands {
             XCTAssertEqual(command["runtimeMode"]?.stringValue, "approval-required")
-            XCTAssertEqual(command["interactionMode"]?.stringValue, "default")
+            XCTAssertEqual(command["interactionMode"]?.stringValue, "plan")
         }
         for command in bootstrapCommands {
             XCTAssertEqual(command["runtimeMode"]?.stringValue, "auto-accept-edits")
-            XCTAssertEqual(command["interactionMode"]?.stringValue, "default")
+            XCTAssertEqual(command["interactionMode"]?.stringValue, "plan")
         }
         await client.disconnect()
     }

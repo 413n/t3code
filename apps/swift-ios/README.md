@@ -7,6 +7,9 @@ React Native T3 Code app.
 ## Requirements
 
 - A current Xcode release with an iOS Simulator runtime.
+- The repository's Node.js version and dependencies installed with `vp i`.
+  Xcode bundles the shared remote-device viewer during the build. If Xcode
+  cannot find Node.js, set its `NODE_BINARY` build setting to the executable path.
 - iOS 17 or later for physical-device builds.
 - A T3 pairing URL for direct connections. T3 Connect builds additionally need
   the cloud settings below.
@@ -15,8 +18,8 @@ React Native T3 Code app.
 
 Open `T3Code.xcodeproj`, choose the `T3Code` scheme, and run an installed iOS
 Simulator. Xcode automatically includes files added below `App`, `Core`,
-`Features`, `DesignSystem`, and `Resources`; `Info.plist` is the one resource
-excluded from copying because it supplies the target's generated Info.plist.
+`Features`, `DesignSystem`, and `Resources`. The target excludes `Info.plist`
+from resource copying and runs the device-stream generator as a build phase.
 
 Pair with the same URL produced by a T3 server. The one-time pairing credential is
 exchanged for an access token and stored in the Keychain. Environment metadata and
@@ -68,8 +71,8 @@ Queued messages can be edited, reordered, removed, or sent to the running agent
 when the provider supports it. Stopping a run pauses its queue; resume it from
 the queue view.
 
-The app speaks HTTP and Effect RPC WebSocket contracts directly. It does not
-embed a JavaScript runtime.
+The app speaks HTTP and Effect RPC WebSocket contracts directly. Remote-device
+streaming uses the shared browser viewer inside a WKWebView.
 
 ## Build configuration
 

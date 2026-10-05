@@ -5,6 +5,83 @@ import XCTest
 
 @MainActor
 final class NativeMultiEnvironmentTests: XCTestCase {
+    func testProjectRuntimeSettingsUseTheOwningEnvironmentAndPreserveOtherOverrides() async throws {
+        let server = MultiEnvironmentConfigurationServer(
+            projectSettingsSupportHosts: ["one.example", "two.example"],
+            settingsByHost: [
+                "one.example": ["defaultRuntimeMode": .string("approval-required")],
+                "two.example": [
+                    "defaultRuntimeMode": .string("auto-accept-edits"),
+                    "projectSettingsOverrides": .object([
+                        "project-shared": .object([
+                            "defaultRuntimeMode": .string("full-access"),
+                            "branchNamePrefix": .string("remote"),
+                        ]),
+                    ]),
+                ],
+            ]
+        )
+        let fixture = try await Self.makeFixture(
+            duplicateIDs: true,
+            webSocketConnector: MultiEnvironmentConfigurationConnector(server: server),
+            rpcConnectionWaitTimeout: .seconds(2),
+            fallbackPollingInitialDelay: .seconds(60), aggregateRefreshInterval: .seconds(60)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let initial = try await fixture.client.initialSnapshot()
+        let project = try XCTUnwrap(initial.projects.first { $0.environmentID == "two" })
+        XCTAssertEqual(initial.preferencesByEnvironment?["one"]?.defaultRuntimeMode, .approvalRequired)
+        XCTAssertEqual(initial.preferencesByEnvironment?["two"]?.defaultRuntimeMode, .autoAcceptEdits)
+        XCTAssertEqual(project.defaultRuntimeMode, .fullAccess)
+
+        try await fixture.client.updateProjectPreferences(
+            projectID: project.id, change: .init(key: .defaultRuntimeMode, value: .string("auto"))
+        )
+        let updated = try await fixture.client.initialSnapshot()
+        XCTAssertEqual(updated.projects.first { $0.environmentID == "two" }?.defaultRuntimeMode, .automatic)
+        XCTAssertEqual(updated.projects.first { $0.environmentID == "one" }?.defaultRuntimeMode, .approvalRequired)
+        try await fixture.client.updateProjectPreferences(
+            projectID: project.id, change: .init(key: .defaultRuntimeMode, value: nil)
+        )
+        let inherited = try await fixture.client.initialSnapshot()
+        XCTAssertEqual(inherited.projects.first { $0.environmentID == "two" }?.defaultRuntimeMode, .autoAcceptEdits)
+        let saved = await server.settings(host: "two.example")
+        XCTAssertEqual(saved["projectSettingsOverrides"]?["project-shared"], .object([
+            "branchNamePrefix": .string("remote"),
+        ]))
+        let hosts = await server.updatedHosts()
+        XCTAssertEqual(hosts, ["two.example", "two.example"])
+        await fixture.client.disconnect()
+    }
+
+    func testLimitedThreadSettingsSkipOlderEnvironments() async throws {
+        let server = MultiEnvironmentConfigurationServer(settingsByHost: [
+            "one.example": ["autoResumeLimitedThreads": .bool(false), "snoozeLimitedThreads": .bool(false)],
+        ])
+        let fixture = try await Self.makeFixture(
+            webSocketConnector: MultiEnvironmentConfigurationConnector(server: server),
+            rpcConnectionWaitTimeout: .seconds(2),
+            fallbackPollingInitialDelay: .seconds(60), aggregateRefreshInterval: .seconds(60)
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.client.initialSnapshot()
+        try await fixture.client.updateServerPreferences(environmentID: "one", change: .autoResumeLimitedThreads(true))
+        try await fixture.client.updateServerPreferences(environmentID: "one", change: .snoozeLimitedThreads(true))
+        let hosts = await server.updatedHosts()
+        XCTAssertEqual(hosts, ["one.example", "one.example"])
+        XCTAssertTrue(fixture.client.sharedPreferenceMismatches(environmentID: "one").isEmpty)
+        let saved = await server.settings(host: "one.example")
+        XCTAssertEqual(saved["autoResumeLimitedThreads"], .bool(true))
+        XCTAssertEqual(saved["snoozeLimitedThreads"], .bool(true))
+        do {
+            try await fixture.client.updateServerPreferences(environmentID: "two", change: .autoResumeLimitedThreads(true))
+            XCTFail("An older server must not receive an unsupported preference.")
+        } catch is FeatureCapabilityUnavailable { }
+        let finalHosts = await server.updatedHosts()
+        XCTAssertEqual(finalHosts, hosts)
+        await fixture.client.disconnect()
+    }
+
     func testDelegateLineageSurvivesNativeMappingAndCachedSnapshots() async throws {
         let fixture = try await Self.makeFixture(
             fallbackPollingInitialDelay: .seconds(60), aggregateRefreshInterval: .seconds(60)
@@ -672,7 +749,7 @@ final class NativeMultiEnvironmentTests: XCTestCase {
         let legacySettings = await server.settings(host: "two.example")
         XCTAssertEqual(supportedSettings["continueThreadsAfterServerUpdate"], .bool(true))
         XCTAssertNil(legacySettings["continueThreadsAfterServerUpdate"])
-        XCTAssertEqual(legacySettings["defaultThreadEnvMode"], .string("local"))
+        XCTAssertEqual(legacySettings["defaultThreadEnvMode"], .null)
         do {
             try await fixture.client.updateServerPreferences(
                 environmentID: "two", change: .continueThreadsAfterServerUpdate(true)
@@ -1573,6 +1650,9 @@ struct NativePassiveThreadRefreshTests {
         )
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         _ = try await fixture.client.initialSnapshot()
+        let initialShellReads = await fixture.transport.shellReadCount(host: "three.example")
+        let initialPeerReads = await fixture.transport.shellReadCount(host: "two.example")
+        #expect(initialShellReads == 1)
         await fixture.transport.setShell(
             multiEnvironmentShell(
                 projectID: "project-two",
@@ -1591,24 +1671,25 @@ struct NativePassiveThreadRefreshTests {
         await refreshSleep.resume()
         let secondCadence = await refreshSleep.waitUntilRequested(count: 2)
         #expect(secondCadence == .seconds(5))
-        let initialFailedDiscoveryCount = await fixture.transport.failedDiscoveryCount(host: "three.example")
-        #expect(initialFailedDiscoveryCount == 1)
-        #expect(await fixture.transport.shellReadCount(host: "three.example") == 1)
+        // Discovery is cached for 60 seconds. The offline read fails at the shell endpoint.
+        #expect(await fixture.transport.failedShellReadCount(host: "three.example") == 1)
+        #expect(await fixture.transport.shellReadCount(host: "three.example") == initialShellReads + 1)
+        #expect(await fixture.transport.shellReadCount(host: "two.example") == initialPeerReads + 1)
 
         for requestCount in 2...4 {
             await refreshSleep.resume()
             let cadence = await refreshSleep.waitUntilRequested(count: requestCount + 1)
             #expect(cadence == .seconds(5))
-            let failedDiscoveryCount = await fixture.transport.failedDiscoveryCount(host: "three.example")
-            #expect(failedDiscoveryCount == 1)
-            #expect(await fixture.transport.shellReadCount(host: "three.example") == 1)
+            #expect(await fixture.transport.failedShellReadCount(host: "three.example") == 1)
+            #expect(await fixture.transport.shellReadCount(host: "three.example") == initialShellReads + 1)
+            #expect(await fixture.transport.shellReadCount(host: "two.example") == initialPeerReads + requestCount)
         }
 
         await refreshSleep.resume()
         _ = await refreshSleep.waitUntilRequested(count: 6)
-        let retriedDiscoveryCount = await fixture.transport.failedDiscoveryCount(host: "three.example")
-        #expect(retriedDiscoveryCount == 2)
-        #expect(await fixture.transport.shellReadCount(host: "three.example") == 1)
+        #expect(await fixture.transport.failedShellReadCount(host: "three.example") == 2)
+        #expect(await fixture.transport.shellReadCount(host: "three.example") == initialShellReads + 2)
+        #expect(await fixture.transport.shellReadCount(host: "two.example") == initialPeerReads + 5)
         await fixture.client.disconnect()
     }
 }
@@ -1912,7 +1993,7 @@ private actor MultiEnvironmentHTTPTransport: HTTPTransport {
     private var reachableHosts: Set<String>
     private var shellReadsEnabledHosts: Set<String>
     private var shellReadCounts: [String: Int] = [:]
-    private var failedDiscoveryCounts: [String: Int] = [:]
+    private var failedShellReadCounts: [String: Int] = [:]
     private var dispatched: [MultiEnvironmentDispatchRecord] = []
     private var hostsDroppingNextCreateReply = Set<String>()
     private var diffRequests: [(host: String, input: JSONValue)] = []
@@ -1966,8 +2047,8 @@ private actor MultiEnvironmentHTTPTransport: HTTPTransport {
         shellReadCounts[host, default: 0]
     }
 
-    func failedDiscoveryCount(host: String) -> Int {
-        failedDiscoveryCounts[host, default: 0]
+    func failedShellReadCount(host: String) -> Int {
+        failedShellReadCounts[host, default: 0]
     }
 
     func dropNextCreateReply(host: String) {
@@ -1994,8 +2075,8 @@ private actor MultiEnvironmentHTTPTransport: HTTPTransport {
             shellReadCounts[host, default: 0] += 1
         }
         guard reachableHosts.contains(host) else {
-            if path == "/.well-known/t3/environment" {
-                failedDiscoveryCounts[host, default: 0] += 1
+            if path == "/api/orchestration/shell" {
+                failedShellReadCounts[host, default: 0] += 1
             }
             throw URLError(.cannotConnectToHost)
         }

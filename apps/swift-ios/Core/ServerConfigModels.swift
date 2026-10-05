@@ -5,6 +5,7 @@ public struct ServerProviderAuthSnapshot: Codable, Equatable, Sendable {
     public let type: String?
     public let label: String?
     public let email: String?
+    public var canLogout: Bool? = nil
 }
 
 public struct ServerProviderOptionChoice: Codable, Identifiable, Equatable, Sendable {
@@ -68,6 +69,7 @@ public enum ServerProviderOptionDescriptor: Codable, Equatable, Sendable {
 
 public struct ServerModelCapabilities: Codable, Equatable, Sendable {
     public let optionDescriptors: [ServerProviderOptionDescriptor]?
+    public var supportedRuntimeModes: [RuntimeMode]? = nil
 }
 
 public struct ServerProviderModelSnapshot: Codable, Identifiable, Equatable, Sendable {
@@ -158,7 +160,9 @@ public enum ServerProjectGroupingMode: String, Codable, Equatable, Sendable {
 /// can resolve these differently even though they share one mobile client.
 public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public var defaultModelSelection: ModelSelection? = nil
-    public var defaultThreadEnvMode: ServerThreadEnvironmentMode
+    public var defaultRuntimeMode: RuntimeMode = .fullAccess
+    public var supportsDefaultRuntimeMode = false
+    public var defaultThreadEnvMode: ServerThreadEnvironmentMode?
     public var newWorktreesStartFromOrigin: Bool
     public let sidebarProjectGroupingMode: ServerProjectGroupingMode?
     public let sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]?
@@ -166,6 +170,15 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public var sidebarAutoSettleAfterDays: Double?
     public var continueThreadsAfterServerUpdate: Bool
     public var defaultAutoPull = false
+    public var defaultProjectScripts: [ProjectScript] = []
+    public var projectScriptOverrides: [String: JSONValue] = [:]
+    public var branchNamingMode: BranchNamingMode? = nil
+    public var branchNamePrefix: String? = nil
+    public var branchNameInstructions: String? = nil
+    public var enableAgentBrowserAccess: Bool? = nil
+    public var enableProviderUpdateChecks: Bool? = nil
+    public var autoResumeLimitedThreads: Bool? = nil
+    public var snoozeLimitedThreads: Bool? = nil
     public var storageCleanup: [String: JSONValue]? = nil
     public var worktreeCleanup: JSONValue? = nil
     public var worktreeSubmodules: WorktreeSubmodules? = nil
@@ -177,6 +190,21 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     public var environmentIcon: String? = nil
     public var sourceControlWritingStyle: JSONValue? = nil
 
+    /// Optional fields indicate support on older servers. Do not send a newer
+    /// preference to an environment that has not advertised it.
+    var unsupportedPreferenceKeys: Set<String> {
+        var keys = Set<String>()
+        if !supportsDefaultRuntimeMode { keys.insert("defaultRuntimeMode") }
+        if branchNamingMode == nil { keys.insert("branchNamingMode") }
+        if branchNamePrefix == nil { keys.insert("branchNamePrefix") }
+        if branchNameInstructions == nil { keys.insert("branchNameInstructions") }
+        if enableAgentBrowserAccess == nil { keys.insert("enableAgentBrowserAccess") }
+        if enableProviderUpdateChecks == nil { keys.insert("enableProviderUpdateChecks") }
+        if autoResumeLimitedThreads == nil { keys.insert("autoResumeLimitedThreads") }
+        if snoozeLimitedThreads == nil { keys.insert("snoozeLimitedThreads") }
+        return keys
+    }
+
     public var sharedPatch: JSONValue {
         sharedPatch(supportsRestartContinuation: false)
     }
@@ -186,9 +214,18 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         var fields: [String: JSONValue] = [
             "sidebarAutoSettleAfterDays": sidebarAutoSettleAfterDays.map(JSONValue.number) ?? .null,
             "sidebarAutoSettleOnMerge": .bool(sidebarAutoSettleOnMerge),
-            "defaultThreadEnvMode": .string(defaultThreadEnvMode.rawValue),
+            "defaultThreadEnvMode": defaultThreadEnvMode.map { .string($0.rawValue) } ?? .null,
             "newWorktreesStartFromOrigin": .bool(newWorktreesStartFromOrigin),
+            "defaultAutoPull": .bool(defaultAutoPull),
         ]
+        if supportsDefaultRuntimeMode { fields["defaultRuntimeMode"] = .string(defaultRuntimeMode.rawValue) }
+        if let branchNamingMode { fields["branchNamingMode"] = .string(branchNamingMode.rawValue) }
+        if let branchNamePrefix { fields["branchNamePrefix"] = .string(branchNamePrefix) }
+        if let branchNameInstructions { fields["branchNameInstructions"] = .string(branchNameInstructions) }
+        if let enableAgentBrowserAccess { fields["enableAgentBrowserAccess"] = .bool(enableAgentBrowserAccess) }
+        if let enableProviderUpdateChecks { fields["enableProviderUpdateChecks"] = .bool(enableProviderUpdateChecks) }
+        if let autoResumeLimitedThreads { fields["autoResumeLimitedThreads"] = .bool(autoResumeLimitedThreads) }
+        if let snoozeLimitedThreads { fields["snoozeLimitedThreads"] = .bool(snoozeLimitedThreads) }
         if let sourceControlWritingStyle { fields["sourceControlWritingStyle"] = sourceControlWritingStyle }
         if supportsRestartContinuation {
             fields["continueThreadsAfterServerUpdate"] = .bool(continueThreadsAfterServerUpdate)
@@ -197,7 +234,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
     }
 
     public init(
-        defaultThreadEnvMode: ServerThreadEnvironmentMode = .local,
+        defaultThreadEnvMode: ServerThreadEnvironmentMode? = nil,
         newWorktreesStartFromOrigin: Bool = true,
         sidebarProjectGroupingMode: ServerProjectGroupingMode? = nil,
         sidebarProjectGroupingOverrides: [String: ServerProjectGroupingMode]? = nil,
@@ -216,6 +253,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case defaultModelSelection
+        case defaultRuntimeMode
         case defaultThreadEnvMode
         case newWorktreesStartFromOrigin
         case sidebarProjectGroupingMode
@@ -227,11 +265,25 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         case sourceControlWritingStyle
         case worktreeSubmodules, storageCleanup, worktreeCleanup
         case defaultAutoPull, responseStreamingMode, projectSettingsOverrides, projectSettingsFolded
+        case defaultProjectScripts, projectScriptOverrides
+        case branchNamingMode, branchNamePrefix, branchNameInstructions
+        case enableAgentBrowserAccess, enableProviderUpdateChecks, autoResumeLimitedThreads, snoozeLimitedThreads
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         defaultModelSelection = try container.decodeIfPresent(ModelSelection.self, forKey: .defaultModelSelection)
+        defaultRuntimeMode = try container.decodeIfPresent(RuntimeMode.self, forKey: .defaultRuntimeMode) ?? .fullAccess
+        supportsDefaultRuntimeMode = container.contains(.defaultRuntimeMode)
+        defaultProjectScripts = try container.decodeIfPresent([ProjectScript].self, forKey: .defaultProjectScripts) ?? []
+        projectScriptOverrides = try container.decodeIfPresent([String: JSONValue].self, forKey: .projectScriptOverrides) ?? [:]
+        branchNamingMode = try container.decodeIfPresent(BranchNamingMode.self, forKey: .branchNamingMode)
+        branchNamePrefix = try container.decodeIfPresent(String.self, forKey: .branchNamePrefix)
+        branchNameInstructions = try container.decodeIfPresent(String.self, forKey: .branchNameInstructions)
+        enableAgentBrowserAccess = try container.decodeIfPresent(Bool.self, forKey: .enableAgentBrowserAccess)
+        enableProviderUpdateChecks = try container.decodeIfPresent(Bool.self, forKey: .enableProviderUpdateChecks)
+        autoResumeLimitedThreads = try container.decodeIfPresent(Bool.self, forKey: .autoResumeLimitedThreads)
+        snoozeLimitedThreads = try container.decodeIfPresent(Bool.self, forKey: .snoozeLimitedThreads)
         environmentIcon = try container.decodeIfPresent(String.self, forKey: .environmentIcon)
         sourceControlWritingStyle = try container.decodeIfPresent(JSONValue.self, forKey: .sourceControlWritingStyle)
         storageCleanup = try container.decodeIfPresent([String: JSONValue].self, forKey: .storageCleanup)
@@ -249,7 +301,7 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
         defaultThreadEnvMode = try container.decodeIfPresent(
             ServerThreadEnvironmentMode.self,
             forKey: .defaultThreadEnvMode
-        ) ?? .local
+        )
         newWorktreesStartFromOrigin = try container.decodeIfPresent(
             Bool.self,
             forKey: .newWorktreesStartFromOrigin
@@ -277,7 +329,16 @@ public struct ServerSettingsSnapshot: Codable, Equatable, Sendable {
 public enum ServerSettingsChange: Equatable, Sendable {
     case sidebarAutoSettleOnMerge(Bool)
     case sidebarAutoSettleAfterDays(Double?)
-    case defaultThreadEnvMode(ServerThreadEnvironmentMode)
+    case defaultRuntimeMode(RuntimeMode)
+    case defaultThreadEnvMode(ServerThreadEnvironmentMode?)
+    case defaultAutoPull(Bool)
+    case branchNamingMode(BranchNamingMode)
+    case branchNamePrefix(String)
+    case branchNameInstructions(String)
+    case enableAgentBrowserAccess(Bool)
+    case enableProviderUpdateChecks(Bool)
+    case autoResumeLimitedThreads(Bool)
+    case snoozeLimitedThreads(Bool)
     case newWorktreesStartFromOrigin(Bool)
     case continueThreadsAfterServerUpdate(Bool)
     case environmentIcon(String?)
@@ -290,7 +351,16 @@ public enum ServerSettingsChange: Equatable, Sendable {
 
     public var jsonValue: JSONValue {
         switch self {
-        case let .defaultThreadEnvMode(value): .object(["defaultThreadEnvMode": .string(value.rawValue)])
+        case let .defaultRuntimeMode(value): .object(["defaultRuntimeMode": .string(value.rawValue)])
+        case let .defaultThreadEnvMode(value): .object(["defaultThreadEnvMode": value.map { .string($0.rawValue) } ?? .null])
+        case let .defaultAutoPull(value): .object(["defaultAutoPull": .bool(value)])
+        case let .branchNamingMode(value): .object(["branchNamingMode": .string(value.rawValue)])
+        case let .branchNamePrefix(value): .object(["branchNamePrefix": .string(value)])
+        case let .branchNameInstructions(value): .object(["branchNameInstructions": .string(value)])
+        case let .enableAgentBrowserAccess(value): .object(["enableAgentBrowserAccess": .bool(value)])
+        case let .enableProviderUpdateChecks(value): .object(["enableProviderUpdateChecks": .bool(value)])
+        case let .autoResumeLimitedThreads(value): .object(["autoResumeLimitedThreads": .bool(value)])
+        case let .snoozeLimitedThreads(value): .object(["snoozeLimitedThreads": .bool(value)])
         case let .newWorktreesStartFromOrigin(value): .object(["newWorktreesStartFromOrigin": .bool(value)])
         case let .continueThreadsAfterServerUpdate(value):
             .object(["continueThreadsAfterServerUpdate": .bool(value)])

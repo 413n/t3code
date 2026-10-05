@@ -209,6 +209,7 @@ public protocol FeatureClient: AnyObject {
     ) async throws -> [FeatureFileEntry]
     func readFile(threadID: String, path: String) async throws -> FeatureFileContent
     func loadReview(threadID: String) async throws -> FeatureReview
+    func loadReview(threadID: String, target: FeatureReviewTarget?) async throws -> FeatureReview
     func loadReviewFileContents(
         threadID: String,
         file: FeatureReviewFile
@@ -226,6 +227,11 @@ public protocol FeatureClient: AnyObject {
         action: FeatureSourceControlAction,
         message: String?
     ) async throws
+
+    func performSourceControlAction(threadID: String, request: FeatureSourceControlRequest) async throws
+    func sourceControlBranches(threadID: String) async throws -> FeatureSourceControlBranches
+    func changeSourceControlWorkspace(threadID: String, action: FeatureSourceControlWorkspaceAction) async throws
+    func syncSourceControlWorkspace(threadID: String, workspace: FeatureSourceControlWorkspace) async throws
 
     func terminalSnapshot(threadID: String, terminalID: String) async throws -> FeatureTerminalSnapshot
     func terminalHostOS(threadID: String) -> String?
@@ -516,6 +522,11 @@ public extension FeatureClient {
         throw FeatureCapabilityUnavailable("File preview")
     }
 
+    func loadReview(threadID: String, target: FeatureReviewTarget?) async throws -> FeatureReview {
+        guard target == nil else { throw FeatureCapabilityUnavailable("Review source selection") }
+        return try await loadReview(threadID: threadID)
+    }
+
     func loadReview(threadID: String) async throws -> FeatureReview {
         throw FeatureCapabilityUnavailable("Review")
     }
@@ -546,6 +557,25 @@ public extension FeatureClient {
         message: String?
     ) async throws {
         throw FeatureCapabilityUnavailable("Source control actions")
+    }
+
+    func performSourceControlAction(threadID: String, request: FeatureSourceControlRequest) async throws {
+        guard request.filePaths == nil, !request.featureBranch else {
+            throw FeatureCapabilityUnavailable("Commit file and branch options")
+        }
+        try await performSourceControlAction(threadID: threadID, action: request.action, message: request.message)
+    }
+
+    func sourceControlBranches(threadID: String) async throws -> FeatureSourceControlBranches {
+        throw FeatureCapabilityUnavailable("Branches and worktrees")
+    }
+
+    func changeSourceControlWorkspace(threadID: String, action: FeatureSourceControlWorkspaceAction) async throws {
+        throw FeatureCapabilityUnavailable("Branches and worktrees")
+    }
+
+    func syncSourceControlWorkspace(threadID: String, workspace: FeatureSourceControlWorkspace) async throws {
+        throw FeatureCapabilityUnavailable("Thread workspace updates")
     }
 
     func terminalSnapshot(threadID: String, terminalID _: String) async throws -> FeatureTerminalSnapshot {

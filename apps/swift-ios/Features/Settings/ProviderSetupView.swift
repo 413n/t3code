@@ -5,6 +5,24 @@ struct ProviderSetupContext {
     let environmentID: String
 }
 
+struct FeatureProviderAccountActions {
+    let provider: FeatureProvider
+    let auth: ProviderAuthState?
+
+    var isSignedIn: Bool {
+        provider.authStatus == "authenticated"
+            || (provider.authStatus == "unknown" && auth?.phase == "succeeded")
+    }
+
+    var canChangeAccount: Bool {
+        isSignedIn && auth?.isActive != true && provider.setup?.canAuthenticate != false
+    }
+
+    var canSignOut: Bool {
+        isSignedIn && auth?.isActive != true && (provider.canLogout ?? provider.setup?.canAuthenticate) == true
+    }
+}
+
 private struct ProviderSetupContextKey: EnvironmentKey {
     static let defaultValue: ProviderSetupContext? = nil
 }
@@ -64,6 +82,8 @@ private struct ProviderSetupView: View {
     @State private var errorMessage: String?
     @State private var confirmSignOut = false
     @State private var confirmRemove = false
+    @State private var subscriptionRevision = 0
+    @State private var authSubscriptionFailed = false
 
     private var provider: FeatureProvider? {
         model.snapshot.providersByEnvironment?[environmentID]?.first { $0.id == instanceID }
@@ -72,6 +92,7 @@ private struct ProviderSetupView: View {
     var body: some View {
         Form {
             if let provider {
+                let accountActions = FeatureProviderAccountActions(provider: provider, auth: auth)
                 Section {
                     Text(provider.statusMessage ?? (provider.isAvailable ? "Ready" : "Setup needed"))
                     if provider.driver == "antigravity" {
@@ -128,13 +149,9 @@ private struct ProviderSetupView: View {
                         if let message = install?.message { Text(message).font(.footnote) }
                     }
                 }
-                if provider.setup?.canAuthenticate == true {
+                if ProviderAccountDiscovery.isSupported(driver: provider.driver, installed: provider.isInstalled, setup: provider.setup) {
                     Section("Account") {
-                        if provider.authStatus == "authenticated"
-                            || (provider.isEnabled == false && provider.authStatus == "unknown") {
-                            if provider.authStatus == "authenticated" { Text("Signed in") }
-                            Button("Sign out", role: .destructive) { confirmSignOut = true }
-                        } else if let auth, auth.isActive {
+                        if let auth, auth.isActive {
                             if let rawURL = auth.interaction?.url ?? auth.authorizationUrl, let url = URL(string: rawURL), url.scheme == "https" {
                                 Button("Open sign-in page") { openURL(url) }
                             }
@@ -154,6 +171,38 @@ private struct ProviderSetupView: View {
                                 }
                                 Button("Cancel sign-in") { callbackURL = ""; run(.cancelSignIn(flowID: flowID)) }
                             }
+                        } else if accountActions.isSignedIn {
+                            Text("Signed in")
+                            if accountActions.canChangeAccount {
+                                if let methods = auth?.methods, methods.count > 1 {
+                                    Menu("Change account") {
+                                        ForEach(methods) { method in
+                                            Button(method.name) { run(.signInMethod(method.id)) }
+                                        }
+                                    }
+                                    .disabled(auth == nil || authSubscriptionFailed || provider.isEnabled == false || provider.isInstalled == false)
+                                } else {
+                                    Button("Change account") { run(.signIn) }
+                                        .disabled(auth == nil || authSubscriptionFailed || provider.isEnabled == false || provider.isInstalled == false)
+                                }
+                            }
+                            if accountActions.canSignOut {
+                                Button("Sign out", role: .destructive) { confirmSignOut = true }
+                                    .disabled(auth == nil || authSubscriptionFailed)
+                            }
+                            if authSubscriptionFailed {
+                                Button("Retry sign-in discovery") { subscriptionRevision += 1 }
+                            }
+                        } else if authSubscriptionFailed {
+                            Button("Retry sign-in discovery") { subscriptionRevision += 1 }
+                        } else if ProviderAccountDiscovery.isDiscovering(driver: provider.driver, auth: auth) {
+                            Text("Discovering sign-in methods…")
+                        } else if ProviderAccountDiscovery.needsExternalSetup(driver: provider.driver, setup: provider.setup, auth: auth) {
+                            Text("No in-app sign-in is available. Follow the provider’s setup instructions on this environment.")
+                            if let rawURL = provider.setup?.documentationUrl,
+                               let url = URL(string: rawURL), ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
+                                Link("Open provider docs", destination: url)
+                            }
                         } else {
                             if let methods = auth?.methods, !methods.isEmpty {
                                 ForEach(methods) { method in
@@ -168,7 +217,7 @@ private struct ProviderSetupView: View {
                         if auth?.phase != "succeeded", let message = auth?.message { Text(message).font(.footnote) }
                     }
                 }
-                if provider.setup == nil {
+                if provider.setup == nil && !ProviderAccountDiscovery.isSupported(driver: provider.driver, installed: provider.isInstalled, setup: provider.setup) {
                     Section { Text("Configure this provider on its computer.") }
                 }
                 Section { Button("Refresh models") { Task { _ = await model.refreshProviders(environmentID: environmentID) } } }
@@ -182,12 +231,24 @@ private struct ProviderSetupView: View {
         .navigationTitle(provider?.name ?? "Provider")
         .navigationBarTitleDisplayMode(.inline)
         .tint(T3Colors.accent)
-        .task(id: instanceID) {
+        .task(id: subscriptionKey) {
+            auth = nil
+            install = nil
+            authSubscriptionFailed = false
+            errorMessage = nil
+            callbackURL = ""
+            credentialValues = [:]
+            terminalInput = ""
             do {
                 for try await event in model.client.providerSetupEvents(environmentID: environmentID, instanceID: instanceID) {
+                    try Task.checkCancellation()
                     receive(event)
                 }
-            } catch is CancellationError {} catch { errorMessage = "Could not load provider setup. Check this connection and its permissions." }
+            } catch is CancellationError {} catch {
+                guard !Task.isCancelled else { return }
+                authSubscriptionFailed = true
+                errorMessage = "Could not load provider setup. Check this connection and its permissions."
+            }
         }
         .onDisappear { callbackURL = ""; credentialValues = [:]; terminalInput = "" }
         .onChange(of: auth?.interaction?.id) { callbackURL = ""; credentialValues = [:]; terminalInput = "" }
@@ -197,6 +258,10 @@ private struct ProviderSetupView: View {
         .confirmationDialog("Remove the runtime from this environment?", isPresented: $confirmRemove) {
             Button("Remove runtime", role: .destructive) { run(.remove) }
         }
+    }
+
+    private var subscriptionKey: String {
+        "\(environmentID.utf8.count):\(environmentID)\(instanceID):\(provider?.isInstalled == true):\(subscriptionRevision)"
     }
 
     @ViewBuilder

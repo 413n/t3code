@@ -1,5 +1,17 @@
 import SwiftUI
 
+enum FeatureSourceControlDestinationPolicy {
+    /// Commit needs local changes, even when the remote status never arrives.
+    static func shouldOpenCommit(
+        destination: FeatureThreadDestination?,
+        handledDestination: FeatureThreadDestination?,
+        status: FeatureSourceControlStatus?
+    ) -> Bool {
+        destination == .gitCommit && handledDestination != .gitCommit
+            && status?.availableActions.contains(.commit) == true
+    }
+}
+
 @MainActor
 func runFeatureSourceControlAction<Value>(
     setRunning: (Bool) -> Void,
@@ -18,22 +30,28 @@ func runFeatureSourceControlAction<Value>(
 public struct FeatureSourceControlView: View {
     let client: any FeatureClient
     let threadID: String
+    let initialDestination: FeatureThreadDestination?
 
     @State private var status: FeatureSourceControlStatus?
     @State private var isLoading = true
     @State private var isRunningAction = false
-    @State private var runState = FeatureToolRunState<FeatureSourceControlOperation>()
-    @State private var recovery = FeatureToolFailureState<FeatureSourceControlOperation>()
+    @State private var runState = FeatureToolRunState<FeatureGitOperation>()
+    @State private var recovery = FeatureToolFailureState<FeatureGitOperation>()
     @State private var errorMessage: String?
     @State private var loadGeneration = 0
     @State private var statusGeneration = 0
-    @State private var commitMessage = ""
+    @State private var commitSubmission: FeatureSourceControlRequest?
+    @State private var branchChoice: FeatureSourceControlRequest?
+    @State private var branchChoiceName: String?
+    @State private var showsBranches = false
+    @State private var handledDestination: FeatureThreadDestination?
     @State private var pendingCommitAction: FeatureSourceControlAction?
     @AccessibilityFocusState private var recoveryFocus: FeatureToolRecoveryFocus?
 
-    public init(client: any FeatureClient, threadID: String) {
+    public init(client: any FeatureClient, threadID: String, initialDestination: FeatureThreadDestination? = nil) {
         self.client = client
         self.threadID = threadID
+        self.initialDestination = initialDestination
     }
 
     public var body: some View {
@@ -77,22 +95,47 @@ public struct FeatureSourceControlView: View {
                 .accessibilityLabel("Reload source control")
             }
         }
-        .alert("Commit changes", isPresented: Binding(
+        .sheet(isPresented: Binding(
             get: { pendingCommitAction != nil },
             set: { if !$0 { pendingCommitAction = nil } }
-        )) {
-            TextField("Commit message", text: $commitMessage)
-            Button("Cancel", role: .cancel) { pendingCommitAction = nil }
-            Button("Commit") {
-                if let action = pendingCommitAction {
-                    Task { await perform(action, message: commitMessage) }
-                }
-                pendingCommitAction = nil
+        ), onDismiss: {
+            if let request = commitSubmission {
+                commitSubmission = nil
+                begin(request)
             }
-            .disabled(
-                commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || runState.isBusy
-            )
+        }) {
+            if let action = pendingCommitAction, let status {
+                FeatureGitCommitView(status: status, action: action) { request in
+                    commitSubmission = request
+                    pendingCommitAction = nil
+                }
+            }
+        }
+        .confirmationDialog("Continue on \(branchChoiceName ?? status?.branch ?? "the default branch")?", isPresented: Binding(
+            get: { branchChoice != nil },
+            set: { if !$0 { branchChoice = nil } }
+        ), titleVisibility: .visible) {
+            if let request = branchChoice {
+                Button("Continue on this branch") {
+                    var next = request
+                    next.allowDefaultBranch = true
+                    branchChoice = nil
+                    Task { await run(.action(next)) }
+                }
+                Button("Create a feature branch and continue") {
+                    var next = request
+                    next.featureBranch = true
+                    branchChoice = nil
+                    Task { await run(.action(next)) }
+                }
+                Button("Cancel", role: .cancel) { branchChoice = nil }
+            }
+        }
+        .navigationDestination(isPresented: $showsBranches) {
+            FeatureGitBranchesView(client: client, threadID: threadID)
+        }
+        .onChange(of: showsBranches) { _, visible in
+            if !visible { Task { await reload() } }
         }
         .onChange(of: recovery.failure?.id) { _, failureID in
             guard failureID != nil else { return }
@@ -103,7 +146,18 @@ public struct FeatureSourceControlView: View {
             recoveryFocus = .recoveredContent
             AccessibilityNotification.Announcement(announcement).post()
         }
-        .task { await load() }
+        .onChange(of: status) { _, _ in
+            openCommitDestinationIfNeeded()
+        }
+        .task(id: initialDestination) {
+            let shouldOpen = initialDestination != handledDestination
+            if shouldOpen, initialDestination == .gitBranches {
+                handledDestination = initialDestination
+                showsBranches = true
+            }
+            openCommitDestinationIfNeeded()
+            await load()
+        }
     }
 
     /// Keeps the failed output on screen — including while its retry runs — with a labelled
@@ -211,6 +265,13 @@ public struct FeatureSourceControlView: View {
             }
 
             Section("Actions") {
+                Button {
+                    showsBranches = true
+                } label: {
+                    Label("Branches and worktrees", systemImage: "arrow.triangle.branch")
+                }
+                .disabled(runState.isBusy)
+
                 if status.availableActions.isEmpty {
                     Text(status.isBusy ? "Source control operation in progress" : "No actions available")
                         .foregroundStyle(T3Colors.textSecondary)
@@ -263,12 +324,30 @@ public struct FeatureSourceControlView: View {
         }
     }
 
+    private func openCommitDestinationIfNeeded() {
+        guard FeatureSourceControlDestinationPolicy.shouldOpenCommit(
+            destination: initialDestination,
+            handledDestination: handledDestination,
+            status: status
+        ) else { return }
+        handledDestination = .gitCommit
+        begin(.commit)
+    }
+
     private func begin(_ action: FeatureSourceControlAction) {
-        if action.requiresMessage {
-            commitMessage = ""
+        if action.includesCommit {
             pendingCommitAction = action
         } else {
-            Task { await perform(action, message: nil) }
+            begin(FeatureSourceControlRequest(action: action))
+        }
+    }
+
+    private func begin(_ request: FeatureSourceControlRequest) {
+        if let status, request.requiresBranchChoice(status) {
+            branchChoiceName = status.branch
+            branchChoice = request
+        } else {
+            Task { await run(.action(request)) }
         }
     }
 
@@ -313,7 +392,7 @@ public struct FeatureSourceControlView: View {
             }
         } catch {
             guard statusID == statusGeneration else { return }
-            if FeatureToolFailureState<FeatureSourceControlOperation>.isCancellation(error) {
+            if FeatureToolFailureState<FeatureGitOperation>.isCancellation(error) {
                 recovery.recordFailure(.load, error: error)
                 return
             }
@@ -337,15 +416,9 @@ public struct FeatureSourceControlView: View {
         }
     }
 
-    private func perform(_ action: FeatureSourceControlAction, message: String?) async {
-        await run(
-            .action(action, message: message?.trimmingCharacters(in: .whitespacesAndNewlines))
-        )
-    }
-
     /// Mutations finish before refresh so Retry cannot repeat completed work.
-    private func run(_ operation: FeatureSourceControlOperation) async {
-        guard case let .action(action, message) = operation else {
+    private func run(_ operation: FeatureGitOperation) async {
+        guard !operation.isLoad else {
             await reload()
             return
         }
@@ -357,11 +430,14 @@ public struct FeatureSourceControlView: View {
         let result = await runFeatureSourceControlAction(
             setRunning: { isRunningAction = $0 }
         ) {
-            try await client.performSourceControlAction(
-                threadID: threadID,
-                action: action,
-                message: message
-            )
+            switch operation {
+            case .load: break
+            case .action(let request):
+                try await client.performSourceControlAction(threadID: threadID, request: request)
+            case .syncWorkspace(let workspace, let pending):
+                try await client.syncSourceControlWorkspace(threadID: threadID, workspace: workspace)
+                if let pending { try await client.performSourceControlAction(threadID: threadID, request: pending) }
+            }
         }
         var shouldRecoverStatus = false
         switch result {
@@ -378,9 +454,19 @@ public struct FeatureSourceControlView: View {
                 )
             }
         case let .failure(error):
-            recovery.recordFailure(operation, error: error)
-            shouldRecoverStatus = !FeatureToolFailureState<FeatureSourceControlOperation>
-                .isCancellation(error)
+            if let syncError = error as? FeatureSourceControlWorkspaceSyncError {
+                recovery.recordFollowUpFailure(.syncWorkspace(syncError.workspace, then: syncError.pendingRequest), afterCompletionOf: operation, error: error)
+            } else if let retry = error as? FeatureSourceControlActionRetryError {
+                recovery.recordFollowUpFailure(.action(retry.request), afterCompletionOf: operation, error: error)
+            } else if let choice = error as? FeatureSourceControlBranchChoiceRequired,
+                      let request = operation.request {
+                recovery.recordSuccess(operation)
+                branchChoiceName = choice.branch
+                branchChoice = request
+            } else {
+                recovery.recordFailure(operation, error: error)
+                shouldRecoverStatus = !FeatureToolFailureState<FeatureGitOperation>.isCancellation(error)
+            }
         }
         runState.finish(operation)
         if shouldRecoverStatus {
@@ -390,13 +476,6 @@ public struct FeatureSourceControlView: View {
 }
 
 private extension FeatureSourceControlAction {
-    var requiresMessage: Bool {
-        switch self {
-        case .commit, .commitAndPush, .commitPushAndCreatePullRequest: true
-        case .push, .pull, .createPullRequest: false
-        }
-    }
-
     var icon: String {
         switch self {
         case .commit: "checkmark.circle"

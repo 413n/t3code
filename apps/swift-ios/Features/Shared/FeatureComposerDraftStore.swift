@@ -2,6 +2,8 @@ import Foundation
 
 public struct FeatureComposerDraft: Sendable, Equatable {
     public var context: OrchestrationMessageContext?
+    public var runtimeMode: FeatureRuntimeMode?
+    public var interactionMode: FeatureInteractionMode?
     public var text: String
     public var attachments: [FeatureDraftAttachment]
     public var selection: FeatureSelection?
@@ -12,17 +14,22 @@ public struct FeatureComposerDraft: Sendable, Equatable {
         attachments: [FeatureDraftAttachment] = [],
         selection: FeatureSelection? = nil,
         workspace: FeatureComposerWorkspaceDraft? = nil,
-        context: OrchestrationMessageContext? = nil
+        context: OrchestrationMessageContext? = nil,
+        runtimeMode: FeatureRuntimeMode? = nil,
+        interactionMode: FeatureInteractionMode? = nil
     ) {
         self.text = text
         self.attachments = attachments
         self.selection = selection
         self.workspace = workspace
         self.context = context
+        self.runtimeMode = runtimeMode
+        self.interactionMode = interactionMode
     }
 
     public var isEmpty: Bool {
         text.isEmpty && attachments.isEmpty && selection == nil && workspace == nil
+            && runtimeMode == nil && interactionMode == nil
     }
 }
 
@@ -93,6 +100,8 @@ public actor FeatureComposerDraftStore {
 
     private struct PersistedDraft: Codable {
         var context: OrchestrationMessageContext?
+        var runtimeMode: FeatureRuntimeMode?
+        var interactionMode: FeatureInteractionMode?
         var text: String
         var attachments: [PersistedAttachment]
         var selection: FeatureSelection?
@@ -102,6 +111,8 @@ public actor FeatureComposerDraftStore {
         init(_ draft: FeatureComposerDraft) {
             text = draft.text
             context = draft.context
+            runtimeMode = draft.runtimeMode
+            interactionMode = draft.interactionMode
             attachments = draft.attachments.map(PersistedAttachment.init)
             selection = draft.selection
             workspace = draft.workspace.map(PersistedWorkspace.init)
@@ -114,8 +125,19 @@ public actor FeatureComposerDraftStore {
                 attachments: attachments.compactMap { $0.featureValue(fileStore: fileStore) },
                 selection: selection,
                 workspace: workspace?.featureValue,
-                context: context
+                context: context,
+                runtimeMode: runtimeMode,
+                interactionMode: interactionMode
             )
+        }
+
+        func recoveryValue(fileStore: ManagedAttachmentFileStore) throws -> FeatureComposerDraft {
+            let draft = featureValue(fileStore: fileStore)
+            guard draft.attachments.count == attachments.count else {
+                throw FeatureThreadRecoveryError("Some saved attachments could not be read. The saved drafts are kept.")
+            }
+            try FeatureComposerDraftStore.validateRecoveryAttachments(draft)
+            return draft
         }
     }
 
@@ -312,7 +334,8 @@ public actor FeatureComposerDraftStore {
         text: String,
         attachments: [FeatureDraftAttachment],
         for key: String,
-        maximumAttachmentCount: Int = 100
+        maximumAttachmentCount: Int = 100,
+        trimWhitespace: Bool = true
     ) throws -> FeatureComposerDraft {
         var drafts = try loadIfNeeded()
         var persisted = drafts[key] ?? PersistedDraft(FeatureComposerDraft())
@@ -330,9 +353,11 @@ public actor FeatureComposerDraftStore {
             )
         }
 
-        let incomingText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let incomingText = trimWhitespace ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
         if !incomingText.isEmpty {
-            persisted.text = persisted.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimWhitespace {
+                persisted.text = persisted.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
             persisted.text = persisted.text.isEmpty
                 ? incomingText
                 : "\(persisted.text)\n\n\(incomingText)"
@@ -340,16 +365,109 @@ public actor FeatureComposerDraftStore {
 
         persisted.attachments.append(contentsOf: uniqueAttachments.map(PersistedAttachment.init))
         importedIDs.append(shareID)
-        persisted.importedShareIDs = Array(importedIDs.suffix(32))
+        persisted.importedShareIDs = Self.retainedImportIDs(importedIDs)
         drafts[key] = persisted
         try persist(drafts)
         loadedDrafts = drafts
         return persisted.featureValue(fileStore: attachmentFileStore)
     }
 
+    /// Commits all recovered fields and the replay marker together. The outbox
+    /// can then remove its separate copy without a crash duplicating the prompt.
+    func importRecoveredDraft(_ recovery: FeatureSubmissionRecoveryDraft, importID: String,
+                              for key: String) throws -> FeatureSubmissionRecoveryResult {
+        var drafts = try loadIfNeeded()
+        let previous = drafts[key]
+        var importedIDs = previous?.importedShareIDs ?? []
+        // Check before reading the recovery's files. Cleanup can be retried
+        // after the user has removed an imported file or sent the whole draft.
+        if drafts.values.contains(where: { $0.importedShareIDs?.contains(importID) == true }) {
+            return FeatureSubmissionRecoveryResult(
+                draft: try previous?.recoveryValue(fileStore: attachmentFileStore) ?? FeatureComposerDraft()
+            )
+        }
+        let current = try previous?.recoveryValue(fileStore: attachmentFileStore) ?? FeatureComposerDraft()
+        var result = recovery.recoverableComposerDraft()
+        let merged = try Self.mergeRecoveredDraft(result.draft, into: current)
+        var persisted = PersistedDraft(merged)
+        importedIDs.append(importID)
+        persisted.importedShareIDs = Self.retainedImportIDs(importedIDs)
+        drafts[key] = persisted
+        try persist(drafts)
+        loadedDrafts = drafts
+        result.draft = merged
+        return result
+    }
+
+    /// Both the queued edit and the normal composer live in this store. Move
+    /// ownership in one write so recovery survives a crash at any point.
+    func consumeQueuedRunEdit(_ edit: FeatureQueuedRunEdit, recovery: FeatureComposerDraft,
+                              for key: String) throws -> FeatureComposerDraft {
+        var drafts = try loadIfNeeded()
+        let editKey = Self.queuedRunEditKey(for: key)
+        guard let persistedEdit = drafts[editKey],
+              try FeatureQueuedRunEdit(savedDraft: persistedEdit.recoveryValue(fileStore: attachmentFileStore)) == edit else {
+            throw FeatureThreadRecoveryError("The queued edit changed. Keep it open and try again.")
+        }
+        let current = try drafts[key]?.recoveryValue(fileStore: attachmentFileStore) ?? FeatureComposerDraft()
+        let merged = try Self.mergeRecoveredDraft(recovery, into: current)
+        var persisted = PersistedDraft(merged)
+        persisted.importedShareIDs = drafts[key]?.importedShareIDs
+        drafts[key] = persisted
+        drafts.removeValue(forKey: editKey)
+        try persist(drafts)
+        loadedDrafts = drafts
+        return merged
+    }
+
+    private static func mergeRecoveredDraft(_ recovery: FeatureComposerDraft,
+                                           into current: FeatureComposerDraft) throws -> FeatureComposerDraft {
+        try validateRecoveryAttachments(recovery)
+        var incoming = recovery
+        let existingIDs = Set(current.attachments.map(\.id))
+        incoming.attachments.removeAll { existingIDs.contains($0.id) }
+        guard current.attachments.count + incoming.attachments.count <= UploadChatAttachment.maximumCount else {
+            throw FeatureComposerDraftImportError.attachmentLimitExceeded(
+                available: max(0, UploadChatAttachment.maximumCount - current.attachments.count))
+        }
+        var merged = try FeatureConversationRewind.merge(recovery: incoming, into: current)
+        merged.selection = current.selection ?? recovery.selection
+        merged.workspace = current.workspace ?? recovery.workspace
+        merged.runtimeMode = current.runtimeMode ?? recovery.runtimeMode
+        merged.interactionMode = current.interactionMode ?? recovery.interactionMode
+        return merged
+    }
+
+    private static func validateRecoveryAttachments(_ draft: FeatureComposerDraft) throws {
+        for file in draft.attachments.compactMap(\.ownedFile) {
+            guard FileManager.default.isReadableFile(atPath: file.url.path),
+                  let values = try? file.url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, values.fileSize == file.byteCount else {
+                throw FeatureThreadRecoveryError("Some saved attachments could not be read. The saved drafts are kept.")
+            }
+        }
+    }
+
+    private static func retainedImportIDs(_ ids: [String]) -> [String] {
+        // Recovery records live in a separate store and can outlast composer
+        // cleanup. Do not evict their receipts while importing later shares.
+        ids.filter { $0.hasPrefix("outbox-recovery:") }
+            + Array(ids.filter { !$0.hasPrefix("outbox-recovery:") }.suffix(32))
+    }
+
+    /// Read persisted ownership without requiring the files to still exist.
+    func ownedAttachmentFileNames() throws -> Set<String> {
+        Set(try loadIfNeeded().values.flatMap { $0.attachments.compactMap(\.ownedFileName) })
+    }
+
     public func removeDraft(for key: String) throws {
         var drafts = try loadIfNeeded()
-        guard drafts.removeValue(forKey: key) != nil else { return }
+        guard let previous = drafts.removeValue(forKey: key) else { return }
+        if let ids = previous.importedShareIDs, !ids.isEmpty {
+            var empty = PersistedDraft(FeatureComposerDraft())
+            empty.importedShareIDs = ids
+            drafts[key] = empty
+        }
         try persist(drafts)
         loadedDrafts = drafts
     }
@@ -383,7 +501,7 @@ public actor FeatureComposerDraftStore {
               filesAreReadable else {
             throw FeatureConversationRewindError(message: "Some saved attachments could not be read. The recovery copy is kept.")
         }
-        guard current.attachments.count + recovery.attachments.count <= 8 else {
+        guard current.attachments.count + recovery.attachments.count <= 100 else {
             throw FeatureConversationRewindError(message: "Make room for the saved prompt's attachments before recovering it.")
         }
         let recovered = try FeatureConversationRewind.merge(recovery: recovery, into: current)

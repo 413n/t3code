@@ -22,6 +22,22 @@ public struct ProviderUpdateState: Codable, Equatable, Hashable, Sendable {
 public struct ProviderSetupCapabilities: Codable, Equatable, Hashable, Sendable {
     public let canAuthenticate: Bool
     public let canInstall: Bool
+    public var documentationUrl: String? = nil
+}
+
+/// Installed registry agents discover their auth methods through the auth stream.
+public enum ProviderAccountDiscovery {
+    public static func isSupported(driver: String, installed: Bool?, setup: ProviderSetupCapabilities?) -> Bool {
+        setup?.canAuthenticate == true || (driver == "acpRegistry" && installed == true)
+    }
+
+    public static func isDiscovering(driver: String, auth: ProviderAuthState?) -> Bool {
+        driver == "acpRegistry" && auth?.methods == nil && auth?.isActive != true
+    }
+
+    public static func needsExternalSetup(driver: String, setup: ProviderSetupCapabilities?, auth: ProviderAuthState?) -> Bool {
+        setup?.canAuthenticate == false || (driver == "acpRegistry" && auth?.methods?.isEmpty == true)
+    }
 }
 
 public struct ProviderAuthMethod: Codable, Identifiable, Equatable, Sendable {

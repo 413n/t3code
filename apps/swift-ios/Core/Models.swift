@@ -137,6 +137,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public var questionAttachments: Bool? = nil
         public var projectSettingsOverrides: Bool? = nil
         public var inlineMessageContext: Bool? = nil
+        public var projectCloneTracking: Bool? = nil
 
         private enum CodingKeys: String, CodingKey {
             case repositoryIdentity
@@ -164,6 +165,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case questionAttachments
             case projectSettingsOverrides
             case inlineMessageContext
+            case projectCloneTracking
             case serverResolvedCommandContext
         }
 
@@ -174,6 +176,7 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             questionAttachments = try container.decodeIfPresent(Bool.self, forKey: .questionAttachments)
             projectSettingsOverrides = try container.decodeIfPresent(Bool.self, forKey: .projectSettingsOverrides)
             inlineMessageContext = try container.decodeIfPresent(Bool.self, forKey: .inlineMessageContext)
+            projectCloneTracking = try container.decodeIfPresent(Bool.self, forKey: .projectCloneTracking)
             serverResolvedCommandContext = try container.decodeIfPresent(Bool.self, forKey: .serverResolvedCommandContext)
             repositoryIdentity =
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
@@ -554,9 +557,15 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let hasPendingUserInput: Bool
     public let hasActionableProposedPlan: Bool
     public let backgroundLiveness: OrchestrationBackgroundLiveness?
+    public var latestUserAuthoredMessageAt: String? = nil
+    /// Missing on older servers; explicit null means that no user has sent a message.
+    public var latestUserAuthoredMessageAtIsPresent: Bool? = nil
+    /// V2 lifecycle facts must survive the legacy display conversion unchanged.
+    public var v2Lifecycle: OrchestrationV2ThreadLifecycle? = nil
 }
 
 public struct OrchestrationMessage: Codable, Identifiable, Equatable, Sendable {
+    public var v2Timeline: OrchestrationV2TimelineMetadata? = nil
     public let id: String
     public let role: String
     public let text: String
@@ -578,6 +587,8 @@ public struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
 }
 
 public struct OrchestrationActivity: Codable, Identifiable, Equatable, Sendable {
+    public var v2Timeline: OrchestrationV2TimelineMetadata? = nil
+    public var v2Item: JSONValue? = nil
     public let id: String
     public let tone: String
     public let kind: String
@@ -640,6 +651,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     /// Native V2 controls are separate from the shared transcript records.
     public var orchestrationV2Control: JSONValue? = nil
     public var orchestrationV2Revision: Int? = nil
+    public var v2Timeline: [OrchestrationV2TimelineRow]? = nil
 }
 
 public struct OrchestrationShellSnapshot: Codable, Equatable, Sendable {

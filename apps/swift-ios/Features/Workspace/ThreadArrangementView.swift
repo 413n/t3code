@@ -15,6 +15,7 @@ struct ThreadArrangementView: View {
                 model: model,
                 revision: model.homePresentationRevision,
                 busy: model.isArrangingThreads,
+                workingShelfEnabled: model.snapshot.settings.workingShelfEnabled,
                 now: now,
                 onAction: { action = $0 }
             )
@@ -56,6 +57,7 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
     let model: FeatureRootModel
     let revision: UInt64
     let busy: Bool
+    let workingShelfEnabled: Bool
     let now: Date
     let onAction: (String?) -> Void
 
@@ -128,7 +130,13 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
                     let threads: [FeatureThread]
                     switch section {
                     case .pinned: threads = index.pinned
-                    case .active: threads = index.active
+                    case .active:
+                        let active = DailyUXSidebarIndex.orderedSection(
+                            parent.model.snapshot.threads, section: .active, now: parent.now
+                        )
+                        threads = parent.workingShelfEnabled
+                            ? FeatureInboxPolicy.sortInbox(active, returns: parent.model.inboxReturns)
+                            : active
                     case .snoozed: threads = index.snoozed
                     case .settled: threads = index.settled
                     }
@@ -207,7 +215,10 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
                     $0.id == thread.environmentID && $0.isEnabled && $0.connectionState == .connected
                   }) else { return false }
             return ThreadArrangementPlanner.canEnter(thread, section: .pinned, now: .now)
-                || ThreadArrangementPlanner.canEnter(thread, section: .active, now: .now)
+                || ThreadArrangementPlanner.canEnter(
+                    thread, section: .active, now: .now,
+                    workingShelfEnabled: parent.workingShelfEnabled
+                )
                 || (thread.supportsSettlement == true && !thread.isEffectivelySettled() && thread.canSettleNow())
         }
 
@@ -268,7 +279,7 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
         ) -> UICollectionViewDropProposal {
             guard session.localDragSession != nil, let id = draggedID,
                   let destination = destination(at: indexPath, location: session.location(in: collectionView)),
-                  parent.model.arrangementPlan(id: id, destination: destination) != nil else {
+                  arrangementPlan(id: id, destination: destination) != nil else {
                 parent.onAction(nil)
                 return UICollectionViewDropProposal(operation: .forbidden)
             }
@@ -287,7 +298,7 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
                     at: coordinator.destinationIndexPath,
                     location: coordinator.session.location(in: collectionView)
                   ),
-                  parent.model.arrangementPlan(id: id, destination: destination) != nil,
+                  arrangementPlan(id: id, destination: destination) != nil,
                   let moved = rows.first(where: { $0.thread?.id == id })?.thread else { return }
             var next = rows.filter { $0.thread?.id != id }
             let target = destination.targetID.flatMap { id in next.firstIndex { $0.thread?.id == id } }
@@ -308,12 +319,21 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
         private func commit(_ id: String, destination: ThreadArrangementDestination) {
             Task { [weak self] in
                 guard let self else { return }
-                _ = await parent.model.arrangeThread(id, destination: destination)
+                if arrangementPlan(id: id, destination: destination) != nil {
+                    _ = await parent.model.arrangeThread(id, destination: destination)
+                }
                 pendingRows = nil
                 draggedID = nil
                 parent.onAction(nil)
                 update()
             }
+        }
+
+        private func arrangementPlan(
+            id: String, destination: ThreadArrangementDestination
+        ) -> ThreadArrangementPlanner.Plan? {
+            guard !parent.workingShelfEnabled || destination.section != .active else { return nil }
+            return parent.model.arrangementPlan(id: id, destination: destination)
         }
 
         private func action(source: ThreadArrangementSection, destination: ThreadArrangementSection) -> String {
@@ -326,7 +346,8 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
 
         private func accessibilityActions(_ thread: FeatureThread, section: ThreadArrangementSection) -> [UIAccessibilityCustomAction] {
             var choices: [(String, ThreadArrangementDestination)] = []
-            if let orderSection = section.orderSection {
+            if let orderSection = section.orderSection,
+               !(parent.workingShelfEnabled && orderSection == .active) {
                 let ordered = DailyUXSidebarIndex.orderedSection(parent.model.snapshot.threads, section: orderSection, now: .now)
                 if let index = ordered.firstIndex(where: { $0.id == thread.id }) {
                     if index > 0 {
@@ -341,9 +362,9 @@ private struct ThreadArrangementCollection: UIViewRepresentable {
                 choices.append((action(source: section, destination: destination), .init(section: destination)))
             }
             return choices.compactMap { name, destination in
-                guard parent.model.arrangementPlan(id: thread.id, destination: destination) != nil else { return nil }
+                guard arrangementPlan(id: thread.id, destination: destination) != nil else { return nil }
                 return UIAccessibilityCustomAction(name: name) { [weak self] _ in
-                    guard let self, self.parent.model.arrangementPlan(id: thread.id, destination: destination) != nil else { return false }
+                    guard let self, self.arrangementPlan(id: thread.id, destination: destination) != nil else { return false }
                     self.commit(thread.id, destination: destination)
                     return true
                 }

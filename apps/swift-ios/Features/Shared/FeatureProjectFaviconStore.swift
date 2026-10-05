@@ -41,6 +41,20 @@ enum FeatureProjectFaviconStoreError: Error, Equatable {
 /// asset URL. A later missing icon or unreachable environment updates the
 /// refresh time but does not discard bytes that were already shown to a user.
 actor FeatureProjectFaviconStore {
+    private final class WeakStore {
+        weak var value: FeatureProjectFaviconStore?
+        init(_ value: FeatureProjectFaviconStore) { self.value = value }
+    }
+    @MainActor private static var stores: [URL: WeakStore] = [:]
+
+    @MainActor static func shared(directoryURL: URL) -> FeatureProjectFaviconStore {
+        let url = directoryURL.standardizedFileURL
+        if let store = stores[url]?.value { return store }
+        stores = stores.filter { $0.value.value != nil }
+        let store = FeatureProjectFaviconStore(directoryURL: url)
+        stores[url] = WeakStore(store)
+        return store
+    }
     private struct Metadata: Codable {
         let key: FeatureProjectFaviconCacheKey
         var revision: String?
@@ -59,6 +73,41 @@ actor FeatureProjectFaviconStore {
     let directoryURL: URL
     private let fileManager: FileManager
     private var cachedDocument: Document?
+    private var generations: [String: UUID] = [:]
+
+    func generation(environmentID: String) -> UUID {
+        if let current = generations[environmentID] { return current }
+        let current = UUID()
+        generations[environmentID] = current
+        return current
+    }
+
+    func storageSummary() throws -> [String: (count: Int, bytes: Int64)] {
+        let document = try loadDocument()
+        return document.entries.values.reduce(into: [:]) { summary, metadata in
+            let bytes = metadata.dataFileName.flatMap {
+                try? directoryURL.appendingPathComponent($0).resourceValues(forKeys: [.fileSizeKey]).fileSize
+            } ?? 0
+            let previous = summary[metadata.key.environmentID] ?? (count: 0, bytes: 0)
+            summary[metadata.key.environmentID] = (previous.count + 1, previous.bytes + Int64(bytes))
+        }
+    }
+
+    func clear(environmentID: String?) throws {
+        var document = try loadDocument()
+        let ids = environmentID.map { [$0] }
+            ?? Array(Set(generations.keys).union(document.entries.values.map { $0.key.environmentID }))
+        for id in ids { generations[id] = UUID() }
+        let removed = document.entries.filter { environmentID == nil || $0.value.key.environmentID == environmentID }
+        for (key, metadata) in removed {
+            document.entries[key] = nil
+            if let name = metadata.dataFileName {
+                let url = directoryURL.appendingPathComponent(name)
+                if fileManager.fileExists(atPath: url.path) { try fileManager.removeItem(at: url) }
+            }
+        }
+        try persist(document)
+    }
 
     init(directoryURL: URL? = nil, fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -98,8 +147,10 @@ actor FeatureProjectFaviconStore {
         data: Data?,
         revision: String?,
         for key: FeatureProjectFaviconCacheKey,
-        checkedAt: Date = .now
+        checkedAt: Date = .now,
+        generation: UUID? = nil
     ) throws {
+        if let generation, generation != self.generation(environmentID: key.environmentID) { return }
         if let data, data.isEmpty || data.count > Self.maximumDataSize {
             throw FeatureProjectFaviconStoreError.invalidDataSize
         }

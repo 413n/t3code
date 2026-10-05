@@ -94,13 +94,93 @@ struct ComposerDraftStoreTests {
                 branch: "main",
                 worktreePath: nil,
                 startFromOrigin: true
-            )
+            ),
+            runtimeMode: .approvalRequired,
+            interactionMode: .plan
         )
 
         try await store.setDraft(draft, for: "environment:test:thread:one")
 
         let reloaded = FeatureComposerDraftStore(fileURL: fileURL)
         #expect(try await reloaded.draft(for: "environment:test:thread:one") == draft)
+    }
+
+    @Test(arguments: FeatureRuntimeMode.allCases, FeatureInteractionMode.allCases)
+    func modeOnlyDraftsSurviveReloadAndCanReturnToInheritedModes(
+        runtimeMode: FeatureRuntimeMode,
+        interactionMode: FeatureInteractionMode
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("drafts.json")
+        let store = FeatureComposerDraftStore(fileURL: fileURL)
+        let runtimeKey = "environment:test:thread:runtime"
+        let interactionKey = "environment:test:new-task:interaction"
+        let runtimeDraft = FeatureComposerDraft(runtimeMode: runtimeMode)
+        let interactionDraft = FeatureComposerDraft(interactionMode: interactionMode)
+
+        try await store.setDraft(runtimeDraft, for: runtimeKey)
+        try await store.setDraft(interactionDraft, for: interactionKey)
+
+        let reloaded = FeatureComposerDraftStore(fileURL: fileURL)
+        #expect(try await reloaded.draft(for: runtimeKey) == runtimeDraft)
+        #expect(try await reloaded.draft(for: interactionKey) == interactionDraft)
+
+        try await reloaded.setDraft(FeatureComposerDraft(), for: runtimeKey)
+        try await reloaded.setDraft(FeatureComposerDraft(), for: interactionKey)
+
+        let cleared = FeatureComposerDraftStore(fileURL: fileURL)
+        #expect(try await cleared.draft(for: runtimeKey) == nil)
+        #expect(try await cleared.draft(for: interactionKey) == nil)
+    }
+
+    @Test(arguments: [1, 2])
+    func olderDraftsWithoutModesKeepInheritedChoices(version: Int) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("drafts.json")
+        let key = "environment:test:thread:old"
+        try Data(
+            """
+            {
+              "version": \(version),
+              "drafts": {
+                "\(key)": { "text": "Saved before mode overrides", "attachments": [] }
+              }
+            }
+            """.utf8
+        ).write(to: fileURL)
+
+        let draft = try #require(await FeatureComposerDraftStore(fileURL: fileURL).draft(for: key))
+
+        #expect(draft.text == "Saved before mode overrides")
+        #expect(draft.runtimeMode == nil)
+        #expect(draft.interactionMode == nil)
+    }
+
+    @Test func shareImportPreservesSavedModeOverrides() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("drafts.json")
+        let store = FeatureComposerDraftStore(fileURL: fileURL)
+        let key = "environment:test:thread:shared"
+        try await store.setDraft(
+            FeatureComposerDraft(runtimeMode: .autoAcceptEdits, interactionMode: .plan),
+            for: key
+        )
+
+        let imported = try await store.importSharedContent(
+            shareID: "share-with-modes", text: "Shared prompt", attachments: [], for: key
+        )
+
+        #expect(imported.text == "Shared prompt")
+        #expect(imported.runtimeMode == .autoAcceptEdits)
+        #expect(imported.interactionMode == .plan)
+        #expect(try await FeatureComposerDraftStore(fileURL: fileURL).draft(for: key) == imported)
     }
 
     @Test func fileBackedDraftRoundTripUsesTheCurrentStorageRoot() async throws {
@@ -357,7 +437,9 @@ struct ComposerDraftStoreTests {
                 branch: nil,
                 worktreePath: nil,
                 startFromOrigin: true
-            )
+            ),
+            runtimeMode: .approvalRequired,
+            interactionMode: .standard
         )
         let liveAttachment = FeatureDraftAttachment(
             data: Data([0x01]),
@@ -373,7 +455,9 @@ struct ComposerDraftStoreTests {
                 branch: nil,
                 worktreePath: nil,
                 startFromOrigin: false
-            )
+            ),
+            runtimeMode: baseline.runtimeMode,
+            interactionMode: .plan
         )
         let saved = FeatureComposerDraft(
             text: "Older text",
@@ -384,7 +468,9 @@ struct ComposerDraftStoreTests {
                 branch: "main",
                 worktreePath: "/tmp/worktree",
                 startFromOrigin: true
-            )
+            ),
+            runtimeMode: .automatic,
+            interactionMode: .standard
         )
 
         let merged = try FeatureComposerDraftRestoration.merge(
@@ -400,6 +486,51 @@ struct ComposerDraftStoreTests {
         #expect(merged.workspace?.branch == "main")
         #expect(merged.workspace?.worktreePath == "/tmp/worktree")
         #expect(merged.workspace?.startFromOrigin == false)
+        #expect(merged.runtimeMode == .automatic)
+        #expect(merged.interactionMode == .plan)
+    }
+
+    @Test func restorationRestoresBothModesWhenNeitherChanged() throws {
+        let saved = FeatureComposerDraft(runtimeMode: .approvalRequired, interactionMode: .plan)
+        let restored = try FeatureComposerDraftRestoration.merge(
+            saved: saved,
+            baseline: FeatureComposerDraft(),
+            current: FeatureComposerDraft()
+        )
+
+        #expect(restored == saved)
+    }
+
+    @Test func restorationPreservesLiveResetsToInheritedModes() throws {
+        let restored = try FeatureComposerDraftRestoration.merge(
+            saved: FeatureComposerDraft(runtimeMode: .approvalRequired, interactionMode: .standard),
+            baseline: FeatureComposerDraft(runtimeMode: .fullAccess, interactionMode: .plan),
+            current: FeatureComposerDraft()
+        )
+
+        #expect(restored.runtimeMode == nil)
+        #expect(restored.interactionMode == nil)
+        #expect(restored.isEmpty)
+    }
+
+    @Test func modeEditsReleaseTheSavedRecoveryGuard() {
+        let snapshot = FeatureComposerDraft(
+            text: "Recovered prompt", runtimeMode: .fullAccess, interactionMode: .plan
+        )
+        #expect(FeatureComposerDraftRestoration.keepsSavedRecovery(snapshot, current: snapshot))
+
+        var runtimeEdit = snapshot
+        runtimeEdit.runtimeMode = .approvalRequired
+        #expect(!FeatureComposerDraftRestoration.keepsSavedRecovery(snapshot, current: runtimeEdit))
+
+        var interactionEdit = snapshot
+        interactionEdit.interactionMode = .standard
+        #expect(!FeatureComposerDraftRestoration.keepsSavedRecovery(snapshot, current: interactionEdit))
+
+        var reset = snapshot
+        reset.runtimeMode = nil
+        reset.interactionMode = nil
+        #expect(!FeatureComposerDraftRestoration.keepsSavedRecovery(snapshot, current: reset))
     }
 
     @Test func restorationUsesFallbacksWithoutOverwritingLiveChoices() throws {

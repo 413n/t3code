@@ -1,5 +1,4 @@
 import ImageIO
-import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
@@ -56,11 +55,7 @@ struct FeatureAttachmentOperationIdentity: Equatable {
 }
 
 struct FeatureImageAttachmentPicker: View {
-    private enum Source {
-        case photoLibrary
-        case camera
-        case files
-    }
+    @SwiftUI.Environment(\.featureThreadPresentationDismissal) private var presentationDismissal
 
     @Binding var attachments: [FeatureDraftAttachment]
     @Binding var preparationState: FeatureAttachmentPreparationState
@@ -71,12 +66,10 @@ struct FeatureImageAttachmentPicker: View {
     let imagesAllowed: Bool
     let maximumFileBytes: Int?
 
-    @State private var isAttachmentSourcePresented = false
-    @State private var isPhotoLibraryPresented = false
+    @State private var sourceRequestID: UUID?
+    @State private var presentationID = UUID()
+    @State private var isNativePickerPresented = false
     @State private var pendingPhotoLibraryItems: [FeaturePhotoLibraryItem] = []
-    @State private var isCameraPresented = false
-    @State private var isFileImporterPresented = false
-    @State private var sourcePresentationTask: Task<Void, Never>?
     @State private var errorMessage: String?
     @State private var generation = UUID()
     @State private var flowIdentity: FeatureAttachmentOperationIdentity?
@@ -103,13 +96,14 @@ struct FeatureImageAttachmentPicker: View {
 
     var body: some View {
         Button {
+            guard presentationDismissal.requestID == nil else { return }
             flowIdentity = FeatureAttachmentOperationIdentity(
                 ownerID: draftOwnerID,
                 environmentID: environmentID,
                 generation: generation
             )
             isFlowActive = true
-            isAttachmentSourcePresented = true
+            sourceRequestID = UUID()
         } label: {
             Image(systemName: preparationState.isPreparing ? "hourglass" : "paperclip")
                 .font(.system(size: 17, weight: .medium))
@@ -118,52 +112,26 @@ struct FeatureImageAttachmentPicker: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!canAdd)
+        .disabled(!canAdd || isFlowActive)
         .opacity(canAdd ? 1 : 0.3)
         .accessibilityLabel(attachmentAccessibilityLabel)
         .accessibilityIdentifier("image-attachment-picker")
         .accessibilityHint(attachmentAccessibilityHint)
-        .confirmationDialog("Add attachment", isPresented: $isAttachmentSourcePresented) {
-            Button("Photo Library") { present(.photoLibrary) }
-                .disabled(!imagesAllowed && maximumFileBytes == nil)
-            Button("Camera") { present(.camera) }
-                .disabled(!imagesAllowed || !UIImagePickerController.isSourceTypeAvailable(.camera))
-            Button("Files") { present(.files) }
-            Button("Cancel", role: .cancel) {
-                isFlowActive = false
-            }
-        }
-        .fullScreenCover(
-            isPresented: $isPhotoLibraryPresented,
-            onDismiss: finishPhotoLibrarySelection
-        ) {
-            FeaturePhotoLibraryPicker(
+        .background {
+            FeatureAttachmentPickerPresenter(
+                requestID: presentationDismissal.requestID == nil ? sourceRequestID : nil,
                 maximumCount: max(1, remainingCount),
                 imagesAllowed: imagesAllowed,
                 videosAllowed: maximumFileBytes != nil,
-                onFinish: { items in
-                    pendingPhotoLibraryItems = items
-                    isPhotoLibraryPresented = false
-                }
+                onPresentationChange: {
+                    isNativePickerPresented = $0
+                    if !$0, flowIdentity == nil { isFlowActive = false }
+                    presentationDismissal.onPresentationChange(presentationID, $0)
+                },
+                onFinish: finishSelection
             )
-            .ignoresSafeArea()
+            .allowsHitTesting(false)
         }
-        .fullScreenCover(isPresented: $isCameraPresented) {
-            FeatureCameraPicker(
-                onCapture: loadCapturedImage,
-                onCancel: {
-                    isCameraPresented = false
-                    isFlowActive = false
-                }
-            )
-            .ignoresSafeArea()
-        }
-        .fileImporter(
-            isPresented: $isFileImporterPresented,
-            allowedContentTypes: maximumFileBytes == nil ? [.image] : [.item],
-            allowsMultipleSelection: true,
-            onCompletion: loadFiles
-        )
         .alert(
             "Couldn’t add attachment",
             isPresented: Binding(
@@ -175,22 +143,10 @@ struct FeatureImageAttachmentPicker: View {
         } message: {
             Text(errorMessage ?? "")
         }
-        .onDisappear {
-            sourcePresentationTask?.cancel()
-            if !isFlowActive {
-                generation = UUID()
-                flowIdentity = nil
-            }
-        }
-        .onChange(of: draftOwnerID) {
-            generation = UUID()
-            flowIdentity = nil
-            pendingPhotoLibraryItems = []
-        }
-        .onChange(of: environmentID) {
-            generation = UUID()
-            flowIdentity = nil
-            pendingPhotoLibraryItems = []
+        .onChange(of: draftOwnerID) { cancelSelection() }
+        .onChange(of: environmentID) { cancelSelection() }
+        .onChange(of: presentationDismissal.requestID, initial: true) { _, requestID in
+            if requestID != nil { cancelSelection() }
         }
     }
 
@@ -217,26 +173,33 @@ struct FeatureImageAttachmentPicker: View {
             : "Choose a photo, video, or file"
     }
 
-    private func present(_ source: Source) {
-        sourcePresentationTask?.cancel()
-        isAttachmentSourcePresented = false
-        sourcePresentationTask = Task { @MainActor in
-            // A confirmation dialog is still the active presenter while its action
-            // runs. Wait for its dismissal animation before presenting another
-            // controller or UIKit can reject (or race) the new presentation.
-            try? await Task.sleep(for: .milliseconds(300))
-            guard !Task.isCancelled, canAdd else {
-                isFlowActive = false
-                return
-            }
-            switch source {
-            case .photoLibrary:
-                isPhotoLibraryPresented = true
-            case .camera:
-                isCameraPresented = true
-            case .files:
-                isFileImporterPresented = true
-            }
+    private func cancelSelection() {
+        sourceRequestID = nil
+        generation = UUID()
+        flowIdentity = nil
+        pendingPhotoLibraryItems = []
+        errorMessage = nil
+        // Keep an empty composer and its UIKit presenter mounted until the
+        // picker has finished closing, including during a root route change.
+        if !isNativePickerPresented { isFlowActive = false }
+    }
+
+    private func finishSelection(_ selection: FeatureAttachmentPickerSelection?) {
+        sourceRequestID = nil
+        guard presentationDismissal.requestID == nil, flowIdentity != nil else {
+            if !isNativePickerPresented { isFlowActive = false }
+            return
+        }
+        switch selection {
+        case let .photos(providers):
+            pendingPhotoLibraryItems = providers.map { FeaturePhotoLibraryItem(provider: $0) }
+            finishPhotoLibrarySelection()
+        case let .image(image):
+            loadCapturedImage(image)
+        case let .files(urls):
+            loadFiles(.success(urls))
+        case nil:
+            isFlowActive = false
         }
     }
 
@@ -247,11 +210,9 @@ struct FeatureImageAttachmentPicker: View {
             return
         }
         Task { @MainActor in
-            // Keep PhotosUI presentation and asset materialization in separate turns.
-            // Some OS versions become stuck or dismiss mid-selection when the picker
-            // and its selection are driven by the same SwiftUI binding transaction.
+            // Start materialization after the picker completion returns to UIKit.
             await Task.yield()
-            guard !isPhotoLibraryPresented, !pendingPhotoLibraryItems.isEmpty, canAdd else {
+            guard !pendingPhotoLibraryItems.isEmpty, canAdd else {
                 pendingPhotoLibraryItems = []
                 isFlowActive = false
                 return
@@ -286,6 +247,9 @@ struct FeatureImageAttachmentPicker: View {
                     }
                     attachments.append(attachment)
                 } catch {
+                    guard identity.matches(
+                        ownerID: draftOwnerID, environmentID: environmentID, generation: generation
+                    ) else { return }
                     errorMessage = error.localizedDescription
                 }
             }
@@ -293,7 +257,6 @@ struct FeatureImageAttachmentPicker: View {
     }
 
     private func loadCapturedImage(_ image: UIImage) {
-        isCameraPresented = false
         guard canAdd else {
             isFlowActive = false
             return
@@ -327,6 +290,9 @@ struct FeatureImageAttachmentPicker: View {
                 ) else { return }
                 attachments.append(attachment)
             } catch {
+                guard identity.matches(
+                    ownerID: draftOwnerID, environmentID: environmentID, generation: generation
+                ) else { return }
                 errorMessage = error.localizedDescription
             }
         }
@@ -362,6 +328,9 @@ struct FeatureImageAttachmentPicker: View {
                         }
                         attachments.append(attachment)
                     } catch {
+                        guard identity.matches(
+                            ownerID: draftOwnerID, environmentID: environmentID, generation: generation
+                        ) else { return }
                         errorMessage = error.localizedDescription
                         break
                     }
@@ -535,56 +504,6 @@ enum FeatureImageItemProviderLoader {
     }
 }
 
-private struct FeaturePhotoLibraryPicker: UIViewControllerRepresentable {
-    let maximumCount: Int
-    let imagesAllowed: Bool
-    let videosAllowed: Bool
-    let onFinish: @MainActor ([FeaturePhotoLibraryItem]) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onFinish: onFinish)
-    }
-
-    func makeUIViewController(context: Context) -> PHPickerViewController {
-        var configuration = PHPickerConfiguration()
-        configuration.filter = if imagesAllowed && videosAllowed {
-            .any(of: [.images, .videos])
-        } else if videosAllowed {
-            .videos
-        } else {
-            .images
-        }
-        configuration.selectionLimit = maximumCount
-        configuration.selection = .ordered
-        configuration.preferredAssetRepresentationMode = .compatible
-
-        let picker = PHPickerViewController(configuration: configuration)
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ picker: PHPickerViewController, context: Context) {}
-
-    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
-        private let onFinish: @MainActor ([FeaturePhotoLibraryItem]) -> Void
-        private var didFinish = false
-
-        init(onFinish: @escaping @MainActor ([FeaturePhotoLibraryItem]) -> Void) {
-            self.onFinish = onFinish
-        }
-
-        func picker(_: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-            guard !didFinish else { return }
-            didFinish = true
-
-            let items = results.map { FeaturePhotoLibraryItem(provider: $0.itemProvider) }
-            Task { @MainActor in
-                onFinish(items)
-            }
-        }
-    }
-}
-
 struct FeatureAttachmentStrip: View {
     @Binding var attachments: [FeatureDraftAttachment]
 
@@ -663,50 +582,6 @@ private struct FeatureAttachmentThumbnail: View {
             image = await Task.detached(priority: .utility) {
                 UIImage(data: data)
             }.value
-        }
-    }
-}
-
-private struct FeatureCameraPicker: UIViewControllerRepresentable {
-    let onCapture: (UIImage) -> Void
-    let onCancel: () -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onCapture: onCapture, onCancel: onCancel)
-    }
-
-    func makeUIViewController(context: Context) -> UIImagePickerController {
-        let controller = UIImagePickerController()
-        controller.sourceType = .camera
-        controller.cameraCaptureMode = .photo
-        controller.delegate = context.coordinator
-        return controller
-    }
-
-    func updateUIViewController(_ controller: UIImagePickerController, context: Context) {}
-
-    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
-        private let onCapture: (UIImage) -> Void
-        private let onCancel: () -> Void
-
-        init(onCapture: @escaping (UIImage) -> Void, onCancel: @escaping () -> Void) {
-            self.onCapture = onCapture
-            self.onCancel = onCancel
-        }
-
-        func imagePickerController(
-            _ picker: UIImagePickerController,
-            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
-        ) {
-            guard let image = info[.originalImage] as? UIImage else {
-                onCancel()
-                return
-            }
-            onCapture(image)
-        }
-
-        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-            onCancel()
         }
     }
 }

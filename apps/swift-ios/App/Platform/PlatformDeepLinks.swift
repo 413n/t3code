@@ -11,6 +11,7 @@ enum PlatformRoute: Codable, Hashable, Identifiable, Sendable {
     case environment(id: String)
     case project(environmentID: String?, projectID: String)
     case thread(environmentID: String?, threadID: String)
+    case threadDestination(environmentID: String?, threadID: String, destination: FeatureThreadDestination)
     case newTask(environmentID: String?, projectID: String?)
     case usageLimits
 
@@ -26,6 +27,8 @@ enum PlatformRoute: Codable, Hashable, Identifiable, Sendable {
             "project:\(environmentID ?? ""):\(projectID)"
         case let .thread(environmentID, threadID):
             "thread:\(environmentID ?? ""):\(threadID)"
+        case let .threadDestination(environmentID, threadID, destination):
+            "thread:\(environmentID ?? ""):\(threadID):\(destination)"
         case let .newTask(environmentID, projectID):
             "new-task:\(environmentID ?? ""):\(projectID ?? "")"
         }
@@ -60,6 +63,13 @@ enum PlatformRoute: Codable, Hashable, Identifiable, Sendable {
                 environmentID.map { URLQueryItem(name: "environment", value: $0) },
                 URLQueryItem(name: "thread", value: threadID),
             ].compactMap { $0 }
+        case let .threadDestination(environmentID, threadID, destination):
+            components.host = "threads"
+            components.path = destination.routePath
+            components.queryItems = [
+                environmentID.map { URLQueryItem(name: "environment", value: $0) },
+                URLQueryItem(name: "thread", value: threadID),
+            ].compactMap { $0 } + destination.routeQuery
         case let .newTask(environmentID, projectID):
             components.host = "new-task"
             components.queryItems = [
@@ -124,15 +134,18 @@ enum PlatformDeepLinkParser {
             return try connectionRoute(url)
         }
 
-        if let explicit = try? navigationRoute(segments: segments, query: query) {
-            return explicit
+        let routeHeads = ["usage", "thread", "threads", "project", "projects", "environment",
+                          "environments", "server", "servers", "new", "new-task", "compose"]
+        if routeHeads.contains(segments.first?.lowercased() ?? "") || query["thread"] != nil {
+            return try navigationRoute(segments: segments, query: query)
         }
 
         // Web thread routes use /:environmentID/:threadID.
         if segments.count >= 2 {
-            return .thread(
-                environmentID: try validatedIdentifier(segments[0]),
-                threadID: try validatedIdentifier(segments[1])
+            return try threadRoute(
+                environmentID: validatedIdentifier(segments[0]),
+                threadID: validatedIdentifier(segments[1]),
+                suffix: Array(segments.dropFirst(2)), query: query
             )
         }
         throw PlatformDeepLinkError.unsupportedURL
@@ -164,7 +177,11 @@ enum PlatformDeepLinkParser {
                 queryEnvironment: queryEnvironment,
                 queryDestination: queryThread
             )
-            return .thread(environmentID: values.environmentID, threadID: values.destinationID)
+            let consumed = queryThread != nil ? 0 : (queryEnvironment != nil ? 1 : (tail.count >= 2 ? 2 : 1))
+            return try threadRoute(
+                environmentID: values.environmentID, threadID: values.destinationID,
+                suffix: Array(tail.dropFirst(consumed)), query: query
+            )
         case "project", "projects":
             let values = try routeIdentifiers(
                 tail: tail,
@@ -199,6 +216,45 @@ enum PlatformDeepLinkParser {
         }
     }
 
+    private static func threadRoute(
+        environmentID: String?, threadID: String, suffix: [String], query: [String: String]
+    ) throws -> PlatformRoute {
+        guard let head = suffix.first else {
+            return .thread(environmentID: environmentID, threadID: threadID)
+        }
+        let destination: FeatureThreadDestination
+        switch head {
+        case "files":
+            let rawPath = suffix.count > 1 ? suffix.dropFirst().joined(separator: "/") : query["path"]
+            let path = try rawPath.map(validatedFilePath)
+            let line: Int?
+            if let raw = query["line"] {
+                guard let value = Int(raw), value > 0 else { throw PlatformDeepLinkError.invalidIdentifier }
+                line = value
+            } else { line = nil }
+            destination = .files(path: path, line: line)
+        case "terminal" where suffix.count == 1:
+            destination = .terminal(sessionID: try (query["session"] ?? query["sessionid"] ?? query["terminalid"]).map(validatedIdentifier))
+        case "review" where suffix.count == 1: destination = .review
+        case "devices" where suffix.count == 1: destination = .devices
+        case "git" where suffix.count == 1: destination = .git
+        case "git" where suffix == ["git", "commit"]: destination = .gitCommit
+        case "git" where suffix == ["git", "branches"]: destination = .gitBranches
+        default: throw PlatformDeepLinkError.unsupportedURL
+        }
+        return .threadDestination(environmentID: environmentID, threadID: threadID, destination: destination)
+    }
+
+    private static func validatedFilePath(_ raw: String) throws -> String {
+        guard !raw.isEmpty, raw.utf8.count <= 16_384, !raw.hasPrefix("/"),
+              !raw.contains("\\"), raw.range(of: #"^[A-Za-z]:"#, options: .regularExpression) == nil,
+              raw.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
+              raw.split(separator: "/", omittingEmptySubsequences: false).allSatisfy({
+                  !$0.isEmpty && $0 != "." && $0 != ".."
+              }) else { throw PlatformDeepLinkError.invalidIdentifier }
+        return raw
+    }
+
     private static func routeIdentifiers(
         tail: [String],
         queryEnvironment: String?,
@@ -209,6 +265,9 @@ enum PlatformDeepLinkParser {
                 try queryEnvironment.map(validatedIdentifier),
                 try validatedIdentifier(queryDestination)
             )
+        }
+        if let queryEnvironment, let destination = tail.first {
+            return (try validatedIdentifier(queryEnvironment), try validatedIdentifier(destination))
         }
         if tail.count >= 2 {
             return (
@@ -311,6 +370,31 @@ final class PlatformRouteMailbox: @unchecked Sendable {
         lock.withLock {
             guard let data = defaults.data(forKey: key) else { return nil }
             return try? JSONDecoder().decode(PlatformRoute.self, from: data)
+        }
+    }
+}
+
+private extension FeatureThreadDestination {
+    var routePath: String {
+        switch self {
+        case .files: "/files"
+        case .terminal: "/terminal"
+        case .review: "/review"
+        case .devices: "/devices"
+        case .git: "/git"
+        case .gitCommit: "/git/commit"
+        case .gitBranches: "/git/branches"
+        }
+    }
+
+    var routeQuery: [URLQueryItem] {
+        switch self {
+        case let .files(path, line):
+            [path.map { URLQueryItem(name: "path", value: $0) },
+             line.map { URLQueryItem(name: "line", value: String($0)) }].compactMap { $0 }
+        case let .terminal(sessionID):
+            sessionID.map { [URLQueryItem(name: "session", value: $0)] } ?? []
+        default: []
         }
     }
 }

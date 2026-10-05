@@ -131,6 +131,7 @@ public struct FeatureQueuedAttachment: Sendable, Equatable, Codable {
 public struct FeatureQueuedCreation: Sendable, Equatable, Codable {
     public var projectID: String
     public var projectName: String
+    public var draftKey: String?
     public var workspaceMode: FeatureWorkspaceMode
     public var branch: String?
     public var worktreePath: String?
@@ -142,10 +143,12 @@ public struct FeatureQueuedCreation: Sendable, Equatable, Codable {
         workspaceMode: FeatureWorkspaceMode,
         branch: String?,
         worktreePath: String?,
-        startFromOrigin: Bool
+        startFromOrigin: Bool,
+        draftKey: String? = nil
     ) {
         self.projectID = projectID
         self.projectName = projectName
+        self.draftKey = draftKey
         self.workspaceMode = workspaceMode
         self.branch = branch
         self.worktreePath = worktreePath
@@ -188,7 +191,7 @@ public struct FeatureQueuedSubmission: Identifiable, Sendable, Equatable, Codabl
         self.text = text
         self.selection = selection
         self.runtimeMode = runtimeMode
-        self.interactionMode = interactionMode.mobileNormalized
+        self.interactionMode = interactionMode
         self.attachments = attachments.map(FeatureQueuedAttachment.init)
         self.creation = creation
         self.context = context
@@ -268,13 +271,14 @@ public actor FeatureOutboxStore {
     private struct Document: Codable {
         var version = 1
         var submissions: [FeatureQueuedSubmission]
+        var recoveryDrafts: [FeatureSubmissionRecoveryDraft]?
     }
 
     public static let shared = FeatureOutboxStore()
 
     public let fileURL: URL
     public let attachmentFileStore: ManagedAttachmentFileStore
-    private var cached: [FeatureQueuedSubmission]?
+    private var cached: Document?
 
     public init(fileURL: URL? = nil, attachmentStorageRootURL: URL? = nil) {
         attachmentFileStore = ManagedAttachmentFileStore(rootURL: attachmentStorageRootURL)
@@ -292,56 +296,107 @@ public actor FeatureOutboxStore {
     }
 
     public func submissions() throws -> [FeatureQueuedSubmission] {
+        try document().submissions
+    }
+
+    public func recoveryDrafts() throws -> [FeatureSubmissionRecoveryDraft] {
+        try document().recoveryDrafts ?? []
+    }
+
+    private func document() throws -> Document {
         if let cached { return cached }
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            cached = []
-            return []
+            let empty = Document(submissions: [])
+            cached = empty
+            return empty
         }
-        // Keep failed reads uncached so later writes cannot replace unreadable messages.
-        let document = try JSONDecoder.t3.decode(
-            Document.self,
-            from: Data(contentsOf: fileURL)
-        )
-        cached = document.submissions.map { submission in
-            var submission = submission
-            submission.interactionMode = submission.interactionMode.mobileNormalized
-            for index in submission.attachments.indices {
-                submission.attachments[index].resolveOwnedFile(using: attachmentFileStore)
-            }
-            return submission
-        }.sorted {
+        // Failed reads stay uncached. A later write must not replace unreadable input.
+        var document = try JSONDecoder.t3.decode(Document.self, from: Data(contentsOf: fileURL))
+        document.submissions = document.submissions.map(resolveFiles).sorted {
             $0.identity.createdAt < $1.identity.createdAt
         }
-        return cached ?? []
+        document.recoveryDrafts = document.recoveryDrafts?.map {
+            FeatureSubmissionRecoveryDraft(submission: resolveFiles($0.submission), reason: $0.reason)
+        }
+        cached = document
+        return document
+    }
+
+    private func resolveFiles(_ submission: FeatureQueuedSubmission) -> FeatureQueuedSubmission {
+        var submission = submission
+        for index in submission.attachments.indices {
+            submission.attachments[index].resolveOwnedFile(using: attachmentFileStore)
+        }
+        return submission
     }
 
     public func enqueue(_ submission: FeatureQueuedSubmission) throws {
-        var values = try submissions()
-        values.removeAll { $0.id == submission.id }
-        values.append(submission)
-        values.sort { $0.identity.createdAt < $1.identity.createdAt }
-        try save(values)
+        var document = try document()
+        document.submissions.removeAll { $0.id == submission.id }
+        document.submissions.append(submission)
+        document.submissions.sort { $0.identity.createdAt < $1.identity.createdAt }
+        try save(document)
     }
 
     public func remove(id: String) throws {
-        var values = try submissions()
-        values.removeAll { $0.id == id }
-        try save(values)
+        var document = try document()
+        document.submissions.removeAll { $0.id == id }
+        try save(document)
+    }
+
+    /// The saved draft and removal from delivery are one atomic write. Files
+    /// keep their local identity and ownership until the composer takes them.
+    @discardableResult
+    public func recover(id: String, reason: String?) throws -> FeatureSubmissionRecoveryDraft? {
+        var document = try document()
+        if let existing = document.recoveryDrafts?.first(where: { $0.id == id }) {
+            return existing
+        }
+        guard let submission = document.submissions.first(where: { $0.id == id }) else { return nil }
+        let recovery = FeatureSubmissionRecoveryDraft(submission: submission, reason: reason)
+        document.recoveryDrafts = (document.recoveryDrafts ?? []) + [recovery]
+        document.submissions.removeAll { $0.id == id }
+        try save(document)
+        return recovery
+    }
+
+    public func removeRecovery(id: String) throws {
+        var document = try document()
+        document.recoveryDrafts?.removeAll { $0.id == id }
+        try save(document)
+    }
+
+    /// Discard does not validate attachments: a missing file must never trap
+    /// a recovery row. Delete only managed files with no remaining owner.
+    public func discardRecovery(id: String, preservingOwnedFileNames: Set<String>) throws {
+        var document = try document()
+        guard let recovery = document.recoveryDrafts?.first(where: { $0.id == id }) else { return }
+        document.recoveryDrafts?.removeAll { $0.id == id }
+        let remaining = document.submissions + (document.recoveryDrafts ?? []).map(\.submission)
+        let retainedNames = preservingOwnedFileNames.union(
+            remaining.flatMap { $0.attachments.compactMap(\.ownedFileName) }
+        )
+        try save(document)
+        for name in Set(recovery.submission.attachments.compactMap(\.ownedFileName))
+        where !retainedNames.contains(name) {
+            try? attachmentFileStore.removeOwnedFile(fileName: name)
+        }
     }
 
     public func removeAll(environmentID: String) throws {
-        var values = try submissions()
-        values.removeAll { $0.environmentID == environmentID }
-        try save(values)
+        var document = try document()
+        document.submissions.removeAll { $0.environmentID == environmentID }
+        document.recoveryDrafts?.removeAll { $0.environmentID == environmentID }
+        try save(document)
     }
 
-    private func save(_ submissions: [FeatureQueuedSubmission]) throws {
+    private func save(_ document: Document) throws {
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let data = try JSONEncoder.t3.encode(Document(submissions: submissions))
+        let data = try JSONEncoder.t3.encode(document)
         try data.write(to: fileURL, options: .atomic)
-        cached = submissions
+        cached = document
     }
 }

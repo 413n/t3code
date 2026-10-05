@@ -1,21 +1,32 @@
 import SwiftUI
 
+enum FeatureSettingsDestination: Hashable {
+    case appearance, scheduledTasks, projects
+}
+
 public struct SettingsView: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
     @Bindable private var model: FeatureRootModel
     @State private var saveErrorMessage: String?
     @State private var isPresented = false
+    @State private var path: [FeatureSettingsDestination] = []
 
     public init(model: FeatureRootModel) {
         self.model = model
     }
 
+    init(model: FeatureRootModel, initialDestination: FeatureSettingsDestination?) {
+        self.model = model
+        _path = State(initialValue: initialDestination.map { [$0] } ?? [])
+    }
+
     public var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     workspaceSection
                     appSection
+                    betaSection
                     activitySection
                     supportSection
                     aboutSection
@@ -27,6 +38,17 @@ public struct SettingsView: View {
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .t3NavigationChrome()
+            .navigationDestination(for: FeatureSettingsDestination.self) { destination in
+                switch destination {
+                case .appearance:
+                    SettingsAppearanceView(appearance: preference(\.appearance),
+                        textSize: preference(\.textSize), codeSize: preference(\.codeSize))
+                case .scheduledTasks:
+                    ScheduledTasksView(model: model)
+                case .projects:
+                    ProjectsSettingsView(model: model)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
@@ -107,6 +129,13 @@ public struct SettingsView: View {
                 .accessibilityHint("Shows provider usage")
                 settingsDivider
                 NavigationLink {
+                    ScheduledTasksView(model: model)
+                } label: {
+                    SettingsNavigationRow(title: "Scheduled tasks", systemImage: "calendar.badge.clock")
+                }
+                .buttonStyle(.plain)
+                settingsDivider
+                NavigationLink {
                     PullRequestsView(model: model)
                 } label: {
                     SettingsNavigationRow(
@@ -141,8 +170,8 @@ public struct SettingsView: View {
                 settingsDivider
                 NavigationLink {
                     SettingsNotificationsView(
-                        notificationsEnabled: preference(\.notificationsEnabled),
-                        liveActivitiesEnabled: preference(\.liveActivitiesEnabled)
+                        model: model,
+                        notificationsEnabled: preference(\.notificationsEnabled)
                     )
                 } label: {
                     SettingsNavigationRow(title: "Notifications", systemImage: "bell")
@@ -150,6 +179,17 @@ public struct SettingsView: View {
                 .buttonStyle(.plain)
                 .accessibilityHint("Notifications and Live Activities")
                 .accessibilityIdentifier("settings-notifications")
+                if let storage = model.client as? any FeatureClientStorageManaging {
+                    settingsDivider
+                    NavigationLink {
+                        FeatureClientStorageView(storage: storage)
+                    } label: {
+                        SettingsNavigationRow(title: "Client Storage", systemImage: "internaldrive")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Manage saved offline history on this device")
+                    .accessibilityIdentifier("settings-client-storage")
+                }
                 settingsDivider
                 SettingsToggleRow(
                     title: "Haptics",
@@ -157,6 +197,30 @@ public struct SettingsView: View {
                     isOn: preference(\.hapticsEnabled)
                 )
                 .accessibilityIdentifier("settings-haptics")
+                settingsDivider
+                Picker("Follow-ups", selection: preference(\.followUpBehavior)) {
+                    ForEach(FeatureFollowUpBehavior.allCases, id: \.self) { behavior in
+                        Text(behavior.label).tag(behavior)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: T3Metrics.minimumTapTarget)
+                settingsDivider
+                Picker("Hardware Return", selection: preference(\.composerEnterBehavior)) {
+                    ForEach(FeatureComposerEnterBehavior.allCases, id: \.self) { behavior in
+                        Text(behavior.title).tag(behavior)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: T3Metrics.minimumTapTarget)
+                Text(model.snapshot.settings.composerEnterBehavior.explanation)
+                    .font(T3Typography.supporting)
+                    .foregroundStyle(T3Colors.textSecondary)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
+                settingsDivider
+                SettingsToggleRow(title: "Legacy Plan mode", systemImage: "list.bullet.clipboard",
+                    isOn: preference(\.legacyPlanModeEnabled))
             }
         }
     }
@@ -170,6 +234,20 @@ public struct SettingsView: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("settings-diagnostics")
+        }
+    }
+
+    private var betaSection: some View {
+        SettingsSection(
+            title: "Beta",
+            footer: "Fold working and monitoring threads into a Working section. They return to the top when they need you. Active threads use time order while this is on."
+        ) {
+            SettingsToggleRow(
+                title: "Working section",
+                systemImage: "bolt.circle",
+                isOn: preference(\.workingShelfEnabled)
+            )
+            .accessibilityIdentifier("settings-working-section")
         }
     }
 
@@ -340,38 +418,94 @@ private struct SettingsAppearanceView: View {
 }
 
 private struct SettingsNotificationsView: View {
+    @Bindable var model: FeatureRootModel
     @Binding var notificationsEnabled: Bool
-    @Binding var liveActivitiesEnabled: Bool
+    @State private var desiredLiveActivities = false
+    private let delivery = PlatformCloudDeliveryCoordinator.shared
+
+    private var candidates: [FeatureEnvironment] {
+        model.snapshot.environments.filter { $0.isEnabled && $0.source == .direct }
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                SettingsToggleRow(
-                    title: "Notifications", systemImage: "bell",
-                    isOn: $notificationsEnabled
-                )
-                .accessibilityIdentifier("settings-notifications-enabled")
-                Divider()
-                    .overlay(T3Colors.separator)
-                    .padding(.leading, 54)
-                    .padding(.trailing, 20)
-                SettingsToggleRow(
-                    title: "Live Activities", systemImage: "waveform.path.ecg.rectangle",
-                    isOn: $liveActivitiesEnabled
-                )
-                .accessibilityIdentifier("settings-live-activities-enabled")
+            VStack(alignment: .leading, spacing: 16) {
+                SettingsToggleRow(title: "Notifications", systemImage: "bell", isOn: $notificationsEnabled)
+                    .accessibilityIdentifier("settings-notifications-enabled")
+                Divider().overlay(T3Colors.separator)
+                SettingsToggleRow(title: "Live Activities", systemImage: "waveform.path.ecg.rectangle",
+                    isOn: $desiredLiveActivities)
+                    .disabled(delivery.isSettingUpLiveActivities)
+                    .accessibilityIdentifier("settings-live-activities-enabled")
                 Text("Show thread progress on the Lock Screen and Dynamic Island.")
                     .font(T3Typography.supporting)
                     .foregroundStyle(T3Colors.textSecondary)
-                    .padding(.leading, 54)
-                    .padding(.trailing, 20)
+                if !candidates.isEmpty {
+                    Text("Computers").font(T3Typography.control)
+                    ForEach(candidates) { environment in
+                        Toggle(environment.name, isOn: Binding(
+                            get: { delivery.selectedLiveActivityEnvironmentIDs.contains(environment.id) },
+                            set: { selected in
+                                if selected { delivery.selectedLiveActivityEnvironmentIDs.insert(environment.id) }
+                                else { delivery.selectedLiveActivityEnvironmentIDs.remove(environment.id) }
+                            }
+                        ))
+                        .disabled(delivery.isSettingUpLiveActivities)
+                    }
+                    Text("Apply updates only the selected computers. Enabling links them to your T3 Connect account.")
+                        .font(T3Typography.supporting)
+                        .foregroundStyle(T3Colors.textSecondary)
+                }
+                Button(delivery.isSettingUpLiveActivities ? "Applying…" : "Apply Live Activity setup", action: apply)
+                    .disabled(delivery.isSettingUpLiveActivities)
+                    .accessibilityIdentifier("settings-live-activities-apply")
+                switch delivery.liveActivitySetupStatus {
+                case let .failed(error):
+                    Text("Live Activity setup failed: \(error) Apply again to retry.")
+                        .font(T3Typography.supporting).foregroundStyle(T3Colors.danger)
+                case let .unavailable(reason):
+                    Text("Local preference saved. Remote delivery unavailable: \(reason)")
+                        .font(T3Typography.supporting)
+                case .signedOut:
+                    Text("Local preference saved. Sign in to T3 Connect, then apply again for remote delivery.")
+                        .font(T3Typography.supporting)
+                default:
+                    EmptyView()
+                }
+                PlatformNotificationRegistrationView(settings: model.snapshot.settings)
             }
-            .padding(.vertical, 20)
+            .padding(20)
         }
         .background(T3Colors.background)
         .navigationTitle("Notifications")
         .navigationBarTitleDisplayMode(.inline)
         .t3NavigationChrome()
+        .onAppear { desiredLiveActivities = model.snapshot.settings.liveActivitiesEnabled }
+    }
+
+    private func apply() {
+        guard !delivery.isSettingUpLiveActivities else { return }
+        let enabled = desiredLiveActivities
+        let previous = model.snapshot.settings.liveActivitiesEnabled
+        let selected = candidates.filter { delivery.selectedLiveActivityEnvironmentIDs.contains($0.id) }.map(\.id)
+        let capability = model.client as? any FeatureLiveActivitySetup
+        // This task must outlive the screen. The coordinator owns progress and
+        // errors so returning to Settings still shows the setup result.
+        Task { @MainActor in
+            let remoteSetup: (@MainActor () async throws -> Void)? = capability.map { capability in
+                { try await capability.setUpLiveActivityUpdates(enabled: enabled,
+                    previousEnabled: previous, environmentIDs: selected) }
+            }
+            await delivery.applyLiveActivityPreference(savePreference: {
+                guard await model.savePreference(\.liveActivitiesEnabled, value: enabled) else {
+                    throw T3ConnectRelayError.invalidConfiguration(
+                        model.errorMessage ?? "Could not save Live Activity preferences."
+                    )
+                }
+                return model.snapshot.settings
+            }, setUpRemote: remoteSetup)
+            desiredLiveActivities = model.snapshot.settings.liveActivitiesEnabled
+        }
     }
 }
 

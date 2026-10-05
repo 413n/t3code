@@ -153,6 +153,7 @@ public struct FeatureProject: Identifiable, Sendable, Equatable, Hashable, Codab
     public var projectIcon: ProjectIconOverride? = nil
     public var isScratch: Bool? = nil
     public var defaultWorkspaceMode: FeatureWorkspaceMode? = nil
+    public var defaultRuntimeMode: FeatureRuntimeMode? = nil
     public var newWorktreesStartFromOrigin: Bool? = nil
     public var supportsProjectSettingsOverrides: Bool? = nil
 
@@ -198,20 +199,24 @@ public enum FeatureRuntimeMode: String, CaseIterable, Sendable, Codable {
     case automatic
     case fullAccess
 
-    /// Mobile offers the two current modes. Legacy modes remain distinct so
-    /// existing threads keep their exact server permission.
-    public static let allCases: [FeatureRuntimeMode] = [.automatic, .fullAccess]
+    public var label: String {
+        switch self {
+        case .approvalRequired: "Supervised"
+        case .autoAcceptEdits: "Auto-accept edits"
+        case .automatic: "Auto"
+        case .fullAccess: "Full access"
+        }
+    }
 }
 
 public enum FeatureInteractionMode: String, CaseIterable, Sendable, Codable {
     case standard
     case plan
 
-    /// Plan remains decodable for existing server state, but is no longer a
-    /// mobile prompt choice.
-    public static let allCases: [FeatureInteractionMode] = [.standard]
+    public var label: String { self == .plan ? "Plan" : "Build" }
 
-    public var mobileNormalized: FeatureInteractionMode { .standard }
+    /// Kept for older draft/outbox call sites. A saved mode must survive a reply.
+    public var mobileNormalized: FeatureInteractionMode { self }
 }
 
 public enum FeatureThreadSettlementOverride: String, Sendable, Equatable, Hashable, Codable {
@@ -287,6 +292,8 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var branchPullRequest: ThreadLinkedPullRequest?
     public var createdAt: Date
     public var updatedAt: Date
+    /// Preserve the V2 server watermark exactly when recording a visit.
+    public var rawUpdatedAt: String?
     public var state: FeatureThreadState
     public var providerID: String?
     public var sessionProviderID: String?
@@ -323,6 +330,9 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var workingStartedAt: Date?
     public var latestTurnCompletedAt: Date?
     public var settlementFacts: FeatureThreadSettlementFacts?
+    public var inboxFacts: FeatureThreadInboxFacts?
+    /// Root-model overlay from the local outbox; never changes the server's settlement.
+    public var hasPendingLocalMessages: Bool? = nil
     public var runtimeMode: FeatureRuntimeMode
     public var interactionMode: FeatureInteractionMode
 
@@ -342,6 +352,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         branchPullRequest: ThreadLinkedPullRequest? = nil,
         createdAt: Date = .now,
         updatedAt: Date = .now,
+        rawUpdatedAt: String? = nil,
         state: FeatureThreadState = .idle,
         providerID: String? = nil,
         sessionProviderID: String? = nil,
@@ -374,6 +385,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         workingStartedAt: Date? = nil,
         latestTurnCompletedAt: Date? = nil,
         settlementFacts: FeatureThreadSettlementFacts? = nil,
+        inboxFacts: FeatureThreadInboxFacts? = nil,
         runtimeMode: FeatureRuntimeMode = .fullAccess,
         interactionMode: FeatureInteractionMode = .standard
     ) {
@@ -392,6 +404,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.branchPullRequest = branchPullRequest
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.rawUpdatedAt = rawUpdatedAt
         self.state = state
         self.providerID = providerID
         self.sessionProviderID = sessionProviderID
@@ -424,6 +437,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.workingStartedAt = workingStartedAt
         self.latestTurnCompletedAt = latestTurnCompletedAt
         self.settlementFacts = settlementFacts
+        self.inboxFacts = inboxFacts
         self.runtimeMode = runtimeMode
         self.interactionMode = interactionMode
     }
@@ -455,23 +469,41 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     /// The server refuses to archive a thread with live work. Hide the action
     /// on those rows instead of offering it and then reporting the refusal.
     public var canArchive: Bool {
-        switch state {
-        case .queued, .working, .monitoring, .waitingForApproval, .waitingForInput:
-            false
-        case .idle, .completed, .failed:
-            true
-        }
+        FeatureThreadLifecyclePolicy.canArchive(self)
     }
 
     /// Mirrors the server's `thread.snooze` guard and client-runtime
     /// `canSnooze`: a raised hand or a turn that is still being adopted blocks
     /// snooze. The session lifecycle state on its own does not.
     public func canSnoozeNow(at now: Date) -> Bool {
-        guard canToggleSnooze else { return false }
-        if state == .waitingForApproval || state == .waitingForInput { return false }
-        return !hasQueuedTurnStart(at: now)
+        FeatureThreadLifecyclePolicy.canSnooze(self, at: now)
     }
 
+    public var supportsVisitTracking: Bool {
+        inboxFacts?.orchestrationVersion == 2 && inboxFacts?.lastVisitedAtIsPresent == true
+    }
+
+    public var lastVisitedAt: Date? {
+        FeatureThreadLifecyclePolicy.date(inboxFacts?.lastVisitedAt)
+    }
+
+    public var hasUnseenCompletion: Bool {
+        FeatureThreadLifecyclePolicy.hasUnseenCompletion(self)
+    }
+
+    /// Display distinctions share existing state cases and do not imply active provider work.
+    public var isWaitingForBackgroundWork: Bool {
+        inboxFacts?.orchestrationVersion == 2 && inboxFacts?.runtimeStatus == "idle"
+            && !FeatureThreadLifecyclePolicy.hasPendingRequest(self)
+    }
+
+    public var isUsageLimited: Bool {
+        inboxFacts?.orchestrationVersion == 2 && inboxFacts?.runtimeStatus == "failed"
+            && inboxFacts?.lastErrorClass == "usage_limit"
+            && !FeatureThreadLifecyclePolicy.hasPendingRequest(self)
+    }
+
+    public var usageLimitResetAt: Date? { inboxFacts?.usageLimitResetAt }
 }
 
 /// The thread-list section a drag reorder arranges. Pinned threads write
@@ -620,6 +652,9 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
 }
 
 public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public var v2Timeline: OrchestrationV2TimelineMetadata? = nil
+    public var v2WorkItems: [FeatureV2WorkItem]? = nil
+    public var v2FoldID: String? = nil
     public var context: OrchestrationMessageContext?
     public let id: String
     public var role: FeatureMessageRole
@@ -670,10 +705,12 @@ public struct FeatureApprovalOption: Identifiable, Sendable, Equatable, Hashable
     public var id: FeatureApprovalDecision { decision }
     public let decision: FeatureApprovalDecision
     public let label: String
+    public let warning: String?
 
-    public init(decision: FeatureApprovalDecision, label: String) {
+    public init(decision: FeatureApprovalDecision, label: String, warning: String? = nil) {
         self.decision = decision
         self.label = label
+        self.warning = warning
     }
 }
 
@@ -687,6 +724,9 @@ public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Coda
     public var detail: String
     public var appName: String?
     public var options: [FeatureApprovalOption]?
+    public var responseCapability: String?
+
+    public var canRespond: Bool { responseCapability == nil || responseCapability == "live" }
 
     public init(
         id: String,
@@ -696,7 +736,8 @@ public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Coda
         title: String,
         detail: String,
         appName: String? = nil,
-        options: [FeatureApprovalOption]? = nil
+        options: [FeatureApprovalOption]? = nil,
+        responseCapability: String? = nil
     ) {
         self.id = id
         self.wireID = wireID
@@ -706,21 +747,28 @@ public struct FeatureApproval: Identifiable, Sendable, Equatable, Hashable, Coda
         self.detail = detail
         self.appName = appName
         self.options = options
+        self.responseCapability = responseCapability
     }
 }
 
-public struct FeatureInputOption: Sendable, Equatable, Hashable, Codable {
+public struct FeatureInputOption: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public var id: String { wireValue }
     public var label: String
     public var detail: String
+    public var value: String?
 
-    public init(label: String, detail: String) {
+    /// An explicit provider value, including an empty string, must reach the wire unchanged.
+    public var wireValue: String { value ?? label.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    public init(label: String, detail: String, value: String? = nil) {
         self.label = label
         self.detail = detail
+        self.value = value
     }
 }
 
 /// A provider answer is either free-form/single-select text or the selected
-/// labels for a multi-select question. Its Codable shape intentionally matches
+/// values for a multi-select question. Its Codable shape intentionally matches
 /// the provider wire contract: a JSON string or an array of JSON strings.
 public enum FeatureInputAnswer: Sendable, Equatable, Hashable, Codable {
     case text(String)
@@ -746,37 +794,44 @@ public enum FeatureInputAnswer: Sendable, Equatable, Hashable, Codable {
     }
 }
 
-extension FeatureInputAnswer {
-    var normalized: FeatureInputAnswer? {
-        switch self {
-        case let .text(value):
-            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return normalized.isEmpty ? nil : .text(normalized)
-        case let .selections(values):
-            var seen: Set<String> = []
-            let normalized = values.compactMap { value -> String? in
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { return nil }
-                return trimmed
-            }
-            return normalized.isEmpty ? nil : .selections(normalized)
+/// Keep option selection separate from custom text until submission. This also
+/// distinguishes a selected empty wire value from an unanswered question.
+struct FeatureInputDraftAnswer: Equatable {
+    private(set) var selectedOptionValues: [String] = []
+    private(set) var customAnswer = ""
+
+    mutating func setCustomAnswer(_ text: String, for question: FeatureInputQuestion) {
+        guard question.canWriteCustomAnswer else { return }
+        customAnswer = text
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            selectedOptionValues = []
         }
     }
 
-    func togglingOption(_ label: String, allowsMultiple: Bool) -> FeatureInputAnswer {
-        guard allowsMultiple else { return .text(label) }
+    mutating func toggleOption(_ value: String, for question: FeatureInputQuestion) {
+        guard question.options.contains(where: { $0.wireValue == value }) else { return }
+        customAnswer = ""
+        let current = validSelectedValues(for: question)
+        selectedOptionValues = question.allowsMultiple
+            ? (current.contains(value) ? current.filter { $0 != value } : current + [value])
+            : [value]
+    }
 
-        let current: [String]
-        if case let .selections(values) = self {
-            current = values
-        } else {
-            current = []
-        }
+    func isOptionSelected(_ value: String, for question: FeatureInputQuestion) -> Bool {
+        validSelectedValues(for: question).contains(value)
+    }
 
-        if current.contains(label) {
-            return .selections(current.filter { $0 != label })
-        }
-        return .selections(current + [label])
+    func normalized(for question: FeatureInputQuestion) -> FeatureInputAnswer? {
+        let text = customAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if question.canWriteCustomAnswer, !text.isEmpty { return .text(text) }
+        let values = validSelectedValues(for: question)
+        guard let first = values.first else { return nil }
+        return question.allowsMultiple ? .selections(values) : .text(first)
+    }
+
+    private func validSelectedValues(for question: FeatureInputQuestion) -> [String] {
+        let allowed = Set(question.options.map(\.wireValue))
+        return selectedOptionValues.filter(allowed.contains)
     }
 }
 
@@ -814,8 +869,11 @@ public struct FeatureUserInput: Identifiable, Sendable, Equatable, Hashable, Cod
     /// Only message-based questions can close without a provider callback.
     public var dismissible: Bool? = nil
     public var supportsAttachments: Bool? = nil
+    public var responseCapability: String? = nil
 
     public var canDismiss: Bool { dismissible == true }
+    /// Message responses remain available after the provider exits.
+    public var canRespond: Bool { responseCapability != "not_resumable" }
 
     public init(
         id: String,
@@ -864,6 +922,9 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
     public var backgroundWorkIsActive: Bool
     public var isCompacting: Bool?
     public var execution: FeatureThreadExecution? = nil
+    public var workflows: FeatureThreadWorkflows? = nil
+    public var allowsProviderSwitch: Bool? = nil
+    public var recovery: FeatureThreadRecovery? = nil
 
     public init(
         thread: FeatureThread,
@@ -874,7 +935,10 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
         activeSubagentCount: Int = 0,
         backgroundWorkIsActive: Bool = false,
         isCompacting: Bool = false,
-        execution: FeatureThreadExecution? = nil
+        execution: FeatureThreadExecution? = nil,
+        workflows: FeatureThreadWorkflows? = nil,
+        allowsProviderSwitch: Bool? = nil,
+        recovery: FeatureThreadRecovery? = nil
     ) {
         self.thread = thread
         self.messages = messages
@@ -885,6 +949,9 @@ public struct FeatureThreadDetail: Sendable, Equatable, Codable {
         self.backgroundWorkIsActive = backgroundWorkIsActive
         self.isCompacting = isCompacting
         self.execution = execution
+        self.workflows = workflows
+        self.allowsProviderSwitch = allowsProviderSwitch
+        self.recovery = recovery
     }
 }
 
@@ -922,6 +989,7 @@ public struct FeatureModel: Identifiable, Sendable, Equatable, Hashable, Codable
     public var detail: String?
     public var supportsImages: Bool
     public var imageSupportIsUnknown: Bool? = nil
+    public var supportedRuntimeModes: [FeatureRuntimeMode]? = nil
     public var supportsReasoning: Bool
     public var isDefault: Bool
     public var isLegacy: Bool?
@@ -1059,6 +1127,7 @@ public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Coda
     public var isAvailable: Bool
     public var driver: String
     public var requiresNewThreadForModelChange: Bool
+    public var showInteractionModeToggle: Bool? = nil
     public var models: [FeatureModel]
     public var slashCommands: [FeatureProviderSlashCommand]?
     public var skills: [FeatureProviderSkill]?
@@ -1078,6 +1147,7 @@ public struct FeatureProvider: Identifiable, Sendable, Equatable, Hashable, Coda
     public var isEnabled: Bool? = nil
     public var isInstalled: Bool? = nil
     public var authStatus: String? = nil
+    public var canLogout: Bool? = nil
     public var statusMessage: String? = nil
     public var accentColor: String? = nil
 
@@ -1163,7 +1233,11 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
     public var hapticsEnabled: Bool
     public var notificationsEnabled: Bool
     public var liveActivitiesEnabled: Bool
+    public var workingShelfEnabled: Bool
     public var defaultSelection: FeatureSelection?
+    public var followUpBehavior: FeatureFollowUpBehavior
+    public var legacyPlanModeEnabled: Bool
+    public var composerEnterBehavior: FeatureComposerEnterBehavior
 
     public init(
         appearance: FeatureAppearance = .system,
@@ -1172,14 +1246,22 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
         hapticsEnabled: Bool = true,
         notificationsEnabled: Bool = true,
         liveActivitiesEnabled: Bool = true,
-        defaultSelection: FeatureSelection? = nil
+        workingShelfEnabled: Bool = false,
+        defaultSelection: FeatureSelection? = nil,
+        followUpBehavior: FeatureFollowUpBehavior = .queue,
+        legacyPlanModeEnabled: Bool = false,
+        composerEnterBehavior: FeatureComposerEnterBehavior = .send
     ) {
+        self.followUpBehavior = followUpBehavior
+        self.legacyPlanModeEnabled = legacyPlanModeEnabled
+        self.composerEnterBehavior = composerEnterBehavior
         self.appearance = appearance
         self.textSize = textSize
         self.codeSize = codeSize
         self.hapticsEnabled = hapticsEnabled
         self.notificationsEnabled = notificationsEnabled
         self.liveActivitiesEnabled = liveActivitiesEnabled
+        self.workingShelfEnabled = workingShelfEnabled
         self.defaultSelection = defaultSelection
     }
 
@@ -1190,11 +1272,21 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
         case hapticsEnabled
         case notificationsEnabled
         case liveActivitiesEnabled
+        case workingShelfEnabled
         case defaultSelection
+        case followUpBehavior
+        case legacyPlanModeEnabled
+        case composerEnterBehavior
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        followUpBehavior = try container.decodeIfPresent(FeatureFollowUpBehavior.self, forKey: .followUpBehavior) ?? .queue
+        legacyPlanModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .legacyPlanModeEnabled) ?? false
+        composerEnterBehavior = try container.decodeIfPresent(
+            FeatureComposerEnterBehavior.self,
+            forKey: .composerEnterBehavior
+        ) ?? .send
         appearance = try container.decodeIfPresent(
             FeatureAppearance.self,
             forKey: .appearance
@@ -1219,6 +1311,10 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
             Bool.self,
             forKey: .liveActivitiesEnabled
         ) ?? true
+        workingShelfEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .workingShelfEnabled
+        ) ?? false
         defaultSelection = try container.decodeIfPresent(
             FeatureSelection.self,
             forKey: .defaultSelection
@@ -1227,12 +1323,16 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
 
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(followUpBehavior, forKey: .followUpBehavior)
+        try container.encode(legacyPlanModeEnabled, forKey: .legacyPlanModeEnabled)
+        try container.encode(composerEnterBehavior, forKey: .composerEnterBehavior)
         try container.encode(appearance, forKey: .appearance)
         try container.encode(textSize, forKey: .textSize)
         try container.encode(codeSize, forKey: .codeSize)
         try container.encode(hapticsEnabled, forKey: .hapticsEnabled)
         try container.encode(notificationsEnabled, forKey: .notificationsEnabled)
         try container.encode(liveActivitiesEnabled, forKey: .liveActivitiesEnabled)
+        try container.encode(workingShelfEnabled, forKey: .workingShelfEnabled)
         try container.encodeIfPresent(defaultSelection, forKey: .defaultSelection)
     }
 }
@@ -1250,6 +1350,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
     }
 
     public var defaultWorkspaceMode: FeatureWorkspaceMode
+    public var defaultRuntimeMode: FeatureRuntimeMode
     public var newWorktreesStartFromOrigin: Bool
     public var projectGroupingMode: ProjectGroupingMode
     public var projectGroupingOverrides: [String: ProjectGroupingMode]
@@ -1266,9 +1367,11 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
         automaticSettlement: FeatureAutomaticSettlementSettings? = nil,
         supportsImageUploads: Bool = false,
         maxFileAttachmentBytes: Int? = nil,
-        continueThreadsAfterServerUpdate: Bool? = nil
+        continueThreadsAfterServerUpdate: Bool? = nil,
+        defaultRuntimeMode: FeatureRuntimeMode = .fullAccess
     ) {
         self.defaultWorkspaceMode = defaultWorkspaceMode
+        self.defaultRuntimeMode = defaultRuntimeMode
         self.newWorktreesStartFromOrigin = newWorktreesStartFromOrigin
         self.projectGroupingMode = projectGroupingMode
         self.projectGroupingOverrides = projectGroupingOverrides
@@ -1280,6 +1383,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
 
     private enum CodingKeys: String, CodingKey {
         case defaultWorkspaceMode
+        case defaultRuntimeMode
         case newWorktreesStartFromOrigin
         case projectGroupingMode
         case projectGroupingOverrides
@@ -1295,6 +1399,9 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
             FeatureWorkspaceMode.self,
             forKey: .defaultWorkspaceMode
         ) ?? .local
+        defaultRuntimeMode = try container.decodeIfPresent(
+            FeatureRuntimeMode.self, forKey: .defaultRuntimeMode
+        ) ?? .fullAccess
         newWorktreesStartFromOrigin = try container.decodeIfPresent(
             Bool.self,
             forKey: .newWorktreesStartFromOrigin
@@ -1328,6 +1435,7 @@ public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(defaultWorkspaceMode, forKey: .defaultWorkspaceMode)
+        try container.encode(defaultRuntimeMode, forKey: .defaultRuntimeMode)
         try container.encode(newWorktreesStartFromOrigin, forKey: .newWorktreesStartFromOrigin)
         try container.encode(projectGroupingMode, forKey: .projectGroupingMode)
         try container.encode(projectGroupingOverrides, forKey: .projectGroupingOverrides)

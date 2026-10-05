@@ -4,7 +4,7 @@ import QuickLook
 import SwiftUI
 import UIKit
 
-enum FeatureMediaPreviewSource: Equatable {
+enum FeatureMediaPreviewSource: Equatable, Sendable {
     case localImage(Data)
     case file(URL)
     case remote(URL)
@@ -27,6 +27,8 @@ struct FeatureTypedMediaPreviewRoute: Equatable {
         switch rawKind {
         case "image": kind = .image
         case "video": kind = .video
+        case "audio": kind = .audio
+        case "browser": kind = .browser
         case "pdf": kind = .pdf
         case "document": kind = .document
         default: return nil
@@ -106,7 +108,11 @@ final class FeatureMediaPreviewLoader: ObservableObject {
         if let ownedDirectory { try? FileManager.default.removeItem(at: ownedDirectory) }
     }
 
-    func load(source: FeatureMediaPreviewSource, fileName: String) async {
+    func load(
+        source: FeatureMediaPreviewSource,
+        fileName: String,
+        resolveURL: (@MainActor () async throws -> URL)? = nil
+    ) async {
         guard fileURL == nil, !isLoading else { return }
         let activeGeneration = generation.begin()
         errorMessage = nil
@@ -130,6 +136,9 @@ final class FeatureMediaPreviewLoader: ObservableObject {
                 try data.write(to: destination, options: .atomic)
                 fileURL = destination
             case let .remote(url):
+                let url = try await resolveURL?() ?? url
+                try Task.checkCancellation()
+                guard generation.isCurrent(activeGeneration) else { return }
                 let request = URLRequest(url: url, timeoutInterval: 30)
                 let (temporaryURL, response) = try await URLSession.shared.download(for: request)
                 defer { try? FileManager.default.removeItem(at: temporaryURL) }
@@ -160,13 +169,14 @@ final class FeatureMediaPreviewLoader: ObservableObject {
                 fileURL = destination
             }
         } catch is CancellationError {
+            guard generation.isCurrent(activeGeneration) else { return }
             if let ownedDirectory { try? FileManager.default.removeItem(at: ownedDirectory) }
             ownedDirectory = nil
             return
         } catch {
+            guard generation.isCurrent(activeGeneration) else { return }
             if let ownedDirectory { try? FileManager.default.removeItem(at: ownedDirectory) }
             ownedDirectory = nil
-            guard generation.isCurrent(activeGeneration) else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -177,6 +187,7 @@ final class FeatureMediaPreviewLoader: ObservableObject {
         self.ownedDirectory = nil
         fileURL = nil
         isLoading = false
+        errorMessage = nil
     }
 }
 
@@ -184,15 +195,49 @@ struct FeatureNativeMediaPreviewView: View {
     let source: FeatureMediaPreviewSource
     let kind: FeatureFilePreviewKind
     let fileName: String
+    var mimeType: String? = nil
+    var resolveURL: (@MainActor () async throws -> URL)? = nil
 
     @StateObject private var loader = FeatureMediaPreviewLoader()
     @State private var sharedFile: FeatureSharedFile?
+    @State private var shareError: String?
+    @State private var nativeFile: FeatureSharedFile?
+    @State private var nativeError: String?
+
+    private var contentKind: FeatureAttachmentContentKind {
+        // Existing workspace and linked-media callers already supply a resolved kind.
+        // Attachment callers can pass a MIME type to retain its precedence over the name.
+        if let mimeType { return .infer(name: fileName, mimeType: mimeType) }
+        return switch kind {
+        case .image: .image
+        case .video: .video
+        case .audio: .audio
+        case .browser: .html
+        case .pdf: .pdf
+        case .markdown: .markdown
+        case .source, .plainText, .document: .infer(name: fileName)
+        }
+    }
+
+    private var loadsOnOpen: Bool {
+        !isRemoteBrowser && ![.text, .markdown].contains(contentKind)
+            && !(isRemoteSource && [.video, .audio].contains(contentKind))
+    }
+
+    private var isRemoteBrowser: Bool { kind == .browser && isRemoteSource && mimeType == nil }
 
     var body: some View {
         Group {
-            if kind == .video, case let .remote(url) = source {
-                FeatureVideoPlayerView(url: url)
-            } else if kind == .image, case let .localImage(data) = source,
+            if isRemoteBrowser, case let .remote(url) = source {
+                FeatureBrowserPreviewView(url: url, resolveURL: resolveURL)
+            } else if contentKind == .text || contentKind == .markdown {
+                FeatureAttachmentDocumentView(
+                    source: source, kind: contentKind, fileName: fileName,
+                    mimeType: mimeType, resolveURL: resolveURL, openNative: openNative
+                )
+            } else if [.video, .audio].contains(contentKind), case let .remote(url) = source {
+                FeatureVideoPlayerView(url: url, isAudio: contentKind == .audio, resolveURL: resolveURL)
+            } else if contentKind == .image, case let .localImage(data) = source,
                let image = UIImage(data: data) {
                 FeatureNativeZoomableImageView(image: image)
             } else if let fileURL = loader.fileURL {
@@ -201,17 +246,20 @@ struct FeatureNativeMediaPreviewView: View {
                 ContentUnavailableView {
                     Label("Preview unavailable", systemImage: "doc.badge.ellipsis")
                 } description: { Text(errorMessage) } actions: {
-                    Button("Try again") { Task { await loader.load(source: source, fileName: fileName) } }
+                    Button("Try again") {
+                        Task { await loader.load(source: source, fileName: fileName, resolveURL: resolveURL) }
+                    }
                 }
             } else {
                 Text("Loading preview…")
                     .foregroundStyle(T3Colors.textSecondary)
             }
         }
-        .background(kind == .image || kind == .video ? Color.black : T3Colors.background)
-        .task {
-            if kind != .video || !isRemoteSource {
-                await loader.load(source: source, fileName: fileName)
+        .background(T3Colors.background)
+        .task(id: source) {
+            loader.cleanUp()
+            if loadsOnOpen {
+                await loader.load(source: source, fileName: fileName, resolveURL: resolveURL)
             }
         }
         .onDisappear {
@@ -220,16 +268,38 @@ struct FeatureNativeMediaPreviewView: View {
         .sheet(item: $sharedFile) { file in
             FeatureFileActivityView(url: file.url)
         }
+        .sheet(item: $nativeFile) { file in
+            NavigationStack {
+                FeatureQuickLookPreview(url: file.url)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { nativeFile = nil }
+                        }
+                    }
+            }
+        }
+        .alert("Preview unavailable", isPresented: Binding(
+            get: { nativeError != nil }, set: { if !$0 { nativeError = nil } }
+        )) {
+            Button("OK") { nativeError = nil }
+        } message: { Text(nativeError ?? "") }
+        .alert("Could not share file", isPresented: Binding(
+            get: { shareError != nil }, set: { if !$0 { shareError = nil } }
+        )) {
+            Button("OK") { shareError = nil }
+        } message: { Text(shareError ?? "") }
         .toolbar {
-            if kind == .video, isRemoteSource {
+            if !loadsOnOpen {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task {
-                            await loader.load(source: source, fileName: fileName)
+                            await loader.load(source: source, fileName: fileName, resolveURL: resolveURL)
+                            guard !Task.isCancelled else { return }
                             sharedFile = FeatureMediaPreviewFiles.shareURL(
                                 for: source,
                                 downloadedURL: loader.fileURL
                             ).map(FeatureSharedFile.init)
+                            shareError = sharedFile == nil ? loader.errorMessage : nil
                         }
                     } label: {
                         Image(systemName: "square.and.arrow.up")
@@ -252,43 +322,65 @@ struct FeatureNativeMediaPreviewView: View {
 
     @ViewBuilder
     private func preview(_ url: URL) -> some View {
-        switch kind {
+        switch contentKind {
         case .image:
             if let image = UIImage(contentsOfFile: url.path) {
                 FeatureNativeZoomableImageView(image: image)
             } else {
                 ContentUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark")
             }
-        case .video:
-            FeatureVideoPlayerView(url: url)
-        case .pdf, .document:
+        case .video, .audio:
+            FeatureVideoPlayerView(url: url, isAudio: contentKind == .audio)
+        case .pdf, .native:
             FeatureQuickLookPreview(url: url)
-        case .markdown, .source, .plainText:
-            FeatureQuickLookPreview(url: url)
+        case .html, .markdown, .text:
+            FeatureAttachmentDocumentView(
+                source: .file(url), kind: contentKind, fileName: fileName, mimeType: mimeType,
+                openNative: openNative
+            )
+        }
+    }
+
+    private func openNative() {
+        Task {
+            await loader.load(source: source, fileName: fileName, resolveURL: resolveURL)
+            guard !Task.isCancelled else { return }
+            nativeFile = loader.fileURL.map(FeatureSharedFile.init)
+            nativeError = nativeFile == nil ? loader.errorMessage : nil
         }
     }
 }
 
-private struct FeatureVideoPlayerView: View {
-    let url: URL
+struct FeatureVideoPlayerView: View {
+    var url: URL? = nil
+    var isAudio = false
+    var resolveURL: (@MainActor () async throws -> URL)? = nil
     @StateObject private var playback = FeatureVideoPlayback()
+    @State private var revision = 0
+    @SwiftUI.Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
             if playback.failed {
                 ContentUnavailableView {
-                    Label("Video unavailable", systemImage: "video.slash")
-                } description: { Text("The video could not load.") } actions: {
-                    Button("Try again") { playback.load(url) }
+                    Label(isAudio ? "Audio unavailable" : "Video unavailable", systemImage: isAudio ? "speaker.slash" : "video.slash")
+                } description: { Text(playback.errorMessage ?? "The media could not load.") } actions: {
+                    Button("Try again") { revision += 1 }
                 }
             } else {
                 VideoPlayer(player: playback.player)
                     .overlay {
-                        if !playback.ready { Text("Loading video…").foregroundStyle(.white) }
+                        if !playback.ready {
+                            Text(isAudio ? "Loading audio…" : "Loading video…").foregroundStyle(.white)
+                        }
                     }
             }
         }
-        .onAppear { playback.load(url) }
+        .task(id: revision) { await playback.load(url, resolveURL: resolveURL) }
+        .onChange(of: url) { _, _ in revision += 1 }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { revision += 1 } else { playback.stop() }
+        }
         .onDisappear { playback.stop() }
     }
 }
@@ -298,24 +390,40 @@ private final class FeatureVideoPlayback: ObservableObject {
     let player = AVPlayer()
     @Published private(set) var failed = false
     @Published private(set) var ready = false
+    @Published private(set) var errorMessage: String?
     private var observation: NSKeyValueObservation?
+    private var generation = FeatureMediaPreviewGeneration()
 
-    func load(_ url: URL) {
+    func load(_ url: URL?, resolveURL: (@MainActor () async throws -> URL)?) async {
         stop()
+        let activeGeneration = generation.begin()
         failed = false
         ready = false
-        let item = AVPlayerItem(url: url)
-        player.replaceCurrentItem(with: item)
-        observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.player.currentItem === item else { return }
-                self.failed = item.status == .failed
-                self.ready = item.status == .readyToPlay
+        errorMessage = nil
+        do {
+            guard let resolvedURL = try await resolveURL?() ?? url else {
+                throw FeatureMediaPreviewError.invalidResponse
             }
+            try Task.checkCancellation()
+            guard generation.isCurrent(activeGeneration) else { return }
+            let item = AVPlayerItem(url: resolvedURL)
+            player.replaceCurrentItem(with: item)
+            observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.player.currentItem === item else { return }
+                    self.failed = item.status == .failed
+                    self.ready = item.status == .readyToPlay
+                }
+            }
+        } catch {
+            guard !Task.isCancelled, generation.isCurrent(activeGeneration) else { return }
+            failed = true
+            errorMessage = error.localizedDescription
         }
     }
 
     func stop() {
+        generation.invalidate()
         observation?.invalidate()
         observation = nil
         player.pause()

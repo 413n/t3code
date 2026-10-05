@@ -87,6 +87,26 @@ public enum OrchestrationV2Commands {
             _ = try string(value["projectId"], field: "projectId")
             return Plan(requests: [Request(method: "projects.mutate", payload: .object(value), responseKind: .project)])
         }
+        // Context transfers address two threads and have no single threadId.
+        if type == "thread.fork" || type == "thread.merge_back" {
+            let sourceID = try string(value["sourceThreadId"], field: "sourceThreadId")
+            let targetID = try string(value["targetThreadId"], field: "targetThreadId")
+            guard sourceID != targetID else { throw AdapterError.invalidField("targetThreadId") }
+            if let projection, projection["thread"]?["id"]?.stringValue != sourceID {
+                throw AdapterError.projectionMismatch
+            }
+            let point = try object(try required(value["sourcePoint"], field: "sourcePoint"), field: "sourcePoint")
+            switch try string(point["type"], field: "sourcePoint.type") {
+            case "run": _ = try string(point["runId"], field: "sourcePoint.runId")
+            case "checkpoint": _ = try string(point["checkpointId"], field: "sourcePoint.checkpointId")
+            case "latest_stable": break
+            default: throw AdapterError.invalidField("sourcePoint.type")
+            }
+            if let title = value["title"] { _ = try string(title, field: "title") }
+            value["createdBy"] = value["createdBy"] ?? .string("user")
+            value["creationSource"] = value["creationSource"] ?? .string("mobile")
+            return Plan(requests: [dispatch(value)])
+        }
         let threadID = try string(value["threadId"], field: "threadId")
         if let projection, projection["thread"]?["id"]?.stringValue != threadID {
             throw AdapterError.projectionMismatch
@@ -146,6 +166,36 @@ public enum OrchestrationV2Commands {
             guard directCommands.contains(type) else { throw AdapterError.unsupportedOperation(type) }
         }
         return Plan(requests: [dispatch(value)])
+    }
+
+    public static func fork(
+        sourceThreadID: String, targetThreadID: String, runID: String, title: String? = nil,
+        commandID: String = UUID().uuidString
+    ) -> JSONValue {
+        var fields = threadTransfer("thread.fork", sourceThreadID: sourceThreadID,
+                                    targetThreadID: targetThreadID, runID: runID, commandID: commandID)
+        if let title { fields["title"] = .string(title) }
+        return .object(fields)
+    }
+
+    /// Transfers conversation context; the server chooses the transfer strategy.
+    public static func mergeBack(
+        sourceThreadID: String, targetThreadID: String, runID: String,
+        commandID: String = UUID().uuidString
+    ) -> JSONValue {
+        .object(threadTransfer("thread.merge_back", sourceThreadID: sourceThreadID,
+                               targetThreadID: targetThreadID, runID: runID, commandID: commandID))
+    }
+
+    private static func threadTransfer(
+        _ type: String, sourceThreadID: String, targetThreadID: String, runID: String, commandID: String
+    ) -> [String: JSONValue] {
+        [
+            "type": .string(type), "commandId": .string(commandID),
+            "createdBy": .string("user"), "creationSource": .string("mobile"),
+            "sourceThreadId": .string(sourceThreadID), "targetThreadId": .string(targetThreadID),
+            "sourcePoint": .object(["type": .string("run"), "runId": .string(runID)]),
+        ]
     }
 
     /// Convenience for T3Client: transport selection stays with the caller; errors propagate unchanged.

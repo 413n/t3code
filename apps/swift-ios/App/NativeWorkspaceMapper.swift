@@ -61,19 +61,41 @@ enum NativeWorkspaceMapper {
         }
     }
 
-    static func review(_ preview: ReviewDiffPreview) -> FeatureReview {
+    static func review(_ preview: ReviewDiffPreview, sourceID: String? = nil) -> FeatureReview {
+        let source = preview.sources.first { $0.id == sourceID }
+            ?? preview.sources.first { $0.kind == "branch-range" }
+            ?? preview.sources.first
+        let sources = preview.sources.map {
+            FeatureReviewSource(id: $0.id, title: reviewTitle($0), target: .gitSource($0.id))
+        }
+        guard let source else { return FeatureReview(title: "Changes", sources: sources) }
+        return review(source, sources: sources)
+    }
+
+    static func review(_ source: ReviewDiffSource, sources: [FeatureReviewSource] = []) -> FeatureReview {
         FeatureReview(
-            title: "Working tree",
-            baseReference: preview.sources.compactMap(\.baseRef).first,
-            files: preview.sources.flatMap(parseDiff),
-            isTruncated: preview.sources.contains(where: \.truncated)
+            title: reviewTitle(source), baseReference: source.baseRef,
+            files: parseDiff(source), isTruncated: source.truncated,
+            sources: sources, selectedSourceID: source.id
         )
+    }
+
+    private static func reviewTitle(_ source: ReviewDiffSource) -> String {
+        switch source.kind {
+        case "branch-range": "Changes"
+        case "working-tree": "Uncommitted"
+        default: source.title
+        }
     }
 
     static func sourceControl(_ status: VCSStatus) -> FeatureSourceControlStatus {
         sourceControl(
             isRepository: status.isRepo,
             branch: status.refName,
+            hasPrimaryRemote: status.hasPrimaryRemote,
+            isDefaultBranch: status.isDefaultRef,
+            hasUpstream: status.hasUpstream,
+            aheadOfDefaultCount: status.aheadOfDefaultCount,
             files: status.workingTree.files,
             aheadCount: status.aheadCount,
             behindCount: status.behindCount,
@@ -88,6 +110,10 @@ enum NativeWorkspaceMapper {
         sourceControl(
             isRepository: local.isRepo,
             branch: local.refName,
+            hasPrimaryRemote: local.hasPrimaryRemote,
+            isDefaultBranch: local.isDefaultRef,
+            hasUpstream: remote?.hasUpstream,
+            aheadOfDefaultCount: remote?.aheadOfDefaultCount,
             files: local.workingTree.files,
             aheadCount: remote?.aheadCount ?? 0,
             behindCount: remote?.behindCount ?? 0,
@@ -98,6 +124,10 @@ enum NativeWorkspaceMapper {
     private static func sourceControl(
         isRepository: Bool,
         branch: String?,
+        hasPrimaryRemote: Bool,
+        isDefaultBranch: Bool,
+        hasUpstream: Bool?,
+        aheadOfDefaultCount: Int?,
         files: [VCSWorkingTreeFile],
         aheadCount: Int,
         behindCount: Int,
@@ -125,7 +155,9 @@ enum NativeWorkspaceMapper {
                     url: URL(string: $0.url),
                     updatedAt: $0.updatedAt
                 )
-            }
+            },
+            hasPrimaryRemote: hasPrimaryRemote, isDefaultBranch: isDefaultBranch,
+            hasUpstream: hasUpstream, aheadOfDefaultCount: aheadOfDefaultCount
         )
     }
 
@@ -139,6 +171,10 @@ enum NativeWorkspaceMapper {
         sourceControl(
             isRepository: local.isRepo,
             branch: local.refName,
+            hasPrimaryRemote: local.hasPrimaryRemote,
+            isDefaultBranch: local.isDefaultRef,
+            hasUpstream: remote?.hasUpstream,
+            aheadOfDefaultCount: remote?.aheadOfDefaultCount,
             files: local.workingTree.files,
             aheadCount: remote?.aheadCount ?? 0,
             behindCount: remote?.behindCount ?? 0,
@@ -229,6 +265,9 @@ enum NativeWorkspaceMapper {
                     additions: additions,
                     deletions: deletions,
                     lines: annotateChangedSpans(lines),
+                    sourceDiffHash: source.diffHash,
+                    sourceID: source.id,
+                    sourceTitle: reviewTitle(source),
                     sourceKind: source.kind,
                     sourceBaseReference: source.baseRef,
                     sourceHeadReference: source.headRef
@@ -344,6 +383,9 @@ enum NativeWorkspaceMapper {
                     additions: additions,
                     deletions: deletions,
                     lines: annotateChangedSpans(lines),
+                    sourceDiffHash: source.diffHash,
+                    sourceID: source.id,
+                    sourceTitle: reviewTitle(source),
                     sourceKind: source.kind,
                     sourceBaseReference: source.baseRef,
                     sourceHeadReference: source.headRef

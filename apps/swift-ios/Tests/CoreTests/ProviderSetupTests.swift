@@ -2,6 +2,52 @@ import Testing
 @testable import T3Code
 
 struct ProviderSetupTests {
+    @Test func logoutCapabilityPreservesFalseAndOlderServerAbsence() throws {
+        let legacy = try JSONValue.object(["status": .string("authenticated")]).decode(ServerProviderAuthSnapshot.self)
+        #expect(legacy.canLogout == nil)
+        for value in [false, true] {
+            let auth = try JSONValue.object([
+                "status": .string("authenticated"), "canLogout": .bool(value),
+            ]).decode(ServerProviderAuthSnapshot.self)
+            #expect(auth.canLogout == value)
+        }
+    }
+
+    @Test func installedRegistryProvidersDiscoverMethodsWithoutAdvertisedSignIn() throws {
+        let external = ProviderSetupCapabilities(canAuthenticate: false, canInstall: true)
+        #expect(ProviderAccountDiscovery.isSupported(driver: "acpRegistry", installed: true, setup: external))
+        #expect(ProviderAccountDiscovery.isSupported(driver: "acpRegistry", installed: true, setup: nil))
+        #expect(!ProviderAccountDiscovery.isSupported(driver: "acpRegistry", installed: false, setup: external))
+        #expect(!ProviderAccountDiscovery.isSupported(driver: "codex", installed: true, setup: external))
+        #expect(ProviderAccountDiscovery.isSupported(driver: "codex", installed: true,
+            setup: ProviderSetupCapabilities(canAuthenticate: true, canInstall: false)))
+
+        let discovering = try JSONValue.object([
+            "instanceId": .string("registry-work"), "phase": .string("idle"),
+        ]).decode(ProviderAuthState.self)
+        #expect(ProviderAccountDiscovery.isDiscovering(driver: "acpRegistry", auth: discovering))
+        #expect(!ProviderAccountDiscovery.isDiscovering(driver: "codex", auth: discovering))
+        let externalState = try JSONValue.object([
+            "instanceId": .string("registry-work"), "phase": .string("idle"), "methods": .array([]),
+        ]).decode(ProviderAuthState.self)
+        #expect(!ProviderAccountDiscovery.isDiscovering(driver: "acpRegistry", auth: externalState))
+        #expect(ProviderAccountDiscovery.needsExternalSetup(driver: "acpRegistry", setup: nil, auth: externalState))
+        let ready = try JSONValue.object([
+            "instanceId": .string("registry-work"), "phase": .string("idle"),
+            "methods": .array([.object(["id": .string("device"), "name": .string("Device code"), "type": .string("agent")])]),
+        ]).decode(ProviderAuthState.self)
+        #expect(!ProviderAccountDiscovery.isDiscovering(driver: "acpRegistry", auth: ready))
+        #expect(!ProviderAccountDiscovery.needsExternalSetup(driver: "acpRegistry", setup: nil, auth: ready))
+    }
+
+    @Test func providerSetupDocumentationSurvivesDecoding() throws {
+        let setup = try JSONValue.object([
+            "canAuthenticate": .bool(false), "canInstall": .bool(true),
+            "documentationUrl": .string("https://example.test/setup"),
+        ]).decode(ProviderSetupCapabilities.self)
+        #expect(setup.documentationUrl == "https://example.test/setup")
+    }
+
     @Test func updateDiscoveryPreservesTheEnvironmentReleaseChannel() {
         let releases = [
             EnvironmentReleaseIndex.Release(tag_name: "v0.0.44-nightly.20260930.10", draft: false),

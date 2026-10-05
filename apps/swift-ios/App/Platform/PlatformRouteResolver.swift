@@ -44,7 +44,8 @@ enum PlatformInAppLinkRouter {
             return route
         case .connection:
             return nil
-        case let .thread(environmentID, threadID):
+        case let .thread(environmentID, threadID),
+             let .threadDestination(environmentID, threadID, _):
             guard isSavedEnvironment(environmentID, in: snapshot),
                   PlatformRouteResolver.thread(
                       in: snapshot,
