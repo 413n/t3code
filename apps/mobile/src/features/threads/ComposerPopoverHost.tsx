@@ -1,0 +1,35 @@
+import type { ReactNode, RefObject } from "react";
+import { createContext, useContext, useMemo, useRef, useState } from "react";
+import { View, type ViewInstance } from "react-native";
+
+type ComposerPopoverHostValue = {
+  readonly hostRef: RefObject<ViewInstance | null>;
+  readonly setContent: (content: ReactNode) => void;
+};
+
+const ComposerPopoverHostContext = createContext<ComposerPopoverHostValue | null>(null);
+
+export function useComposerPopoverHost() {
+  return useContext(ComposerPopoverHostContext);
+}
+
+/**
+ * Full-size layer around the composer for its popovers. Mount it inside the
+ * composer's KeyboardStickyView: popovers placed here move with the composer
+ * and sit inside a parent that covers them, so Android delivers their scroll
+ * gestures. It wraps the composer because measureLayout needs an ancestor.
+ */
+export function ComposerPopoverHost(props: { readonly children: ReactNode }) {
+  const hostRef = useRef<ViewInstance>(null);
+  const [content, setContent] = useState<ReactNode>(null);
+  const value = useMemo(() => ({ hostRef, setContent }), []);
+
+  return (
+    <ComposerPopoverHostContext.Provider value={value}>
+      <View ref={hostRef} collapsable={false} pointerEvents="box-none" className="absolute inset-0">
+        {props.children}
+        {content}
+      </View>
+    </ComposerPopoverHostContext.Provider>
+  );
+}
