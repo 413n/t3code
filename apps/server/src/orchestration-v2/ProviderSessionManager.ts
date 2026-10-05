@@ -1518,11 +1518,20 @@ export const layerWithOptions = (
                 providerInstanceId: runtime.instanceId,
               }),
             ).pipe(
-              Effect.andThen(observeActivity(providerSessionId, markBusy(providerSessionId))),
-              Effect.andThen(runtime.startTurn(input)),
               // A start that fails or is stopped never emits turn.terminal, so
-              // the busy mark is undone here or the session never goes idle.
-              Effect.onError(() => observeActivity(providerSessionId, markIdle(providerSessionId))),
+              // it undoes its own busy mark or the session never goes idle.
+              // Only a mark it made: on a session shared by several threads,
+              // undoing another thread's would idle-release its running turn.
+              Effect.andThen(
+                Effect.acquireUseRelease(
+                  observeActivity(providerSessionId, markBusy(providerSessionId)),
+                  () => runtime.startTurn(input),
+                  (_, exit) =>
+                    Exit.isFailure(exit)
+                      ? observeActivity(providerSessionId, markIdle(providerSessionId))
+                      : Effect.void,
+                ),
+              ),
             ),
           steerTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
@@ -1672,7 +1681,9 @@ export const layerWithOptions = (
       // Parent of every session scope. On layer close, shutdown releases the
       // live sessions first, then closes any session whose open is still in
       // flight, time-boxed so a stuck adapter cannot hold up server shutdown.
-      const sessionScopes = yield* Scope.make();
+      // Parallel, so one session whose close hangs does not stop the rest from
+      // closing within the time box.
+      const sessionScopes = yield* Scope.make("parallel");
       const shutdown = Effect.gen(function* () {
         const activeSessions = [...(yield* Ref.get(sessions)).values()];
         yield* Effect.forEach(

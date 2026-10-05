@@ -1151,6 +1151,110 @@ it.effect("ProviderSessionManagerV2 releases an idle session whose turn start wa
   }),
 );
 
+it.effect(
+  "ProviderSessionManagerV2 keeps a shared session busy when another thread's start is stopped early",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const projectId = ProjectId.make("project-provider-session-manager-shared-stopped-start");
+      // Blocks the next project read, so a re-attach can be stopped before its
+      // start marks the session busy.
+      const holdProjectRead = yield* Ref.make(false);
+      const projectReadHeld = yield* Deferred.make<void>();
+      const projectServiceLayer = Layer.mock(ProjectService.ProjectService)({
+        getById: (requestedProjectId) =>
+          Ref.get(holdProjectRead).pipe(
+            Effect.flatMap((hold) =>
+              hold
+                ? Deferred.succeed(projectReadHeld, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(Option.some(makeBrowserAccessProject(requestedProjectId))),
+            ),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadA = ThreadId.make("thread-provider-session-manager-shared-stopped-a");
+        const threadB = ThreadId.make("thread-provider-session-manager-shared-stopped-b");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: threadA, now, projectId }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: threadB, now, projectId }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId: threadA,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* manager.open({
+          threadId: threadB,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const startTurn = (threadId: ThreadId) =>
+          Effect.gen(function* () {
+            const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+            return yield* runtime.startTurn({
+              appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+              threadId,
+              runId,
+              runOrdinal: 1,
+              providerTurnOrdinal: 1,
+              attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+              rootNodeId: idAllocator.derive.rootNode({ runId }),
+              providerThread: makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                text: "turn",
+                attachments: [],
+              },
+              modelSelection,
+              runtimePolicy,
+            });
+          });
+
+        // B's turn is accepted and still running.
+        yield* startTurn(threadB);
+
+        // A detaches, and its next start is stopped while re-attaching, before
+        // it marks the session busy.
+        yield* manager.detach({ providerSessionId, threadId: threadA });
+        yield* Ref.set(holdProjectRead, true);
+        const startingA = yield* startTurn(threadA).pipe(Effect.forkChild);
+        yield* Deferred.await(projectReadHeld);
+        yield* Fiber.interrupt(startingA);
+
+        // B's running turn keeps the session busy past the idle timeout.
+        yield* TestClock.adjust("2 seconds");
+        yield* Effect.yieldNow;
+        assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+      }).pipe(
+        Effect.provide(
+          makeTestLayer({
+            state,
+            idleTimeoutMs: 1000,
+            projectServiceLayer,
+            serverSettingsLayer: ServerSettings.layerTest({
+              projectSettingsOverrides: { [projectId]: { enableAgentBrowserAccess: true } },
+            }),
+          }),
+        ),
+      );
+    }),
+);
+
 it.effect("ProviderSessionManagerV2 stops a session still opening when its layer shuts down", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);

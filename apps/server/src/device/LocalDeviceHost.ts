@@ -595,16 +595,20 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
     );
     yield* onPhase("starting");
     const hub = yield* spawnHub(hubTool, nodePath);
-    yield* pruneLocalDeviceTools(config.baseDir, nodePath, "hub").pipe(
-      Effect.provideService(Path.Path, path),
-      Effect.provideService(ProcessRunner.ProcessRunner, runner),
-      Effect.ignore,
-    );
+    // Until the hub is in runningRef, nothing else stops it.
+    const [axExists, cliExists] = yield* Effect.gen(function* () {
+      yield* pruneLocalDeviceTools(config.baseDir, nodePath, "hub").pipe(
+        Effect.provideService(Path.Path, path),
+        Effect.provideService(ProcessRunner.ProcessRunner, runner),
+        Effect.ignore,
+      );
+      const candidate = helperPaths(hubTool);
+      return yield* Effect.all([
+        fs.exists(candidate.serveSimAxSettings).pipe(Effect.orElseSucceed(() => false)),
+        fs.exists(candidate.serveSimCli).pipe(Effect.orElseSucceed(() => false)),
+      ]);
+    }).pipe(Effect.onError(() => stopHub(hub)));
     const candidate = helperPaths(hubTool);
-    const [axExists, cliExists] = yield* Effect.all([
-      fs.exists(candidate.serveSimAxSettings).pipe(Effect.orElseSucceed(() => false)),
-      fs.exists(candidate.serveSimCli).pipe(Effect.orElseSucceed(() => false)),
-    ]);
     const next: RunningHost = {
       hub,
       agentDevice: null,
