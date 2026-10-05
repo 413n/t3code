@@ -274,7 +274,11 @@ export const observerLive = Layer.effect(
             [workspaceEntries.refresh(cwd), vcsStatus.refreshLocalStatus(cwd)],
             { concurrency: "unbounded" },
           );
-          if (local.refName === null || local.isDefaultRef) return;
+          // isDefaultRef only rules out looking up a PR for the default
+          // branch below; a dedicated worktree switching to that branch is
+          // still drift and must still be followed, so this cannot bail
+          // before the drift check runs (#11078 review).
+          if (local.refName === null) return;
           const thread = yield* projections.getThreadShell(threadId);
           if (!thread) return;
           if (thread.activeRunId !== null && thread.activeRunId !== runId) return;
@@ -282,6 +286,7 @@ export const observerLive = Layer.effect(
             yield* followBranchDrift(thread, local.refName, runId);
             return;
           }
+          if (local.isDefaultRef) return;
           yield* vcsStatus.refreshPullRequestStatus(cwd).pipe(
             Effect.catch((error) =>
               Effect.logWarning("failed to refresh pull request status after run completion", {

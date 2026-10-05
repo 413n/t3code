@@ -187,6 +187,17 @@ it.effect.each(
         checkedOut: "t3code/0a1b2c3d",
         expectDispatch: false,
       },
+      {
+        // #11078 review: isDefaultRef only rules out a PR lookup for the
+        // default branch; it must not also skip the drift check itself, or
+        // switching a dedicated worktree to the repo's default branch would
+        // never reconcile.
+        label: "follows the drift when switching a dedicated worktree to the default branch",
+        branch: "feature",
+        worktreePath: "/repo",
+        checkedOut: "main",
+        expectDispatch: true,
+      },
     ] as const
   ).map((scenario) => [scenario.label, scenario] as const),
 )("%s", ([, scenario]) => {
@@ -208,7 +219,7 @@ it.effect.each(
             Effect.succeed({
               isRepo: true,
               hasPrimaryRemote: true,
-              isDefaultRef: false,
+              isDefaultRef: scenario.checkedOut === "main",
               refName: scenario.checkedOut,
               hasWorkingTreeChanges: false,
               workingTree: { files: [], insertions: 0, deletions: 0 },
