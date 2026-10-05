@@ -71,7 +71,8 @@ const ProjectEventPersistedRowSchema = Schema.Struct({
   metadata: EventMetadataFromJsonString,
 });
 
-const READ_PAGE_SIZE = 500;
+/** Exported so tests can exercise a full raw page without hardcoding a number that could drift. */
+export const READ_PAGE_SIZE = 500;
 
 interface ApplicationEventRow {
   readonly sequence: number;

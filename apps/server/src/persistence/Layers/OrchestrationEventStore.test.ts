@@ -27,7 +27,7 @@ import {
 import { PersistenceDecodeError } from "../Errors.ts";
 import { toShellApplicationEvent } from "../../orchestration-v2/ShellStream.ts";
 import * as OrchestrationEventStore from "../Services/OrchestrationEventStore.ts";
-import { OrchestrationEventStoreLive } from "./OrchestrationEventStore.ts";
+import { OrchestrationEventStoreLive, READ_PAGE_SIZE } from "./OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./Sqlite.ts";
 const isPersistenceDecodeError = Schema.is(PersistenceDecodeError);
 const isLiveStreamBufferError = Schema.is(LiveStreamBufferError);
@@ -564,6 +564,85 @@ layer("OrchestrationEventStore", (it) => {
 
         // Without the opt-in the exact same range still fails outright -- the
         // same line the thread replay fix drew, now on the shell's own reader.
+        const strictResult = yield* Effect.result(
+          store
+            .readApplicationEvents({ afterSequence: baseline, throughSequence })
+            .pipe(Stream.runCollect),
+        );
+        assert.equal(strictResult._tag, "Failure");
+        if (strictResult._tag === "Failure") {
+          assert.isTrue(isPersistenceDecodeError(strictResult.failure));
+        }
+      }),
+  );
+
+  it.effect(
+    "readApplicationEvents with skipUnknownEventTypes pages past a full page of unknown rows",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const baseline = yield* store.latestApplicationSequence;
+        const now = "2026-01-05T00:00:01.000Z";
+        const threadId = "thread:shell-skip-unknown-page-boundary";
+        const projectEvent = (suffix: string) => ({
+          type: "project.created" as const,
+          eventId: EventId.make(`evt-shell-skip-unknown-page-${suffix}`),
+          aggregateKind: "project" as const,
+          aggregateId: ProjectId.make(`project-shell-skip-unknown-page-${suffix}`),
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          payload: {
+            projectId: ProjectId.make(`project-shell-skip-unknown-page-${suffix}`),
+            title: `Shell skip-unknown page ${suffix}`,
+            workspaceRoot: `/tmp/project-shell-skip-unknown-page-${suffix}`,
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+
+        const before = yield* store.appendProjectEvent(projectEvent("before"));
+        // A full raw page (READ_PAGE_SIZE) of rows a newer build wrote, none
+        // of which this build knows -- the skip has to carry the cursor past
+        // an entire page, not just one row at a time. If pagination counted
+        // decoded (post-filter) rows instead of raw SQL rows, a page that
+        // decodes to zero kept events would look like the last page and this
+        // read would never reach "after".
+        yield* Effect.forEach(
+          Array.from({ length: READ_PAGE_SIZE }, (_, index) => index),
+          (index) => sql`
+            INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type,
+              occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+            ) VALUES (
+              ${`event:shell-skip-unknown-page:${index}`}, 'thread', ${threadId}, ${index},
+              'thread.turn-item.exotic-future-feature', ${now}, 'server',
+              '{"anything":true}', '{}', 2
+            )
+          `,
+          { discard: true },
+        );
+        const after = yield* store.appendProjectEvent(projectEvent("after"));
+
+        const throughSequence = yield* store.latestApplicationSequence;
+        const replayed = yield* store
+          .readApplicationEvents({
+            afterSequence: baseline,
+            throughSequence,
+            skipUnknownEventTypes: true,
+          })
+          .pipe(Stream.runCollect);
+        assert.deepEqual(
+          Array.from(replayed, (event) => event.sequence),
+          [before.sequence, after.sequence],
+        );
+
+        // Same range, strict: still fails outright without the opt-in.
         const strictResult = yield* Effect.result(
           store
             .readApplicationEvents({ afterSequence: baseline, throughSequence })
