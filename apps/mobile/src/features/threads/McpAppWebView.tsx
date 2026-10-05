@@ -9,7 +9,12 @@ import {
 } from "@t3tools/client-runtime/mcp-apps";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { CommandId, MessageId } from "@t3tools/contracts";
-import { MCP_APP_MAX_HEIGHT, mcpAppFileName, type McpAppReference } from "@t3tools/shared/mcpApp";
+import {
+  MCP_APP_MAX_HEIGHT,
+  mcpAppAllowAttribute,
+  mcpAppFileName,
+  type McpAppReference,
+} from "@t3tools/shared/mcpApp";
 import Constants from "expo-constants";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Platform, View } from "react-native";
@@ -35,14 +40,21 @@ export function mcpAppRowHeight() {
   return MCP_APP_ROW_HEIGHT + ROW_BOTTOM_MARGIN;
 }
 
-// In a WebView the app is the top document, so `window.parent` is itself. This
-// routes the app's posts to React Native and is how host replies, injected as
-// `window.__t3McpAppReceive(...)`, arrive as `message` events from the "parent".
-const BRIDGE_SCRIPT = `(function(){
-var post=function(message){window.ReactNativeWebView.postMessage(JSON.stringify(message));};
-try{Object.defineProperty(window,"parent",{value:{postMessage:post},configurable:false});}catch(e){}
-window.__t3McpAppReceive=function(message){window.dispatchEvent(new MessageEvent("message",{data:message,source:window.parent}));};
-})();true;`;
+// The WebView loads a tiny outer page that hosts the app in a real
+// opaque-origin iframe, as web does, so the app's `window.parent` and the
+// `event.source` of host replies are a real window, which the MCP Apps SDK
+// requires. The outer page only relays: app → React Native, and host
+// replies (injected as `__t3McpAppReceive(...)`) → app.
+function outerDocument(src: string, allow: string) {
+  const attribute = (value: string) =>
+    value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>html,body{margin:0;height:100%;background:transparent}iframe{border:0;display:block;width:100%;height:100%}</style></head>
+<body><iframe id="app" sandbox="allow-scripts allow-forms" allow="${attribute(allow)}" src="${attribute(src)}"></iframe>
+<script>(function(){var frame=document.getElementById("app");
+window.addEventListener("message",function(e){if(e.source===frame.contentWindow)window.ReactNativeWebView.postMessage(JSON.stringify(e.data));});
+window.__t3McpAppReceive=function(m){frame.contentWindow&&frame.contentWindow.postMessage(m,"*");};})();</script></body></html>`;
+}
 
 const commandFailure = (result: {
   readonly cause: Parameters<typeof squashAtomCommandFailure>[0]["cause"];
@@ -120,13 +132,18 @@ export function ThreadMcpApp(props: {
   const callTool = useAtomCommand(mcpAppEnvironment.callTool, { reportFailure: false });
   const toolInfo = useAtomCommand(mcpAppEnvironment.toolInfo, { reportFailure: false });
   const readResource = useAtomCommand(mcpAppEnvironment.readResource, { reportFailure: false });
+  // Read by the host on every message, so it always sees current values
+  // without being rebuilt (which would drop the app's session).
   const latest = useRef({ theme, props, callTool, toolInfo, readResource });
-  latest.current = { theme, props, callTool, toolInfo, readResource };
+  useEffect(() => {
+    latest.current = { theme, props, callTool, toolInfo, readResource };
+  });
   const webView = useRef<WebView<object>>(null);
   const hostRef = useRef<McpAppHost | null>(null);
 
-  const host = useMemo(() => {
-    hostRef.current?.dispose();
+  // One host per loaded document.
+  useEffect(() => {
+    if (uri === null) return;
     const scope = () => {
       const { environmentId, threadId, itemId } = latest.current.props;
       return { environmentId, input: { threadId, itemId } };
@@ -205,39 +222,48 @@ export function ThreadMcpApp(props: {
       onSizeChanged: () => undefined,
     });
     hostRef.current = next;
-    return next;
-    // One host per document; current values are read through `latest`.
+    return () => {
+      next.dispose();
+      hostRef.current = null;
+    };
   }, [uri, app]);
-  useEffect(() => () => hostRef.current?.dispose(), []);
 
+  // The host reads the context through `latest`; these only say when to resend.
   useEffect(() => {
-    host.updateHostContext();
-  }, [host, theme, props.width]);
+    hostRef.current?.updateHostContext();
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Context changes trigger a resend.
+  }, [theme, props.width]);
+  // A new document gets a new host, which needs the call again.
   useEffect(() => {
-    if (toolCall !== undefined) host.setToolCall(toolCall);
-  }, [host, toolCall]);
+    if (toolCall !== undefined) hostRef.current?.setToolCall(toolCall);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Each new document needs the call.
+  }, [toolCall, uri]);
 
-  const withoutFragment = (url: string) => url.split("#", 1)[0];
+  const source = useMemo(
+    () =>
+      uri === null ? null : { html: outerDocument(uri, mcpAppAllowAttribute(app.permissions)) },
+    [uri, app.permissions],
+  );
 
   return (
     <View style={{ height: MCP_APP_ROW_HEIGHT, marginBottom: ROW_BOTTOM_MARGIN }}>
       {uri !== null ? (
         <WebView<object>
           ref={webView}
-          source={{ uri }}
+          source={source!}
           accessibilityLabel={`${app.server} app`}
           style={{ flex: 1, backgroundColor: "transparent" }}
-          injectedJavaScriptBeforeContentLoaded={BRIDGE_SCRIPT}
           nestedScrollEnabled
-          // Only the app's own document loads here; it opens links through the bridge.
+          originWhitelist={["*"]}
+          // Only the outer page loads at the top; the app opens links through the bridge.
           onShouldStartLoadWithRequest={(request) =>
-            request.isTopFrame === false || withoutFragment(request.url) === withoutFragment(uri)
+            request.isTopFrame === false || request.url === "about:blank"
           }
           setSupportMultipleWindows={false}
           onLoadEnd={() => setLoaded(true)}
           onMessage={(event: WebViewMessageEvent) => {
             try {
-              host.receive(JSON.parse(event.nativeEvent.data));
+              hostRef.current?.receive(JSON.parse(event.nativeEvent.data));
             } catch {
               // Not JSON: not a bridge message.
             }

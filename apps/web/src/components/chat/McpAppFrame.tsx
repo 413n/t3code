@@ -105,22 +105,23 @@ export function McpAppFrame(props: {
   // Read by the host on every message, so it always sees current values
   // without being rebuilt (which would drop the app's session).
   const latest = useRef({ theme, width, props, callTool, toolInfo, readResource });
-  latest.current = { theme, width, props, callTool, toolInfo, readResource };
-  const hostRef = useRef<McpAppHost | null>(null);
-
-  const hostContext = (): McpAppHostContext => ({
-    theme: latest.current.theme.appearance,
-    styles: { variables: mcpAppStyleVariables(latest.current.theme.variables) },
-    displayMode: "inline",
-    availableDisplayModes: ["inline"],
-    containerDimensions: { width: latest.current.width, maxHeight: MCP_APP_MAX_HEIGHT },
-    platform: "web",
-    locale: navigator.language,
-    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  useEffect(() => {
+    latest.current = { theme, width, props, callTool, toolInfo, readResource };
   });
+  const hostRef = useRef<McpAppHost | null>(null);
 
   useEffect(() => {
     if (src === null) return;
+    const hostContext = (): McpAppHostContext => ({
+      theme: latest.current.theme.appearance,
+      styles: { variables: mcpAppStyleVariables(latest.current.theme.variables) },
+      displayMode: "inline",
+      availableDisplayModes: ["inline"],
+      containerDimensions: { width: latest.current.width, maxHeight: MCP_APP_MAX_HEIGHT },
+      platform: "web",
+      locale: navigator.language,
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
     const target = () => frameRef.current?.contentWindow ?? null;
     const scope = () => {
       const { environmentId, threadId, itemId } = latest.current.props;
@@ -191,15 +192,18 @@ export function McpAppFrame(props: {
       host.dispose();
       hostRef.current = null;
     };
-    // The host lives as long as the document; everything else is read through `latest`.
   }, [src, app]);
 
+  // The host reads the context through `latest`; these only say when to resend.
   useEffect(() => {
     hostRef.current?.updateHostContext();
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Context changes trigger a resend.
   }, [theme, width]);
 
+  // A new document gets a new host, which needs the call again.
   useEffect(() => {
     if (toolCall !== undefined) hostRef.current?.setToolCall(toolCall);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Each new document needs the call.
   }, [toolCall, src]);
 
   return (
