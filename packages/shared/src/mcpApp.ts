@@ -17,7 +17,7 @@ export const MCP_APP_RESOURCE_SCHEME = "ui://";
 /** Where T3 records the app reference inside a tool item's output object. */
 export const MCP_APP_OUTPUT_KEY = "t3McpApp";
 
-export const MCP_APP_MIN_HEIGHT = 80;
+const MCP_APP_MIN_HEIGHT = 80;
 export const MCP_APP_DEFAULT_HEIGHT = 320;
 export const MCP_APP_MAX_HEIGHT = 2000;
 /** Largest app document T3 stores. */

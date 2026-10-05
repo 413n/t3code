@@ -29,7 +29,7 @@ export interface McpAppHostContext {
 export interface McpAppCallToolResult {
   readonly content: ReadonlyArray<unknown>;
   readonly structuredContent?: unknown;
-  readonly isError?: boolean;
+  readonly isError?: boolean | undefined;
   readonly _meta?: unknown;
 }
 
@@ -42,9 +42,7 @@ export interface McpAppHostOptions {
   /** Posts one JSON-RPC message to the app document. */
   readonly post: (message: unknown) => void;
   readonly hostContext: () => McpAppHostContext;
-  /** The original tool call's arguments and result, replayed after initialization. */
-  readonly toolInput: () => unknown;
-  readonly toolResult: () => McpAppCallToolResult | undefined;
+
   readonly callTool: (input: {
     readonly name: string;
     readonly arguments: Record<string, unknown>;
@@ -58,6 +56,14 @@ export interface McpAppHostOptions {
 export interface McpAppHost {
   /** Handles one message the app posted; the caller has already checked its source. */
   readonly receive: (data: unknown) => void;
+  /**
+   * Supplies the original tool call's arguments and result. They reach the
+   * app once it has initialized, whichever happens last, and only once.
+   */
+  readonly setToolCall: (call: {
+    readonly arguments: unknown;
+    readonly result: McpAppCallToolResult | undefined;
+  }) => void;
   /** Sends `host-context-changed` with the fields that differ from what the app last saw. */
   readonly updateHostContext: () => void;
   readonly dispose: () => void;
@@ -85,6 +91,10 @@ const errorMessage = (error: unknown) =>
 export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
   let initialized = false;
   let disposed = false;
+  let toolCall:
+    | { readonly arguments: unknown; readonly result: McpAppCallToolResult | undefined }
+    | undefined;
+  let toolCallSent = false;
   let pending = 0;
   let sentContext: McpAppHostContext | undefined;
 
@@ -95,6 +105,15 @@ export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
   const respond = (id: JsonRpcId, result: unknown) => post({ jsonrpc: "2.0", id, result });
   const fail = (id: JsonRpcId, code: number, message: string) =>
     post({ jsonrpc: "2.0", id, error: { code, message } });
+
+  const sendToolCall = () => {
+    if (!initialized || toolCall === undefined || toolCallSent) return;
+    toolCallSent = true;
+    notify("ui/notifications/tool-input", {
+      arguments: Predicate.isObject(toolCall.arguments) ? toolCall.arguments : {},
+    });
+    if (toolCall.result !== undefined) notify("ui/notifications/tool-result", toolCall.result);
+  };
 
   const answer = (id: JsonRpcId, run: () => Promise<unknown>) => {
     if (pending >= MAX_PENDING_REQUESTS) {
@@ -202,12 +221,7 @@ export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
       case "ui/notifications/initialized": {
         if (initialized) return;
         initialized = true;
-        const args = options.toolInput();
-        notify("ui/notifications/tool-input", {
-          arguments: Predicate.isObject(args) ? args : {},
-        });
-        const result = options.toolResult();
-        if (result !== undefined) notify("ui/notifications/tool-result", result);
+        sendToolCall();
         return;
       }
       case "ui/notifications/size-changed": {
@@ -240,6 +254,10 @@ export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
       const params = Predicate.isObject(data.params) ? data.params : {};
       if (isId(data.id)) handleRequest(data.id, method, params);
       else handleNotification(method, params);
+    },
+    setToolCall: (call) => {
+      toolCall ??= call;
+      sendToolCall();
     },
     updateHostContext: () => {
       // The spec forbids messages before the app finishes initializing; it

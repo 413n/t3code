@@ -22,7 +22,7 @@ const encoder = new TextEncoder();
  * resource declared. Only `text/html;profile=mcp-app` content counts; a blob is
  * base64 per MCP.
  */
-export function readMcpAppDocument(
+function readMcpAppDocument(
   contents: ReadonlyArray<unknown>,
   uri: string,
 ): { readonly html: string; readonly meta: unknown } | undefined {

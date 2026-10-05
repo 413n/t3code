@@ -19,7 +19,8 @@ const context = (theme: "light" | "dark" = "dark"): McpAppHostContext => ({
   platform: "web",
 });
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+// Lets the host settle the promises its callbacks return.
+const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve)).then(() => undefined);
 
 function setup(overrides: Partial<Parameters<typeof makeMcpAppHost>[0]> = {}) {
   const sent: Array<Record<string, unknown>> = [];
@@ -29,8 +30,6 @@ function setup(overrides: Partial<Parameters<typeof makeMcpAppHost>[0]> = {}) {
     hostVersion: "1.0.0",
     post: (message) => sent.push(message as Record<string, unknown>),
     hostContext: () => context(theme),
-    toolInput: () => ({ city: "Oslo" }),
-    toolResult: () => ({ content: [{ type: "text", text: "Sunny" }] }),
     callTool: async (input) => ({ content: [{ type: "text", text: `called ${input.name}` }] }),
     readResource: async () => ({ contents: [] }),
     openLink: async () => undefined,
@@ -50,6 +49,10 @@ function setup(overrides: Partial<Parameters<typeof makeMcpAppHost>[0]> = {}) {
 describe("makeMcpAppHost", () => {
   it("initializes, then replays the tool input and result after initialized", () => {
     const { host, sent } = setup();
+    host.setToolCall({
+      arguments: { city: "Oslo" },
+      result: { content: [{ type: "text", text: "Sunny" }] },
+    });
     host.receive({
       jsonrpc: "2.0",
       id: 1,
@@ -77,6 +80,22 @@ describe("makeMcpAppHost", () => {
         jsonrpc: "2.0",
         method: "ui/notifications/tool-result",
         params: { content: [{ type: "text", text: "Sunny" }] },
+      },
+    ]);
+  });
+
+  it("replays a tool call that arrives after initialization, once", () => {
+    const { host, sent } = setup();
+    host.receive({ jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    host.receive({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    sent.length = 0;
+    host.setToolCall({ arguments: { city: "Oslo" }, result: undefined });
+    host.setToolCall({ arguments: { city: "Bergen" }, result: undefined });
+    expect(sent).toEqual([
+      {
+        jsonrpc: "2.0",
+        method: "ui/notifications/tool-input",
+        params: { arguments: { city: "Oslo" } },
       },
     ]);
   });

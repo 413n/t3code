@@ -89,9 +89,7 @@ function makeLayer(input: {
   );
 }
 
-const reason = (
-  effect: Effect.Effect<unknown, McpAppRequestError, McpAppRequests.McpAppRequests>,
-) =>
+const reason = <A, R>(effect: Effect.Effect<A, McpAppRequestError, R>) =>
   effect.pipe(
     Effect.flip,
     Effect.map((error) => error.reason),
