@@ -1,7 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
-  AuthOrchestrationOperateScope,
+  AuthPreviewOperateScope,
   EnvironmentId,
   PreviewAutomationClientDisconnectedError,
   PreviewAutomationInvalidSelectorError,
@@ -1262,7 +1262,7 @@ it.effect("evicts an unanswered host and lets later calls use a healthy runtime"
             group.toLayer({
               [WS_METHODS.previewAutomationConnect]: (host) => Stream.unwrap(broker.connect(host)),
             }),
-            rpcScopeAuthorizationLayer([AuthOrchestrationOperateScope]),
+            rpcScopeAuthorizationLayer([AuthPreviewOperateScope]),
           ),
         ),
       );
