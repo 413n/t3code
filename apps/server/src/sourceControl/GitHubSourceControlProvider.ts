@@ -46,6 +46,7 @@ function toChangeRequest(summary: GitHubCli.GitHubPullRequestSummary): ChangeReq
     ...(summary.headRepositoryOwnerLogin !== undefined
       ? { headRepositoryOwnerLogin: summary.headRepositoryOwnerLogin }
       : {}),
+    ...(summary.headRefOid !== undefined ? { headRefOid: summary.headRefOid } : {}),
   };
 }
 
