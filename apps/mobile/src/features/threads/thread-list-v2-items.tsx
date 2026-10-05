@@ -647,10 +647,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const handleArchive = useCallback(() => onArchiveThread(thread), [onArchiveThread, thread]);
   const groupMenuItems = useMemo<MenuAction[]>(
     () =>
-      onUngroupThreads === undefined || group === null
+      onUngroupThreads === undefined || (group === null && thread.groupedUnderThreadId == null)
         ? []
         : [
-            group.role === "parent"
+            group?.role === "parent"
               ? { id: "ungroup", title: "Ungroup", image: "rectangle.stack.badge.minus" }
               : {
                   id: "remove-from-group",
@@ -658,7 +658,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                   image: "rectangle.stack.badge.minus",
                 },
           ],
-    [group, onUngroupThreads],
+    [group, onUngroupThreads, thread.groupedUnderThreadId],
   );
 
   // Swipe: the v2 primary action is the lifecycle transition. Un-settling a

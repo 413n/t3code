@@ -244,18 +244,16 @@ function groupListKey(
     : `${thread.environmentId}:${thread.groupedUnderThreadId}`;
 }
 
-/** Canonical card section for Move up/down, independent of search or scope.
-    A thread grouped under another one moves with its group, so the section
-    lists only the row that leads each group. */
-export function getThreadListV2OrderedSection(input: {
+interface ThreadListV2OrderInput {
   readonly threads: readonly EnvironmentThreadShell[];
-  readonly section: "pinned" | "active";
-  readonly pendingOrder?: PendingThreadOrder | null;
   readonly now: string;
   readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
   readonly snoozeEnvironmentIds?: ReadonlySet<EnvironmentId>;
   readonly queuedThreadKeys?: ReadonlySet<string>;
-}): EnvironmentThreadShell[] {
+}
+
+/** Pinned, Active, and parked threads in saved order, grouped into blocks. */
+function layoutThreadListV2OrderSections(input: ThreadListV2OrderInput) {
   const pinned: EnvironmentThreadShell[] = [];
   const active: EnvironmentThreadShell[] = [];
   const parked: EnvironmentThreadShell[] = [];
@@ -275,21 +273,47 @@ export function getThreadListV2OrderedSection(input: {
     active: sortActiveThreadsByOrderKey(active),
     parked,
   };
-  const leads = new Set(
-    layoutThreadGroups({
-      sections,
-      order: ["pinned", "active", "parked"],
-      live: ORDER_LIVE_SECTIONS,
-      keyOf: threadListKey,
-      groupKeyOf: groupListKey,
-    })[input.section].map((block) => block.leadKey),
-  );
+  const layout = layoutThreadGroups({
+    sections,
+    order: ["pinned", "active", "parked"],
+    live: ORDER_LIVE_SECTIONS,
+    keyOf: threadListKey,
+    groupKeyOf: groupListKey,
+  });
+  return { sections, layout };
+}
+
+/** Canonical card section for Move up/down, independent of search or scope.
+    A thread grouped under another one moves with its group, so the section
+    lists only the row that leads each group. */
+export function getThreadListV2OrderedSection(
+  input: ThreadListV2OrderInput & {
+    readonly section: "pinned" | "active";
+    readonly pendingOrder?: PendingThreadOrder | null;
+  },
+): EnvironmentThreadShell[] {
+  const { sections, layout } = layoutThreadListV2OrderSections(input);
+  const leads = new Set(layout[input.section].map((block) => block.leadKey));
   const ordered = sections[input.section].filter((thread) => leads.has(threadListKey(thread)));
   const pending =
     input.pendingOrder?.section === input.section
       ? reconcilePendingThreadOrder(input.pendingOrder, ordered)
       : null;
   return applyPendingThreadOrder(ordered, input.section, pending);
+}
+
+/** Every thread in a group that sits in Pinned or Active, including a
+    snoozed or settled top thread. It moves with its group, so the
+    arrangement sheet keeps it out of the parked lists. */
+export function getThreadListV2LiveGroupThreads(
+  input: ThreadListV2OrderInput,
+): ReadonlySet<EnvironmentThreadShell> {
+  const { layout } = layoutThreadListV2OrderSections(input);
+  return new Set(
+    [...layout.pinned, ...layout.active].flatMap((block) =>
+      block.rows.length > 1 ? block.rows.map((row) => row.thread) : [],
+    ),
+  );
 }
 
 const ORDER_LIVE_SECTIONS: ReadonlySet<"pinned" | "active" | "parked"> = new Set([
@@ -317,8 +341,10 @@ export interface ThreadListV2Item {
 
 const LIST_SECTIONS = ["pinned", "active", "working", "snoozed", "settled"] as const;
 type ThreadListSection = (typeof LIST_SECTIONS)[number];
-// A group whose top thread is snoozed or settled moves to its first thread here.
-const LIVE_LIST_SECTIONS: ReadonlySet<ThreadListSection> = new Set(["pinned", "active", "working"]);
+// A group whose top thread is outside these sections moves to a member in
+// them. The Working shelf folds away like the parked shelves, so a group
+// there must not hide a member that needs you in Active.
+const LIVE_LIST_SECTIONS: ReadonlySet<ThreadListSection> = new Set(["pinned", "active"]);
 type ThreadListBlock = ThreadGroupBlock<EnvironmentThreadShell, ThreadListSection>;
 
 export interface ThreadListV2Layout {

@@ -313,8 +313,10 @@ const SIDEBAR_SECTION_ORDER = [
   "snoozed",
   "settled",
 ] as const satisfies readonly SidebarSection[];
-// A group whose top thread is snoozed or settled moves to its first thread here.
-const LIVE_SIDEBAR_SECTIONS: ReadonlySet<SidebarSection> = new Set(["pinned", "active", "working"]);
+// A group whose top thread is outside these sections moves to a member in
+// them. The Working shelf folds away like the parked shelves, so a group
+// there must not hide a member that needs you in Active.
+const LIVE_SIDEBAR_SECTIONS: ReadonlySet<SidebarSection> = new Set(["pinned", "active"]);
 
 /** A launch block as rendered: `rows` drops what a folded group hides. */
 interface RenderedLaunchBlock {
@@ -5141,7 +5143,9 @@ export default function Sidebar() {
               isSnoozed,
               canSnoozeNow: canSnooze(thread, { now: new Date().toISOString() }),
               isRegeneratingTitle,
-              inLaunchGroup: launchChildKeysRef.current.has(threadKey),
+              // Also when the group's top thread is filtered out of the list.
+              inLaunchGroup:
+                launchChildKeysRef.current.has(threadKey) || thread.groupedUnderThreadId != null,
               ...(ledGroup ? { leadsLaunchGroup: { settleCount: groupSettleable.length } } : {}),
               isRunning: !threadRuntimeCanArchive(thread.runtime),
               supports: {

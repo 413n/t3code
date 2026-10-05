@@ -30,6 +30,7 @@ import { threadJumpTarget } from "../keyboard/threadKeyboardShortcuts";
 import {
   buildThreadListV2Items,
   buildThreadListV2ListItems,
+  getThreadListV2LiveGroupThreads,
   getThreadListV2OrderedSection,
   isThreadListV2ListItem,
   resolveThreadListV2SnoozeMenuSelection,
@@ -476,6 +477,16 @@ describe("thread groups", () => {
       ["Child", "child"],
     ]);
     expect(layout.settledCount).toBe(0);
+  });
+
+  it("keeps a settled top thread with its live group out of the parked lists", () => {
+    const settledParent = { ...parent, settledOverride: "settled" as const, settledAt: NOW };
+    const lone = { ...solo, settledOverride: "settled" as const, settledAt: NOW };
+    expect(
+      [...getThreadListV2LiveGroupThreads({ threads: [settledParent, child, lone], now: NOW })]
+        .map((thread) => thread.title)
+        .toSorted(),
+    ).toEqual(["Child", "Parent"]);
   });
 
   it("moves a group as one row", () => {
