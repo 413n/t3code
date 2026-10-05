@@ -118,7 +118,9 @@ describe("WS RPC guard instrumentation", () => {
                   Effect.andThen(new ScheduledTaskError({ message: "List failed." })),
                 ),
               ),
-              group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () => Effect.never),
+              group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () =>
+                Effect.die("the guard let a rejected call through"),
+              ),
               group.toLayerHandler(WS_METHODS.pullRequestsSubscribeRefreshes, () =>
                 Stream.make(1, 2),
               ),
@@ -137,7 +139,7 @@ describe("WS RPC guard instrumentation", () => {
         assert.deepStrictEqual(yield* client[WS_METHODS.serverProbe]({}), {});
         const listError = yield* client[WS_METHODS.scheduledTasksList]({}).pipe(Effect.flip);
         assert.equal(listError._tag, "ScheduledTaskError");
-        // Retrying telemetry needs operate scope; the handler would never return.
+        // Retrying telemetry needs operate scope, so the handler must not run.
         const rejection = yield* client[WS_METHODS.serverRetryResourceTelemetry]({}).pipe(
           Effect.flip,
         );
@@ -269,9 +271,8 @@ describe("WS RPC guard instrumentation", () => {
         yield* TestClock.adjust(Duration.millis(250));
         assert.deepStrictEqual(appSpans(ended), []);
 
+        // The client waits for the server to stop the call, which ends the RPC span.
         yield* Fiber.interrupt(consumer);
-        // The client forwards the interrupt to the server, which ends the RPC span when it stops.
-        yield* Effect.yieldNow.pipe(Effect.repeat({ until: () => rpcSpans(ended).length > 0 }));
 
         const [rpcSpan] = rpcSpans(ended);
         assert.equal(rpcSpan?.name, "ws.rpc.pullRequests.subscribeRefreshes");
