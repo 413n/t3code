@@ -23,6 +23,36 @@ import * as CheckpointCapture from "./CheckpointCaptureService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
+/**
+ * A normalized, bounded failure category safe for a log annotation: the
+ * error's own tag when it has one (a typed domain failure), or its name
+ * otherwise. Never the message or a stringified cause/stack, which can
+ * carry git/command output or, further upstream, credentials — the real
+ * value stays in the error's own `cause` field for the error chain, not in
+ * annotations (effect-service-conventions review).
+ */
+function failureCategory(error: unknown): string {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    typeof error._tag === "string"
+  ) {
+    return error._tag;
+  }
+  if (error instanceof Error) return error.name;
+  return typeof error;
+}
+
+/** Same bounded category, from a Cause instead of a single error value. */
+function causeCategory(cause: Cause.Cause<unknown>): string {
+  for (const reason of cause.reasons) {
+    if (Cause.isFailReason(reason)) return failureCategory(reason.error);
+    if (Cause.isDieReason(reason)) return failureCategory(reason.defect);
+  }
+  return "Interrupted";
+}
+
 export class RunFinalizationError extends Schema.TaggedError<RunFinalizationError>()(
   "RunFinalizationError",
   {
@@ -98,7 +128,7 @@ const make = Effect.gen(function* () {
         Effect.logWarning("worktree-location follow failed", {
           threadId: input.threadId,
           runId: input.runId,
-          cause: Cause.pretty(cause),
+          category: causeCategory(cause),
         }),
       ),
     );
@@ -176,7 +206,7 @@ export const observerLive = Layer.effect(
               threadId: thread.id,
               previousBranch: thread.branch,
               branch: refName,
-              detail: error.message,
+              category: failureCategory(error),
             }),
           ),
         );
@@ -220,7 +250,7 @@ export const observerLive = Layer.effect(
             Effect.logWarning("failed to read git status after a worktree move", {
               threadId,
               cwd: liveCwd,
-              detail: error.message,
+              category: failureCategory(error),
             }).pipe(Effect.as(null)),
           ),
         );
@@ -257,7 +287,7 @@ export const observerLive = Layer.effect(
               Effect.logWarning("failed to follow the provider session into its new worktree", {
                 threadId,
                 worktreePath: newWorktreePath,
-                detail: error.message,
+                category: failureCategory(error),
               }),
             ),
           );
