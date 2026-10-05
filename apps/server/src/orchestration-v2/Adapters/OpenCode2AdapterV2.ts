@@ -1770,7 +1770,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const base = {
         type: "turn.terminal" as const,
         driver,
-        providerThreadId: state.providerThread.id,
+        // The provider thread the turn started on. After a native fork the
+        // session's own thread has a fresh id, and the terminal must name the
+        // thread the start was recorded against.
+        providerThreadId: turn.providerTurn.providerThreadId,
         providerTurnId: turn.providerTurn.id,
         runOrdinal: turn.input.runOrdinal,
         threadDisposition,
