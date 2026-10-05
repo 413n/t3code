@@ -3831,7 +3831,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees
-              // their defects and nothing else on the server.
+              // their defects, not the rest of the server's.
               Layer.provide(DefectReporter.layer),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
               Layer.provide(AgentSessionScanner.layer),

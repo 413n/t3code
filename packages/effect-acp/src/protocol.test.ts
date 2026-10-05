@@ -11,6 +11,7 @@ import * as Sink from "effect/Sink";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { it, assert } from "@effect/vitest";
@@ -285,7 +286,9 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       );
 
       // Pending requests are failed through termination instead of hanging.
-      const error = yield* Deferred.await(termination);
+      const error = yield* TestClock.withLive(
+        Deferred.await(termination).pipe(Effect.timeout("2 seconds")),
+      );
       assert.instanceOf(error, AcpError.AcpTransportError);
       assert.equal((error as AcpError.AcpTransportError).operation, "read-input-stream");
     }),

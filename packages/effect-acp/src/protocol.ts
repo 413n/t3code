@@ -699,8 +699,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     // terminates the connection so pending requests fail instead of hanging.
     Effect.matchCauseEffect({
       onFailure: (cause) => {
+        // The reader's own interruption never gets here: an interrupted fiber
+        // skips failure handlers. An interrupt raised inside it ends it too.
         const failure = Cause.findErrorOption(cause);
-        if (Option.isNone(failure) && Cause.hasInterruptsOnly(cause)) return Effect.void;
         const error = Option.isSome(failure) ? failure.value : Cause.squash(cause);
         const normalized: AcpError.AcpError = isAcpError(error)
           ? error

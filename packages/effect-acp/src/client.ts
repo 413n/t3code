@@ -1,6 +1,7 @@
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as ErrorReporter from "effect/ErrorReporter";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Predicate from "effect/Predicate";
@@ -1104,6 +1105,9 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
   );
 
   yield* RpcServer.make(AcpRpcs.CompatClientRpcs, { disableFatalDefects: true }).pipe(
+    // runHandler logs handler defects with their method. A reporter inherited
+    // from the caller (a WebSocket request, say) would log them again.
+    Effect.provideService(ErrorReporter.CurrentErrorReporters, new Set()),
     Effect.provideService(RpcServer.Protocol, transport.serverProtocol),
     Effect.provide(clientHandlerLayer),
     Effect.forkScoped,

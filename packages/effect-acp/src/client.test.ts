@@ -11,6 +11,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -1168,6 +1169,9 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
       const send = <E>(line: Effect.Effect<Uint8Array, E>) =>
         Effect.flatMap(line, (bytes) => Queue.offer(input, bytes));
       const decodeDie = Schema.decodeEffect(Schema.fromJsonString(DieResponse));
+      // A stopped reader leaves these waiting; fail instead of hanging.
+      const next = <A>(queue: Queue.Dequeue<A>) =>
+        TestClock.withLive(Queue.take(queue).pipe(Effect.timeout("2 seconds")));
 
       yield* send(
         encodeJsonl(PermissionRequest, {
@@ -1186,7 +1190,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           headers: [],
         }),
       );
-      assert.equal((yield* Queue.take(output).pipe(Effect.flatMap(decodeDie))).id, "permission-a");
+      assert.equal((yield* next(output).pipe(Effect.flatMap(decodeDie))).id, "permission-a");
 
       yield* send(
         encodeJsonl(jsonRpcRequest("x/dies", Schema.Unknown), {
@@ -1197,7 +1201,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           headers: [],
         }),
       );
-      const extDied = yield* Queue.take(output).pipe(
+      const extDied = yield* next(output).pipe(
         Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ErrorResponse))),
       );
       assert.equal(extDied.id, "ext-a");
@@ -1221,7 +1225,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
       );
 
       // The next session handler still ran.
-      assert.equal(yield* Queue.take(updates), "session-1");
+      assert.equal(yield* next(updates), "session-1");
 
       // The reader survived all three: a later request is still answered.
       yield* send(
@@ -1233,7 +1237,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           headers: [],
         }),
       );
-      const answered = yield* Queue.take(output).pipe(
+      const answered = yield* next(output).pipe(
         Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(ExtResponse))),
       );
       assert.deepEqual([answered.id, answered.result], ["ext-b", { ok: true }]);
