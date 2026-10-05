@@ -9,7 +9,7 @@ import * as Logger from "effect/Logger";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { Rpc, RpcClient, RpcGroup, RpcServer } from "effect/unstable/rpc";
+import { Rpc, RpcClient, RpcGroup, RpcServer } from "effect/rpc";
 
 import { WS_RPC_SERVER_OPTIONS } from "../ws.ts";
 import * as DefectReporter from "./DefectReporter.ts";
