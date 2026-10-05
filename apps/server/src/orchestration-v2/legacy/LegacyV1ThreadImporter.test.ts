@@ -536,8 +536,8 @@ it.layer(TestLayer)("LegacyV1ThreadImporter unreadable message context", (it) =>
   it.effect("drops an unreadable context and keeps the message and readable contexts", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      const importer = yield* LegacyV1ThreadImporter;
-      const projections = yield* ProjectionStoreV2;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
       const threadId = ThreadId.make("thread:legacy-context");
 
       yield* sql`
@@ -608,8 +608,8 @@ it.layer(TestLayer)("LegacyV1ThreadImporter unreadable message context", (it) =>
   it.effect("hydrates later threads when an older message's context is unreadable", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      const importer = yield* LegacyV1ThreadImporter;
-      const projections = yield* ProjectionStoreV2;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
       // Sorts first, so a failure here would have stopped the good thread's hydration.
       const badThreadId = ThreadId.make("thread:legacy-transcript-bad");
       const goodThreadId = ThreadId.make("thread:legacy-transcript-good");
@@ -680,8 +680,8 @@ it.layer(TestLayer)("LegacyV1ThreadImporter unreadable message context", (it) =>
   it.effect("records a failed thread and keeps hydrating the rest", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      const importer = yield* LegacyV1ThreadImporter;
-      const projections = yield* ProjectionStoreV2;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
       const failingThreadId = ThreadId.make("thread:legacy-defect-failing");
       const laterThreadId = ThreadId.make("thread:legacy-defect-later");
 
