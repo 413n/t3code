@@ -293,6 +293,7 @@ function makeProviderAdapter(
     }) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hangSessionScopeClose?: boolean;
+    readonly startTurn?: Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
     /** Registers the process's closeCount finalizer before `beforeOpen` runs. */
     readonly spawnBeforeOpen?: boolean;
@@ -385,7 +386,7 @@ function makeProviderAdapter(
               ...current,
               resumeCount: current.resumeCount + 1,
             })).pipe(Effect.as(threadInput.providerThread)),
-          startTurn: () => Effect.void,
+          startTurn: () => options.startTurn ?? Effect.void,
           steerTurn: () => Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
@@ -430,6 +431,7 @@ function makeTestLayer(input: {
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hangSessionScopeClose?: boolean;
+  readonly startTurn?: Effect.Effect<void>;
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
@@ -454,6 +456,7 @@ function makeTestLayer(input: {
       ...(input.hangSessionScopeClose === undefined
         ? {}
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
+      ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
       ...(input.scopeCloseReached === undefined
@@ -1008,6 +1011,7 @@ it.effect("ProviderSessionManagerV2 cleans up an interrupted open whose scope cl
     >([]);
     const handshakeStarted = yield* Deferred.make<void>();
     const scopeCloseReached = yield* Deferred.make<void>();
+    const releaseRetry = yield* Deferred.make<void>();
     yield* Effect.gen(function* () {
       const eventSink = yield* EventSink.EventSinkV2;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -1023,34 +1027,124 @@ it.effect("ProviderSessionManagerV2 cleans up an interrupted open whose scope cl
         events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
       });
 
-      // Detached so the layer's close does not wait on the wedged scope.
       const opening = yield* manager
         .open({ threadId, providerSessionId, modelSelection, runtimePolicy })
-        .pipe(Effect.forkDetach);
+        .pipe(Effect.forkChild);
       yield* Deferred.await(handshakeStarted);
       const issued = (yield* Ref.get(mcpConfigs)).at(-1);
       const token = issued?.authorizationHeader.replace(/^Bearer\s+/, "");
       assert.isDefined(token);
 
       // The interrupt starts cleanup; the scope close then never finishes.
-      opening.interruptUnsafe();
+      const interrupter = yield* Fiber.interrupt(opening).pipe(Effect.forkChild);
       yield* Deferred.await(scopeCloseReached);
 
       // The session cleanup already ran, ahead of the stuck close.
       assert.isUndefined(yield* registry.resolve(token!));
       assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
       assert.equal((yield* Ref.get(state)).closeCount, 0);
+
+      // The close is time-boxed, so the interrupter returns and the session's
+      // open lock is free for the next open.
+      yield* TestClock.adjust("30 seconds");
+      yield* Fiber.join(interrupter);
+      yield* Deferred.succeed(releaseRetry, undefined);
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+
+      // Its close hangs as well; release it while the test clock can still move.
+      const stopping = yield* manager.shutdown.pipe(Effect.forkChild);
+      yield* TestClock.adjust("30 seconds");
+      yield* Fiber.join(stopping);
     }).pipe(
       Effect.provide(
         makeTestLayer({
           state,
           idleTimeoutMs: 60_000,
           mcpConfigs,
+          // The first open hangs in its handshake; the retry completes.
           beforeOpen: () =>
-            Deferred.succeed(handshakeStarted, undefined).pipe(Effect.andThen(Effect.never)),
+            Deferred.isDone(handshakeStarted).pipe(
+              Effect.flatMap((retry) =>
+                retry
+                  ? Deferred.await(releaseRetry)
+                  : Deferred.succeed(handshakeStarted, undefined).pipe(
+                      Effect.andThen(Effect.never),
+                    ),
+              ),
+            ),
           spawnBeforeOpen: true,
           hangSessionScopeClose: true,
           scopeCloseReached,
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 releases an idle session whose turn start was stopped", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const startTurnReached = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-stopped-turn-start");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+      const runtime = yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+      const starting = yield* runtime
+        .startTurn({
+          appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+          threadId,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: idAllocator.derive.rootNode({ runId }),
+          providerThread: makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "stopped before the provider accepted it",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(startTurnReached);
+
+      // Stop lands while the provider is still accepting the turn. No terminal
+      // event follows, so the session must count itself idle again.
+      yield* Fiber.interrupt(starting);
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
+      assert.equal((yield* Ref.get(state)).closeCount, 1);
+    }).pipe(
+      Effect.provide(
+        makeTestLayer({
+          state,
+          idleTimeoutMs: 1000,
+          startTurn: Deferred.succeed(startTurnReached, undefined).pipe(
+            Effect.andThen(Effect.never),
+          ),
         }),
       ),
     );

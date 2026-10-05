@@ -358,60 +358,60 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
     );
     const origin = `http://127.0.0.1:${port}`;
     const scope = yield* Scope.make("sequential");
-    const child = yield* spawner
-      .spawn(
-        ChildProcess.make(
-          nodePath,
-          [
-            hubTool.entryPath,
-            "--port",
-            String(port),
-            "--host",
-            "127.0.0.1",
-            "--hide-sidebar",
-            "--hide-boot-device",
-          ],
-          {
-            detached: false,
-            shell: false,
-            stdout: "pipe",
-            stderr: "pipe",
-            env: hubEnvironment(),
-          },
-        ),
-      )
-      .pipe(
-        Effect.provideService(Scope.Scope, scope),
-        Effect.mapError(
-          (cause) =>
-            new DeviceHost.DeviceHostError({
-              hostId,
-              step: "starting the device hub",
-              cause,
-            }),
-        ),
-      );
-    const startedAtMillis = yield* Clock.currentTimeMillis;
-    const hub: HubProcess = { child, scope, origin, startedAtMillis, nodePath };
-    yield* Effect.forkIn(observeHubOutput(hub), scope);
-    yield* waitForHttpReady({
-      baseUrl: origin,
-      path: "/readyz",
-      timeoutMs: HUB_READY_TIMEOUT_MS,
-      makeError: (info) =>
-        new DeviceHost.DeviceHostError({
-          hostId,
-          step: "waiting for the device hub to answer",
-          cause: info.cause,
-        }),
-    }).pipe(
-      Effect.provideService(HttpClient.HttpClient, httpClient),
-      // On interrupt too: the hub is not recorded yet, so nothing else stops it.
-      Effect.onError(() => stopHub(hub)),
-    );
-    yield* recordHub(hub, hubTool);
-    yield* Effect.logInfo("Device hub started", { pid: Number(child.pid), port });
-    return hub;
+    // On failure or interrupt, from the spawn on: the hub is not recorded yet,
+    // so nothing else stops it.
+    return yield* Effect.gen(function* () {
+      const child = yield* spawner
+        .spawn(
+          ChildProcess.make(
+            nodePath,
+            [
+              hubTool.entryPath,
+              "--port",
+              String(port),
+              "--host",
+              "127.0.0.1",
+              "--hide-sidebar",
+              "--hide-boot-device",
+            ],
+            {
+              detached: false,
+              shell: false,
+              stdout: "pipe",
+              stderr: "pipe",
+              env: hubEnvironment(),
+            },
+          ),
+        )
+        .pipe(
+          Effect.provideService(Scope.Scope, scope),
+          Effect.mapError(
+            (cause) =>
+              new DeviceHost.DeviceHostError({
+                hostId,
+                step: "starting the device hub",
+                cause,
+              }),
+          ),
+        );
+      const startedAtMillis = yield* Clock.currentTimeMillis;
+      const hub: HubProcess = { child, scope, origin, startedAtMillis, nodePath };
+      yield* Effect.forkIn(observeHubOutput(hub), scope);
+      yield* waitForHttpReady({
+        baseUrl: origin,
+        path: "/readyz",
+        timeoutMs: HUB_READY_TIMEOUT_MS,
+        makeError: (info) =>
+          new DeviceHost.DeviceHostError({
+            hostId,
+            step: "waiting for the device hub to answer",
+            cause: info.cause,
+          }),
+      }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
+      yield* recordHub(hub, hubTool);
+      yield* Effect.logInfo("Device hub started", { pid: Number(child.pid), port });
+      return hub;
+    }).pipe(Effect.onError(() => Scope.close(scope, Exit.void).pipe(Effect.ignore)));
   });
 
   const observeHubOutput = (hub: HubProcess) =>

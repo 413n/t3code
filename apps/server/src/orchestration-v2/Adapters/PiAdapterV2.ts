@@ -2342,10 +2342,6 @@ export function makePiAdapterV2(
               activeProviderRetry: null,
               failure: null,
             };
-            // Set together with the send and its pending-response entry, with
-            // no gap for an interrupt to land in: a sent turn always has the
-            // entry that settles or fails it.
-            let sent = false;
             // Only the install/send/start-event boundary excludes the event
             // pump. Earlier correlated requests must leave the pump free so
             // project trust, login, and session-switch dialogs can be shown
@@ -2353,37 +2349,21 @@ export function makePiAdapterV2(
             yield* Effect.gen(function* () {
               state.activeTurn = activeTurn;
               if (compactCommand !== null) {
-                yield* connection.send(compactRpcRecord(compactCommand)).pipe(
-                  Effect.tap(() =>
-                    Effect.sync(() => {
-                      pendingCompactResponses.push({
-                        providerTurnId: providerTurn.id,
-                        kind: "turn_start",
-                      });
-                      sent = true;
-                    }),
-                  ),
-                  Effect.uninterruptible,
-                );
+                yield* connection.send(compactRpcRecord(compactCommand));
+                pendingCompactResponses.push({
+                  providerTurnId: providerTurn.id,
+                  kind: "turn_start",
+                });
               } else if (payload !== null) {
-                yield* connection
-                  .send({
-                    type: "prompt",
-                    message: payload.message,
-                    ...(payload.images.length === 0 ? {} : { images: payload.images }),
-                  })
-                  .pipe(
-                    Effect.tap(() =>
-                      Effect.sync(() => {
-                        pendingPromptResponses.push({
-                          providerTurnId: providerTurn.id,
-                          kind: "turn_start",
-                        });
-                        sent = true;
-                      }),
-                    ),
-                    Effect.uninterruptible,
-                  );
+                yield* connection.send({
+                  type: "prompt",
+                  message: payload.message,
+                  ...(payload.images.length === 0 ? {} : { images: payload.images }),
+                });
+                pendingPromptResponses.push({
+                  providerTurnId: providerTurn.id,
+                  kind: "turn_start",
+                });
               }
               yield* emit({
                 type: "provider_turn.updated",
@@ -2402,13 +2382,8 @@ export function makePiAdapterV2(
               }
             }).pipe(
               sessionEventPermit.withPermits(1),
-              // A turn interrupted before its prompt went out is cleared, or
-              // every later turn is rejected as active. Once the prompt is out,
-              // Pi is running it: the turn stays installed so its events stay
-              // its own, and Stop (interruptTurn) or settlement ends it.
-              Effect.onError((cause) =>
+              Effect.tapError(() =>
                 Effect.sync(() => {
-                  if (sent && Cause.hasInterruptsOnly(cause)) return;
                   if (state.activeTurn === activeTurn) state.activeTurn = null;
                 }),
               ),

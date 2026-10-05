@@ -854,6 +854,45 @@ export const layerWithOptions = (
           ] as const;
         });
 
+      // Scope close can wedge on a misbehaving adapter finalizer (e.g. a
+      // provider process that never yields its message stream). Time-box it so
+      // the caller, and any lock or worker it holds, moves on and leaves a
+      // diagnosable trail. A close that finishes late is still logged.
+      const closeScopeWithin = (
+        scope: Scope.Closeable,
+        annotations: { readonly providerSessionId?: ProviderSessionId; readonly reason: string },
+      ) =>
+        Effect.gen(function* () {
+          const closeFiber = yield* Scope.close(scope, Exit.void).pipe(
+            Effect.exit,
+            Effect.forkDetach({ startImmediately: true }),
+          );
+          const closeExit = yield* Fiber.join(closeFiber).pipe(
+            Effect.timeoutOption(RELEASE_SCOPE_CLOSE_TIMEOUT_MS),
+          );
+          if (Option.isNone(closeExit)) {
+            yield* Effect.logWarning("orchestration-v2.provider-session-scope-close-timeout", {
+              ...annotations,
+              timeoutMs: RELEASE_SCOPE_CLOSE_TIMEOUT_MS,
+            });
+            yield* Fiber.join(closeFiber).pipe(
+              Effect.flatMap((exit) =>
+                Exit.isFailure(exit)
+                  ? Effect.logWarning("orchestration-v2.provider-session-scope-close-failed", {
+                      ...annotations,
+                      cause: exit.cause,
+                    })
+                  : Effect.logInfo(
+                      "orchestration-v2.provider-session-scope-close-completed-late",
+                      annotations,
+                    ),
+              ),
+              Effect.forkDetach,
+            );
+          }
+          return closeExit;
+        });
+
       const releaseEntry = (input: {
         readonly providerSessionId: ProviderSessionId;
         readonly reason: ProviderSessionReleaseReason;
@@ -882,49 +921,10 @@ export const layerWithOptions = (
                       input.detail ?? `Provider session released: ${input.reason}.`,
                     );
                   }
-                  // Scope close can wedge on a misbehaving adapter finalizer
-                  // (e.g. a provider process that never yields its message
-                  // stream). Time-box it so release still persists released
-                  // events and leaves a diagnosable trail instead of silently
-                  // parking the session as "ready" forever.
-                  const closeFiber = yield* Scope.close(entry.scope, Exit.void).pipe(
-                    Effect.exit,
-                    Effect.forkDetach({ startImmediately: true }),
-                  );
-                  const closeExit = yield* Fiber.join(closeFiber).pipe(
-                    Effect.timeoutOption(RELEASE_SCOPE_CLOSE_TIMEOUT_MS),
-                  );
-                  if (Option.isNone(closeExit)) {
-                    yield* Effect.logWarning(
-                      "orchestration-v2.provider-session-scope-close-timeout",
-                      {
-                        providerSessionId: input.providerSessionId,
-                        reason: input.reason,
-                        timeoutMs: RELEASE_SCOPE_CLOSE_TIMEOUT_MS,
-                      },
-                    );
-                    yield* Fiber.join(closeFiber).pipe(
-                      Effect.flatMap((exit) =>
-                        Exit.isFailure(exit)
-                          ? Effect.logWarning(
-                              "orchestration-v2.provider-session-scope-close-failed",
-                              {
-                                providerSessionId: input.providerSessionId,
-                                reason: input.reason,
-                                cause: exit.cause,
-                              },
-                            )
-                          : Effect.logInfo(
-                              "orchestration-v2.provider-session-scope-close-completed-late",
-                              {
-                                providerSessionId: input.providerSessionId,
-                                reason: input.reason,
-                              },
-                            ),
-                      ),
-                      Effect.forkDetach,
-                    );
-                  }
+                  const closeExit = yield* closeScopeWithin(entry.scope, {
+                    providerSessionId: input.providerSessionId,
+                    reason: input.reason,
+                  });
                   const records = {
                     entry,
                     reason: input.reason,
@@ -1520,11 +1520,9 @@ export const layerWithOptions = (
             ).pipe(
               Effect.andThen(observeActivity(providerSessionId, markBusy(providerSessionId))),
               Effect.andThen(runtime.startTurn(input)),
-              Effect.catch((error) =>
-                observeActivity(providerSessionId, markIdle(providerSessionId)).pipe(
-                  Effect.andThen(Effect.fail(error)),
-                ),
-              ),
+              // A start that fails or is stopped never emits turn.terminal, so
+              // the busy mark is undone here or the session never goes idle.
+              Effect.onError(() => observeActivity(providerSessionId, markIdle(providerSessionId))),
             ),
           steerTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
@@ -1671,10 +1669,10 @@ export const layerWithOptions = (
         );
       };
 
-      // Parent of every session scope, forked before the shutdown finalizer is
-      // added: on layer close, shutdown releases the live sessions first, then
-      // this closes any session whose open is still in flight.
-      const sessionScopes = yield* Scope.fork(layerScope);
+      // Parent of every session scope. On layer close, shutdown releases the
+      // live sessions first, then closes any session whose open is still in
+      // flight, time-boxed so a stuck adapter cannot hold up server shutdown.
+      const sessionScopes = yield* Scope.make();
       const shutdown = Effect.gen(function* () {
         const activeSessions = [...(yield* Ref.get(sessions)).values()];
         yield* Effect.forEach(
@@ -1694,7 +1692,11 @@ export const layerWithOptions = (
           { discard: true },
         );
       });
-      yield* Effect.addFinalizer(() => shutdown);
+      yield* Effect.addFinalizer(() =>
+        shutdown.pipe(
+          Effect.ensuring(closeScopeWithin(sessionScopes, { reason: "server_shutdown" })),
+        ),
+      );
 
       return ProviderSessionManagerV2.of({
         shutdown,
@@ -1787,9 +1789,10 @@ export const layerWithOptions = (
                   Effect.provideService(Scope.Scope, sessionScope),
                   // Any failure, including a Stop that interrupts a slow
                   // handshake, stops the provider process this open started.
-                  // The session cleanup runs first, so an adapter finalizer
-                  // that never finishes cannot hold it up; the process it
-                  // was set up for is being stopped either way.
+                  // The session cleanup runs first, and the close is
+                  // time-boxed: this runs under the session's open lock, so an
+                  // adapter finalizer that never finishes must not hold the
+                  // interrupter, the lock, or later opens.
                   Effect.onError(() =>
                     dropReservation.pipe(
                       // Clear only a session this open freshly set up: a reused
@@ -1800,7 +1803,12 @@ export const layerWithOptions = (
                           ? clearMcpSession(input.threadId, mcpCredentialId)
                           : Effect.void,
                       ),
-                      Effect.ensuring(Scope.close(sessionScope, Exit.void).pipe(Effect.ignore)),
+                      Effect.ensuring(
+                        closeScopeWithin(sessionScope, {
+                          providerSessionId: input.providerSessionId,
+                          reason: "open_failed",
+                        }),
+                      ),
                     ),
                   ),
                   Effect.mapError(
