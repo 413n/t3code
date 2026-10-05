@@ -36,6 +36,7 @@ import type {
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { applyClaudePromptEffortPrefix } from "@t3tools/shared/model";
+import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import {
   CLAUDE_RESUME_COMPACTION_NEVER_ANSWER,
   formatClaudeResumeCompactionQuestion,
@@ -1574,36 +1575,106 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
   };
 }
 
+// Settings file Claude itself merges for a configured Claude home: only the
+// two restrictive policy keys this check cares about. Lenient because these
+// files are hand-edited and Claude Code tolerates comments and trailing
+// commas in them (same tolerance ClaudeSkills.ts already applies to the same
+// files for skillOverrides).
+const ClaudeHomeBypassSettings = fromLenientJson(
+  Schema.Struct({
+    disableAutoMode: Schema.optional(Schema.Literal("disable")),
+    permissions: Schema.optional(
+      Schema.Struct({
+        disableBypassPermissionsMode: Schema.optional(Schema.Literal("disable")),
+        disableAutoMode: Schema.optional(Schema.Literal("disable")),
+      }),
+    ),
+  }),
+);
+const decodeClaudeHomeBypassSettings = Schema.decodeUnknownEffect(ClaudeHomeBypassSettings);
+
+const CLAUDE_BYPASS_DISABLED_FAIL_CLOSED: ClaudeBypassAvailability = {
+  bypassDisabled: true,
+  autoDisabled: false,
+};
+
+// `disableBypassPermissionsMode` and `disableAutoMode` are restrictive-only:
+// once any settings source sets one to "disable", nothing overrides it back
+// (the Agent SDK's own managed-settings merge treats them the same way).
+// Combining several sources with OR is therefore exactly right, not just
+// convenient.
+function combineClaudeBypassAvailability(
+  a: ClaudeBypassAvailability,
+  b: ClaudeBypassAvailability,
+): ClaudeBypassAvailability {
+  return {
+    bypassDisabled: a.bypassDisabled || b.bypassDisabled,
+    autoDisabled: a.autoDisabled || b.autoDisabled,
+  };
+}
+
+// A configured Claude home's own settings.json (the "user" tier `claudeHome`
+// read for every other instance via `resolveSettings`'s ambient-env "user"
+// source, see `resolveClaudeBypassAvailability` below). Missing file: no
+// restriction from this source, same as `resolveSettings` treats an absent
+// settings file. Unreadable or malformed file: fail closed, matching this
+// whole check's policy of treating uncertainty as "assume restricted".
+const readClaudeHomeBypassAvailability = Effect.fn(
+  "ClaudeAdapterV2.readClaudeHomeBypassAvailability",
+)(function* (
+  homePath: string,
+): Effect.fn.Return<ClaudeBypassAvailability, never, FileSystem.FileSystem | Path.Path> {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const contents = yield* fileSystem
+    .readFileString(path.join(homePath, "settings.json"))
+    .pipe(Effect.orElseSucceed(() => undefined));
+  if (contents === undefined) {
+    return CLAUDE_BYPASS_FULLY_AVAILABLE;
+  }
+  return yield* decodeClaudeHomeBypassSettings(contents).pipe(
+    Effect.map((parsed): ClaudeBypassAvailability => ({
+      bypassDisabled: parsed.permissions?.disableBypassPermissionsMode === "disable",
+      autoDisabled:
+        parsed.permissions?.disableAutoMode === "disable" || parsed.disableAutoMode === "disable",
+    })),
+    Effect.catch(() => Effect.succeed(CLAUDE_BYPASS_DISABLED_FAIL_CLOSED)),
+  );
+});
+
 // Reads Claude's own settings cascade the same way the CLI does at startup,
-// without spawning it (`resolveSettings` from the Agent SDK). The SDK reads
-// `CLAUDE_CONFIG_DIR` from the ambient process env rather than taking it as
-// an option, so an instance with its own configured Claude home
-// (`settings.homePath`, exported as CLAUDE_CONFIG_DIR only for the spawned
-// CLI) cannot be resolved here without a global env swap; skip the check for
-// those instances rather than risk reading a different home's policy. Full
-// access still requests bypassPermissions as before for them (unchanged
-// pre-fix behavior). This must not key off an inherited CLAUDE_CONFIG_DIR in
-// the resolved environment: an ambient value the server process itself
-// happened to inherit is exactly what `resolveSettings` reads anyway, so
-// there is no mismatch to guard against, and skipping on it would silently
-// turn the fix off for the common default-instance case.
+// without spawning it (`resolveSettings` from the Agent SDK). Project and
+// local settings (`<cwd>/.claude/settings*.json`) are always cwd-relative,
+// never home-relative, so they resolve correctly for every instance
+// regardless of a configured Claude home. `resolveSettings` always loads the
+// managed-settings.json / MDM / cached-remote-managed-settings policy tier
+// too (verified against the installed Agent SDK: it unconditionally adds
+// that tier to the requested `settingSources`), which is itself
+// machine/account policy, not something a per-instance call could meaningfully
+// scope differently. What `resolveSettings` cannot be pointed at is a
+// specific *user*-tier settings file: the SDK reads `CLAUDE_CONFIG_DIR` from
+// the ambient process env with no override option, so for an instance with
+// its own configured Claude home (`settings.homePath`, exported as
+// CLAUDE_CONFIG_DIR only for the spawned CLI) the SDK's own "user" source
+// would read the wrong home. For those instances, "user" is dropped from
+// `settingSources` (so no mismatched home leaks in) and that home's own
+// settings.json is read directly instead and combined with OR (see
+// `combineClaudeBypassAvailability`): the two restrictive flags this check
+// cares about are the only thing read from it, so no other merge semantics
+// (array unions, trust filtering for repo-committed escalating modes, etc.)
+// are needed to read it correctly.
 // Resolution failures fail closed: treat bypass as disabled rather than risk
 // requesting a mode a hidden policy actually forbids.
 function resolveClaudeBypassAvailability(
   cwd: string | null,
-  options: { readonly hasCustomClaudeHome: boolean },
-): Effect.Effect<ClaudeBypassAvailability> {
-  if (options.hasCustomClaudeHome) {
-    return Effect.succeed(CLAUDE_BYPASS_FULLY_AVAILABLE);
-  }
-  const bypassDisabledFailClosed: ClaudeBypassAvailability = {
-    bypassDisabled: true,
-    autoDisabled: false,
-  };
-  return Effect.tryPromise(() =>
+  options: { readonly customClaudeHomePath: string | null },
+): Effect.Effect<ClaudeBypassAvailability, never, FileSystem.FileSystem | Path.Path> {
+  const settingSources: ReadonlyArray<"user" | "project" | "local"> =
+    options.customClaudeHomePath === null ? ["user", "project", "local"] : ["project", "local"];
+  const fromCascade = Effect.tryPromise(() =>
     resolveClaudeSettings({
       ...(cwd === null ? {} : { cwd }),
-      settingSources: ["user", "project", "local"],
+      settingSources: [...settingSources],
     }),
   ).pipe(
     Effect.map((resolved): ClaudeBypassAvailability => ({
@@ -1616,8 +1687,15 @@ function resolveClaudeBypassAvailability(
         resolved.effective.permissions?.disableAutoMode === "disable" ||
         resolved.effective.disableAutoMode === "disable",
     })),
-    Effect.catch(() => Effect.succeed(bypassDisabledFailClosed)),
+    Effect.catch(() => Effect.succeed(CLAUDE_BYPASS_DISABLED_FAIL_CLOSED)),
   );
+  if (options.customClaudeHomePath === null) {
+    return fromCascade;
+  }
+  return Effect.all([
+    fromCascade,
+    readClaudeHomeBypassAvailability(options.customClaudeHomePath),
+  ]).pipe(Effect.map(([cascade, home]) => combineClaudeBypassAvailability(cascade, home)));
 }
 
 function shouldInstallClaudePermissionCallback(policy: ClaudeRuntimeQueryPolicy): boolean {
@@ -3002,6 +3080,39 @@ export function claudeProposedPlan(input: unknown): string | null {
   return typeof plan === "string" && plan.trim().length > 0 ? plan.trim() : null;
 }
 
+export interface BoundedRecentSet<T> {
+  readonly has: (value: T) => boolean;
+  /** Marks `value` as seen (most recently), evicting the least-recently-marked entry past capacity. */
+  readonly mark: (value: T) => void;
+}
+
+/**
+ * A `Set` with an LRU eviction cap, for one-time-per-key tracking (like the
+ * #4927 bypass-downgrade notice) kept on a long-lived object that has no
+ * natural lifecycle hook to clear entries on. Exported for direct testing:
+ * production capacities are too large to exercise end-to-end through real
+ * call sites.
+ */
+export function makeBoundedRecentSet<T>(capacity: number): BoundedRecentSet<T> {
+  const seen = new Map<T, true>();
+  return {
+    has: (value) => seen.has(value),
+    mark: (value) => {
+      // Delete-then-set moves the key to the end of Map iteration order
+      // (most recently used), so the entry evicted below is genuinely the
+      // least-recently-marked one, not an arbitrary one.
+      seen.delete(value);
+      seen.set(value, true);
+      if (seen.size > capacity) {
+        const oldest = seen.keys().next().value;
+        if (oldest !== undefined) {
+          seen.delete(oldest);
+        }
+      }
+    },
+  };
+}
+
 export interface ClaudeAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
   readonly settings: ClaudeSettings;
@@ -3028,15 +3139,23 @@ export function makeClaudeAdapterV2(
   const continuationRequests = adapterOptions.continuationRequests ?? {
     offer: () => Effect.void,
   };
-  // A configured per-instance Claude home (CLAUDE_CONFIG_DIR, exported only
-  // for the spawned CLI) is what makes `resolveClaudeBypassAvailability`'s
-  // ambient-env read unsafe, not whether the resolved environment happens to
-  // carry an inherited CLAUDE_CONFIG_DIR (see that function).
-  const hasCustomClaudeHome = adapterOptions.settings.homePath.trim().length > 0;
+  // Same resolution `makeClaudeEnvironment` uses for this instance's
+  // CLAUDE_CONFIG_DIR, so `resolveClaudeBypassAvailability`'s direct
+  // settings.json read targets the exact home the spawned CLI will use.
+  // `null` means this instance has no configured home of its own.
+  const homePathSetting = adapterOptions.settings.homePath.trim();
+  const customClaudeHomePath =
+    homePathSetting.length > 0 ? path.resolve(expandHomePath(homePathSetting)) : null;
   // Shared across every session this adapter instance opens (not just one),
   // so the one-time #4927 downgrade notice survives an idle release and
   // resume instead of reappearing on the thread's next provider session.
-  const announcedBypassPolicyDowngradeThreadIds = new Set<ThreadId>();
+  // Nothing upstream tells this adapter instance when a thread is deleted,
+  // so this cannot be cleared on thread lifecycle; bounded by LRU eviction
+  // instead (see `makeBoundedRecentSet`), so a long-lived adapter instance
+  // serving many threads over time cannot grow this forever. Re-showing the
+  // notice once more for a thread whose entry was evicted is a minor UX
+  // repeat, not a correctness problem.
+  const announcedBypassPolicyDowngradeThreadIds = makeBoundedRecentSet<ThreadId>(1000);
 
   // Re-scan on every send: skills are added and switched off mid-session, and
   // the scan is a few directory reads. A skill switched off via skillOverrides,
@@ -3099,8 +3218,11 @@ export function makeClaudeAdapterV2(
             return cached.availability;
           }
           const availability = yield* resolveClaudeBypassAvailability(cwd, {
-            hasCustomClaudeHome,
-          });
+            customClaudeHomePath,
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+          );
           yield* Ref.set(claudeBypassAvailabilityCache, { cwd, availability });
           return availability;
         });
@@ -7222,7 +7344,7 @@ export function makeClaudeAdapterV2(
           if (announcedBypassPolicyDowngradeThreadIds.has(context.input.threadId)) {
             return;
           }
-          announcedBypassPolicyDowngradeThreadIds.add(context.input.threadId);
+          announcedBypassPolicyDowngradeThreadIds.mark(context.input.threadId);
           const now = yield* DateTime.now;
           const nativeItemId = `bypass-policy-downgrade:${context.providerTurnId}`;
           const notice =
