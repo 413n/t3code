@@ -15,6 +15,7 @@ import {
   type ForkSessionResult,
   getSubagentMessages,
   query,
+  resolveSettings as resolveClaudeSettings,
   type Options as ClaudeQueryOptions,
   type PermissionMode,
   type PermissionResult,
@@ -1494,10 +1495,46 @@ export interface ClaudeRuntimeQueryPolicy {
   readonly installPermissionCallback: boolean;
 }
 
+// What Claude's own settings cascade (user/project/local, or a managed
+// policy) allows a session to run in. Resolved once per Claude session via
+// `resolveClaudeBypassAvailability`; a session that never asks for bypass
+// never pays for the resolve, and one that hasn't resolved yet (or can't,
+// see that function) is treated as fully available, matching behavior
+// before this policy check existed.
+export interface ClaudeBypassAvailability {
+  readonly bypassDisabled: boolean;
+  readonly autoDisabled: boolean;
+}
+
+export const CLAUDE_BYPASS_FULLY_AVAILABLE: ClaudeBypassAvailability = {
+  bypassDisabled: false,
+  autoDisabled: false,
+};
+
+// `permissions.disableBypassPermissionsMode: "disable"` in Claude's settings
+// makes the CLI refuse to run in bypassPermissions (#4927). Request the
+// strongest mode the policy still allows instead of a mode we already know
+// is forbidden: Auto if only bypass is locked, the default (manual-approval)
+// mode if Auto is locked too.
+function downgradeClaudePermissionModeForPolicy(
+  permissionMode: PermissionMode,
+  bypassAvailability: ClaudeBypassAvailability,
+): PermissionMode {
+  if (permissionMode !== "bypassPermissions" || !bypassAvailability.bypassDisabled) {
+    return permissionMode;
+  }
+  return bypassAvailability.autoDisabled ? "default" : "auto";
+}
+
 export function claudeRuntimeQueryPolicyForRuntimePolicy(
   runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  bypassAvailability: ClaudeBypassAvailability = CLAUDE_BYPASS_FULLY_AVAILABLE,
 ): ClaudeRuntimeQueryPolicy {
-  const permissionMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
+  const requestedPermissionMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
+  const permissionMode = downgradeClaudePermissionModeForPolicy(
+    requestedPermissionMode,
+    bypassAvailability,
+  );
   const readOnlyTools =
     sandboxPolicyKindForClaudeRuntimePolicy(runtimePolicy) === "readOnly"
       ? CLAUDE_READ_ONLY_ALLOWED_TOOLS
@@ -1507,12 +1544,17 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
       ? readOnlyTools
       : undefined;
   // acceptEdits approves edits before the callback runs; everything else it
-  // leaves to the callback, which must ask rather than allow.
+  // leaves to the callback, which must ask rather than allow. A policy
+  // downgrade away from bypassPermissions always installs the callback too:
+  // it is keyed on the requested runtime mode below, which would otherwise
+  // keep auto-allowing tools the CLI is no longer bypassing permissions for.
   const installPermissionCallback =
-    runtimePolicy.approvalPolicy === undefined
-      ? runtimePolicy.runtimeMode === "approval-required" ||
-        runtimePolicy.runtimeMode === "auto-accept-edits"
-      : runtimePolicy.approvalPolicy !== "never";
+    permissionMode !== requestedPermissionMode
+      ? true
+      : runtimePolicy.approvalPolicy === undefined
+        ? runtimePolicy.runtimeMode === "approval-required" ||
+          runtimePolicy.runtimeMode === "auto-accept-edits"
+        : runtimePolicy.approvalPolicy !== "never";
 
   if (permissionMode === "plan") {
     return {
@@ -1532,14 +1574,63 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
   };
 }
 
+// Reads Claude's own settings cascade the same way the CLI does at startup,
+// without spawning it (`resolveSettings` from the Agent SDK). The SDK reads
+// `CLAUDE_CONFIG_DIR` from the ambient process env rather than taking it as
+// an option, so an instance with its own configured Claude home
+// (`settings.homePath`, exported as CLAUDE_CONFIG_DIR only for the spawned
+// CLI) cannot be resolved here without a global env swap; skip the check for
+// those instances rather than risk reading a different home's policy. Full
+// access still requests bypassPermissions as before for them (unchanged
+// pre-fix behavior). This must not key off an inherited CLAUDE_CONFIG_DIR in
+// the resolved environment: an ambient value the server process itself
+// happened to inherit is exactly what `resolveSettings` reads anyway, so
+// there is no mismatch to guard against, and skipping on it would silently
+// turn the fix off for the common default-instance case.
+// Resolution failures fail closed: treat bypass as disabled rather than risk
+// requesting a mode a hidden policy actually forbids.
+export function resolveClaudeBypassAvailability(
+  cwd: string | null,
+  options: { readonly hasCustomClaudeHome: boolean },
+): Effect.Effect<ClaudeBypassAvailability> {
+  if (options.hasCustomClaudeHome) {
+    return Effect.succeed(CLAUDE_BYPASS_FULLY_AVAILABLE);
+  }
+  const bypassDisabledFailClosed: ClaudeBypassAvailability = {
+    bypassDisabled: true,
+    autoDisabled: false,
+  };
+  return Effect.tryPromise(() =>
+    resolveClaudeSettings({
+      ...(cwd === null ? {} : { cwd }),
+      settingSources: ["user", "project", "local"],
+    }),
+  ).pipe(
+    Effect.map((resolved): ClaudeBypassAvailability => ({
+      bypassDisabled: resolved.effective.permissions?.disableBypassPermissionsMode === "disable",
+      // Claude honors `disableAutoMode` both as a top-level setting and
+      // nested under `permissions` (confirmed empirically against the
+      // installed Agent SDK's resolveSettings() with both placements, and
+      // against the real CLI in manual testing): read both.
+      autoDisabled:
+        resolved.effective.permissions?.disableAutoMode === "disable" ||
+        resolved.effective.disableAutoMode === "disable",
+    })),
+    Effect.catch(() => Effect.succeed(bypassDisabledFailClosed)),
+  );
+}
+
 function shouldInstallClaudePermissionCallback(policy: ClaudeRuntimeQueryPolicy): boolean {
   return policy.installPermissionCallback;
 }
 
 // Whether a tool's permission callback must ask the user before answering.
-function requiresClaudeApproval(context: ActiveClaudeTurnContext): boolean {
+function requiresClaudeApproval(
+  context: ActiveClaudeTurnContext,
+  bypassAvailability: ClaudeBypassAvailability,
+): boolean {
   return shouldInstallClaudePermissionCallback(
-    claudeRuntimeQueryPolicyForRuntimePolicy(context.input.runtimePolicy),
+    claudeRuntimeQueryPolicyForRuntimePolicy(context.input.runtimePolicy, bypassAvailability),
   );
 }
 
@@ -2937,6 +3028,15 @@ export function makeClaudeAdapterV2(
   const continuationRequests = adapterOptions.continuationRequests ?? {
     offer: () => Effect.void,
   };
+  // A configured per-instance Claude home (CLAUDE_CONFIG_DIR, exported only
+  // for the spawned CLI) is what makes `resolveClaudeBypassAvailability`'s
+  // ambient-env read unsafe, not whether the resolved environment happens to
+  // carry an inherited CLAUDE_CONFIG_DIR (see that function).
+  const hasCustomClaudeHome = adapterOptions.settings.homePath.trim().length > 0;
+  // Shared across every session this adapter instance opens (not just one),
+  // so the one-time #4927 downgrade notice survives an idle release and
+  // resume instead of reappearing on the thread's next provider session.
+  const announcedBypassPolicyDowngradeThreadIds = new Set<ThreadId>();
 
   // Re-scan on every send: skills are added and switched off mid-session, and
   // the scan is a few directory reads. A skill switched off via skillOverrides,
@@ -2981,6 +3081,29 @@ export function makeClaudeAdapterV2(
         const interruptedTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const steeredTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const queryContext = yield* Ref.make<ClaudeLiveQueryContext | null>(null);
+        // Resolved lazily on the first turn that would request
+        // bypassPermissions, then cached for the life of the session: Claude's
+        // own settings cascade does not change turn to turn (#4927). Keyed on
+        // cwd, not just resolved once: the turn's cwd can change inside the
+        // same session (for example after a worktree handoff), and a cwd
+        // change can change which project settings apply.
+        const claudeBypassAvailabilityCache = yield* Ref.make<{
+          readonly cwd: string | null;
+          readonly availability: ClaudeBypassAvailability;
+        } | null>(null);
+        const resolveClaudeBypassAvailabilityOnce = Effect.fn(
+          "ClaudeAdapterV2.resolveClaudeBypassAvailabilityOnce",
+        )(function* (cwd: string | null) {
+          const cached = yield* Ref.get(claudeBypassAvailabilityCache);
+          if (cached !== null && cached.cwd === cwd) {
+            return cached.availability;
+          }
+          const availability = yield* resolveClaudeBypassAvailability(cwd, {
+            hasCustomClaudeHome,
+          });
+          yield* Ref.set(claudeBypassAvailabilityCache, { cwd, availability });
+          return availability;
+        });
         const openedNativeThreads = yield* Ref.make(new Set<string>());
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
         const planIdsByNativeItem = yield* Ref.make(
@@ -6555,6 +6678,9 @@ export function makeClaudeAdapterV2(
               toolUseID: callbackOptions.toolUseID,
             } satisfies PermissionResult;
           }
+          const bypassAvailability =
+            (yield* Ref.get(claudeBypassAvailabilityCache))?.availability ??
+            CLAUDE_BYPASS_FULLY_AVAILABLE;
 
           const nativeRequestId = callbackOptions.toolUseID;
           const nativeToolInput = claudeNativeToolInputFromRecord(toolInput);
@@ -6579,7 +6705,7 @@ export function makeClaudeAdapterV2(
           if (
             heldForEcho &&
             toolName !== "ExitPlanMode" &&
-            (toolName === "AskUserQuestion" || requiresClaudeApproval(context))
+            (toolName === "AskUserQuestion" || requiresClaudeApproval(context, bypassAvailability))
           ) {
             // The SDK blocks on the answer, and the prompt echo cannot arrive
             // until the held turn goes on, so the request is raised now and
@@ -6687,7 +6813,7 @@ export function makeClaudeAdapterV2(
             } satisfies PermissionResult;
           }
 
-          if (!requiresClaudeApproval(context)) {
+          if (!requiresClaudeApproval(context, bypassAvailability)) {
             return {
               behavior: "allow",
               updatedInput: toolInput,
@@ -6877,7 +7003,14 @@ export function makeClaudeAdapterV2(
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
         ) {
-          const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
+          const bypassAvailability =
+            permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) === "bypassPermissions"
+              ? yield* resolveClaudeBypassAvailabilityOnce(turnInput.runtimePolicy.cwd)
+              : CLAUDE_BYPASS_FULLY_AVAILABLE;
+          const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(
+            turnInput.runtimePolicy,
+            bypassAvailability,
+          );
           const mcpOverrides = claudeMcpQueryOverrides({
             threadId: turnInput.threadId,
             readOnlySandbox:
@@ -7078,6 +7211,53 @@ export function makeClaudeAdapterV2(
           return context;
         });
 
+        // Surfaces the one-time #4927 policy downgrade the same way the
+        // adapter already announces Claude usage-limit warnings: a
+        // system_notice turn item, not a new UI surface. Tracked per thread
+        // (not per session) on the adapter instance, so it stays a one-time
+        // notice across an idle release and resume.
+        const announceClaudeBypassPolicyDowngrade = Effect.fn(
+          "ClaudeAdapterV2.announceClaudeBypassPolicyDowngrade",
+        )(function* (context: ActiveClaudeTurnContext) {
+          if (announcedBypassPolicyDowngradeThreadIds.has(context.input.threadId)) {
+            return;
+          }
+          announcedBypassPolicyDowngradeThreadIds.add(context.input.threadId);
+          const now = yield* DateTime.now;
+          const nativeItemId = `bypass-policy-downgrade:${context.providerTurnId}`;
+          const notice =
+            "Claude's settings disable bypass permissions here, so full access is running with approval checks instead of skipping them.";
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver: CLAUDE_PROVIDER,
+            turnItem: {
+              id: idAllocator.derive.turnItemFromProviderItem({
+                driver: CLAUDE_PROVIDER,
+                nativeItemId,
+              }),
+              threadId: context.input.threadId,
+              runId: context.input.runId,
+              nodeId: context.input.rootNodeId,
+              providerThreadId: context.input.providerThread.id,
+              providerTurnId: context.providerTurnId,
+              nativeItemRef: {
+                driver: CLAUDE_PROVIDER,
+                nativeId: nativeItemId,
+                strength: "weak",
+              },
+              parentItemId: null,
+              ordinal: yield* resolveItemOrdinal(context, nativeItemId),
+              type: "system_notice",
+              status: "completed",
+              title: notice,
+              message: notice,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            },
+          });
+        });
+
         const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
             const startedAt = yield* DateTime.now;
@@ -7163,6 +7343,14 @@ export function makeClaudeAdapterV2(
                 });
             const querySession = yield* openQuery(turnInput, nativeThreadId);
             yield* Ref.set(activeTurn, context);
+            const bypassAvailability = yield* Ref.get(claudeBypassAvailabilityCache);
+            if (
+              bypassAvailability !== null &&
+              bypassAvailability.cwd === turnInput.runtimePolicy.cwd &&
+              bypassAvailability.availability.bypassDisabled
+            ) {
+              yield* announceClaudeBypassPolicyDowngrade(context);
+            }
             yield* emitProviderEvent({
               type: "provider_turn.updated",
               driver: CLAUDE_PROVIDER,
