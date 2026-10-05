@@ -4532,6 +4532,13 @@ export default function Sidebar() {
         assignedKeys: new Map(assignments.map(({ id, orderKey }) => [id, orderKey])),
       };
       setOptimisticDrop(drop);
+      // The group this drop moves, when the lifted row leads one.
+      const droppedGroup = launchGroupByKeyRef.current.get(
+        sidebarListItems.find(
+          (item): item is Extract<SidebarListItem, { kind: "thread" }> =>
+            item.kind === "thread" && item.key === activeKey && !isNestedSidebarListItem(item),
+        )?.group ?? "",
+      );
       void (async () => {
         const run = async (
           operation: Promise<AtomCommandResult<unknown, unknown>>,
@@ -4557,14 +4564,6 @@ export default function Sidebar() {
           case "settle": {
             // A group dropped on Settled settles every thread in it; otherwise
             // its live threads would keep the group in Active.
-            const droppedGroup = launchGroupByKeyRef.current.get(
-              sidebarListItems.find(
-                (item): item is Extract<SidebarListItem, { kind: "thread" }> =>
-                  item.kind === "thread" &&
-                  item.key === activeKey &&
-                  !isNestedSidebarListItem(item),
-              )?.group ?? "",
-            );
             const groupKeys =
               droppedGroup === undefined
                 ? undefined
@@ -4599,6 +4598,15 @@ export default function Sidebar() {
             // The drag expresses unpin intent; button/menu confirmation is unchanged.
             if (plan.unpin && !(await run(unpinThread(threadRef), "Failed to unpin thread")))
               return;
+            // A group whose top thread is parked sits at a pinned member while
+            // any member is pinned, so moving it to Active unpins them all.
+            if (plan.unpin && droppedGroup !== undefined) {
+              for (const row of droppedGroup.block.rows) {
+                if (row.key === activeKey || row.thread.pinnedAt == null) continue;
+                const ref = scopeThreadRef(row.thread.environmentId, row.thread.id);
+                if (!(await run(unpinThread(ref), "Failed to unpin thread"))) return;
+              }
+            }
             if (
               plan.unsettle &&
               !(await run(unsettleThread(threadRef), "Failed to un-settle thread"))
@@ -4881,7 +4889,10 @@ export default function Sidebar() {
             // A new parent leaves any group it was in, so the group stays flat.
             ...(parentLeadsGroup ? [] : [{ thread: parent, launcherId: null }]),
             ...selectedThreads
-              .filter((thread) => thread !== parent)
+              .filter(
+                (thread) =>
+                  thread.environmentId !== parent.environmentId || thread.id !== parent.id,
+              )
               .map((thread) => ({ thread, launcherId: parent.id })),
           ],
           "Grouped",
