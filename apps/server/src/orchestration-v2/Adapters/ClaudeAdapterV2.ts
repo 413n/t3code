@@ -7007,9 +7007,18 @@ export function makeClaudeAdapterV2(
                     (hookInput) =>
                       runPromise(
                         Effect.gen(function* () {
-                          // agent_id is present only for a subagent's own
-                          // tool call; a subagent's worktree is its own
-                          // isolated concern, not this (root) session's.
+                          // BaseHookInput.agent_id (@anthropic-ai/claude-agent-sdk
+                          // sdk.d.ts) is documented as present only for a tool
+                          // call from within a subagent, and as the field to
+                          // use (not agent_type) for exactly this root-vs-
+                          // subagent distinction; a session started with
+                          // --agent carries agent_type without agent_id on its
+                          // own (root) calls, so checking agent_type here would
+                          // misattribute those. The SDK forwards it unmodified
+                          // from the CLI's own hook_callback control request,
+                          // it is not inferred by the SDK layer itself. A
+                          // subagent's worktree is its own isolated concern,
+                          // not this (root) session's.
                           if (hookInput.hook_event_name === "PostToolUse" && !hookInput.agent_id) {
                             yield* followWorktreeCwdChange(hookInput.cwd);
                           }
