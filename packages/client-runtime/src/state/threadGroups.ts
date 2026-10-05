@@ -29,8 +29,8 @@ export type ThreadGroupLayout<T, S extends string> = Readonly<
 /**
  * Groups each section's threads into blocks. A group renders where its top
  * thread renders. When the top thread is in a parked section (snoozed,
- * settled) but a grouped thread is live, the group moves to that thread's
- * place, so live work never hides in a shelf. Chains join the top group.
+ * settled) but a grouped thread is live, the group moves to one live
+ * thread's place, so live work never hides in a shelf. Chains join the top group.
  * Threads grouped under a thread outside the given sections stay top-level.
  */
 export function layoutThreadGroups<T, S extends string>(input: {
@@ -76,11 +76,27 @@ export function layoutThreadGroups<T, S extends string>(input: {
     childrenByRoot.set(rootKey, children);
   }
 
+  // A parked top thread's group anchors to one live thread, picked by
+  // section and then by key, never by order. Moving the anchor moves the
+  // group; if order picked it, the next live thread would take its place.
+  const sectionRank = new Map(input.order.map((section, index) => [section, index]));
   const rootByAnchor = new Map<string, string>();
   for (const [rootKey, children] of childrenByRoot) {
-    const anchor = input.live.has(rowByKey.get(rootKey)!.section)
-      ? rootKey
-      : (children.find((child) => input.live.has(child.section))?.key ?? rootKey);
+    let anchor = rootKey;
+    if (!input.live.has(rowByKey.get(rootKey)!.section)) {
+      let best: ThreadGroupRow<T, S> | undefined;
+      for (const child of children) {
+        if (!input.live.has(child.section)) continue;
+        if (
+          best === undefined ||
+          sectionRank.get(child.section)! < sectionRank.get(best.section)! ||
+          (child.section === best.section && child.key < best.key)
+        ) {
+          best = child;
+        }
+      }
+      anchor = best?.key ?? rootKey;
+    }
     rootByAnchor.set(anchor, rootKey);
   }
 

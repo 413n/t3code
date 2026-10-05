@@ -64,6 +64,31 @@ describe("layoutThreadGroups", () => {
     });
   });
 
+  it("anchors a settled top thread's group to the same live thread in any order", () => {
+    // Moving the anchor "a" below "solo" moves the group; "b" does not take
+    // its place.
+    expect(
+      layout({
+        active: [
+          { id: "a", groupedUnder: "lead" },
+          { id: "b", groupedUnder: "lead" },
+          { id: "solo" },
+        ],
+        settled: [{ id: "lead" }],
+      }).active,
+    ).toEqual(["lead>a(active)*>b(active)", "solo"]);
+    expect(
+      layout({
+        active: [
+          { id: "b", groupedUnder: "lead" },
+          { id: "solo" },
+          { id: "a", groupedUnder: "lead" },
+        ],
+        settled: [{ id: "lead" }],
+      }).active,
+    ).toEqual(["solo", "lead>b(active)>a(active)*"]);
+  });
+
   it("keeps threads top-level when their group's thread is not listed or the chain loops", () => {
     expect(
       layout({
