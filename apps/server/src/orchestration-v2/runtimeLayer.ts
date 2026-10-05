@@ -3,6 +3,7 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
 import * as OrchestrationCommandReceipts from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import * as OrchestrationEventStore from "../persistence/Layers/OrchestrationEventStore.ts";
+import * as McpAppRequests from "../mcpApps/McpAppRequests.ts";
 import { layer as providerSessionRuntimeLayer } from "../persistence/ProviderSessionRuntime.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { ProviderAuthServiceLive } from "../provider/Layers/ProviderAuthService.ts";
@@ -296,8 +297,15 @@ const providerRuntimeRecoveryProvided = providerRuntimeRecoveryLayer.pipe(
   ),
 );
 
+const mcpAppRequestsProvided = McpAppRequests.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(orchestratorProvided, threadManagementProvided, providerSessionManagerProvided),
+  ),
+);
+
 export const OrchestrationV2LayerLive = Layer.mergeAll(
   orchestratorProvided,
+  mcpAppRequestsProvided,
   threadManagementProvided,
   effectWorkerProvided,
   providerSessionManagerProvided,

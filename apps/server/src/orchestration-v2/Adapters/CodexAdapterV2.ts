@@ -110,6 +110,13 @@ import {
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
+  MCP_APP_EXTENSION_ID,
+  MCP_APP_MIME_TYPE,
+  MCP_APP_OUTPUT_KEY,
+  MCP_APP_RESOURCE_SCHEME,
+} from "@t3tools/shared/mcpApp";
+import { snapshotMcpApp } from "../../mcpApps/McpAppSnapshot.ts";
+import {
   ProviderAdapterDriverCreateError,
   type ProviderAdapterDriver,
   type ProviderAdapterDriverCreateInput,
@@ -148,6 +155,7 @@ import {
   type ProviderAdapterV2ForkThreadInput,
   type ProviderAdapterV2RollbackThreadInput,
   type ProviderAdapterV2RuntimePolicy,
+  type ProviderAdapterV2McpApps,
   type ProviderAdapterV2SessionRuntime,
   type ProviderAdapterV2InterruptInput,
   type ProviderAdapterV2SteerInput,
@@ -234,6 +242,9 @@ const decodeCodexBackgroundTerminalsListResponse = Schema.decodeUnknownEffect(
 const CODEX_CLIENT_CAPABILITIES = {
   experimentalApi: true,
   optOutNotificationMethods: ["turn/diff/updated"],
+  // Declares MCP Apps support (SEP-1724 extension negotiation), so servers
+  // attach their UI resources and Codex reports them on tool call items.
+  extensions: { [MCP_APP_EXTENSION_ID]: { mimeTypes: [MCP_APP_MIME_TYPE] } },
 } as const;
 
 export const CodexProviderCapabilitiesV2 = {
@@ -471,6 +482,17 @@ function codexMcpToolOutput(
   return resultOutput === undefined
     ? { error: item.error.message }
     : { error: item.error.message, result: resultOutput };
+}
+
+// Reading an app's resource is one MCP round trip; a server that hangs must not
+// hold the item (and the run's ingestion) open.
+const MCP_APP_CAPTURE_TIMEOUT = "20 seconds";
+
+/** The UI resource a completed Codex MCP tool call names, under any field Codex reports it in. */
+function codexMcpAppResourceUri(item: CodexDynamicToolItem): string | undefined {
+  if (item.type !== "mcpToolCall") return undefined;
+  const uri = item.mcpAppUi?.resourceUri ?? item.mcpAppResourceUri ?? item.appContext?.resourceUri;
+  return typeof uri === "string" && uri.startsWith(MCP_APP_RESOURCE_SCHEME) ? uri : undefined;
 }
 
 function codexDynamicToolOutput(
@@ -2003,6 +2025,19 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             return [remaining.size === 0, updated] as const;
           });
 
+        // MCP app captures still reading their resource, by native turn. Each
+        // counts as retained background work, so the turn's context and the
+        // run's ingestion stay open until its app lands on the item.
+        const pendingMcpAppCaptures = yield* Ref.make(new Map<string, number>());
+        const adjustPendingMcpAppCaptures = (nativeTurnId: string, delta: 1 | -1) =>
+          Ref.update(pendingMcpAppCaptures, (current) => {
+            const next = (current.get(nativeTurnId) ?? 0) + delta;
+            const updated = new Map(current);
+            if (next <= 0) updated.delete(nativeTurnId);
+            else updated.set(nativeTurnId, next);
+            return updated;
+          });
+
         const trackRunningDynamicTool = (nativeTurnId: string, item: CodexDynamicToolItem) =>
           Ref.update(runningDynamicToolsByTurn, (current) => {
             const updated = new Map(current);
@@ -2033,6 +2068,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           Effect.gen(function* () {
             const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(nativeTurnId);
             if (commands !== undefined && commands.size > 0) {
+              return true;
+            }
+            if ((yield* Ref.get(pendingMcpAppCaptures)).has(nativeTurnId)) {
               return true;
             }
             const tools = (yield* Ref.get(runningDynamicToolsByTurn)).get(nativeTurnId);
@@ -3503,6 +3541,99 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             return { node, turnItem };
           });
 
+        /**
+         * Completes an MCP tool call whose tool names a UI resource: reads the
+         * resource through Codex's MCP client, stores it, and records the app
+         * in the item's output. The item stays running until then, which keeps
+         * the run's event ingestion open past turn/completed; it runs off the
+         * notification reader so a slow server cannot stall other events.
+         */
+        const captureMcpApp = (
+          context: ActiveCodexTurnContext,
+          nativeTurnId: string,
+          item: Extract<CodexDynamicToolItem, { readonly type: "mcpToolCall" }>,
+          resourceUri: string,
+        ) =>
+          Effect.gen(function* () {
+            yield* adjustPendingMcpAppCaptures(nativeTurnId, 1);
+            // Released once: before the final emit, or on interruption.
+            let released = false;
+            const release = Effect.suspend(() => {
+              if (released) return Effect.void;
+              released = true;
+              return adjustPendingMcpAppCaptures(nativeTurnId, -1);
+            });
+            yield* captureMcpAppItem(context, nativeTurnId, item, resourceUri, release).pipe(
+              Effect.onInterrupt(() => release),
+              Effect.forkIn(scope, { startImmediately: true }),
+            );
+          });
+
+        const captureMcpAppItem = (
+          context: ActiveCodexTurnContext,
+          nativeTurnId: string,
+          item: Extract<CodexDynamicToolItem, { readonly type: "mcpToolCall" }>,
+          resourceUri: string,
+          release: Effect.Effect<void>,
+        ) =>
+          Effect.gen(function* () {
+            const reference =
+              item.status === "completed" && item.result != null && item.error == null
+                ? yield* getNativeThreadId(context.providerThread).pipe(
+                    Effect.flatMap((threadId) =>
+                      client.request("mcpServer/resource/read", {
+                        threadId,
+                        server: item.server,
+                        uri: resourceUri,
+                      }),
+                    ),
+                    Effect.timeout(MCP_APP_CAPTURE_TIMEOUT),
+                    Effect.flatMap((response) =>
+                      snapshotMcpApp({
+                        attachmentsDir: serverConfig.attachmentsDir,
+                        threadId: context.projectionThreadId,
+                        server: item.server,
+                        tool: item.tool,
+                        resourceUri,
+                        contents: response.contents,
+                      }),
+                    ),
+                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("Failed to capture an MCP app; showing a plain tool row.", {
+                        server: item.server,
+                        tool: item.tool,
+                        resourceUri,
+                        cause,
+                      }).pipe(Effect.as(undefined)),
+                    ),
+                  )
+                : undefined;
+            const artifacts = yield* buildDynamicToolArtifacts(context, item);
+            // Cleared before the final emit: ingestion re-checks pending work
+            // after each event, and must see this capture done by then.
+            yield* release;
+            const turnItem =
+              reference === undefined || artifacts.turnItem.type !== "dynamic_tool"
+                ? artifacts.turnItem
+                : {
+                    ...artifacts.turnItem,
+                    // The full CallToolResult the app replays, beside the app.
+                    output: { [MCP_APP_OUTPUT_KEY]: reference, result: item.result },
+                  };
+            yield* emitProviderEvent({
+              type: "node.updated",
+              driver: CODEX_PROVIDER,
+              node: artifacts.node,
+            });
+            yield* emitProviderEvent({
+              type: "turn_item.updated",
+              driver: CODEX_PROVIDER,
+              turnItem,
+            });
+            yield* releaseSettledTurnIfIdle(nativeTurnId);
+          });
+
         const buildProposedPlanArtifacts = (input: {
           readonly context: ActiveCodexTurnContext;
           readonly nativeItemId: string;
@@ -4479,6 +4610,11 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
 
             if (payload.item.type === "mcpToolCall" || payload.item.type === "dynamicToolCall") {
               yield* clearRunningDynamicTool(payload.turnId, payload.item.id);
+              const appResourceUri = codexMcpAppResourceUri(payload.item);
+              if (appResourceUri !== undefined && payload.item.type === "mcpToolCall") {
+                yield* captureMcpApp(context, payload.turnId, payload.item, appResourceUri);
+                return;
+              }
               const artifacts = yield* buildDynamicToolArtifacts(context, payload.item);
               yield* emitProviderEvent({
                 type: "node.updated",
@@ -5970,6 +6106,64 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             ),
           );
 
+        // MCP Apps reach their server through Codex's own MCP client, so any
+        // server the user configured for Codex works without T3 connecting to it.
+        const mcpAppsError = (detail: string) => (cause: unknown) =>
+          new ProviderAdapterProtocolError({ driver: CODEX_PROVIDER, detail, payload: cause });
+        const mcpApps: ProviderAdapterV2McpApps = {
+          listTools: (toolsInput) =>
+            Effect.gen(function* () {
+              const threadId = yield* getNativeThreadId(toolsInput.providerThread);
+              const response = yield* ensureInitialized.pipe(
+                Effect.andThen(
+                  client.request("mcpServerStatus/list", {
+                    threadId,
+                    serverName: toolsInput.server,
+                    detail: "toolsAndAuthOnly",
+                  }),
+                ),
+              );
+              const server = response.data.find((entry) => entry.name === toolsInput.server);
+              return Object.values(server?.tools ?? {});
+            }).pipe(Effect.mapError(mcpAppsError("Failed to list Codex MCP tools."))),
+          callTool: (callInput) =>
+            Effect.gen(function* () {
+              const threadId = yield* getNativeThreadId(callInput.providerThread);
+              const response = yield* ensureInitialized.pipe(
+                Effect.andThen(
+                  client.request("mcpServer/tool/call", {
+                    threadId,
+                    server: callInput.server,
+                    tool: callInput.tool,
+                    arguments: callInput.arguments as Schema.Json,
+                  }),
+                ),
+              );
+              return {
+                content: response.content,
+                ...(response.structuredContent === undefined
+                  ? {}
+                  : { structuredContent: response.structuredContent }),
+                ...(response.isError === true ? { isError: true } : {}),
+                ...(response._meta === undefined ? {} : { _meta: response._meta }),
+              };
+            }).pipe(Effect.mapError(mcpAppsError("Codex MCP tool call failed."))),
+          readResource: (readInput) =>
+            Effect.gen(function* () {
+              const threadId = yield* getNativeThreadId(readInput.providerThread);
+              const response = yield* ensureInitialized.pipe(
+                Effect.andThen(
+                  client.request("mcpServer/resource/read", {
+                    threadId,
+                    server: readInput.server,
+                    uri: readInput.uri,
+                  }),
+                ),
+              );
+              return { contents: response.contents };
+            }).pipe(Effect.mapError(mcpAppsError("Codex MCP resource read failed."))),
+        };
+
         const runtime: ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
@@ -5991,6 +6185,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               if (items.size > 0) {
                 return true;
               }
+            }
+            if ((yield* Ref.get(pendingMcpAppCaptures)).size > 0) {
+              return true;
             }
             for (const subagent of (yield* Ref.get(subagentThreads)).values()) {
               if (subagent.task.status === "running") {
@@ -6711,6 +6908,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                   }),
               ),
             ),
+          mcpApps,
           readThreadSnapshot: (threadInput) =>
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(threadInput.providerThread);
