@@ -221,6 +221,7 @@ import {
   useThreadJumpHintVisibility,
   useRetainedValue,
   useSidebarRowSubscriptionLease,
+  isNestedSidebarListItem,
   type SidebarDropMembership,
   type SidebarListItem,
   type SidebarListMarker,
@@ -4305,6 +4306,16 @@ export default function Sidebar() {
     [sidebarListItems],
   );
   const sortableIds = useMemo(() => sidebarListItems.map(sidebarListItemId), [sidebarListItems]);
+  const routeBlockLeadKey = useMemo(
+    () =>
+      routeThreadKey === null
+        ? null
+        : (Object.values(launchLayout)
+            .flat()
+            .find((block) => block.rows.some((row) => row.key === routeThreadKey))?.leadKey ??
+          routeThreadKey),
+    [launchLayout, routeThreadKey],
+  );
   const draggedSettledOrder = useMemo(() => {
     const thread = dragState === null ? undefined : threadByKey.get(dragState.activeKey);
     if (dragState === null || thread === undefined) return [];
@@ -4345,14 +4356,16 @@ export default function Sidebar() {
         ...(draggedActiveOrder === undefined ? {} : { activeOrder: draggedActiveOrder }),
         settledExpanded: settledShelfExpanded,
         settledVisibleCount,
-        routeThreadKey,
+        // The settled order lists block leads, so a grouped open thread keeps
+        // its whole block by its lead.
+        routeThreadKey: routeBlockLeadKey,
         snoozedThreadCount: shelfThreadCounts.snoozed,
       }),
     [
       draggedActiveOrder,
       draggedSettledOrder,
       isContextDrag,
-      routeThreadKey,
+      routeBlockLeadKey,
       settledShelfExpanded,
       settledVisibleCount,
       sidebarListItems,
@@ -4394,7 +4407,11 @@ export default function Sidebar() {
         if (membership?.kind === "stay") return true;
         // Groups live on one server: a thread joins only a group from its own.
         if (membership?.kind === "join") {
-          return threadByKey.get(membership.group)?.environmentId === source.environmentId;
+          return (
+            threadByKey.get(membership.group)?.environmentId === source.environmentId &&
+            serverConfigs.get(source.environmentId)?.environment.capabilities.threadGrouping ===
+              true
+          );
         }
         return (
           planSidebarThreadDrop({
@@ -4523,6 +4540,23 @@ export default function Sidebar() {
         };
         switch (plan.kind) {
           case "settle": {
+            // A group dropped on Settled settles every thread in it; otherwise
+            // its live threads would keep the group in Active.
+            const droppedGroup = launchGroupByKeyRef.current.get(
+              sidebarListItems.find(
+                (item): item is Extract<SidebarListItem, { kind: "thread" }> =>
+                  item.kind === "thread" &&
+                  item.key === activeKey &&
+                  !isNestedSidebarListItem(item),
+              )?.group ?? "",
+            );
+            if (droppedGroup !== undefined) {
+              settleLaunchGroup(
+                droppedGroup.block.rows
+                  .filter((row) => row.key !== activeKey)
+                  .map((row) => row.thread),
+              );
+            }
             settlingThreadKeysRef.current.add(activeKey);
             const navigateAfterSettle = planForwardNavigation(activeKey);
             const settled = await run(settleThread(threadRef), "Failed to settle thread").finally(
@@ -4600,6 +4634,7 @@ export default function Sidebar() {
       reorderPinnedThread,
       reorderActiveThread,
       sectionByThreadKey,
+      settleLaunchGroup,
       settleThread,
       sidebarListItems,
       threadByKey,
@@ -4735,7 +4770,9 @@ export default function Sidebar() {
         count > 1 &&
         selectedThreads.every(
           (thread) => thread.environmentId === selectedThreads[0]!.environmentId,
-        )
+        ) &&
+        serverConfigs.get(selectedThreads[0]!.environmentId)?.environment.capabilities
+          .threadGrouping === true
           ? (orderedThreadKeysRef.current.find(
               (threadKey) =>
                 selectedKeySet.has(threadKey) && launchGroupByKeyRef.current.has(threadKey),
