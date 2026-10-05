@@ -233,11 +233,11 @@ import {
   restrictBelowSidebarLabel,
 } from "./Sidebar.drag";
 import {
-  layoutSidebarLaunchGroups,
+  layoutThreadGroups,
   routeRowOnly,
-  type SidebarLaunchBlock,
-  type SidebarLaunchRow,
-} from "./Sidebar.launchGroups";
+  type ThreadGroupBlock,
+  type ThreadGroupRow,
+} from "@t3tools/client-runtime/state/thread-groups";
 import { SidebarDragLifecycle, SidebarPointerSensor } from "./Sidebar.pointer";
 import { createSidebarListMotion } from "./Sidebar.motion";
 import {
@@ -305,12 +305,21 @@ const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
 const FOLDED_LAUNCH_GROUPS_KEY = "t3code:sidebar:folded-launch-groups";
 const FoldedLaunchGroupKeys = Schema.Array(Schema.String);
+const SIDEBAR_SECTION_ORDER = [
+  "pinned",
+  "active",
+  "working",
+  "snoozed",
+  "settled",
+] as const satisfies readonly SidebarSection[];
+// A group whose top thread is snoozed or settled moves to its first thread here.
+const LIVE_SIDEBAR_SECTIONS: ReadonlySet<SidebarSection> = new Set(["pinned", "active", "working"]);
 
 /** A launch block as rendered: `rows` drops what a folded group hides. */
 interface RenderedLaunchBlock {
-  readonly block: SidebarLaunchBlock<EnvironmentThreadShell>;
+  readonly block: ThreadGroupBlock<EnvironmentThreadShell, SidebarSection>;
   /** The launcher row always renders: it holds the fold toggle and footer. */
-  readonly rows: readonly SidebarLaunchRow<EnvironmentThreadShell>[];
+  readonly rows: readonly ThreadGroupRow<EnvironmentThreadShell, SidebarSection>[];
   readonly folded: boolean;
 }
 
@@ -3070,11 +3079,11 @@ export default function Sidebar() {
       return next;
     });
   }, [pendingLaunchers, threads]);
-  // Threads an agent launched through T3 MCP tools render under their
-  // launcher. Each thread keeps its own section; only placement changes.
+  // Grouped threads render under the thread they are grouped under. Each
+  // thread keeps its own section; only placement changes.
   const launchLayout = useMemo(
     () =>
-      layoutSidebarLaunchGroups({
+      layoutThreadGroups({
         sections: {
           pinned: pinnedThreads,
           active: activeThreads,
@@ -3082,8 +3091,10 @@ export default function Sidebar() {
           snoozed: snoozedThreads,
           settled: settledThreads,
         },
+        order: SIDEBAR_SECTION_ORDER,
+        live: LIVE_SIDEBAR_SECTIONS,
         keyOf: (thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
-        launcherKeyOf: (thread) => {
+        groupKeyOf: (thread) => {
           const pending = pendingLaunchers.get(
             scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
           );
@@ -3174,12 +3185,12 @@ export default function Sidebar() {
   );
   const renderedLaunchBlocks = useMemo(() => {
     const folded = new Set(foldedLaunchGroupKeys);
-    const staysVisible = (row: SidebarLaunchRow<EnvironmentThreadShell>) =>
+    const staysVisible = (row: ThreadGroupRow<EnvironmentThreadShell, SidebarSection>) =>
       row.key === routeThreadKey ||
       row.thread.hasPendingApprovals ||
       row.thread.hasPendingUserInput ||
       threadWokeAt(row.thread, { now: snoozeNow }) !== null;
-    const fold = (blocks: readonly SidebarLaunchBlock<EnvironmentThreadShell>[]) =>
+    const fold = (blocks: readonly ThreadGroupBlock<EnvironmentThreadShell, SidebarSection>[]) =>
       blocks.map((block): RenderedLaunchBlock => {
         if (block.rows.length === 1 || !folded.has(block.key)) {
           return { block, rows: block.rows, folded: false };
@@ -3193,8 +3204,9 @@ export default function Sidebar() {
           folded: true,
         };
       });
-    const routeOnly = (blocks: readonly SidebarLaunchBlock<EnvironmentThreadShell>[]) =>
-      fold(routeRowOnly(blocks, routeThreadKey));
+    const routeOnly = (
+      blocks: readonly ThreadGroupBlock<EnvironmentThreadShell, SidebarSection>[],
+    ) => fold(routeRowOnly(blocks, routeThreadKey));
     return {
       pinned: fold(launchLayout.pinned),
       active: fold(launchLayout.active),
@@ -3267,7 +3279,7 @@ export default function Sidebar() {
   // Shelf headers count the threads that render in them. A thread nested
   // under a live launcher does not count toward its own shelf.
   const shelfThreadCounts = useMemo(() => {
-    const count = (blocks: readonly SidebarLaunchBlock<EnvironmentThreadShell>[]) =>
+    const count = (blocks: readonly ThreadGroupBlock<EnvironmentThreadShell, SidebarSection>[]) =>
       blocks.reduce((total, block) => total + block.rows.length, 0);
     return {
       working: count(launchLayout.working),

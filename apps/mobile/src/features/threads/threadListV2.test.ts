@@ -416,6 +416,61 @@ describe("getThreadListV2OrderedSection", () => {
   });
 });
 
+describe("thread groups", () => {
+  const parent = makeThread({
+    id: ThreadId.make("parent"),
+    title: "Parent",
+    createdAt: "2026-06-01T00:00:00.000Z",
+  });
+  const child = makeThread({
+    id: ThreadId.make("child"),
+    title: "Child",
+    groupedUnderThreadId: ThreadId.make("parent"),
+    createdAt: "2026-06-01T03:00:00.000Z",
+  });
+  const settledChild = makeThread({
+    id: ThreadId.make("settled-child"),
+    title: "Settled child",
+    groupedUnderThreadId: ThreadId.make("parent"),
+    settledOverride: "settled",
+    settledAt: NOW,
+  });
+  const solo = makeThread({
+    id: ThreadId.make("solo"),
+    title: "Solo",
+    createdAt: "2026-06-01T02:00:00.000Z",
+  });
+  const threads = [parent, child, settledChild, solo];
+
+  it("renders grouped threads under the top thread, each with its own look", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+    expect(
+      layout.items.map((item) => [item.thread.title, item.variant, item.group?.role ?? null]),
+    ).toEqual([
+      ["Solo", "card", null],
+      ["Parent", "card", "parent"],
+      ["Child", "card", "child"],
+      ["Settled child", "slim", "child"],
+    ]);
+    expect(layout.items[1]?.group).toEqual({ role: "parent", members: [child, settledChild] });
+    // The settled child renders in its group, so the shelf does not count it.
+    expect(layout.settledCount).toBe(0);
+  });
+
+  it("moves a group as one row", () => {
+    expect(
+      getThreadListV2OrderedSection({ threads, section: "active", now: NOW }).map(
+        (thread) => thread.title,
+      ),
+    ).toEqual(["Solo", "Parent"]);
+  });
+});
+
 describe("buildThreadListV2Items", () => {
   it("places a persisted settled thread in the settled shelf", () => {
     const thread = makeThread({

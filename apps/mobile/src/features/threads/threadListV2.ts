@@ -12,6 +12,11 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell
 import { resolveThreadProviderStack } from "@t3tools/client-runtime/state/models";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import {
+  layoutThreadGroups,
+  routeRowOnly,
+  type ThreadGroupBlock,
+} from "@t3tools/client-runtime/state/thread-groups";
+import {
   createInboxReturnTracker,
   isThreadWorking,
   sortInboxThreadsByReturn,
@@ -227,7 +232,21 @@ export function sortThreadsForListV2<
   return sortActiveThreadsByOrderKey(threads);
 }
 
-/** Canonical card section for Move up/down, independent of search or scope. */
+function threadListKey(thread: Pick<EnvironmentThreadShell, "environmentId" | "id">): string {
+  return `${thread.environmentId}:${thread.id}`;
+}
+
+function groupListKey(
+  thread: Pick<EnvironmentThreadShell, "environmentId" | "groupedUnderThreadId">,
+): string | null {
+  return thread.groupedUnderThreadId == null
+    ? null
+    : `${thread.environmentId}:${thread.groupedUnderThreadId}`;
+}
+
+/** Canonical card section for Move up/down, independent of search or scope.
+    A thread grouped under another one moves with its group, so the section
+    lists only the row that leads each group. */
 export function getThreadListV2OrderedSection(input: {
   readonly threads: readonly EnvironmentThreadShell[];
   readonly section: "pinned" | "active";
@@ -237,28 +256,35 @@ export function getThreadListV2OrderedSection(input: {
   readonly snoozeEnvironmentIds?: ReadonlySet<EnvironmentId>;
   readonly queuedThreadKeys?: ReadonlySet<string>;
 }): EnvironmentThreadShell[] {
-  const threads = input.threads.filter((thread) => {
-    if (thread.archivedAt !== null || thread.lineage.relationshipToParent === "subagent")
-      return false;
-    if (
+  const pinned: EnvironmentThreadShell[] = [];
+  const active: EnvironmentThreadShell[] = [];
+  const parked: EnvironmentThreadShell[] = [];
+  for (const thread of input.threads) {
+    if (thread.archivedAt !== null || thread.lineage.relationshipToParent === "subagent") continue;
+    const settled =
       (input.settlementEnvironmentIds?.has(thread.environmentId) ?? true) &&
       thread.settledOverride === "settled" &&
-      input.queuedThreadKeys?.has(`${thread.environmentId}:${thread.id}`) !== true
-    ) {
-      return false;
-    }
-    if (
+      input.queuedThreadKeys?.has(threadListKey(thread)) !== true;
+    const snoozed =
       (input.snoozeEnvironmentIds?.has(thread.environmentId) ?? true) &&
-      effectiveSnoozed(thread, { now: input.now })
-    ) {
-      return false;
-    }
-    return (thread.pinnedAt != null) === (input.section === "pinned");
-  });
-  const ordered =
-    input.section === "pinned"
-      ? sortPinnedThreadsByOrderKey(threads)
-      : sortActiveThreadsByOrderKey(threads);
+      effectiveSnoozed(thread, { now: input.now });
+    (settled || snoozed ? parked : thread.pinnedAt != null ? pinned : active).push(thread);
+  }
+  const sections = {
+    pinned: sortPinnedThreadsByOrderKey(pinned),
+    active: sortActiveThreadsByOrderKey(active),
+    parked,
+  };
+  const leads = new Set(
+    layoutThreadGroups({
+      sections,
+      order: ["pinned", "active", "parked"],
+      live: ORDER_LIVE_SECTIONS,
+      keyOf: threadListKey,
+      groupKeyOf: groupListKey,
+    })[input.section].map((block) => block.leadKey),
+  );
+  const ordered = sections[input.section].filter((thread) => leads.has(threadListKey(thread)));
   const pending =
     input.pendingOrder?.section === input.section
       ? reconcilePendingThreadOrder(input.pendingOrder, ordered)
@@ -266,15 +292,34 @@ export function getThreadListV2OrderedSection(input: {
   return applyPendingThreadOrder(ordered, input.section, pending);
 }
 
+const ORDER_LIVE_SECTIONS: ReadonlySet<"pinned" | "active" | "parked"> = new Set([
+  "pinned",
+  "active",
+]);
+
+/** A row's place in a thread group. The group's top thread renders first and
+    carries the other threads, so its menu can ungroup them. */
+export type ThreadListV2Group =
+  | { readonly role: "parent"; readonly members: readonly EnvironmentThreadShell[] }
+  | { readonly role: "child"; readonly last: boolean };
+
 export interface ThreadListV2Item {
   readonly thread: EnvironmentThreadShell;
   readonly variant: "card" | "slim";
+  /** Null outside a group. */
+  readonly group: ThreadListV2Group | null;
   /** Snoozed-shelf row: shows the wake countdown and offers Wake. */
   readonly snoozed: boolean;
   /** Pinned-block row: renders the pin glyph and offers Unpin. */
   readonly pinned: boolean;
   readonly isLast: boolean;
 }
+
+const LIST_SECTIONS = ["pinned", "active", "working", "snoozed", "settled"] as const;
+type ThreadListSection = (typeof LIST_SECTIONS)[number];
+// A group whose top thread is snoozed or settled moves to its first thread here.
+const LIVE_LIST_SECTIONS: ReadonlySet<ThreadListSection> = new Set(["pinned", "active", "working"]);
+type ThreadListBlock = ThreadGroupBlock<EnvironmentThreadShell, ThreadListSection>;
 
 export interface ThreadListV2Layout {
   readonly items: ThreadListV2Item[];
@@ -411,6 +456,7 @@ export function threadListV2ListItemsAreEqual(
         previous.item.variant === item.item.variant &&
         previous.item.snoozed === item.item.snoozed &&
         previous.item.pinned === item.item.pinned &&
+        threadListV2GroupsAreEqual(previous.item.group, item.item.group) &&
         previous.snoozeWakeLabelText === item.snoozeWakeLabelText &&
         previous.timeLabel === item.timeLabel &&
         previous.snoozePresetMinute === item.snoozePresetMinute &&
@@ -449,6 +495,19 @@ export function threadListV2ListItemsAreEqual(
         previous.disabled === item.disabled
       );
   }
+}
+
+function threadListV2GroupsAreEqual(
+  previous: ThreadListV2Group | null,
+  group: ThreadListV2Group | null,
+): boolean {
+  if (previous === null || group === null) return previous === group;
+  if (previous.role === "child") return group.role === "child" && previous.last === group.last;
+  return (
+    group.role === "parent" &&
+    previous.members.length === group.members.length &&
+    previous.members.every((member, index) => member === group.members[index])
+  );
 }
 
 /** The timestamp a row renders when it shows no status label: the settle
@@ -736,86 +795,73 @@ export function buildThreadListV2Items(input: {
       parseTimestampMs(left.snoozedUntil ?? "") - parseTimestampMs(right.snoozedUntil ?? ""),
   );
   const selectedThreadKey = input.selectedThreadKey ?? null;
-  const visibleWorking =
-    input.workingShelfExpanded === true
-      ? orderedWorking
-      : orderedWorking.filter(
-          (thread) => `${thread.environmentId}:${thread.id}` === selectedThreadKey,
-        );
-  const visibleSnoozed =
-    input.snoozedShelfExpanded === true
-      ? orderedSnoozed
-      : orderedSnoozed.filter(
-          (thread) => `${thread.environmentId}:${thread.id}` === selectedThreadKey,
-        );
   const orderedSettled = sortSettledThreads(settled);
   const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
   const pagedSettled =
     orderedSettled.length > settledLimit ? orderedSettled.slice(0, settledLimit) : orderedSettled;
   const selectedSettled = orderedSettled
     .slice(pagedSettled.length)
-    .find((thread) => `${thread.environmentId}:${thread.id}` === selectedThreadKey);
+    .find((thread) => threadListKey(thread) === selectedThreadKey);
   if (selectedSettled !== undefined) pagedSettled.push(selectedSettled);
-  const visibleSettled =
-    input.settledShelfExpanded !== false
-      ? pagedSettled
-      : pagedSettled.filter(
-          (thread) => `${thread.environmentId}:${thread.id}` === selectedThreadKey,
-        );
+
+  // Grouped threads render under their group's top thread, each row keeping
+  // its own section look. A collapsed shelf shows only the open thread.
+  const layout = layoutThreadGroups({
+    sections: {
+      pinned: applyPendingThreadOrder(sortPinnedThreadsByOrderKey(pinned), "pinned", pending),
+      active: orderedActive,
+      working: orderedWorking,
+      snoozed: orderedSnoozed,
+      settled: pagedSettled,
+    },
+    order: LIST_SECTIONS,
+    live: LIVE_LIST_SECTIONS,
+    keyOf: threadListKey,
+    groupKeyOf: groupListKey,
+  });
+  const rowCount = (blocks: readonly ThreadListBlock[]) =>
+    blocks.reduce((total, block) => total + block.rows.length, 0);
+  // Settled threads pulled into a live group render there, not on the shelf.
+  const settledInLiveGroups = LIST_SECTIONS.flatMap((section) =>
+    section === "settled" ? [] : layout[section],
+  ).reduce(
+    (total, block) => total + block.rows.filter((row) => row.section === "settled").length,
+    0,
+  );
+  const shelf = (blocks: readonly ThreadListBlock[], expanded: boolean) =>
+    expanded ? blocks : routeRowOnly(blocks, selectedThreadKey);
 
   const items: ThreadListV2Item[] = [];
-  for (const thread of applyPendingThreadOrder(
-    sortPinnedThreadsByOrderKey(pinned),
-    "pinned",
-    pending,
-  )) {
-    items.push({
-      thread,
-      variant: "card",
-      snoozed: false,
-      pinned: true,
-      isLast: false,
-    });
-  }
-  for (const thread of orderedActive) {
-    items.push({
-      thread,
-      variant: "card",
-      snoozed: false,
-      pinned: false,
-      isLast: false,
-    });
-  }
-  const workingShelfHeaderIndex = orderedWorking.length > 0 ? items.length : null;
-  for (const thread of visibleWorking) {
-    items.push({
-      thread,
-      variant: "card",
-      snoozed: false,
-      pinned: false,
-      isLast: false,
-    });
-  }
-  const snoozedShelfHeaderIndex = orderedSnoozed.length > 0 ? items.length : null;
-  for (const thread of visibleSnoozed) {
-    items.push({
-      thread,
-      variant: "slim",
-      snoozed: true,
-      pinned: false,
-      isLast: false,
-    });
-  }
-  const settledShelfHeaderIndex = orderedSettled.length > 0 ? items.length : null;
-  for (const thread of visibleSettled) {
-    items.push({
-      thread,
-      variant: "slim",
-      snoozed: false,
-      pinned: false,
-      isLast: false,
-    });
-  }
+  const pushBlocks = (blocks: readonly ThreadListBlock[]) => {
+    for (const block of blocks) {
+      block.rows.forEach((row, index) => {
+        items.push({
+          thread: row.thread,
+          variant: row.section === "snoozed" || row.section === "settled" ? "slim" : "card",
+          group:
+            block.rows.length === 1
+              ? null
+              : index === 0
+                ? { role: "parent", members: block.rows.slice(1).map((member) => member.thread) }
+                : { role: "child", last: index === block.rows.length - 1 },
+          snoozed: row.section === "snoozed",
+          pinned: row.section === "pinned",
+          isLast: false,
+        });
+      });
+    }
+  };
+  pushBlocks(layout.pinned);
+  pushBlocks(layout.active);
+  const workingCount = rowCount(layout.working);
+  const workingShelfHeaderIndex = workingCount > 0 ? items.length : null;
+  pushBlocks(shelf(layout.working, input.workingShelfExpanded === true));
+  const snoozedCount = rowCount(layout.snoozed);
+  const snoozedShelfHeaderIndex = snoozedCount > 0 ? items.length : null;
+  pushBlocks(shelf(layout.snoozed, input.snoozedShelfExpanded === true));
+  const settledCount = orderedSettled.length - settledInLiveGroups;
+  const settledShelfHeaderIndex = settledCount > 0 ? items.length : null;
+  pushBlocks(shelf(layout.settled, input.settledShelfExpanded !== false));
   const last = items.at(-1);
   if (last) {
     items[items.length - 1] = { ...last, isLast: true };
@@ -823,11 +869,11 @@ export function buildThreadListV2Items(input: {
   return {
     items,
     hiddenSettledCount: orderedSettled.length - pagedSettled.length,
-    workingCount: orderedWorking.length,
+    workingCount,
     workingShelfHeaderIndex,
-    snoozedCount: orderedSnoozed.length,
+    snoozedCount,
     snoozedShelfHeaderIndex,
-    settledCount: orderedSettled.length,
+    settledCount,
     settledShelfHeaderIndex,
     nextSnoozeWakeAt,
   };
