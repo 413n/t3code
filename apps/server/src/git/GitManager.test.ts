@@ -1943,6 +1943,67 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     }),
   );
 
+  it.effect(
+    "status re-checks the local tip instead of reusing a stale moved-past verdict for minutes",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        yield* initRepo(repoDir);
+        const remoteDir = yield* createBareRemote();
+        yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+        yield* runGit(repoDir, ["checkout", "-b", "fix/cursor-usage-cache-savings"]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "fix/cursor-usage-cache-savings"]);
+        const releasedHead = yield* runGit(repoDir, ["rev-parse", "HEAD"]);
+
+        const { manager } = yield* makeManager({
+          ghScenario: {
+            prListSequence: [
+              // @effect-diagnostics-next-line preferSchemaOverJson:off
+              JSON.stringify([
+                {
+                  number: 13731,
+                  title: "fix(usage): price Cursor cache savings by base model",
+                  url: "https://github.com/pingdotgg/t3code/pull/13731",
+                  baseRefName: "main",
+                  headRefName: "fix/cursor-usage-cache-savings",
+                  headRefOid: releasedHead.stdout.trim(),
+                  state: "MERGED",
+                  mergedAt: "2026-04-02T15:00:00Z",
+                  updatedAt: "2026-04-02T15:00:00Z",
+                },
+              ]),
+            ],
+          },
+        });
+
+        // Move past the PR head and look it up once. The GitHub-side record
+        // (merged, this head commit) is now cached for minutes; the moved
+        // verdict must not be cached alongside it.
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(NodePath.join(repoDir, "next.md"), "next\n");
+        yield* runGit(repoDir, ["add", "next.md"]);
+        yield* runGit(repoDir, ["commit", "-m", "Work after the release merged"]);
+        const movedStatus = yield* manager.status({ cwd: repoDir });
+        expect(movedStatus.pr).toBeNull();
+
+        // An external `git reset` (outside the app, so nothing tells the PR
+        // cache to invalidate) puts the branch back on the PR's head commit.
+        // `prListSequence` has nothing left to hand out, so a passing re-check
+        // here proves the GitHub-side answer came from cache, not a second
+        // `gh` call, while the local-tip verdict is still correct.
+        yield* runGit(repoDir, ["reset", "--hard", releasedHead.stdout.trim()]);
+        // Only the 1-second outer status cache, standing in for the next
+        // periodic poll; the slower PR-lookup cache (and its single-shot fake
+        // `gh` answer) stays warm, same as it would for a real external change.
+        yield* manager.invalidateRemoteStatus(repoDir);
+        const restoredStatus = yield* manager.status({ cwd: repoDir });
+
+        expect(restoredStatus.pr?.number).toBe(13731);
+        expect(restoredStatus.pr?.state).toBe("merged");
+      }),
+  );
+
   it.effect("status still looks up PRs for a branch pushed without --set-upstream", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");

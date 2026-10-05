@@ -1228,7 +1228,7 @@ export const make = Effect.gen(function* () {
       return Effect.gen(function* () {
         const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
         if (!lookup) {
-          return { latest: null, headContext, superseded: null };
+          return { latest: null, headContext };
         }
         // Only skip when the branch is untracked as well: anything carrying an
         // upstream keeps the old behaviour.
@@ -1237,25 +1237,19 @@ export const make = Effect.gen(function* () {
           details.upstreamRef === null &&
           (yield* isUnpublishedBranch(cwd, headContext))
         ) {
-          return { latest: null, headContext, superseded: null };
+          return { latest: null, headContext };
         }
         const latest = yield* findLatestPrForHeadContext(cwd, headContext);
-        // A long-lived branch reused after its release merged (`develop` into
-        // `main`, then developed on) has moved off that change request's head
-        // commit, and every later thread on the branch would otherwise inherit
-        // the same historical number. Open change requests still follow their
-        // branch, so only terminal ones are checked.
-        if (
-          latest !== null &&
-          latest.state !== "open" &&
-          (yield* branchMovedPastChangeRequest(cwd, headContext, latest))
-        ) {
-          // Kept, not discarded: discovery has to tell a match rejected here
-          // from one that was never found, or it restores this very change
-          // request as a thread's saved historical reference.
-          return { latest: null, headContext, superseded: latest };
-        }
-        return { latest, headContext, superseded: null };
+        // Deliberately not filtered by the branch's current commit here: that
+        // comparison reads a local ref that can move at any time (an external
+        // `git reset`/`commit` the app never hears about), while this entry is
+        // cached for minutes. Baking a moving answer into a slow-changing cache
+        // means a branch reused after release can read as superseded for one
+        // poll and current for the next, both stale by the time they're read.
+        // Callers re-run `branchMovedPastChangeRequest` against this cached
+        // record on every call instead, so only the slow-changing half (what
+        // GitHub reports for this branch) is cached.
+        return { latest, headContext };
       });
     },
     {
@@ -1353,14 +1347,27 @@ export const make = Effect.gen(function* () {
       }
     }
     return yield* getPrLookup(cacheKey).pipe(
-      Effect.map(({ latest, headContext }) => {
-        if (!latest) return { pr: null, headContext };
+      Effect.flatMap(({ latest, headContext }) => {
+        if (!latest) return Effect.succeed({ pr: null, headContext });
         // On the default branch, only surface open PRs.
         // Merged/closed matches are usually reverse-merge history, not the thread's PR context.
         if (details.isDefaultBranch && latest.state !== "open") {
-          return { pr: null, headContext };
+          return Effect.succeed({ pr: null, headContext });
         }
-        return { pr: toStatusPr(latest), headContext };
+        if (latest.state === "open") {
+          return Effect.succeed({ pr: toStatusPr(latest), headContext });
+        }
+        // A long-lived branch reused after its release merged (`develop` into
+        // `main`, then developed on) has moved off that change request's head
+        // commit, and every later thread on the branch would otherwise inherit
+        // the same historical number. Checked fresh on every call (not cached
+        // alongside `latest` above): see the comment on the cache's compute
+        // function for why.
+        return branchMovedPastChangeRequest(cwd, headContext, latest).pipe(
+          Effect.map((moved) =>
+            moved ? { pr: null, headContext } : { pr: toStatusPr(latest), headContext },
+          ),
+        );
       }),
       Effect.tap(({ pr, headContext }) =>
         Effect.sync(() =>
@@ -2424,12 +2431,20 @@ export const make = Effect.gen(function* () {
     const resolved = yield* resolveBranchLookup({ cwd, branch }, options);
     if (resolved === null) return null;
     const { cached, defaultBranch } = resolved;
-    const { latest } = cached;
+    const { latest, headContext } = cached;
     if (latest === null) return null;
     if (
       (branch === defaultBranch ||
         (defaultBranch === null && (branch === "main" || branch === "master"))) &&
       latest.state !== "open"
+    ) {
+      return null;
+    }
+    // Checked fresh on every call, not cached alongside `latest` above: see
+    // the comment on the PR-lookup cache's compute function for why.
+    if (
+      latest.state !== "open" &&
+      (yield* branchMovedPastChangeRequest(cwd, headContext, latest))
     ) {
       return null;
     }
@@ -2445,19 +2460,26 @@ export const make = Effect.gen(function* () {
 
   /**
    * Whether `branch` has moved off `pullRequest`'s head commit, which is why
-   * the badge lookup reports nothing for it. Reads the entry that lookup
-   * already cached, so asking costs no extra git or host work.
+   * the badge lookup reports nothing for it. Reads the cached GitHub-side
+   * record `resolveBranchLookup` already fetched, then re-checks the branch's
+   * current local tip fresh, so asking costs no extra host work and never
+   * reads a stale verdict left over from a commit the branch has since moved
+   * away from (or back to).
    */
   const branchSupersededPullRequest: GitManager["Service"]["branchSupersededPullRequest"] =
     Effect.fn("branchSupersededPullRequest")(function* ({ cwd, branch, pullRequest }) {
       const resolved = yield* resolveBranchLookup({ cwd, branch });
-      const superseded = resolved?.cached.superseded ?? null;
-      if (superseded === null || superseded.number !== pullRequest.number) {
+      if (resolved === null) return false;
+      const { latest, headContext } = resolved.cached;
+      if (latest === null || latest.state === "open" || latest.number !== pullRequest.number) {
         return false;
       }
       // Numbers repeat across repositories, so the URLs have to agree before
       // this counts as the same change request.
-      return pullRequestRepositoryKey(superseded.url) === pullRequestRepositoryKey(pullRequest.url);
+      if (pullRequestRepositoryKey(latest.url) !== pullRequestRepositoryKey(pullRequest.url)) {
+        return false;
+      }
+      return yield* branchMovedPastChangeRequest(cwd, headContext, latest);
     });
 
   const invalidateLocalStatus: GitManager["Service"]["invalidateLocalStatus"] = Effect.fn(
