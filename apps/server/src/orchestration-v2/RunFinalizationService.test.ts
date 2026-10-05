@@ -6,6 +6,7 @@ import {
   ThreadId,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -429,6 +430,79 @@ it.effect.each(
     }
   }).pipe(Effect.provide(layer));
 });
+
+it.effect(
+  "picks the most recently updated provider session, not the last one in array order",
+  () => {
+    const threadId = ThreadId.make("thread-worktree-move-session-order");
+    const runId = RunId.make("completed-run");
+    const projectId = ProjectId.make("project-worktree-move-session-order");
+    // ProjectionStoreV2's SQL path orders providerSessions by updated_at, but
+    // layerMemory does not (#11078 review); this mock mirrors the unordered
+    // case deliberately, with the stale session listed last.
+    const providerSessions = [
+      {
+        cwd: "/repo/.claude/worktrees/current",
+        updatedAt: DateTime.makeUnsafe("2026-01-01T00:01:00Z"),
+      },
+      {
+        cwd: "/repo/.claude/worktrees/stale",
+        updatedAt: DateTime.makeUnsafe("2026-01-01T00:00:00Z"),
+      },
+    ] as never;
+    const dispatch = vi.fn(
+      (_command: Parameters<ThreadManagementService.ThreadManagementServiceShape["dispatch"]>[0]) =>
+        Effect.succeed({ sequence: 1, storedEvents: [] }),
+    );
+    const layer = RunFinalization.observerLive.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(WorkspaceEntries.WorkspaceEntries)({ refresh: () => Effect.void }),
+          Layer.mock(PullRequestService.PullRequestService)({
+            refreshAfterTurn: () => Effect.void,
+          }),
+          Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({
+            refreshLocalStatus: () =>
+              Effect.succeed({
+                isRepo: true,
+                hasPrimaryRemote: true,
+                isDefaultRef: false,
+                refName: "feature",
+                hasWorkingTreeChanges: false,
+                workingTree: { files: [], insertions: 0, deletions: 0 },
+              }),
+          }),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getThreadShell: () =>
+              Effect.succeed({
+                id: threadId,
+                projectId,
+                branch: "original",
+                worktreePath: null,
+                activeRunId: null,
+              } as OrchestrationV2ThreadShell),
+            getThreadProviderContext: () =>
+              Effect.succeed({ thread: undefined, providerSessions, providerThreads: [] } as never),
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({ dispatch }),
+          Layer.mock(ProjectService.ProjectService)({
+            getById: () =>
+              Effect.succeed(Option.some({ projectId, workspaceRoot: "/repo" } as never)),
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const observer = yield* RunFinalization.RunFinalizationObserver;
+      yield* observer.followWorktreeMove({ threadId, runId });
+      assert.equal(
+        (dispatch.mock.calls[0]?.[0] as { readonly worktreePath?: string } | undefined)
+          ?.worktreePath,
+        "/repo/.claude/worktrees/current",
+      );
+    }).pipe(Effect.provide(layer));
+  },
+);
 
 it.effect("does not follow a worktree move for a stale, no-longer-active run", () => {
   const threadId = ThreadId.make("thread-worktree-move-stale-run");

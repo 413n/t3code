@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -199,7 +200,14 @@ export const observerLive = Layer.effect(
         if (!thread) return;
         if (thread.activeRunId !== null && thread.activeRunId !== runId) return;
         const providerContext = yield* projections.getThreadProviderContext(threadId);
-        const liveCwd = providerContext.providerSessions.at(-1)?.cwd;
+        // Most recently updated, not last in array order: ProjectionStoreV2's
+        // SQL path already returns these ordered by updated_at, but
+        // layerMemory does not, so picking explicitly here works under both.
+        const liveCwd = providerContext.providerSessions
+          .toSorted(
+            (a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt),
+          )
+          .at(-1)?.cwd;
         if (liveCwd === undefined) return;
         const project = yield* projects.getById(thread.projectId);
         if (Option.isNone(project)) return;
