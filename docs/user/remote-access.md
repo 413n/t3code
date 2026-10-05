@@ -190,7 +190,7 @@ may do. A browser already signed in to that environment as an administrator can
 approve without a code.
 
 - **Read only** lets the agent read projects and threads in every project, and
-  nothing else.
+  see which providers and models are available. It cannot change anything.
 - **Supervised** through **Full access** also let it start, message and stop
   threads in every project, but it cannot start or steer a thread with more
   permissions than the mode you chose.
