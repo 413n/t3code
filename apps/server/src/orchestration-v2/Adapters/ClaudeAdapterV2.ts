@@ -825,6 +825,7 @@ export function makeClaudeQueryOptions(input: {
   readonly onUserDialog?: ClaudeQueryOptions["onUserDialog"];
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
   readonly allowDangerouslySkipPermissions?: boolean;
+  readonly hooks?: ClaudeQueryOptions["hooks"];
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection);
   const {
@@ -899,6 +900,7 @@ export function makeClaudeQueryOptions(input: {
     ...(input.supportedDialogKinds === undefined
       ? {}
       : { supportedDialogKinds: input.supportedDialogKinds }),
+    ...(input.hooks === undefined ? {} : { hooks: input.hooks }),
     ...(input.settings?.binaryPath
       ? { pathToClaudeCodeExecutable: input.settings.binaryPath }
       : {}),
@@ -3220,6 +3222,28 @@ export function makeClaudeAdapterV2(
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
+
+        // Live-tracks this session's actual cwd, separately from `session`
+        // (the snapshot ProviderSessionManager first registered this session
+        // with). Claude's EnterWorktree/ExitWorktree tools move the running
+        // session's cwd without going through any T3 command (#11078); the
+        // PostToolUse hook below reports that move here so the server can
+        // follow it at turn end, the same way it already follows a plain
+        // branch change (git checkout) inside an unmoved cwd.
+        const trackedCwd = yield* Ref.make(session.cwd);
+        const followWorktreeCwdChange = Effect.fn("ClaudeAdapterV2.followWorktreeCwdChange")(
+          function* (nextCwd: string) {
+            const previousCwd = yield* Ref.get(trackedCwd);
+            if (nextCwd === previousCwd) return;
+            yield* Ref.set(trackedCwd, nextCwd);
+            const updatedAt = yield* DateTime.now;
+            yield* emitProviderEvent({
+              type: "provider_session.updated",
+              driver: CLAUDE_PROVIDER,
+              providerSession: { ...session, cwd: nextCwd, updatedAt },
+            });
+          },
+        );
 
         // Claude emits retry progress but no recovered frame; the next
         // assistant message is the first reliable evidence of recovery.
@@ -6975,6 +6999,27 @@ export function makeClaudeAdapterV2(
             canUseTool,
             onUserDialog,
             supportedDialogKinds: ["resume_return"],
+            hooks: {
+              PostToolUse: [
+                {
+                  matcher: "^(EnterWorktree|ExitWorktree)$",
+                  hooks: [
+                    (hookInput) =>
+                      runPromise(
+                        Effect.gen(function* () {
+                          // agent_id is present only for a subagent's own
+                          // tool call; a subagent's worktree is its own
+                          // isolated concern, not this (root) session's.
+                          if (hookInput.hook_event_name === "PostToolUse" && !hookInput.agent_id) {
+                            yield* followWorktreeCwdChange(hookInput.cwd);
+                          }
+                          return {};
+                        }),
+                      ),
+                  ],
+                },
+              ],
+            },
           });
           const querySession = yield* queryRunner
             .open({

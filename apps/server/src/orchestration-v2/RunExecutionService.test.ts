@@ -1033,6 +1033,7 @@ it.effect.each(["failure", "interruption", "stale-attempt", "start-guard"] as co
             Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
               refresh: () => Effect.void,
               refreshAfterTurn: () => Ref.update(refreshes, (count) => count + 1),
+              followWorktreeMove: () => Effect.void,
             }),
           ),
         ),
@@ -3447,6 +3448,7 @@ function captureRootRunTermination(input: {
               Ref.update(observed, (current) => [...current, "pull-requests-refreshed"]).pipe(
                 Effect.andThen(input.refreshAfterTurn ?? Effect.void),
               ),
+            followWorktreeMove: () => Effect.void,
           }),
         ),
       ),
