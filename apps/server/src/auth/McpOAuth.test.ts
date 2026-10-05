@@ -28,7 +28,9 @@ import * as McpOAuthHttp from "./mcpOAuthHttp.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as AuthHttp from "./http.ts";
 
-class AuthTestApi extends HttpApi.make("environment").add(EnvironmentHttpApi.groups.auth) {}
+class AuthTestApi extends HttpApi.make("environment")
+  .add(EnvironmentHttpApi.groups.auth)
+  .add(EnvironmentHttpApi.groups.mcpOAuth) {}
 
 const layerConfig = ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-oauth-test-" });
 const layerEnvironmentAuth = EnvironmentAuth.layer.pipe(
@@ -40,12 +42,12 @@ const layerEnvironmentAuth = EnvironmentAuth.layer.pipe(
 // Each router gets its own database; the capture hands that router's EnvironmentAuth to its test.
 const makeLayerRoutes = (capture: (auth: EnvironmentAuth.EnvironmentAuth["Service"]) => void) =>
   Layer.mergeAll(
-    McpOAuthHttp.layerRoutes.pipe(Layer.provide(McpOAuth.layer)),
     Layer.effectDiscard(
       EnvironmentAuth.EnvironmentAuth.pipe(Effect.tap((auth) => Effect.sync(() => capture(auth)))),
     ),
     HttpApiBuilder.layer(AuthTestApi).pipe(
       Layer.provide(AuthHttp.layer),
+      Layer.provide(McpOAuthHttp.layer.pipe(Layer.provide(McpOAuth.layer))),
       Layer.provide(AuthHttp.layerAuthenticatedAuth),
     ),
   ).pipe(
@@ -105,18 +107,23 @@ const withRoutes = <A, E>(
 
 const json = <A>(response: Response) => Effect.promise(() => response.json() as Promise<A>);
 
-/** What the approval page posts: the agent's request plus the user's choice. */
-const postJson = (path: string, body: Record<string, string>, cookie?: string) =>
+const postJson = (path: string, body: unknown, cookie?: string) =>
   at(path, {
     method: "POST",
     headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
     body: encodeJson(body),
   });
 
-const decide = (handler: Handler, body: Record<string, string>, cookie?: string) =>
-  handler(postJson("/oauth/mcp/decision", body, cookie)).pipe(
+/** What the approval page posts: the agent's request plus the user's choice. */
+const decide = (
+  handler: Handler,
+  authorization: Record<string, string>,
+  decision: Record<string, string>,
+  cookie?: string,
+) =>
+  handler(postJson("/oauth/mcp/decision", { authorization, decision }, cookie)).pipe(
     Effect.flatMap((response) =>
-      json<{ redirectTo?: string; error?: string }>(response).pipe(
+      json<{ redirectTo?: string; message?: string }>(response).pipe(
         Effect.map((payload) => ({ status: response.status, ...payload })),
       ),
     ),
@@ -234,20 +241,18 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
       const pairing = yield* auth.issuePairingCredential();
       const params = authorizeParams(clientId);
 
-      const wrongCode = yield* decide(handler, {
-        ...params,
-        decision: "approve",
+      const wrongCode = yield* decide(handler, params, {
+        _tag: "pairing-code",
         access: "auto",
-        pairing_code: "nope",
+        code: "nope",
       });
       expect(wrongCode.status).toBe(400);
-      expect(wrongCode.error).toContain("unknown, expired, or already used");
+      expect(wrongCode.message).toContain("unknown, expired, or already used");
 
-      const approved = yield* decide(handler, {
-        ...params,
-        decision: "approve",
+      const approved = yield* decide(handler, params, {
+        _tag: "pairing-code",
         access: "auto",
-        pairing_code: pairing.credential,
+        code: pairing.credential,
       });
       expect(approved.status).toBe(200);
       const callback = new URL(approved.redirectTo!);
@@ -310,11 +315,10 @@ it.live("rejects a wrong PKCE verifier and spends the code", () =>
       const clientId = yield* registeredClientId(handler);
       const pairing = yield* auth.issuePairingCredential();
       const params = authorizeParams(clientId);
-      const approved = yield* decide(handler, {
-        ...params,
-        decision: "approve",
+      const approved = yield* decide(handler, params, {
+        _tag: "pairing-code",
         access: "approval-required",
-        pairing_code: pairing.credential,
+        code: pairing.credential,
       });
       const code = new URL(approved.redirectTo!).searchParams.get("code")!;
       const exchange = (codeVerifier: string) =>
@@ -346,18 +350,13 @@ it.live(
         const clientId = yield* registeredClientId(handler);
         const params = authorizeParams(clientId);
 
-        const denied = yield* decide(handler, { ...params, decision: "deny" });
+        const denied = yield* decide(handler, params, { _tag: "deny" });
         const deniedUrl = new URL(denied.redirectTo!);
         expect(deniedUrl.searchParams.get("error")).toBe("access_denied");
         expect(deniedUrl.searchParams.get("state")).toBe("state-1");
 
         const approveWith = (code: string) =>
-          decide(handler, {
-            ...params,
-            decision: "approve",
-            access: "auto",
-            pairing_code: code,
-          });
+          decide(handler, params, { _tag: "pairing-code", access: "auto", code });
 
         // A T3 Connect code is bound to a device key: refused, and still usable by its device.
         const bound = yield* auth.createPairingLink({
@@ -380,15 +379,14 @@ it.live(
         const readOnly = yield* auth.issuePairingCredential({ scopes: ["orchestration:read"] });
         const readOnlyResponse = yield* approveWith(readOnly.credential);
         expect(readOnlyResponse.status).toBe(400);
-        expect(readOnlyResponse.error).toContain("cannot grant this access");
+        expect(readOnlyResponse.message).toContain("cannot grant this access");
 
         // A read-only code can approve read-only access.
         const readOnlyCode = yield* auth.issuePairingCredential({ scopes: ["orchestration:read"] });
-        const readOnlyApproval = yield* decide(handler, {
-          ...params,
-          decision: "approve",
+        const readOnlyApproval = yield* decide(handler, params, {
+          _tag: "pairing-code",
           access: "read-only",
-          pairing_code: readOnlyCode.credential,
+          code: readOnlyCode.credential,
         });
         expect(readOnlyApproval.status).toBe(200);
         const readOnlyToken = yield* handler(
@@ -443,12 +441,8 @@ it.live("offers one-click only to a browser session that holds the scopes it wou
       expect(adminDetails.csrfToken).toEqual(expect.any(String));
       const oneClick = yield* decide(
         handler,
-        {
-          ...params,
-          decision: "approve",
-          access: "auto",
-          csrf_token: adminDetails.csrfToken!,
-        },
+        params,
+        { _tag: "browser-session", access: "auto", csrfToken: adminDetails.csrfToken! },
         admin,
       );
       expect(new URL(oneClick.redirectTo!).searchParams.get("code")).toEqual(expect.any(String));
@@ -458,11 +452,12 @@ it.live("offers one-click only to a browser session that holds the scopes it wou
       expect((yield* details(accessOnly)).csrfToken).toBeUndefined();
       const forged = yield* decide(
         handler,
-        { ...params, decision: "approve", access: "auto", csrf_token: "forged" },
+        params,
+        { _tag: "browser-session", access: "auto", csrfToken: "forged" },
         accessOnly,
       );
       expect(forged.status).toBe(400);
-      expect(forged.error).toContain("Enter a pairing code instead");
+      expect(forged.message).toContain("Enter a pairing code instead");
     }),
   ),
 );

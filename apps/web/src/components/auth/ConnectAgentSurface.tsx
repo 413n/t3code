@@ -1,14 +1,19 @@
 import {
-  AuthMcpApprovalDetails,
+  type AuthMcpApprovalDecision,
+  type AuthMcpApprovalDetails,
   AuthMcpApprovalError,
-  AuthMcpApprovalResult,
   AuthMcpClientAccess,
+  type AuthMcpAuthorizationRequest,
 } from "@t3tools/contracts";
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
 import { EyeIcon, type LucideIcon } from "lucide-react";
+import type * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 
+import { PrimaryEnvironmentHttpClient } from "~/environments/primary/httpClient";
+import { runPrimaryHttp } from "~/lib/runtime";
 import { cn } from "~/lib/utils";
 import { runtimeModeConfig } from "../chat/runtimeModeConfig";
 import { Alert, AlertDescription } from "../ui/alert";
@@ -17,11 +22,6 @@ import { Input } from "../ui/input";
 import { RadioGroup } from "../ui/radio-group";
 import { Spinner } from "../ui/spinner";
 import { AuthSurfaceShell } from "./AuthSurfaceShell";
-
-const decodeDetails = Schema.decodeUnknownOption(AuthMcpApprovalDetails);
-const decodeResult = Schema.decodeUnknownOption(AuthMcpApprovalResult);
-const decodeError = Schema.decodeUnknownOption(AuthMcpApprovalError);
-const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const accessConfig: Record<
   AuthMcpClientAccess,
@@ -40,43 +40,44 @@ type Loaded =
   | { readonly status: "invalid"; readonly message: string }
   | { readonly status: "ready"; readonly details: AuthMcpApprovalDetails };
 
+const UNREACHABLE = "Could not reach this environment. Try again.";
+const isApprovalError = Schema.is(AuthMcpApprovalError);
+
+type Answer<A> =
+  | { readonly kind: "ok"; readonly value: A }
+  | { readonly kind: "redirect"; readonly url: string }
+  | { readonly kind: "error"; readonly message: string };
+
 /**
- * Posts the agent's sign-in request, which the server validates again on every
- * call. Answers either the JSON the caller expects, a message to show, or a
- * URL the browser must follow (an approval, a denial, or a protocol error the
+ * Runs an approval call. The server validates the agent's request again on
+ * every call and answers what the page asked for, a message to show, or a URL
+ * the browser must follow (an approval, a denial, or a protocol error the
  * agent should receive).
  */
-async function postApproval(
-  path: "/oauth/mcp/approval" | "/oauth/mcp/decision",
-  body: Record<string, string>,
-): Promise<
-  | { readonly kind: "body"; readonly body: unknown }
-  | { readonly kind: "redirect"; readonly url: string }
-  | { readonly kind: "error"; readonly message: string }
-> {
-  const response = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "content-type": "application/json" },
-    body: encodeJson(body),
-  }).catch(() => undefined);
-  if (response === undefined) {
-    return { kind: "error", message: "Could not reach this environment. Try again." };
-  }
-  const payload: unknown = await response.json().catch(() => undefined);
-  const redirect = decodeResult(payload);
-  if (redirect._tag === "Some") return { kind: "redirect", url: redirect.value.redirectTo };
-  if (!response.ok) {
-    const error = decodeError(payload);
-    return {
-      kind: "error",
-      message: error._tag === "Some" ? error.value.error : "The sign-in could not continue.",
-    };
-  }
-  return { kind: "body", body: payload };
+function runApproval<A>(
+  call: (
+    client: Context.Service.Shape<typeof PrimaryEnvironmentHttpClient>,
+  ) => Effect.Effect<A | { readonly redirectTo: string }, unknown>,
+): Promise<Answer<A>> {
+  return runPrimaryHttp(
+    PrimaryEnvironmentHttpClient.pipe(
+      Effect.flatMap(call),
+      Effect.map((value): Answer<A> =>
+        typeof value === "object" && value !== null && "redirectTo" in value
+          ? { kind: "redirect", url: value.redirectTo }
+          : { kind: "ok", value: value as A },
+      ),
+      Effect.catch((error) =>
+        Effect.succeed<Answer<A>>({
+          kind: "error",
+          message: isApprovalError(error) ? error.message : UNREACHABLE,
+        }),
+      ),
+    ),
+  ).catch((): Answer<A> => ({ kind: "error", message: UNREACHABLE }));
 }
 
-function readRequestParams(): Record<string, string> {
+function readAuthorizationRequest(): AuthMcpAuthorizationRequest {
   return Object.fromEntries(new URL(window.location.href).searchParams);
 }
 
@@ -87,7 +88,7 @@ function readRequestParams(): Record<string, string> {
  * signed in to the environment as an administrator.
  */
 export function ConnectAgentSurface() {
-  const [params] = useState(readRequestParams);
+  const [authorization] = useState(readAuthorizationRequest);
   const [loaded, setLoaded] = useState<Loaded>({ status: "loading" });
   const [access, setAccess] = useState<AuthMcpClientAccess>("read-only");
   const [pairingCode, setPairingCode] = useState("");
@@ -96,41 +97,40 @@ export function ConnectAgentSurface() {
 
   useEffect(() => {
     let cancelled = false;
-    void postApproval("/oauth/mcp/approval", params).then((answer) => {
-      if (cancelled) return;
-      if (answer.kind === "redirect") {
-        window.location.replace(answer.url);
-        return;
-      }
-      if (answer.kind === "error") {
-        setLoaded({ status: "invalid", message: answer.message });
-        return;
-      }
-      const details = decodeDetails(answer.body);
-      setLoaded(
-        details._tag === "Some"
-          ? { status: "ready", details: details.value }
-          : { status: "invalid", message: "The sign-in could not continue." },
-      );
-    });
+    void runApproval((client) => client.mcpOAuth.approval({ payload: authorization })).then(
+      (answer) => {
+        if (cancelled) return;
+        if (answer.kind === "redirect") {
+          window.location.replace(answer.url);
+          return;
+        }
+        setLoaded(
+          answer.kind === "error"
+            ? { status: "invalid", message: answer.message }
+            : { status: "ready", details: answer.value },
+        );
+      },
+    );
     return () => {
       cancelled = true;
     };
-  }, [params]);
+  }, [authorization]);
 
   const decide = useCallback(
-    async (decision: "approve" | "deny") => {
+    async (choice: "approve" | "deny") => {
       if (loaded.status !== "ready") return;
-      setPending(decision);
+      setPending(choice);
       setErrorMessage("");
-      const answer = await postApproval("/oauth/mcp/decision", {
-        ...params,
-        decision,
-        access,
-        ...(loaded.details.csrfToken === undefined
-          ? { pairing_code: pairingCode.trim() }
-          : { csrf_token: loaded.details.csrfToken }),
-      });
+      const { csrfToken } = loaded.details;
+      const decision: AuthMcpApprovalDecision =
+        choice === "deny"
+          ? { _tag: "deny" }
+          : csrfToken === undefined
+            ? { _tag: "pairing-code", access, code: pairingCode.trim() }
+            : { _tag: "browser-session", access, csrfToken };
+      const answer = await runApproval((client) =>
+        client.mcpOAuth.decision({ payload: { authorization, decision } }),
+      );
       if (answer.kind === "redirect") {
         window.location.replace(answer.url);
         return;
@@ -138,7 +138,7 @@ export function ConnectAgentSurface() {
       setPending(null);
       setErrorMessage(answer.kind === "error" ? answer.message : "The sign-in could not continue.");
     },
-    [access, loaded, params, pairingCode],
+    [access, authorization, loaded, pairingCode],
   );
 
   if (loaded.status === "loading") {
