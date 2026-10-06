@@ -36,12 +36,8 @@ export class GitHubApiRequestError extends Schema.TaggedError<GitHubApiRequestEr
   "GitHubApiRequestError",
   { host: Schema.String, operation: Schema.String, cause: Schema.Defect() },
 ) {
-  get detail(): string {
-    return `Could not reach GitHub at ${this.host}.`;
-  }
-
   override get message(): string {
-    return `GitHub API failed in ${this.operation}: ${this.detail}`;
+    return `Could not reach GitHub at ${this.host}.`;
   }
 }
 
@@ -49,12 +45,8 @@ export class GitHubApiAuthenticationError extends Schema.TaggedError<GitHubApiAu
   "GitHubApiAuthenticationError",
   { host: Schema.String, operation: Schema.String },
 ) {
-  get detail(): string {
-    return `GitHub refused the credential for ${this.host}. Run \`gh auth login --hostname ${this.host}\` and retry.`;
-  }
-
   override get message(): string {
-    return `GitHub API failed in ${this.operation}: ${this.detail}`;
+    return `GitHub refused the credential for ${this.host}. Run \`gh auth login --hostname ${this.host}\` and retry.`;
   }
 }
 
@@ -66,12 +58,8 @@ export class GitHubApiRateLimitError extends Schema.TaggedError<GitHubApiRateLim
     retryAt: Schema.optionalKey(Schema.Finite),
   },
 ) {
-  get detail(): string {
-    return "GitHub API rate limit exceeded.";
-  }
-
   override get message(): string {
-    return `GitHub API failed in ${this.operation}: ${this.detail}`;
+    return "GitHub API rate limit exceeded.";
   }
 }
 
@@ -79,12 +67,8 @@ export class GitHubApiNotFoundError extends Schema.TaggedError<GitHubApiNotFound
   "GitHubApiNotFoundError",
   { host: Schema.String, operation: Schema.String },
 ) {
-  get detail(): string {
-    return "GitHub could not find the requested resource, or the credential cannot see it.";
-  }
-
   override get message(): string {
-    return `GitHub API failed in ${this.operation}: ${this.detail}`;
+    return "GitHub could not find the requested resource, or the credential cannot see it.";
   }
 }
 
@@ -101,14 +85,10 @@ export class GitHubApiResponseError extends Schema.TaggedError<GitHubApiResponse
     graphqlErrors: Schema.optionalKey(Schema.Array(Schema.String)),
   },
 ) {
-  get detail(): string {
+  override get message(): string {
     return this.graphqlErrors !== undefined && this.graphqlErrors.length > 0
       ? `GitHub returned an error: ${this.graphqlErrors.join("; ")}`
       : `GitHub returned HTTP ${this.status}.`;
-  }
-
-  override get message(): string {
-    return `GitHub API failed in ${this.operation}: ${this.detail}`;
   }
 }
 
@@ -355,16 +335,14 @@ export const make = Effect.gen(function* () {
         }),
         {
           Ok: () =>
-            limits
-              .recordSuccess({ ...key, lease })
-              .pipe(
-                Effect.as({
-                  status,
-                  headers,
-                  body: collected.text,
-                  truncated: collected.truncated,
-                }),
-              ),
+            limits.recordSuccess({ ...key, lease }).pipe(
+              Effect.as({
+                status,
+                headers,
+                body: collected.text,
+                truncated: collected.truncated,
+              }),
+            ),
           RateLimited: () =>
             Effect.gen(function* () {
               const retryAt = retryAtFrom(headers, yield* Clock.currentTimeMillis);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
@@ -223,7 +224,10 @@ describe("GitHubApi", () => {
 
 describe("GitHubCredentials", () => {
   const credentialsWith = (run: VcsProcess.VcsProcess["Service"]["run"]) =>
-    GitHubCredentials.layer.pipe(Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run })));
+    GitHubCredentials.layer.pipe(
+      Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run })),
+      Layer.provide(NodeServices.layer),
+    );
 
   it.effect("fails with GitHubCliMissingError when gh is not on PATH", () =>
     Effect.gen(function* () {

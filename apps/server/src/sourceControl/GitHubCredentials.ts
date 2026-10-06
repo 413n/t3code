@@ -1,13 +1,16 @@
 import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
-import * as NodeCrypto from "node:crypto";
+
+import { HostProcessEnvironment, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 
@@ -32,12 +35,8 @@ export class GitHubCliMissingError extends Schema.TaggedError<GitHubCliMissingEr
   "GitHubCliMissingError",
   { host: Schema.String },
 ) {
-  get detail(): string {
-    return `No GitHub credential for ${this.host}: set GH_TOKEN, or install the GitHub CLI and run \`gh auth login\`.`;
-  }
-
   override get message(): string {
-    return this.detail;
+    return `No GitHub credential for ${this.host}: set GH_TOKEN, or install the GitHub CLI and run \`gh auth login\`.`;
   }
 }
 
@@ -46,12 +45,8 @@ export class GitHubNotSignedInError extends Schema.TaggedError<GitHubNotSignedIn
   "GitHubNotSignedInError",
   { host: Schema.String },
 ) {
-  get detail(): string {
-    return `No GitHub credential for ${this.host}: run \`gh auth login --hostname ${this.host}\`.`;
-  }
-
   override get message(): string {
-    return this.detail;
+    return `No GitHub credential for ${this.host}: run \`gh auth login --hostname ${this.host}\`.`;
   }
 }
 
@@ -97,13 +92,20 @@ export function environmentToken(
   return null;
 }
 
-export function credentialFingerprint(host: string, token: string): string {
-  return `${host}:${NodeCrypto.createHash("sha256").update(token).digest("hex")}`;
-}
-
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const process = yield* VcsProcess.VcsProcess;
+  const crypto = yield* Crypto.Crypto;
+  const environment = yield* HostProcessEnvironment;
+  const workingDirectory = yield* HostProcessWorkingDirectory;
+
+  /** `host:sha256(token)`, safe for cache keys and rate-limit scopes. */
+  const fingerprintOf = (host: string, token: string) =>
+    crypto.digest("SHA-256", new TextEncoder().encode(token)).pipe(
+      Effect.map((digest) => `${host}:${Hex.encode(digest)}`),
+      // Hashing a string in memory has no platform failure worth a typed error.
+      Effect.orDie,
+    );
 
   const fromGh = (host: string) =>
     process
@@ -111,7 +113,7 @@ export const make = Effect.gen(function* () {
         operation: "GitHubCredentials.get",
         command: "gh",
         args: ["auth", "token", "--hostname", host],
-        cwd: globalThis.process.cwd(),
+        cwd: workingDirectory,
         // Never let gh print the token into a debug log.
         env: { GH_DEBUG: "", GH_PROMPT_DISABLED: "1" },
         timeoutMs: 10_000,
@@ -132,13 +134,13 @@ export const make = Effect.gen(function* () {
       );
 
   const lookup = Effect.fn("GitHubCredentials.lookup")(function* (host: string) {
-    const fromEnv = environmentToken(host, globalThis.process.env);
+    const fromEnv = environmentToken(host, environment);
     const token = fromEnv ?? (yield* fromGh(host));
     return {
       host,
       token: Redacted.make(token),
       source: fromEnv !== null ? "env" : "gh",
-      fingerprint: credentialFingerprint(host, token),
+      fingerprint: yield* fingerprintOf(host, token),
     } satisfies GitHubCredential;
   });
 
