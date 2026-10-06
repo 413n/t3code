@@ -21,6 +21,28 @@ import {
   unavailable,
 } from "./threadAccess.ts";
 
+// Only the classes below assign these, from their static blocks, so nothing
+// outside this module can build a declaration or a handlers layer.
+
+/** Builds a declaration; only the declaration functions below call it. */
+let declare: <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+) => Declaration<(params: P) => Effect.Effect<A, E, R>>;
+
+type CheckedHandlerOf<D> = D extends Declaration<infer Handler> ? Handler : never;
+
+/** Turns each declaration back into the handler it checks, keeping its type. */
+interface CheckedHandler extends Struct.Lambda {
+  <Handler>(declaration: Declaration<Handler>): Handler;
+  readonly "~lambda.out": CheckedHandlerOf<this["~lambda.in"]>;
+}
+let checkedHandler: CheckedHandler;
+
+/** Only `toLayer` below builds one. */
+let handlersLayer: <Tools extends Record<string, Tool.Any>, EX, RX>(
+  layer: Layer.Layer<Tool.HandlersFor<Tools>, EX, RX>,
+) => HandlersLayer<Tools, EX, RX>;
+
 /**
  * Who may call a T3 MCP tool. Every handler is built by one of the
  * declarations below, which say what the tool does. `toLayer` accepts only
@@ -41,20 +63,17 @@ import {
  * check what only they can see, such as a queued run belonging to its thread.
  */
 export class Declaration<out Handler> {
-  // A private field makes the class nominal: only `make` below produces one,
-  // and copying a declaration's fields onto anything else fails to typecheck
-  // and, at runtime, to run.
+  // A private field makes the class nominal, and only this module can build
+  // one: its constructor is private and the static block hands the only way
+  // in to module-scoped functions. Copying a declaration's fields onto
+  // anything else fails to typecheck and, at runtime, to run.
   readonly #handle: Handler;
   private constructor(handle: Handler) {
     this.#handle = handle;
   }
-  /** @internal Builds a declaration; only the functions below call it. */
-  static make<P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) {
-    return new Declaration(handle);
-  }
-  /** @internal The checked handler, for `toLayer`. */
-  static handler<Handler>(declaration: Declaration<Handler>): Handler {
-    return declaration.#handle;
+  static {
+    declare = (handle) => new Declaration(handle);
+    checkedHandler = Struct.lambda<CheckedHandler>((declaration) => declaration.#handle);
   }
 }
 
@@ -67,11 +86,11 @@ const requireThreadCaller = McpInvocationContext.McpInvocationContext.pipe(
 
 /** Changes nothing, so every caller may call it. */
 export const reads = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  Declaration.make((params: P) => handle(params));
+  declare((params: P) => handle(params));
 
 /** Reads what belongs to the calling T3 thread, such as its preview tabs or devices. */
 export const readsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  Declaration.make((params: P) => requireThreadCaller.pipe(Effect.flatMap(() => handle(params))));
+  declare((params: P) => requireThreadCaller.pipe(Effect.flatMap(() => handle(params))));
 
 /**
  * Acts as the calling T3 thread (its subagents, preview tabs, devices,
@@ -79,7 +98,7 @@ export const readsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A
  * T3 thread has one.
  */
 export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  Declaration.make((params: P) =>
+  declare((params: P) =>
     requireThreadCaller.pipe(
       Effect.flatMap(() => writingCaller),
       Effect.flatMap(() => handle(params)),
@@ -88,7 +107,7 @@ export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A,
 
 /** Changes something that belongs to no thread, such as a pending upload or a scheduled task. */
 export const writes = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  Declaration.make((params: P) => writingCaller.pipe(Effect.flatMap(() => handle(params))));
+  declare((params: P) => writingCaller.pipe(Effect.flatMap(() => handle(params))));
 
 /**
  * Changes the threads `threads` names. An omitted id is the caller's own
@@ -99,7 +118,7 @@ export const writesThreads = <P, A, E, R>(
   threads: (params: P) => ReadonlyArray<ThreadId | undefined>,
   handle: (params: P) => Effect.Effect<A, E, R>,
 ) =>
-  Declaration.make((params: P) =>
+  declare((params: P) =>
     Effect.gen(function* () {
       const caller = yield* writingCaller;
       for (const threadId of threads(params)) {
@@ -129,7 +148,7 @@ export const startsThreads = <P, A, E, R>(
   },
   handle: (params: P, modes: StartedModes) => Effect.Effect<A, E, R>,
 ) =>
-  Declaration.make((params: P) =>
+  declare((params: P) =>
     Effect.gen(function* () {
       const { limits } = yield* writingCaller;
       const requested = modes(params);
@@ -161,7 +180,7 @@ export const writesEnvironment = <P, A, E, R>(
   const check = writingCaller.pipe(
     Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
   );
-  return Declaration.make((params: P) => check.pipe(Effect.flatMap(() => handle(params, check))));
+  return declare((params: P) => check.pipe(Effect.flatMap(() => handle(params, check))));
 };
 
 /** What a declaration's own check needs. */
@@ -193,11 +212,8 @@ export class HandlersLayer<Tools extends Record<string, Tool.Any>, EX = never, R
   private constructor(layer: Layer.Layer<Tool.HandlersFor<Tools>, EX, RX>) {
     this.#layer = layer;
   }
-  /** @internal Only `toLayer` below builds one. */
-  static make<Tools extends Record<string, Tool.Any>, EX, RX>(
-    layer: Layer.Layer<Tool.HandlersFor<Tools>, EX, RX>,
-  ) {
-    return new HandlersLayer(layer);
+  static {
+    handlersLayer = (layer) => new HandlersLayer(layer);
   }
   /** The handlers, for registering this toolkit on the MCP server. */
   static layer<Tools extends Record<string, Tool.Any>, EX, RX>(
@@ -207,14 +223,6 @@ export class HandlersLayer<Tools extends Record<string, Tool.Any>, EX = never, R
   }
 }
 
-type CheckedHandlerOf<D> = D extends Declaration<infer Handler> ? Handler : never;
-
-/** Turns each declaration back into the handler it checks, keeping its type. */
-interface CheckedHandler extends Struct.Lambda {
-  <Handler>(declaration: Declaration<Handler>): Handler;
-  readonly "~lambda.out": CheckedHandlerOf<this["~lambda.in"]>;
-}
-const checkedHandler = Struct.lambda<CheckedHandler>(Declaration.handler);
 const checkedHandlers = <Handlers>(declarations: Declarations<Handlers>): Handlers =>
   Struct.map(declarations, checkedHandler);
 
@@ -223,7 +231,7 @@ export const toLayer = <Tools extends Record<string, Tool.Any>, EX = never, RX =
   toolkit: Toolkit.Toolkit<Tools>,
   build: Handlers<Tools> | Effect.Effect<Handlers<Tools>, EX, RX>,
 ): HandlersLayer<Tools, EX, Exclude<RX, Scope.Scope>> =>
-  HandlersLayer.make(
+  handlersLayer(
     toolkit.toLayer(
       Effect.isEffect(build)
         ? Effect.map(build, checkedHandlers<Toolkit.HandlersFrom<Tools>>)

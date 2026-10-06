@@ -1369,11 +1369,6 @@ const make = Effect.gen(function* () {
     }).pipe(Effect.timeoutOption(Duration.millis(timeoutMs)), Effect.map(Option.flatten));
 
   /**
-   * A scheduled task the caller may change: one whose modes are no broader
-   * than the caller's own, so editing its prompt cannot run work above the
-   * caller's limits.
-   */
-  /**
    * The modes a task's runs execute at: its own, or for a task bound to a
    * thread, also that thread's modes as they are now, since its runs are
    * messages to that thread.
@@ -1398,22 +1393,38 @@ const make = Effect.gen(function* () {
     runtimeModeRank(modes.runtimeMode) <= runtimeModeRank(limits.runtimeMode) &&
     interactionModeRank(modes.interactionMode) <= interactionModeRank(limits.interactionMode);
 
+  /**
+   * A task as the caller may see it. Its webhook URL starts runs, so only a
+   * caller that may start one sees it: a thread caller with a live turn, at
+   * modes covering every mode the task runs at.
+   */
   const summarizeScheduledTask = (
-    task: ScheduledTask,
-    limits: {
-      readonly runtimeMode: RuntimeMode;
-      readonly interactionMode: ProviderInteractionMode;
+    scope: McpInvocationScope,
+    caller: {
+      readonly parent: Pick<OrchestrationV2ThreadProjection, "thread" | "runs"> | undefined;
+      readonly limits: {
+        readonly runtimeMode: RuntimeMode;
+        readonly interactionMode: ProviderInteractionMode;
+      };
     },
+    task: ScheduledTask,
   ) =>
-    scheduledTaskRunModes(task).pipe(
-      Effect.map((modes) =>
-        scheduledTaskSummary(
-          task,
-          modes.every((mode) => withinLimits(limits, mode)),
-        ),
-      ),
-    );
+    Effect.gen(function* () {
+      const live =
+        caller.parent === undefined ||
+        Exit.isSuccess(yield* Effect.exit(assertLiveCaller(scope, caller.parent)));
+      const modes = yield* scheduledTaskRunModes(task);
+      return scheduledTaskSummary(
+        task,
+        live && modes.every((mode) => withinLimits(caller.limits, mode)),
+      );
+    });
 
+  /**
+   * A scheduled task the caller may change: one whose runs execute at modes no
+   * broader than the caller's own, so editing its prompt cannot run work above
+   * the caller's limits.
+   */
   const loadScheduledTask = (
     scheduledTaskId: ScheduledTask["id"],
     limits: {
@@ -1499,7 +1510,7 @@ const make = Effect.gen(function* () {
               failure("orchestration_error", `Could not schedule task: ${error.message}`),
             ),
           );
-        return yield* summarizeScheduledTask(task, limits);
+        return yield* summarizeScheduledTask(scope, { parent, limits }, task);
       }),
     listScheduledTasks: (scope, input) =>
       Effect.gen(function* () {
@@ -1515,7 +1526,7 @@ const make = Effect.gen(function* () {
         return {
           tasks: yield* Effect.forEach(
             tasks.filter((task) => projectId === undefined || task.projectId === projectId),
-            (task) => summarizeScheduledTask(task, limits),
+            (task) => summarizeScheduledTask(scope, { parent, limits }, task),
           ),
         };
       }),
@@ -1570,7 +1581,7 @@ const make = Effect.gen(function* () {
               failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
             ),
           );
-        return yield* summarizeScheduledTask(task, limits);
+        return yield* summarizeScheduledTask(scope, { parent, limits }, task);
       }),
     deleteScheduledTask: (scope, input) =>
       Effect.gen(function* () {

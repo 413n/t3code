@@ -136,6 +136,12 @@ export const refusedAtCompileTime = () => {
       McpToolAccess.reads(() => ran),
     ),
   });
+  // @ts-expect-error a declaration built outside McpToolAccess
+  McpToolAccess.Declaration.make(unchecked);
+  // @ts-expect-error a declaration constructed directly
+  new McpToolAccess.Declaration(unchecked);
+  // @ts-expect-error a handlers layer built outside McpToolAccess
+  McpToolAccess.HandlersLayer.make(Layer.empty);
   // The refused layer below types its error and services as unknown, which is fine here.
   // @effect-diagnostics-next-line anyUnknownInErrorContext:off
   McpHttpServer.toolkitRegistration(
