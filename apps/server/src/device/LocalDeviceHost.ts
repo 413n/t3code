@@ -623,29 +623,30 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
     );
     yield* onPhase("starting");
     const hub = yield* spawnHub(hubTool, nodePath);
-    // Until the hub is in runningRef, nothing else stops it.
-    const [axExists, cliExists] = yield* Effect.gen(function* () {
+    // Until the hub is in runningRef, nothing else stops it, so publishing it
+    // is part of the guarded step.
+    const next = yield* Effect.gen(function* () {
       yield* pruneLocalDeviceTools(config.baseDir, nodePath, "hub").pipe(
         Effect.provideService(Path.Path, path),
         Effect.provideService(ProcessRunner.ProcessRunner, runner),
         Effect.ignore,
       );
       const candidate = helperPaths(hubTool);
-      return yield* Effect.all([
+      const [axExists, cliExists] = yield* Effect.all([
         fs.exists(candidate.serveSimAxSettings).pipe(Effect.orElseSucceed(() => false)),
         fs.exists(candidate.serveSimCli).pipe(Effect.orElseSucceed(() => false)),
       ]);
+      const next: RunningHost = {
+        hub,
+        agentDevice: null,
+        helpers: {
+          serveSimAxSettings: axExists ? candidate.serveSimAxSettings : null,
+          serveSimCli: cliExists ? candidate.serveSimCli : null,
+        },
+      };
+      yield* Ref.set(runningRef, next);
+      return next;
     }).pipe(Effect.onError(() => stopHub(hub)));
-    const candidate = helperPaths(hubTool);
-    const next: RunningHost = {
-      hub,
-      agentDevice: null,
-      helpers: {
-        serveSimAxSettings: axExists ? candidate.serveSimAxSettings : null,
-        serveSimCli: cliExists ? candidate.serveSimCli : null,
-      },
-    };
-    yield* Ref.set(runningRef, next);
     yield* Ref.set(restartDelayRef, 0);
     yield* Effect.forkDetach(superviseHub(hub, hubTool));
     return next;
