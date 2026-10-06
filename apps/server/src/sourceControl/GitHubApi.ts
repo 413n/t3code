@@ -32,6 +32,16 @@ export const PinnedGitHubCredential = Context.Reference<{
   readonly credentialFingerprint: string;
 } | null>("t3/sourceControl/PinnedGitHubCredential", { defaultValue: () => null });
 
+/**
+ * Set by interactive callers (a user's read or write, not a background sweep). Requests made
+ * under it may spend the GraphQL reserve and go through a rate-limit pause: a user acting on a
+ * pull request should not be refused because a background read exhausted the quota.
+ */
+export const AllowGitHubReserve = Context.Reference<boolean>(
+  "t3/sourceControl/AllowGitHubReserve",
+  { defaultValue: () => false },
+);
+
 export class GitHubApiRequestError extends Schema.TaggedError<GitHubApiRequestError>()(
   "GitHubApiRequestError",
   { host: Schema.String, operation: Schema.String, cause: Schema.Defect() },
@@ -120,7 +130,7 @@ export interface GitHubRestInput {
   /** Revalidates a cached answer. A 304 is returned rather than failed, and is free. */
   readonly ifNoneMatch?: string;
   readonly maxResponseBytes?: number;
-  /** Interactive reads may run through a pause, the way they may spend the GraphQL reserve. */
+  /** Overrides `AllowGitHubReserve` for this one request. */
   readonly allowReserve?: boolean;
 }
 
@@ -392,14 +402,18 @@ export const make = Effect.gen(function* () {
       input.body === undefined
         ? withEtag
         : withEtag.pipe(HttpClientRequest.bodyJsonUnsafe(input.body));
-    return send({
-      host: input.host,
-      operation: input.operation,
-      request,
-      maxResponseBytes: input.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
-      allowReserve: input.allowReserve === true,
-      acceptNotModified: input.ifNoneMatch !== undefined,
-    });
+    return AllowGitHubReserve.pipe(
+      Effect.flatMap((interactive) =>
+        send({
+          host: input.host,
+          operation: input.operation,
+          request,
+          maxResponseBytes: input.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+          allowReserve: input.allowReserve ?? interactive,
+          acceptNotModified: input.ifNoneMatch !== undefined,
+        }),
+      ),
+    );
   };
 
   const graphql: GitHubApi["Service"]["graphql"] = Effect.fn("GitHubApi.graphql")(
@@ -407,11 +421,12 @@ export const make = Effect.gen(function* () {
       const host = normalizeHost(input.host);
       const { fingerprint } = yield* credential(host);
       const scope = (yield* SourceControlRateLimit.CredentialScope) || fingerprint;
+      const allowReserve = input.allowReserve ?? (yield* AllowGitHubReserve);
       return yield* Effect.gen(function* () {
         const query = yield* budget.query(
           host,
           input.query,
-          input.allowReserve === true ? { allowReserve: true } : undefined,
+          allowReserve ? { allowReserve: true } : undefined,
         );
         const response = yield* send({
           host,
@@ -421,7 +436,7 @@ export const make = Effect.gen(function* () {
             HttpClientRequest.bodyJsonUnsafe({ query, variables: input.variables ?? {} }),
           ),
           maxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
-          allowReserve: input.allowReserve === true,
+          allowReserve,
           acceptNotModified: false,
           graphql: true,
         });

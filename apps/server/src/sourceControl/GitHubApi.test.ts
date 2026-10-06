@@ -184,6 +184,39 @@ describe("GitHubApi", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("lets an interactive request through a pause a background read recorded", () => {
+    const reset = Math.floor(NOW / 1000) + 600;
+    let call = 0;
+    const { layer, requests } = harness(() =>
+      ++call === 1
+        ? json(
+            { message: "API rate limit exceeded" },
+            {
+              status: 403,
+              headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) },
+            },
+          )
+        : json({ ok: true }),
+    );
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const api = yield* GitHubApi.GitHubApi;
+      const read = { host: "github.com", operation: "sweep", path: "repos/acme/web/pulls" };
+      yield* Effect.flip(api.rest(read));
+      expect((yield* Effect.flip(api.rest(read)))._tag).toBe("SourceControlRateLimitPausedError");
+      const merged = yield* api
+        .rest({
+          host: "github.com",
+          operation: "merge",
+          method: "PUT",
+          path: "repos/acme/web/pulls/7/merge",
+        })
+        .pipe(Effect.provideService(GitHubApi.AllowGitHubReserve, true));
+      expect(merged.status).toBe(200);
+      expect(requests).toHaveLength(2);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("maps REST 403 with an exhausted quota to a rate limit, and 304 to an answer", () => {
     let call = 0;
     const { layer } = harness(() =>
