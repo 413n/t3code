@@ -83,8 +83,9 @@ export class GitHubApiNotFoundError extends Schema.TaggedError<GitHubApiNotFound
 }
 
 /**
- * GitHub answered with a failure that is none of the above. `graphqlErrors` carries GitHub's own
- * error messages for a GraphQL answer: they name the field and the reason, never a token.
+ * GitHub answered with a failure that is none of the above. `githubErrors` carries GitHub's own
+ * error messages, from a GraphQL `errors` list or a REST `message`/`errors` body: they name the
+ * field and the reason ("A pull request already exists for acme:feature"), never a token.
  */
 export class GitHubApiResponseError extends Schema.TaggedError<GitHubApiResponseError>()(
   "GitHubApiResponseError",
@@ -92,12 +93,12 @@ export class GitHubApiResponseError extends Schema.TaggedError<GitHubApiResponse
     host: Schema.String,
     operation: Schema.String,
     status: Schema.Int,
-    graphqlErrors: Schema.optionalKey(Schema.Array(Schema.String)),
+    githubErrors: Schema.optionalKey(Schema.Array(Schema.String)),
   },
 ) {
   override get message(): string {
-    return this.graphqlErrors !== undefined && this.graphqlErrors.length > 0
-      ? `GitHub returned an error: ${this.graphqlErrors.join("; ")}`
+    return this.githubErrors !== undefined && this.githubErrors.length > 0
+      ? `GitHub returned an error: ${this.githubErrors.join("; ")}`
       : `GitHub returned HTTP ${this.status}.`;
   }
 }
@@ -204,6 +205,46 @@ const decodeGraphQlErrors = Schema.decodeUnknownOption(
   ),
 );
 
+/** A REST failure body: `{ message, errors: [{ message } | { resource, field, code }] }`. */
+const decodeRestErrors = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      message: Schema.optional(Schema.String),
+      errors: Schema.optional(
+        Schema.Array(
+          Schema.Union([
+            Schema.String,
+            Schema.Struct({
+              message: Schema.optional(Schema.String),
+              field: Schema.optional(Schema.String),
+              code: Schema.optional(Schema.String),
+            }),
+          ]),
+        ),
+      ),
+    }),
+  ),
+);
+
+function restErrorMessages(body: string): ReadonlyArray<string> | undefined {
+  return Option.match(decodeRestErrors(body), {
+    onNone: () => undefined,
+    onSome: (decoded) => {
+      const details = (decoded.errors ?? []).flatMap((error) =>
+        typeof error === "string"
+          ? [error]
+          : error.message !== undefined
+            ? [error.message]
+            : error.field !== undefined && error.code !== undefined
+              ? [`${error.field} ${error.code}`]
+              : [],
+      );
+      const messages = [...(decoded.message === undefined ? [] : [decoded.message]), ...details];
+      return messages.length > 0 ? messages : undefined;
+    },
+  });
+}
+
 /** What one GitHub answer means, decided once from its status, headers and body. */
 type Answer = Data.TaggedEnum<{
   Ok: {};
@@ -253,7 +294,7 @@ function classify(input: {
   if ((status >= 200 && status < 300) || (status === 304 && input.acceptNotModified)) {
     return Answer.Ok();
   }
-  return Answer.Failed({ messages: undefined });
+  return Answer.Failed({ messages: input.graphql ? undefined : restErrorMessages(body) });
 }
 
 /** @public Service construction is part of the canonical Effect module API. */
@@ -377,7 +418,7 @@ export const make = Effect.gen(function* () {
               new GitHubApiResponseError({
                 ...context,
                 status,
-                ...(messages === undefined ? {} : { graphqlErrors: messages }),
+                ...(messages === undefined ? {} : { githubErrors: messages }),
               }),
             ),
         },

@@ -184,6 +184,38 @@ describe("GitHubApi", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("carries GitHub's own reason for a refused REST request", () => {
+    const { layer } = harness(() =>
+      json(
+        {
+          message: "Validation Failed",
+          errors: [
+            {
+              resource: "PullRequest",
+              code: "custom",
+              message: "A pull request already exists for acme:feature.",
+            },
+          ],
+        },
+        { status: 422 },
+      ),
+    );
+    return Effect.gen(function* () {
+      const api = yield* GitHubApi.GitHubApi;
+      const error = yield* Effect.flip(
+        api.rest({
+          host: "github.com",
+          operation: "createPullRequest",
+          method: "POST",
+          path: "repos/acme/web/pulls",
+        }),
+      );
+      expect(error.message).toBe(
+        "GitHub returned an error: Validation Failed; A pull request already exists for acme:feature.",
+      );
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("lets an interactive request through a pause a background read recorded", () => {
     const reset = Math.floor(NOW / 1000) + 600;
     let call = 0;
