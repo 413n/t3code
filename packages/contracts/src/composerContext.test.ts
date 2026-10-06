@@ -223,13 +223,8 @@ describe("OrchestrationMessageContext", () => {
           payload: { count: Number.NaN },
         },
         { ...knownRecords["review-comment"], contextId: "ctx_3", fenceLanguage: undefined },
-        {
-          ...base,
-          contextId: "ctx_4",
-          kind: "future-kind",
-          label: "deep",
-          payload: Array.from({ length: 20_000 }).reduce((inner: unknown) => [inner], 0),
-        },
+        // JSON.stringify throws on a bigint on every engine.
+        { ...base, contextId: "ctx_4", kind: "future-kind", label: "y", payload: { n: 1n } },
       ],
     });
     expect(decodeContext(wire).records.map((record) => record.contextId)).toEqual(["ctx_1"]);

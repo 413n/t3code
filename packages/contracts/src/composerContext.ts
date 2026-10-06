@@ -250,7 +250,7 @@ export const UnknownContextRecord = Schema.Struct({
       try {
         encoded = JSON.stringify(payload);
       } catch {
-        // Cycles, bigints and payloads nested too deep to stringify.
+        // Cycles, bigints, and payloads nested deeper than this engine's stack.
         return false;
       }
       // Only JSON values, so a payload the wire cannot carry (a Date, NaN, an
