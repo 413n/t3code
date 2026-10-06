@@ -396,9 +396,10 @@ function hasOnlyCommentRowsBetween(
   return true;
 }
 
-/** A segment's lines and the rest of its hunk after them, read lazily. */
+/** A segment's lines and the rest of its hunk after them, read lazily and capped like a batch. */
 function* linesToHunkEnd(rows: ReadonlyArray<NativeReviewDiffRow>, fromRowIndex: number) {
-  for (let rowIndex = fromRowIndex; rowIndex < rows.length; rowIndex += 1) {
+  const endRowIndex = Math.min(rows.length, fromRowIndex + NATIVE_REVIEW_DIFF_VISIBLE_MAX_ROWS);
+  for (let rowIndex = fromRowIndex; rowIndex < endRowIndex; rowIndex += 1) {
     const row = rows[rowIndex]!;
     if (row.kind === "comment") continue;
     if (!isHighlightableLineRow(row)) return;
