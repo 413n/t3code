@@ -1,4 +1,5 @@
 import {
+  OrchestratorMcpFailure,
   ToolActivityIcon,
   PreviewAutomationClickInput,
   PreviewAutomationError,
@@ -26,11 +27,16 @@ import { Tool, Toolkit } from "effect/ai";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
 import * as ServerConfig from "../../../config.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
+  ThreadManagementService.ThreadManagementService,
   PreviewAutomationBroker.PreviewAutomationBroker,
 ];
+
+/** What a browser action fails with, including the access gate's refusal. */
+const PreviewToolFailure = Schema.Union([PreviewAutomationError, OrchestratorMcpFailure]);
 
 const presentationFields = { toolIcon: Schema.optional(ToolActivityIcon) };
 
@@ -55,7 +61,7 @@ const PreviewStatusTool = Tool.make("preview_status", {
     "Report whether a collaborative browser tab is automation-capable, including its URL, title, visibility, loading state, viewport mode, and measured CSS-pixel size. Pass tabId to inspect a specific tab; omit it to use this agent session's current tab.",
   parameters: PreviewAutomationTabTargetInput,
   success: PreviewAutomationStatus,
-  failure: PreviewAutomationError,
+  failure: PreviewToolFailure,
   dependencies,
 })
   .annotate(Tool.Title, "Get preview status")
@@ -69,7 +75,7 @@ const PreviewOpenTool = browserTool(
       "Initialize a collaborative browser tab and open its thread-bound inline preview by default. Set open=false for background-only automation. Pass tabId to reuse a specific existing tab, set reuseExistingTab=false to create another tab, or omit both to use this agent session's current tab.",
     parameters: PreviewAutomationOpenInput,
     success: PreviewAutomationStatus,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   })
     .annotate(Tool.Title, "Open browser preview")
@@ -82,7 +88,7 @@ const PreviewNavigateTool = safeBrowserTool(
       "Navigate a collaborative browser tab. Pass tabId to target a specific tab, plus {url:'https://t3.chat'} for a website or {target:{kind:'environment-port',port:5173}} for a dev server. Exactly one of url or target is required.",
     parameters: PreviewAutomationNavigateInput,
     success: PreviewAutomationStatus,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Navigate browser preview"),
 );
@@ -93,7 +99,7 @@ const PreviewResizeTool = safeBrowserTool(
       "Resize a collaborative browser tab, optionally selected by tabId. Use {mode:'fill'}, {mode:'freeform',width:1024,height:768}, or {mode:'preset',preset:'iphone-12-pro',orientation:'portrait'}. This changes CSS layout breakpoints without changing the desktop browser user agent.",
     parameters: PreviewAutomationResizeInput,
     success: Schema.Struct({ ...PreviewAutomationResizeResult.fields, ...presentationFields }),
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   })
     .annotate(Tool.Title, "Resize browser viewport")
@@ -109,7 +115,7 @@ const PreviewSetAppearanceTool = safeBrowserTool(
       ...PreviewAutomationSetColorSchemeResult.fields,
       ...presentationFields,
     }),
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   })
     .annotate(Tool.Title, "Set preview appearance")
@@ -136,7 +142,7 @@ export const PreviewSnapshotTool = readonlyBrowserTool(
       ),
     }),
     success: PreviewAutomationSnapshot,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Inspect browser page"),
 );
@@ -147,7 +153,7 @@ const PreviewClickTool = browserTool(
       "Click exactly one target in the tab selected by tabId, or this agent session's current tab when omitted. Prefer a Playwright locator; selector accepts legacy CSS; x and y must be supplied together.",
     parameters: PreviewAutomationClickInput,
     success: PreviewActionResult,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Click preview page"),
 );
@@ -158,7 +164,7 @@ const PreviewTypeTool = browserTool(
       "Insert literal text into one input in the tab selected by tabId, or this agent session's current tab when omitted. Prefer a Playwright locator; set clear=true to replace existing text.",
     parameters: PreviewAutomationTypeInput,
     success: PreviewActionResult,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Type into preview page"),
 );
@@ -169,7 +175,7 @@ const PreviewPressTool = browserTool(
       "Press one keyboard key in the tab selected by tabId, or this agent session's current tab when omitted. Examples: {key:'Enter'}, {key:'Escape'}, or {key:'a',modifiers:['Meta']}.",
     parameters: PreviewAutomationPressInput,
     success: PreviewActionResult,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Press key in preview page"),
 );
@@ -180,7 +186,7 @@ const PreviewScrollTool = safeBrowserTool(
       "Scroll the tab selected by tabId, or this agent session's current tab when omitted. Positive deltaY scrolls down and positive deltaX scrolls right; a locator/selector targets a container.",
     parameters: PreviewAutomationScrollInput,
     success: PreviewActionResult,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Scroll preview page"),
 );
@@ -203,7 +209,7 @@ const PreviewEvaluateTool = browserTool(
       "Evaluate JavaScript in the tab selected by tabId, or this agent session's current tab when omitted. Returns {value} with a serializable result up to 64 KB; the expression may mutate page state.",
     parameters: PreviewAutomationEvaluateInput,
     success: PreviewEvaluateResult,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Evaluate JavaScript in preview"),
 );
@@ -214,7 +220,7 @@ const PreviewWaitForTool = readonlyBrowserTool(
       "Wait in the tab selected by tabId, or this agent session's current tab when omitted, until all supplied locator, selector, text, and URL conditions match.",
     parameters: PreviewAutomationWaitForInput,
     success: PreviewActionResult,
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Wait for preview page condition"),
 );
@@ -225,7 +231,7 @@ const PreviewRecordingStartTool = safeBrowserTool(
       "Start recording the collaborative browser tab selected by tabId, or this agent session's current tab when omitted.",
     parameters: PreviewAutomationTabTargetInput,
     success: Schema.Struct({ ...PreviewAutomationRecordingStatus.fields, ...presentationFields }),
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies,
   }).annotate(Tool.Title, "Start browser recording"),
 );
@@ -236,7 +242,7 @@ const PreviewRecordingStopTool = safeBrowserTool(
       "Stop recording the collaborative browser tab selected by tabId, or this agent session's current tab when omitted, and transfer the compressed recording once (up to 50 MiB) to an evidence file readable in this agent's environment. Returns its environment-local path after transfer succeeds.",
     parameters: PreviewAutomationTabTargetInput,
     success: Schema.Struct({ ...PreviewAutomationRecordingArtifact.fields, ...presentationFields }),
-    failure: PreviewAutomationError,
+    failure: PreviewToolFailure,
     dependencies: [...dependencies, FileSystem.FileSystem, ServerConfig.ServerConfig],
   }).annotate(Tool.Title, "Stop browser recording"),
 );
