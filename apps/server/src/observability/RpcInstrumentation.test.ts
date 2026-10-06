@@ -274,6 +274,8 @@ describe("WS RPC instrumentation middleware", () => {
         ).pipe(Effect.forkChild);
         yield* Deferred.await(waiting);
         yield* TestClock.adjust(Duration.millis(250));
+        // A backward wall-clock correction must not shorten the measured duration.
+        yield* TestClock.setTime(0);
         assert.deepStrictEqual(appSpans(ended), []);
 
         // The client waits for the server to stop the call, which ends the RPC span.

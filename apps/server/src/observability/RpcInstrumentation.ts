@@ -219,8 +219,7 @@ const recordRpcMetrics = (
   exit: Exit.Exit<unknown, unknown>,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    const endedAt = yield* Clock.currentTimeNanos;
-    const elapsedNanos = endedAt > startedAt ? endedAt - startedAt : 0n;
+    const elapsedNanos = (yield* Clock.monotonicTimeNanos) - startedAt;
 
     yield* Metric.update(
       Metric.withAttributes(rpcRequestDuration, metricAttributes({ method })),
@@ -247,7 +246,7 @@ const recordRpcMetrics = (
 export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect, { rpc }) => {
   const method = rpc._tag;
   const measured = RpcSchema.isStreamSchema(rpc.successSchema)
-    ? Effect.flatMap(Clock.currentTimeNanos, (startedAt) =>
+    ? Effect.flatMap(Clock.monotonicTimeNanos, (startedAt) =>
         Effect.onExit(effect, (exit) => recordRpcMetrics(method, startedAt, exit)),
       )
     : effect.pipe(
