@@ -35,6 +35,7 @@ catalog:
   "@effect/platform-node": 4.0.1
   "@effect/platform-node-shared": 4.0.1
   "@effect/sql-pg": 4.0.1
+  "@effect/sql-sqlite-do": 4.0.1
   "@effect/tsgo": 0.41.0
   "@effect/vitest": 4.0.1
   "@legendapp/list": 3.3.5
@@ -50,8 +51,10 @@ catalog:
   lightningcss: 1.33.0
   tailwindcss: 4.3.3
   typescript: 7.0.2
+  undici: 8.11.2
   vite: npm:@voidzero-dev/vite-plus-core@1.0.0
   vite-plus: 1.0.0
+  ws: 8.22.0
   yaml: ^2.9.0
 
 minimumReleaseAgeExclude:
@@ -75,6 +78,7 @@ minimumReleaseAgeExclude:
   - "@effect/platform-node-shared@4.0.1"
   - "@effect/platform-node@4.0.1"
   - "@effect/sql-pg@4.0.1"
+  - "@effect/sql-sqlite-do@4.0.1"
   - "@effect/vitest@4.0.1"
   - alchemy@2.0.0-beta.80
   - effect@4.0.1
@@ -233,6 +237,10 @@ overrides:
   node-abi: 4.33.0
   lightningcss: "catalog:"
   tailwindcss: "catalog:"
+  # Ranges from @effect/platform-node, jsdom, unifont, Expo and libsql otherwise
+  # settle on two patch releases of each major. Older majors stay as they are.
+  "undici@^8": "catalog:"
+  "ws@^8": "catalog:"
   vite: "catalog:"
   vite-plus: "catalog:"
   yaml: "catalog:"
