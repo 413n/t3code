@@ -491,6 +491,8 @@ interface HarnessOptions {
   readonly onScriptRun?: (
     input: ProjectSetupScriptRunner.ProjectSetupScriptRunnerInput,
   ) => Effect.Effect<void>;
+  /** Runs inside each `closeIdle` call. */
+  readonly onCloseIdle?: () => Effect.Effect<void>;
   /** Threads `getThread` returns when a `thread.settled` event is handled. */
   readonly currentThreads?: ReadonlyArray<OrchestrationV2AppThread>;
 }
@@ -606,7 +608,8 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
       dispatch,
     }),
     Layer.mock(TerminalManager.TerminalManager)({
-      closeIdle: (input) => Queue.offer(closedIdle, input).pipe(Effect.asVoid),
+      closeIdle: (input) =>
+        Queue.offer(closedIdle, input).pipe(Effect.andThen(options.onCloseIdle?.() ?? Effect.void)),
     }),
     Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
       runForThread: (input) =>
@@ -1127,6 +1130,34 @@ describe("ThreadSettlementServiceV2 terminals", () => {
           assert.strictEqual(run.threadId, worktree.id);
           assert.strictEqual(run.worktreePath, "/worktrees/thread");
           assert.strictEqual(run.trigger, "settle");
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("skips the settle script for a thread re-engaged while its shells close", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const settled = appThread("reengaging-thread", "settled", "/worktrees/reengaging");
+        const marker = appThread("marker-thread", "settled", "/worktrees/marker");
+        const currentThreads = [settled, marker];
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([]),
+          currentThreads,
+          existingWorktreePaths: ["/worktrees/reengaging", "/worktrees/marker"],
+          // The user sends a message while the first close checks processes.
+          onCloseIdle: () =>
+            Effect.sync(() => {
+              currentThreads[0] = { ...settled, settledOverride: "active" };
+            }),
+        });
+
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+          yield* fixture.publishEvent(settledEvent(settled));
+          yield* fixture.publishEvent(settledEvent(marker));
+          assert.strictEqual((yield* Queue.take(fixture.scriptRuns)).threadId, marker.id);
         }).pipe(Effect.provide(fixture.layer));
       }),
     ),
