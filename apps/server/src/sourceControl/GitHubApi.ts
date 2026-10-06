@@ -276,6 +276,12 @@ function classify(input: {
   if (
     status === 429 ||
     types.includes("RATE_LIMITED") ||
+    // An exhausted GraphQL quota can answer HTTP 200 with an untyped "API rate limit already
+    // exceeded" error; the headers say the same thing.
+    (input.graphql && errors !== undefined && headers["x-ratelimit-remaining"] === "0") ||
+    (input.graphql &&
+      messages !== undefined &&
+      messages.some((message) => /rate limit (already )?exceeded/i.test(message))) ||
     (status === 403 &&
       (headers["x-ratelimit-remaining"] === "0" ||
         headers["retry-after"] !== undefined ||

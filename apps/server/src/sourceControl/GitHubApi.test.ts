@@ -249,6 +249,24 @@ describe("GitHubApi", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("reads an untyped GraphQL quota error as a rate limit", () => {
+    const reset = Math.floor(NOW / 1000) + 900;
+    const { layer } = harness(() =>
+      json(
+        { errors: [{ message: "API rate limit already exceeded for user ID 1." }] },
+        { headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } },
+      ),
+    );
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const api = yield* GitHubApi.GitHubApi;
+      const error = yield* Effect.flip(
+        api.graphql({ host: "github.com", operation: "lookup", query: "query { viewer { id } }" }),
+      );
+      expect(error).toMatchObject({ _tag: "GitHubApiRateLimitError", retryAt: reset * 1000 });
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("maps REST 403 with an exhausted quota to a rate limit, and 304 to an answer", () => {
     let call = 0;
     const { layer } = harness(() =>
