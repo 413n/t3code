@@ -24,6 +24,7 @@ import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.t
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as ProjectHandlers from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
 
@@ -84,7 +85,11 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       ),
     );
     const toolkit = yield* ProjectToolkit.pipe(
-      Effect.provide(ProjectHandlers.layer.pipe(Layer.provide(layerDependencies))),
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+          Layer.provide(layerDependencies),
+        ),
+      ),
     );
     const result = yield* toolkit
       .handle("t3_thread_launch", { title: "Audit", message: "Review the change" })
@@ -154,7 +159,11 @@ it.effect("launches a scratch thread into the Scratch project", () =>
       ),
     );
     const toolkit = yield* ProjectToolkit.pipe(
-      Effect.provide(ProjectHandlers.layer.pipe(Layer.provide(layerDependencies))),
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+          Layer.provide(layerDependencies),
+        ),
+      ),
     );
     const handle = (params: Parameters<typeof toolkit.handle<"t3_thread_launch">>[1]) =>
       toolkit
@@ -253,7 +262,11 @@ it.effect("starts a project from just a title when workspaceRoot is omitted", ()
       ),
     );
     const toolkit = yield* ProjectToolkit.pipe(
-      Effect.provide(ProjectHandlers.layer.pipe(Layer.provide(layerDependencies))),
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+          Layer.provide(layerDependencies),
+        ),
+      ),
     );
     const handle = (params: Parameters<typeof toolkit.handle<"t3_project_create">>[1]) =>
       toolkit
@@ -358,7 +371,9 @@ it.effect("a client launches at its ceiling with the project's default model", (
       launched,
     });
     const toolkit = yield* ProjectToolkit.pipe(
-      Effect.provide(ProjectHandlers.layer.pipe(Layer.provide(dependencies))),
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
     );
     const handle = (params: Parameters<typeof toolkit.handle<"t3_thread_launch">>[1]) =>
       toolkit
@@ -405,7 +420,9 @@ it.effect("a launch binds only an existing checkout that is one of the project's
       yield* git.execute({ operation: "test.setupRepo", cwd: repo, args });
     }
     const toolkit = yield* ProjectToolkit.pipe(
-      Effect.provide(ProjectHandlers.layer.pipe(Layer.provide(dependencies))),
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
     );
     const launchInto = (worktreePath: string) =>
       toolkit

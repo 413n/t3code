@@ -14,6 +14,7 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import { liveThreadShell } from "./McpToolAccess.testkit.ts";
@@ -100,7 +101,7 @@ const ProbeToolkit = Toolkit.make(
   Tool.make("writes_environment", probe),
 );
 const ran = Effect.succeed({ ran: "ran" });
-const layerProbeHandlers = McpToolAccess.toLayer(ProbeToolkit, {
+const probeHandlers: McpToolAccess.Handlers<typeof ProbeToolkit.tools> = {
   reads: McpToolAccess.reads(() => ran),
   reads_as_caller: McpToolAccess.readsAsCaller(() => ran),
   acts_as_caller: McpToolAccess.actsAsCaller(() => ran),
@@ -114,11 +115,46 @@ const layerProbeHandlers = McpToolAccess.toLayer(ProbeToolkit, {
     (_, modes) => Effect.succeed({ ran: `${modes.runtimeMode}/${modes.interactionMode}` }),
   ),
   writes_environment: McpToolAccess.writesEnvironment(() => ran),
-});
+};
+const layerProbeHandlers = McpToolAccess.toLayer(ProbeToolkit, probeHandlers);
+
+const unchecked = () => ran;
+
+// What the compiler refuses: each line below must fail to typecheck, and its
+// `@ts-expect-error` fails the build if one ever compiles. Never called.
+export const refusedAtCompileTime = () => {
+  McpToolAccess.toLayer(ProbeToolkit, {
+    ...probeHandlers,
+    // @ts-expect-error a handler that skips its declaration
+    reads: unchecked,
+  });
+  McpToolAccess.toLayer(ProbeToolkit, {
+    ...probeHandlers,
+    // @ts-expect-error a declaration's fields copied onto an unchecked handler
+    reads: Object.assign(
+      unchecked,
+      McpToolAccess.reads(() => ran),
+    ),
+  });
+  // The refused layer below types its error and services as unknown, which is fine here.
+  // @effect-diagnostics-next-line anyUnknownInErrorContext:off
+  McpHttpServer.toolkitRegistration(
+    ProbeToolkit,
+    // @ts-expect-error a handlers layer that skipped `McpToolAccess.toLayer`
+    ProbeToolkit.toLayer({
+      reads: unchecked,
+      reads_as_caller: unchecked,
+      acts_as_caller: unchecked,
+      writes: unchecked,
+      writes_threads: unchecked,
+      starts_threads: unchecked,
+      writes_environment: unchecked,
+    }),
+  );
+};
 
 const probeServer = (threads: Layer.Layer<ThreadManagement.ThreadManagementService>) =>
-  McpServer.toolkit(ProbeToolkit).pipe(
-    Layer.provide(layerProbeHandlers),
+  McpHttpServer.toolkitRegistration(ProbeToolkit, layerProbeHandlers).pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(threads),
   );
@@ -220,6 +256,23 @@ it.effect.each([
     ),
   ),
 );
+
+it("refuses a declaration or handlers layer that only wears another's fields", () => {
+  // The types already refuse these; at runtime the private fields are missing too.
+  const copiedDeclaration = Object.assign(
+    unchecked,
+    McpToolAccess.reads(() => ran),
+  );
+  expect(() =>
+    McpToolAccess.toLayer(ProbeToolkit, {
+      ...probeHandlers,
+      // @ts-expect-error a declaration's fields copied onto an unchecked handler
+      reads: copiedDeclaration,
+    }),
+  ).toThrow(TypeError);
+  const copiedLayer = Object.assign(Layer.empty, layerProbeHandlers);
+  expect(() => McpToolAccess.HandlersLayer.layer(copiedLayer)).toThrow(TypeError);
+});
 
 it.effect("refuses a change when the calling thread cannot be read", () =>
   call("writes", supervised).pipe(

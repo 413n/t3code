@@ -14,6 +14,7 @@ import * as Stream from "effect/Stream";
 import * as Preview from "../../../preview/Manager.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as McpToolAccessTestkit from "../../McpToolAccess.testkit.ts";
 import * as PreviewControlsHandlers from "./handlers.ts";
 import { PreviewControlsToolkit } from "./tools.ts";
@@ -57,7 +58,11 @@ it.effect.each([
         }),
       );
       const toolkit = yield* PreviewControlsToolkit.pipe(
-        Effect.provide(PreviewControlsHandlers.layer.pipe(Layer.provide(layerDependencies))),
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(PreviewControlsHandlers.layer).pipe(
+            Layer.provide(layerDependencies),
+          ),
+        ),
       );
       const listed = yield* toolkit
         .handle("t3_preview_list", {})

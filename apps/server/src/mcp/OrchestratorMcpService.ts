@@ -225,7 +225,12 @@ function scheduledTaskWorkspaceStrategy(
     : { type: "worktree", baseRef: "main", startFromOrigin: true };
 }
 
-function scheduledTaskSummary(task: ScheduledTask): OrchestratorMcpScheduledTask {
+/**
+ * A scheduled task as an agent sees it. `mayRun` says whether the caller may
+ * run it: a webhook's URL carries the secret that starts the task's runs, so
+ * only such a caller sees it.
+ */
+function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): OrchestratorMcpScheduledTask {
   return {
     scheduledTaskId: task.id,
     title: task.title,
@@ -237,7 +242,7 @@ function scheduledTaskSummary(task: ScheduledTask): OrchestratorMcpScheduledTask
     nextRunAt: task.nextRunAt,
     lastRunStatus: task.lastRunStatus,
     // A bare path is not a URL anyone can call, so agents never get one to share.
-    ...(task.webhook?.url == null ? {} : { webhookUrl: task.webhook.url }),
+    ...(task.webhook?.url == null || !mayRun ? {} : { webhookUrl: task.webhook.url }),
     ...(task.webhook === undefined
       ? {}
       : { webhookSignature: task.webhook.hasSecret ? "set" : "none" }),
@@ -1368,6 +1373,47 @@ const make = Effect.gen(function* () {
    * than the caller's own, so editing its prompt cannot run work above the
    * caller's limits.
    */
+  /**
+   * The modes a task's runs execute at: its own, or for a task bound to a
+   * thread, also that thread's modes as they are now, since its runs are
+   * messages to that thread.
+   */
+  const scheduledTaskRunModes = (task: ScheduledTask) =>
+    Effect.gen(function* () {
+      const modes = [{ runtimeMode: task.runtimeMode, interactionMode: task.interactionMode }];
+      if (task.threadId === null) return modes;
+      const bound = yield* threadManagement
+        .getThreadShell(task.threadId)
+        .pipe(Effect.mapError(threadManagementFailure));
+      return bound === null || bound.deletedAt !== null ? modes : [...modes, bound];
+    });
+
+  const withinLimits = (
+    limits: {
+      readonly runtimeMode: RuntimeMode;
+      readonly interactionMode: ProviderInteractionMode;
+    },
+    modes: { readonly runtimeMode: RuntimeMode; readonly interactionMode: ProviderInteractionMode },
+  ) =>
+    runtimeModeRank(modes.runtimeMode) <= runtimeModeRank(limits.runtimeMode) &&
+    interactionModeRank(modes.interactionMode) <= interactionModeRank(limits.interactionMode);
+
+  const summarizeScheduledTask = (
+    task: ScheduledTask,
+    limits: {
+      readonly runtimeMode: RuntimeMode;
+      readonly interactionMode: ProviderInteractionMode;
+    },
+  ) =>
+    scheduledTaskRunModes(task).pipe(
+      Effect.map((modes) =>
+        scheduledTaskSummary(
+          task,
+          modes.every((mode) => withinLimits(limits, mode)),
+        ),
+      ),
+    );
+
   const loadScheduledTask = (
     scheduledTaskId: ScheduledTask["id"],
     limits: {
@@ -1387,8 +1433,10 @@ const make = Effect.gen(function* () {
       if (task === undefined) {
         return yield* failure("task_not_found", `Scheduled task ${scheduledTaskId} was not found.`);
       }
-      yield* resolveRuntimeMode(limits.runtimeMode, task.runtimeMode);
-      yield* resolveInteractionMode(limits.interactionMode, task.interactionMode);
+      for (const modes of yield* scheduledTaskRunModes(task)) {
+        yield* resolveRuntimeMode(limits.runtimeMode, modes.runtimeMode);
+        yield* resolveInteractionMode(limits.interactionMode, modes.interactionMode);
+      }
       return task;
     });
 
@@ -1451,11 +1499,11 @@ const make = Effect.gen(function* () {
               failure("orchestration_error", `Could not schedule task: ${error.message}`),
             ),
           );
-        return scheduledTaskSummary(task);
+        return yield* summarizeScheduledTask(task, limits);
       }),
     listScheduledTasks: (scope, input) =>
       Effect.gen(function* () {
-        const { parent } = yield* loadCaller(scope);
+        const { parent, limits } = yield* loadCaller(scope);
         const projectId = input.projectId ?? parent?.thread.projectId;
         const { tasks } = yield* scheduledTasks
           .list()
@@ -1465,9 +1513,10 @@ const make = Effect.gen(function* () {
             ),
           );
         return {
-          tasks: tasks
-            .filter((task) => projectId === undefined || task.projectId === projectId)
-            .map(scheduledTaskSummary),
+          tasks: yield* Effect.forEach(
+            tasks.filter((task) => projectId === undefined || task.projectId === projectId),
+            (task) => summarizeScheduledTask(task, limits),
+          ),
         };
       }),
     updateScheduledTask: (scope, input) =>
@@ -1521,7 +1570,7 @@ const make = Effect.gen(function* () {
               failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
             ),
           );
-        return scheduledTaskSummary(task);
+        return yield* summarizeScheduledTask(task, limits);
       }),
     deleteScheduledTask: (scope, input) =>
       Effect.gen(function* () {

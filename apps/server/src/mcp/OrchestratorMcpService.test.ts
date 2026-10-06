@@ -3,6 +3,9 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   EnvironmentId,
   NodeId,
+  type OrchestrationV2ThreadShell,
+  type ScheduledTask,
+  ScheduledTaskId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -26,6 +29,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
+import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 
 describe("OrchestratorMcpService", () => {
@@ -1294,4 +1298,125 @@ describe("OrchestratorMcpService provider resolution", () => {
         }
       }),
   );
+
+  describe("scheduled tasks at modes above the caller's", () => {
+    const projectId = ProjectId.make("project:scheduled");
+    const boundThreadId = ThreadId.make("thread:scheduled-bound");
+    const task = (overrides: Partial<ScheduledTask>): ScheduledTask => ({
+      id: ScheduledTaskId.make("scheduled-task:webhook"),
+      title: "On push",
+      prompt: "Do {{body.instruction}}",
+      enabled: true,
+      schedule: { type: "webhook", signature: null },
+      projectId,
+      threadId: null,
+      workspaceStrategy: { type: "root" },
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      createdBy: "agent",
+      creationSource: "mcp",
+      createdAt: "2026-10-05T00:00:00.000Z",
+      updatedAt: "2026-10-05T00:00:00.000Z",
+      nextRunAt: null,
+      lastRunAt: null,
+      lastRunStatus: "never",
+      lastRunError: null,
+      runCount: 0,
+      webhook: {
+        path: "/hooks/scheduled-task/secret",
+        url: "https://t3.example/hooks/secret",
+        hasSecret: false,
+      },
+      ...overrides,
+    });
+    const supervisedClient: McpInvocationScope = {
+      environmentId: EnvironmentId.make("environment:scheduled"),
+      requestNamespace: "client:scheduled",
+      thread: undefined,
+      client: {
+        sessionId: "scheduled",
+        label: "Claude Code",
+        runtimeModeCeiling: "approval-required",
+      },
+      capabilities: new Set(["orchestration"]),
+      issuedAt: 1,
+    };
+    const service = (
+      tasks: ReadonlyArray<ScheduledTask>,
+      boundThread: OrchestrationV2ThreadShell | null,
+      upserted: Ref.Ref<number>,
+    ) =>
+      OrchestratorMcpService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: (threadId) =>
+                Effect.succeed(threadId === boundThreadId ? boundThread : null),
+            }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+              list: () => Effect.succeed([]),
+            }),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+              list: () => Effect.succeed({ tasks }),
+              upsert: () =>
+                Ref.update(upserted, (count) => count + 1).pipe(Effect.as({ task: tasks[0]! })),
+            }),
+          ),
+        ),
+      );
+
+    it.effect("hides a webhook URL from a caller below the task's modes", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        const listed = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((mcp) => mcp.listScheduledTasks(supervisedClient, { projectId })),
+          Effect.provide(
+            service(
+              [
+                task({ runtimeMode: "full-access" }),
+                task({ id: ScheduledTaskId.make("scheduled-task:supervised") }),
+              ],
+              null,
+              upserted,
+            ),
+          ),
+        );
+        assert.deepEqual(
+          listed.tasks.map((summary) => summary.webhookUrl),
+          [undefined, "https://t3.example/hooks/secret"],
+        );
+      }),
+    );
+
+    it.effect("checks a bound task against its thread's current modes", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        // Scheduled while the thread was Supervised; the thread now runs in full access.
+        const bound = task({ threadId: boundThreadId });
+        const layer = service(
+          [bound],
+          liveThreadShell(boundThreadId, { runtimeMode: "full-access" }),
+          upserted,
+        );
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(layer),
+        );
+        const listed = yield* mcp.listScheduledTasks(supervisedClient, { projectId });
+        assert.equal(listed.tasks[0]?.webhookUrl, undefined);
+        const error = yield* mcp
+          .updateScheduledTask(supervisedClient, {
+            scheduledTaskId: bound.id,
+            prompt: "Something else",
+          })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+        assert.equal(yield* Ref.get(upserted), 0);
+      }),
+    );
+  });
 });
