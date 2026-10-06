@@ -76,6 +76,13 @@ describe("t3code/no-raw-mcp-registration", () => {
   );
 
   rule.invalid(
+    "reports a dynamic import written as a template",
+    `
+      export const load = () => import(\`effect/ai/McpServer\`);
+    `,
+  );
+
+  rule.invalid(
     "reports McpServer.toolkit",
     `
       export const registration = McpServer.toolkit(SomeToolkit);
@@ -115,6 +122,14 @@ describe("t3code/no-raw-mcp-registration", () => {
   );
 
   rule.invalid(
+    "reports a registration function taken by destructuring",
+    `
+      const { toolkit } = McpServer;
+      export const registration = toolkit(SomeToolkit);
+    `,
+  );
+
+  rule.invalid(
     "reports a registration method taken by destructuring",
     `
       import * as Effect from "effect/Effect";
@@ -138,6 +153,33 @@ describe("t3code/no-raw-mcp-registration", () => {
     `
       import { McpServer } from "effect/ai";
       export const registration = McpServer.toolkit(SomeToolkit);
+    `,
+  );
+
+  testFile.invalid(
+    "reports a test importing McpServer under another name",
+    `
+      import { McpServer as Server } from "effect/ai";
+      export const registration = Server.toolkit(SomeToolkit);
+    `,
+    (output) => {
+      assert.match(output, /Tests import McpServer only as/);
+    },
+  );
+
+  testFile.invalid(
+    "reports a test importing effect/ai as a namespace",
+    `
+      import * as Ai from "effect/ai";
+      export const registration = Ai.McpServer.toolkit(SomeToolkit);
+    `,
+  );
+
+  testFile.invalid(
+    "reports a test importing the McpServer module directly",
+    `
+      import { toolkit } from "effect/ai/McpServer";
+      export const registration = toolkit(SomeToolkit);
     `,
   );
 });

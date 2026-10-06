@@ -30,13 +30,20 @@ const HOW =
 const registrationMessage = (name: string) =>
   `${name} registers on /mcp without the access checks McpToolAccess declares. ${HOW}`;
 const importMessage = `Only McpHttpServer may use Effect's McpServer: a registration anywhere else skips the access checks McpToolAccess declares. ${HOW}`;
+const testImportMessage =
+  'Tests import McpServer only as `import { McpServer } from "effect/ai"`, so a registration on it is reported.';
 
+/** A module specifier: a string, or a template with nothing substituted. */
 const literalString = (node: unknown): Option.Option<string> =>
-  Option.flatMap(unwrapExpression(node), (expression) =>
-    expression.type === "Literal" && typeof expression.value === "string"
-      ? Option.some(expression.value)
-      : Option.none(),
-  );
+  Option.flatMap(unwrapExpression(node), (expression) => {
+    if (expression.type === "Literal" && typeof expression.value === "string") {
+      return Option.some(expression.value);
+    }
+    if (expression.type === "TemplateLiteral" && expression.expressions.length === 0) {
+      return Option.fromNullishOr(expression.quasis[0]?.value.cooked);
+    }
+    return Option.none();
+  });
 
 const namesMcpServer = (node: unknown) =>
   Option.getOrUndefined(getPropertyName(node)) === "McpServer";
@@ -49,9 +56,10 @@ const exposesMcpServer = (source: Option.Option<string>) =>
  * accept only handlers McpToolAccess built; the lint config exempts that file.
  * Elsewhere it reports runtime imports of Effect's McpServer, under any name
  * or path, and reading a registration method or function in any form. Tests
- * may import McpServer to build a server, so there only the registration
- * reads are reported. It guards against a registration that skips the checks
- * by accident; deliberately working around it needs a reviewed change here.
+ * may import McpServer to build a server, but only under its own name, so a
+ * registration on it is still reported. It guards against a registration that
+ * skips the checks by accident; deliberately working around it needs a
+ * reviewed change here.
  */
 export default defineRule({
   meta: {
@@ -62,24 +70,27 @@ export default defineRule({
     },
   },
   create(context) {
-    const checksImports = !TEST_FILE_PATTERN.test(context.filename);
+    const isTest = TEST_FILE_PATTERN.test(context.filename);
     return {
       ImportDeclaration(node) {
-        if (!checksImports || node.importKind === "type") return;
+        if (node.importKind === "type") return;
         const source = literalString(node.source);
         if (Option.isNone(source)) return;
         const exposes = node.specifiers.some((specifier) => {
           if (specifier.type !== "ImportSpecifier") return exposesMcpServer(source);
           if (specifier.importKind === "type") return false;
+          if (source.value === MCP_SERVER_MODULE) return true;
           return (
-            source.value === MCP_SERVER_MODULE ||
-            (AI_MODULES.has(source.value) && namesMcpServer(specifier.imported))
+            AI_MODULES.has(source.value) &&
+            namesMcpServer(specifier.imported) &&
+            // A test's `McpServer.toolkit(...)` is reported below by name.
+            !(isTest && namesMcpServer(specifier.local))
           );
         });
-        if (exposes) context.report({ node, message: importMessage });
+        if (exposes) context.report({ node, message: isTest ? testImportMessage : importMessage });
       },
       ExportNamedDeclaration(node) {
-        if (!checksImports || node.source === null || node.exportKind === "type") return;
+        if (node.source === null || node.exportKind === "type") return;
         const source = literalString(node.source);
         if (Option.isNone(source)) return;
         const exposes = node.specifiers.some(
@@ -91,13 +102,13 @@ export default defineRule({
         if (exposes) context.report({ node, message: importMessage });
       },
       ExportAllDeclaration(node) {
-        if (!checksImports || node.exportKind === "type") return;
+        if (node.exportKind === "type") return;
         if (exposesMcpServer(literalString(node.source))) {
           context.report({ node, message: importMessage });
         }
       },
       ImportExpression(node) {
-        if (checksImports && exposesMcpServer(literalString(node.source))) {
+        if (exposesMcpServer(literalString(node.source))) {
           context.report({ node, message: importMessage });
         }
       },
@@ -113,13 +124,22 @@ export default defineRule({
           context.report({ node, message: registrationMessage(`McpServer.${name.value}`) });
         }
       },
-      // `const { addTool } = server`
+      // `const { addTool } = server`, `const { toolkit } = McpServer`
       ObjectPattern(node) {
+        const fromMcpServer =
+          node.parent.type === "VariableDeclarator" &&
+          isIdentifier(unwrapExpression(node.parent.init), "McpServer");
         for (const property of node.properties) {
           if (property.type !== "Property") continue;
           const name = getPropertyName(property.key);
-          if (Option.isSome(name) && SERVICE_REGISTRATIONS.has(name.value)) {
+          if (Option.isNone(name)) continue;
+          if (SERVICE_REGISTRATIONS.has(name.value)) {
             context.report({ node: property, message: registrationMessage(`.${name.value}`) });
+          } else if (fromMcpServer && MODULE_REGISTRATIONS.has(name.value)) {
+            context.report({
+              node: property,
+              message: registrationMessage(`McpServer.${name.value}`),
+            });
           }
         }
       },
