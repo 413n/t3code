@@ -24,6 +24,18 @@ import {
 // Only the classes below assign these, from their static blocks, so nothing
 // outside this module can build a declaration or a handlers layer.
 
+/**
+ * Both constructors demand this. Their private constructors only stop the type
+ * checker; this also stops `Reflect.construct` and friends at runtime.
+ */
+const builtHere: unique symbol = Symbol("t3/mcp/McpToolAccess/builtHere");
+
+const refuseOutsideConstruction = (token: symbol) => {
+  if (token !== builtHere) {
+    throw new TypeError("Only McpToolAccess builds MCP tool declarations and handler layers.");
+  }
+};
+
 /** Builds a declaration; only the declaration functions below call it. */
 let declare: <P, A, E, R>(
   handle: (params: P) => Effect.Effect<A, E, R>,
@@ -68,11 +80,12 @@ export class Declaration<out Handler> {
   // in to module-scoped functions. Copying a declaration's fields onto
   // anything else fails to typecheck and, at runtime, to run.
   readonly #handle: Handler;
-  private constructor(handle: Handler) {
+  private constructor(token: typeof builtHere, handle: Handler) {
+    refuseOutsideConstruction(token);
     this.#handle = handle;
   }
   static {
-    declare = (handle) => new Declaration(handle);
+    declare = (handle) => new Declaration(builtHere, handle);
     checkedHandler = Struct.lambda<CheckedHandler>((declaration) => declaration.#handle);
   }
 }
@@ -209,11 +222,15 @@ export type Handlers<Tools extends Record<string, Tool.Any>> = Declarations<
  */
 export class HandlersLayer<Tools extends Record<string, Tool.Any>, EX = never, RX = never> {
   readonly #layer: Layer.Layer<Tool.HandlersFor<Tools>, EX, RX>;
-  private constructor(layer: Layer.Layer<Tool.HandlersFor<Tools>, EX, RX>) {
+  private constructor(
+    token: typeof builtHere,
+    layer: Layer.Layer<Tool.HandlersFor<Tools>, EX, RX>,
+  ) {
+    refuseOutsideConstruction(token);
     this.#layer = layer;
   }
   static {
-    handlersLayer = (layer) => new HandlersLayer(layer);
+    handlersLayer = (layer) => new HandlersLayer(builtHere, layer);
   }
   /** The handlers, for registering this toolkit on the MCP server. */
   static layer<Tools extends Record<string, Tool.Any>, EX, RX>(

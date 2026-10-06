@@ -1911,6 +1911,18 @@ const make = Effect.gen(function* () {
         const current = yield* readTask(scope, input.taskId);
         const key = yield* requestKey(input.clientRequestId);
         const parentProjection = yield* loadProjection(scope.thread.threadId);
+        // Stopping the child is a write to its thread, which its user may have
+        // raised above the parent's modes since it was delegated.
+        const childShell = yield* threadManagement
+          .getThreadShell(current.childThreadId)
+          .pipe(Effect.mapError(threadManagementFailure));
+        if (childShell !== null && childShell.deletedAt === null) {
+          yield* resolveRuntimeMode(parentProjection.thread.runtimeMode, childShell.runtimeMode);
+          yield* resolveInteractionMode(
+            parentProjection.thread.interactionMode,
+            childShell.interactionMode,
+          );
+        }
         const parentTask = parentProjection.subagents.find(
           (task) => task.id === input.taskId && task.origin === "app_owned",
         );

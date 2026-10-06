@@ -263,6 +263,12 @@ it.effect.each([
   ),
 );
 
+it("refuses a declaration or handlers layer built outside McpToolAccess", () => {
+  // Private constructors only bind the type checker; Reflect.construct reaches them anyway.
+  expect(() => Reflect.construct(McpToolAccess.Declaration, [unchecked])).toThrow(TypeError);
+  expect(() => Reflect.construct(McpToolAccess.HandlersLayer, [Layer.empty])).toThrow(TypeError);
+});
+
 it("refuses a declaration or handlers layer that only wears another's fields", () => {
   // The types already refuse these; at runtime the private fields are missing too.
   const copiedDeclaration = Object.assign(
