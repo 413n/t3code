@@ -6,7 +6,7 @@ import * as Redacted from "effect/Redacted";
 import * as PlatformError from "effect/PlatformError";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
-import { VcsProcessSpawnError } from "@t3tools/contracts";
+import { VcsProcessSpawnError, VcsProcessTimeoutError } from "@t3tools/contracts";
 import { HttpClient, HttpClientResponse, type HttpClientRequest } from "effect/http";
 
 import * as GitHubApi from "./GitHubApi.ts";
@@ -82,7 +82,14 @@ describe("environmentToken", () => {
     expect(GitHubCredentials.environmentToken("acme.ghe.com", { GITHUB_TOKEN: "github" })).toBe(
       "github",
     );
-    expect(GitHubCredentials.environmentToken("git.acme.internal", env)).toBe("ghe");
+    // An enterprise token only goes to the host GH_HOST names, never to whatever a remote says.
+    expect(GitHubCredentials.environmentToken("git.acme.internal", env)).toBeNull();
+    expect(
+      GitHubCredentials.environmentToken("git.acme.internal", {
+        ...env,
+        GH_HOST: "git.acme.internal",
+      }),
+    ).toBe("ghe");
     expect(GitHubCredentials.environmentToken("git.acme.internal", { GH_TOKEN: "gh" })).toBeNull();
   });
 });
@@ -124,6 +131,32 @@ describe("GitHubApi", () => {
       expect(error.message).toContain("Resource not accessible");
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect(
+    "reads a NOT_FOUND answer with another error as a failure, not a missing resource",
+    () => {
+      const { layer } = harness(() =>
+        json({
+          data: null,
+          errors: [
+            { type: "NOT_FOUND", message: "Could not resolve" },
+            { message: "Something went wrong" },
+          ],
+        }),
+      );
+      return Effect.gen(function* () {
+        const api = yield* GitHubApi.GitHubApi;
+        const error = yield* Effect.flip(
+          api.graphql({
+            host: "github.com",
+            operation: "detail",
+            query: "query { viewer { id } }",
+          }),
+        );
+        expect(error._tag).toBe("GitHubApiResponseError");
+      }).pipe(Effect.provide(layer));
+    },
+  );
 
   it.effect("pauses the host after a GraphQL RATE_LIMITED answer until the reset", () => {
     const reset = Math.floor(NOW / 1000) + 600;
@@ -253,6 +286,38 @@ describe("GitHubCredentials", () => {
       ),
     ),
   );
+
+  it.effect("does not cache a gh failure that is not about signing in", () => {
+    let calls = 0;
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const first = yield* Effect.flip(credentials.get("github.com"));
+      expect(first._tag).toBe("GitHubCliFailedError");
+      expect((yield* credentials.get("github.com")).source).toBe("gh");
+      expect(calls).toBe(2);
+    }).pipe(
+      Effect.provide(
+        credentialsWith(() =>
+          ++calls === 1
+            ? Effect.fail(
+                new VcsProcessTimeoutError({
+                  operation: "GitHubCredentials.get",
+                  command: "gh",
+                  cwd: "/",
+                  timeoutMs: 10_000,
+                }),
+              )
+            : Effect.succeed({
+                exitCode: ChildProcessSpawner.ExitCode(0),
+                stdout: "token\n",
+                stderr: "",
+                stdoutTruncated: false,
+                stderrTruncated: false,
+              }),
+        ),
+      ),
+    );
+  });
 
   it.effect("fails with GitHubNotSignedInError when gh prints no token", () =>
     Effect.gen(function* () {

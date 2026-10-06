@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
@@ -50,8 +51,21 @@ export class GitHubNotSignedInError extends Schema.TaggedError<GitHubNotSignedIn
   }
 }
 
+/** `gh auth token` timed out or failed for a reason other than having no login. */
+export class GitHubCliFailedError extends Schema.TaggedError<GitHubCliFailedError>()(
+  "GitHubCliFailedError",
+  { host: Schema.String, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return `The GitHub CLI could not hand over a credential for ${this.host}. Check \`gh auth status\` on the server.`;
+  }
+}
+
 /** There is no token for the host. */
-export type GitHubCredentialUnavailableError = GitHubCliMissingError | GitHubNotSignedInError;
+export type GitHubCredentialUnavailableError =
+  | GitHubCliMissingError
+  | GitHubNotSignedInError
+  | GitHubCliFailedError;
 
 /**
  * Where GitHub tokens come from. Callers ask per host and never see how the token was found,
@@ -77,14 +91,20 @@ function isGitHubDotCom(host: string): boolean {
   return host === "github.com" || host.endsWith(".ghe.com");
 }
 
-/** The environment variables gh itself reads for a host, in its precedence order. */
+/**
+ * The environment token for a host, in gh's precedence order. gh hands `GH_ENTERPRISE_TOKEN` to
+ * any non-github.com host; here it only goes to the host `GH_HOST` names, because a remote URL
+ * picks the host and a hostile one must not receive an enterprise token.
+ */
 export function environmentToken(
   host: string,
   env: Readonly<Record<string, string | undefined>>,
 ): string | null {
   const names = isGitHubDotCom(host)
     ? ["GH_TOKEN", "GITHUB_TOKEN"]
-    : ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+    : env.GH_HOST?.trim().toLowerCase() === host
+      ? ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+      : [];
   for (const name of names) {
     const value = env[name]?.trim();
     if (value) return value;
@@ -124,7 +144,10 @@ export const make = Effect.gen(function* () {
           error.cause instanceof PlatformError.PlatformError &&
           error.cause.reason._tag === "NotFound"
             ? new GitHubCliMissingError({ host })
-            : new GitHubNotSignedInError({ host }),
+            : // gh exits non-zero with "no oauth token" when it has no login for the host.
+              error._tag === "VcsProcessExitError"
+              ? new GitHubNotSignedInError({ host })
+              : new GitHubCliFailedError({ host, cause: error }),
         ),
         Effect.map((output) => output.stdout.trim()),
         Effect.filterOrFail(
@@ -146,7 +169,15 @@ export const make = Effect.gen(function* () {
 
   const cache = yield* Cache.makeWith(lookup, {
     capacity: 32,
-    timeToLive: (exit) => (Exit.isSuccess(exit) ? TOKEN_TTL : MISSING_TTL),
+    // A transient gh failure (a timeout, a locked keyring) is asked again on the next read.
+    timeToLive: (exit) =>
+      Exit.isSuccess(exit)
+        ? TOKEN_TTL
+        : Exit.findErrorOption(exit).pipe(
+              Option.exists((error) => error._tag === "GitHubCliFailedError"),
+            )
+          ? Duration.zero
+          : MISSING_TTL,
   });
 
   return GitHubCredentials.of({

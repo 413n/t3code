@@ -233,7 +233,10 @@ function classify(input: {
     return Answer.RateLimited();
   }
   if (status === 401) return Answer.Unauthorized();
-  if (status === 404 || (types.length > 0 && types.every((type) => type === "NOT_FOUND"))) {
+  if (
+    status === 404 ||
+    (errors !== undefined && errors.every((error) => error.type === "NOT_FOUND"))
+  ) {
     return Answer.NotFound();
   }
   if (errors !== undefined) return Answer.Failed({ messages });
@@ -283,6 +286,7 @@ export const make = Effect.gen(function* () {
     readonly acceptNotModified: boolean;
     /** Reads the body for GraphQL `errors`, which GitHub sends with HTTP 200. */
     readonly graphql?: boolean;
+    readonly timeout?: Duration.Duration | undefined;
   }) {
     const host = normalizeHost(input.host);
     const { token, fingerprint } = yield* credential(host);
@@ -293,8 +297,10 @@ export const make = Effect.gen(function* () {
         key,
         input.allowReserve ? { allowPaused: true } : undefined,
       );
-      const response: HttpClientResponse.HttpClientResponse = yield* httpClient
-        .execute(
+      // One deadline covers the headers and the body: a host that answers headers and then stalls
+      // must not hold a slot of the shared gate for undici's own five-minute body timeout.
+      const { response, collected } = yield* Effect.gen(function* () {
+        const response: HttpClientResponse.HttpClientResponse = yield* httpClient.execute(
           input.request.pipe(
             HttpClientRequest.bearerToken(Redacted.value(token)),
             HttpClientRequest.setHeaders({
@@ -302,22 +308,20 @@ export const make = Effect.gen(function* () {
               "user-agent": "t3code",
             }),
           ),
-        )
-        .pipe(
-          Effect.timeout(DEFAULT_TIMEOUT),
-          Effect.mapError(
-            (cause) => new GitHubApiRequestError({ host, operation: input.operation, cause }),
+        );
+        const collected = yield* collectUint8StreamText({
+          stream: response.stream,
+          maxBytes: input.maxResponseBytes,
+        }).pipe(
+          // 204, 304 and many refusals carry no body at all, which is an empty answer.
+          Effect.catchIf(
+            (error) => error.reason._tag === "EmptyBodyError",
+            () => Effect.succeed({ text: "", truncated: false }),
           ),
         );
-      const collected = yield* collectUint8StreamText({
-        stream: response.stream,
-        maxBytes: input.maxResponseBytes,
+        return { response, collected };
       }).pipe(
-        // 204, 304 and many refusals carry no body at all, which is an empty answer, not a failure.
-        Effect.catchIf(
-          (error) => error.reason._tag === "EmptyBodyError",
-          () => Effect.succeed({ text: "", truncated: false }),
-        ),
+        Effect.timeout(input.timeout ?? DEFAULT_TIMEOUT),
         Effect.mapError(
           (cause) => new GitHubApiRequestError({ host, operation: input.operation, cause }),
         ),
@@ -421,6 +425,14 @@ export const make = Effect.gen(function* () {
           acceptNotModified: false,
           graphql: true,
         });
+        // A body cut at the byte cap hides any `errors` past the cut and cannot be decoded.
+        if (response.truncated) {
+          return yield* new GitHubApiResponseError({
+            host,
+            operation: input.operation,
+            status: response.status,
+          });
+        }
         yield* budget.observe(host, response.body);
         return response.body;
       }).pipe(Effect.provideService(SourceControlRateLimit.CredentialScope, scope));
