@@ -27,27 +27,36 @@ export interface GitHubCredential {
   readonly fingerprint: string;
 }
 
-/**
- * There is no token for the host. `cli-missing` means nothing in the environment and no `gh`
- * to ask; `unauthenticated` means `gh` is there but holds no login for the host.
- */
-export class GitHubCredentialUnavailableError extends Schema.TaggedError<GitHubCredentialUnavailableError>()(
-  "GitHubCredentialUnavailableError",
-  {
-    host: Schema.String,
-    reason: Schema.Literals(["cli-missing", "unauthenticated"]),
-  },
+/** Nothing in the environment, and no `gh` on PATH to ask. */
+export class GitHubCliMissingError extends Schema.TaggedError<GitHubCliMissingError>()(
+  "GitHubCliMissingError",
+  { host: Schema.String },
 ) {
   get detail(): string {
-    return this.reason === "cli-missing"
-      ? `No GitHub credential for ${this.host}: set GH_TOKEN or install the GitHub CLI and run \`gh auth login\`.`
-      : `No GitHub credential for ${this.host}: run \`gh auth login --hostname ${this.host}\`.`;
+    return `No GitHub credential for ${this.host}: set GH_TOKEN, or install the GitHub CLI and run \`gh auth login\`.`;
   }
 
   override get message(): string {
     return this.detail;
   }
 }
+
+/** `gh` is installed but holds no login for the host. */
+export class GitHubNotSignedInError extends Schema.TaggedError<GitHubNotSignedInError>()(
+  "GitHubNotSignedInError",
+  { host: Schema.String },
+) {
+  get detail(): string {
+    return `No GitHub credential for ${this.host}: run \`gh auth login --hostname ${this.host}\`.`;
+  }
+
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+/** There is no token for the host. */
+export type GitHubCredentialUnavailableError = GitHubCliMissingError | GitHubNotSignedInError;
 
 /**
  * Where GitHub tokens come from. Callers ask per host and never see how the token was found,
@@ -108,27 +117,23 @@ export const make = Effect.gen(function* () {
         timeoutMs: 10_000,
       })
       .pipe(
+        Effect.mapError((error) =>
+          error._tag === "VcsProcessSpawnError" &&
+          error.cause instanceof PlatformError.PlatformError &&
+          error.cause.reason._tag === "NotFound"
+            ? new GitHubCliMissingError({ host })
+            : new GitHubNotSignedInError({ host }),
+        ),
         Effect.map((output) => output.stdout.trim()),
-        Effect.catch((error) =>
-          Effect.succeed(
-            error._tag === "VcsProcessSpawnError" &&
-              error.cause instanceof PlatformError.PlatformError &&
-              error.cause.reason._tag === "NotFound"
-              ? ("cli-missing" as const)
-              : "",
-          ),
+        Effect.filterOrFail(
+          (token) => token !== "",
+          () => new GitHubNotSignedInError({ host }),
         ),
       );
 
   const lookup = Effect.fn("GitHubCredentials.lookup")(function* (host: string) {
     const fromEnv = environmentToken(host, globalThis.process.env);
     const token = fromEnv ?? (yield* fromGh(host));
-    if (token === "cli-missing" || token === "") {
-      return yield* new GitHubCredentialUnavailableError({
-        host,
-        reason: token === "cli-missing" ? "cli-missing" : "unauthenticated",
-      });
-    }
     return {
       host,
       token: Redacted.make(token),

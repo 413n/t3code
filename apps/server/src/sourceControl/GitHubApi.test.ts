@@ -2,13 +2,17 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as PlatformError from "effect/PlatformError";
 import * as TestClock from "effect/testing/TestClock";
+import { ChildProcessSpawner } from "effect/process";
+import { VcsProcessSpawnError } from "@t3tools/contracts";
 import { HttpClient, HttpClientResponse, type HttpClientRequest } from "effect/http";
 
 import * as GitHubApi from "./GitHubApi.ts";
 import * as GitHubCredentials from "./GitHubCredentials.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
 import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 
 const NOW = Date.parse("2026-10-05T12:00:00.000Z");
 
@@ -215,4 +219,54 @@ describe("GitHubApi", () => {
       expect(requests).toHaveLength(0);
     }).pipe(Effect.provide(layer));
   });
+});
+
+describe("GitHubCredentials", () => {
+  const credentialsWith = (run: VcsProcess.VcsProcess["Service"]["run"]) =>
+    GitHubCredentials.layer.pipe(Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run })));
+
+  it.effect("fails with GitHubCliMissingError when gh is not on PATH", () =>
+    Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const error = yield* Effect.flip(credentials.get("git.acme.internal"));
+      expect(error._tag).toBe("GitHubCliMissingError");
+    }).pipe(
+      Effect.provide(
+        credentialsWith(() =>
+          Effect.fail(
+            new VcsProcessSpawnError({
+              operation: "GitHubCredentials.get",
+              command: "gh",
+              cwd: "/",
+              cause: PlatformError.systemError({
+                _tag: "NotFound",
+                module: "ChildProcess",
+                method: "spawn",
+              }),
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("fails with GitHubNotSignedInError when gh prints no token", () =>
+    Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const error = yield* Effect.flip(credentials.get("git.acme.internal"));
+      expect(error._tag).toBe("GitHubNotSignedInError");
+    }).pipe(
+      Effect.provide(
+        credentialsWith(() =>
+          Effect.succeed({
+            exitCode: ChildProcessSpawner.ExitCode(0),
+            stdout: "\n",
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          }),
+        ),
+      ),
+    ),
+  );
 });

@@ -1,5 +1,6 @@
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -200,25 +201,6 @@ function retryAtFrom(
   return Number.isFinite(reset) && reset > now ? reset : undefined;
 }
 
-function isRateLimited(
-  status: number,
-  headers: Readonly<Record<string, string | undefined>>,
-  body: string,
-) {
-  return (
-    status === 429 ||
-    (status === 403 &&
-      (headers["x-ratelimit-remaining"] === "0" ||
-        headers["retry-after"] !== undefined ||
-        /rate limit/i.test(body)))
-  );
-}
-
-interface GraphQlErrors {
-  readonly messages: ReadonlyArray<string>;
-  readonly types: ReadonlyArray<string>;
-}
-
 const decodeGraphQlErrors = Schema.decodeUnknownOption(
   Schema.fromJsonString(
     Schema.Struct({
@@ -232,14 +214,53 @@ const decodeGraphQlErrors = Schema.decodeUnknownOption(
   ),
 );
 
-function graphqlErrors(body: string): GraphQlErrors | null {
-  return Option.match(decodeGraphQlErrors(body), {
-    onNone: () => null,
-    onSome: ({ errors }) => ({
-      messages: errors.flatMap((error) => (error.message === undefined ? [] : [error.message])),
-      types: errors.flatMap((error) => (error.type === undefined ? [] : [error.type])),
-    }),
-  });
+/** What one GitHub answer means, decided once from its status, headers and body. */
+type Answer = Data.TaggedEnum<{
+  Ok: {};
+  RateLimited: {};
+  Unauthorized: {};
+  NotFound: {};
+  Failed: { readonly messages: ReadonlyArray<string> | undefined };
+}>;
+const Answer = Data.taggedEnum<Answer>();
+
+/**
+ * GitHub reports a failed GraphQL document with HTTP 200 and an `errors` list, so a GraphQL body
+ * is read for its error types as well as its status. `gh api graphql` failed those too, and
+ * callers rely on that to fall back to narrower reads.
+ */
+function classify(input: {
+  readonly status: number;
+  readonly headers: Readonly<Record<string, string | undefined>>;
+  readonly body: string;
+  readonly graphql: boolean;
+  readonly acceptNotModified: boolean;
+}): Answer {
+  const { status, headers, body } = input;
+  const errors = input.graphql
+    ? Option.getOrUndefined(decodeGraphQlErrors(body))?.errors
+    : undefined;
+  const types = errors?.flatMap((error) => (error.type === undefined ? [] : [error.type])) ?? [];
+  const messages = errors?.flatMap((error) => (error.message === undefined ? [] : [error.message]));
+  if (
+    status === 429 ||
+    types.includes("RATE_LIMITED") ||
+    (status === 403 &&
+      (headers["x-ratelimit-remaining"] === "0" ||
+        headers["retry-after"] !== undefined ||
+        /rate limit/i.test(body)))
+  ) {
+    return Answer.RateLimited();
+  }
+  if (status === 401) return Answer.Unauthorized();
+  if (status === 404 || (types.length > 0 && types.every((type) => type === "NOT_FOUND"))) {
+    return Answer.NotFound();
+  }
+  if (errors !== undefined) return Answer.Failed({ messages });
+  if ((status >= 200 && status < 300) || (status === 304 && input.acceptNotModified)) {
+    return Answer.Ok();
+  }
+  return Answer.Failed({ messages: undefined });
 }
 
 /** @public Service construction is part of the canonical Effect module API. */
@@ -280,7 +301,7 @@ export const make = Effect.gen(function* () {
     readonly maxResponseBytes: number;
     readonly allowReserve: boolean;
     readonly acceptNotModified: boolean;
-    /** GitHub answers a throttled GraphQL document with HTTP 200 and a `RATE_LIMITED` error. */
+    /** Reads the body for GraphQL `errors`, which GitHub sends with HTTP 200. */
     readonly graphql?: boolean;
   }) {
     const host = normalizeHost(input.host);
@@ -323,41 +344,52 @@ export const make = Effect.gen(function* () {
       );
       const headers = response.headers;
       const status = response.status;
-      const throttled =
-        input.graphql === true &&
-        status === 200 &&
-        (graphqlErrors(collected.text)?.types.includes("RATE_LIMITED") ?? false);
-      if (
-        !throttled &&
-        ((status >= 200 && status < 300) || (status === 304 && input.acceptNotModified))
-      ) {
-        yield* limits.recordSuccess({ ...key, lease });
-        return { status, headers, body: collected.text, truncated: collected.truncated };
-      }
-      if (throttled || isRateLimited(status, headers, collected.text)) {
-        const retryAt = retryAtFrom(headers, yield* Clock.currentTimeMillis);
-        yield* limits.recordRateLimit({ ...key, lease, retryAt });
-        return yield* new GitHubApiRateLimitError({
-          host,
-          operation: input.operation,
-          ...(retryAt === undefined ? {} : { retryAt }),
-        });
-      }
-      if (status === 401) {
-        // The source may hold a newer token than the one that was refused.
-        yield* credentials.invalidate(host);
-        return yield* new GitHubApiAuthenticationError({ host, operation: input.operation });
-      }
-      if (status === 404) {
-        return yield* new GitHubApiNotFoundError({ host, operation: input.operation });
-      }
-      const errors = graphqlErrors(collected.text);
-      return yield* new GitHubApiResponseError({
-        host,
-        operation: input.operation,
-        status,
-        ...(errors === null ? {} : { graphqlErrors: errors.messages }),
-      });
+      const context = { host, operation: input.operation };
+      return yield* Answer.$match(
+        classify({
+          status,
+          headers,
+          body: collected.text,
+          graphql: input.graphql === true,
+          acceptNotModified: input.acceptNotModified,
+        }),
+        {
+          Ok: () =>
+            limits
+              .recordSuccess({ ...key, lease })
+              .pipe(
+                Effect.as({
+                  status,
+                  headers,
+                  body: collected.text,
+                  truncated: collected.truncated,
+                }),
+              ),
+          RateLimited: () =>
+            Effect.gen(function* () {
+              const retryAt = retryAtFrom(headers, yield* Clock.currentTimeMillis);
+              yield* limits.recordRateLimit({ ...key, lease, retryAt });
+              return yield* new GitHubApiRateLimitError({
+                ...context,
+                ...(retryAt === undefined ? {} : { retryAt }),
+              });
+            }),
+          // The source may hold a newer token than the one that was refused.
+          Unauthorized: () =>
+            credentials
+              .invalidate(host)
+              .pipe(Effect.andThen(Effect.fail(new GitHubApiAuthenticationError(context)))),
+          NotFound: () => Effect.fail(new GitHubApiNotFoundError(context)),
+          Failed: ({ messages }) =>
+            Effect.fail(
+              new GitHubApiResponseError({
+                ...context,
+                status,
+                ...(messages === undefined ? {} : { graphqlErrors: messages }),
+              }),
+            ),
+        },
+      );
     });
     // The rate-limit scope follows the credential, so a pause on one account never blocks another.
     return yield* gate
@@ -412,19 +444,7 @@ export const make = Effect.gen(function* () {
           graphql: true,
         });
         yield* budget.observe(host, response.body);
-        // GitHub answers a failed GraphQL document with HTTP 200 and an `errors` list. `gh api
-        // graphql` fails those, and callers rely on that to fall back to narrower reads.
-        const errors = graphqlErrors(response.body);
-        if (errors === null) return response.body;
-        if (errors.types.length > 0 && errors.types.every((type) => type === "NOT_FOUND")) {
-          return yield* new GitHubApiNotFoundError({ host, operation: input.operation });
-        }
-        return yield* new GitHubApiResponseError({
-          host,
-          operation: input.operation,
-          status: response.status,
-          graphqlErrors: errors.messages,
-        });
+        return response.body;
       }).pipe(Effect.provideService(SourceControlRateLimit.CredentialScope, scope));
     },
   );
