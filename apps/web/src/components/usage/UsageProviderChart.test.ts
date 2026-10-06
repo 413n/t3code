@@ -1,7 +1,95 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildPeriodColumns, niceScale } from "./UsageProviderChart";
+import {
+  buildPeriodColumns,
+  chartScale,
+  mixSamples,
+  niceScale,
+  SAMPLE_XS,
+  sampleCurve,
+  smoothCurve,
+  VIEW_WIDTH,
+} from "./UsageProviderChart";
 import { providersWithUsage } from "./usageProviders";
+
+/** Points spread evenly across the plot, as the chart lays out its periods. */
+const spread = (ys: readonly number[]) =>
+  ys.map((y, index) => ({ x: (index * VIEW_WIDTH) / (ys.length - 1), y }));
+
+describe("sampleCurve", () => {
+  it("passes through every period exactly", () => {
+    const points = spread([200, 40, 120, 260, 90]);
+    const sampled = sampleCurve(
+      smoothCurve(points),
+      points.map((point) => point.x),
+    );
+
+    sampled.forEach((y, index) => expect(y).toBeCloseTo(points[index]?.y ?? Number.NaN, 9));
+  });
+
+  it("stays monotone between rising periods instead of overshooting", () => {
+    const sampled = sampleCurve(smoothCurve(spread([250, 248, 120, 118, 10, 8])), SAMPLE_XS);
+
+    sampled.slice(1).forEach((y, index) => expect(y).toBeLessThanOrEqual(sampled[index] ?? 0));
+  });
+
+  it("lands curves with different period counts on the same grid", () => {
+    // Monotone cubics reproduce a straight line, so 7 and 30 periods of the
+    // same trend must resample to the same values, sample for sample.
+    const line = (count: number) =>
+      sampleCurve(
+        smoothCurve(
+          spread(Array.from({ length: count }, (_, index) => 240 - (index * 200) / (count - 1))),
+        ),
+        SAMPLE_XS,
+      );
+    const weekly = line(7);
+    const monthly = line(30);
+
+    expect(weekly).toHaveLength(SAMPLE_XS.length);
+    expect(monthly).toHaveLength(SAMPLE_XS.length);
+    weekly.forEach((y, index) => expect(y).toBeCloseTo(monthly[index] ?? Number.NaN, 6));
+    expect(weekly[0]).toBeCloseTo(240, 9);
+    expect(weekly[weekly.length - 1]).toBeCloseTo(40, 9);
+  });
+});
+
+describe("mixSamples", () => {
+  it("runs from the old samples to the new ones", () => {
+    const from = [0, 100, 200];
+    const to = [200, 100, 0];
+
+    expect(mixSamples(from, to, 0)).toEqual(from);
+    expect(mixSamples(from, to, 1)).toEqual(to);
+    expect(mixSamples(from, to, 0.25)).toEqual([50, 100, 150]);
+  });
+});
+
+describe("chartScale", () => {
+  const columns = [
+    {
+      total: 0,
+      bands: [
+        { provider: "codex" as const, value: 40 },
+        { provider: "cursor" as const, value: 900 },
+      ],
+    },
+  ];
+
+  it("scales to providers that have answered", () => {
+    const scale = chartScale(columns, ["codex", "cursor"], new Set(["cursor" as const]));
+
+    expect(scale.max).toBe(40);
+    expect(scale.labeled).toBe(true);
+  });
+
+  it("holds unlabeled placeholder gridlines until something answers", () => {
+    const scale = chartScale(columns, ["codex", "cursor"], new Set(["codex", "cursor"] as const));
+
+    expect(scale.labeled).toBe(false);
+    expect(scale.ticks.length).toBeGreaterThan(1);
+  });
+});
 
 describe("niceScale", () => {
   it("never puts the peak above the top of the scale", () => {

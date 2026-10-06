@@ -28,6 +28,7 @@ export interface EnvironmentUsageStatus {
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly isPending: boolean;
+  readonly isConnected: boolean;
   readonly error: string | null;
   readonly summary: UsageSummary | null;
   readonly needsCursorKeychainAccess: boolean;
@@ -53,6 +54,7 @@ const usageByWindowAtom = Atom.family((windowKey: string) =>
         environmentId,
         label: presentation.entry.target.label,
         isPending: result.waiting,
+        isConnected: presentation.connection.phase === "connected",
         error: result._tag === "Failure" ? "This environment could not report usage." : null,
         summary,
         needsCursorKeychainAccess: needsCursorKeychainAccess(

@@ -65,6 +65,29 @@ function boundaryOverlap(previous: readonly string[], current: readonly string[]
   return lengths.at(-1) ?? 0;
 }
 
+const usageEventsUrl = "https://cursor.com/api/dashboard/get-filtered-usage-events";
+// Cursor rejects larger pages with a 400.
+const pageSize = 1000;
+const pageConcurrency = 6;
+
+/** Runs `run` for indexes `0..count-1` with bounded concurrency, keeping results in index order. */
+async function mapBounded<R>(
+  count: number,
+  concurrency: number,
+  run: (index: number) => Promise<R>,
+) {
+  const results: R[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < count) {
+      const index = next++;
+      results[index] = await run(index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, count) }, worker));
+  return results;
+}
+
 /** Dashboard usage includes headless agents and reports fresh input separately from cache reads. */
 export async function readCursorAccountUsage(
   credentialSource: string | { readonly kind: "keychain" },
@@ -118,76 +141,109 @@ export async function readCursorAccountUsage(
     if (!Number.isFinite(sinceMs) || !Number.isFinite(endDate) || sinceMs < 0 || sinceMs > endDate)
       throw new Error("Invalid date window");
     const deadline = AbortSignal.timeout(60_000);
+    const abort = new AbortController();
+    const fetchPage = async (page: number, total: number | undefined) => {
+      try {
+        const response = await request(usageEventsUrl, {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.any([deadline, abort.signal, AbortSignal.timeout(10_000)]),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "https://cursor.com",
+            Cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${userId}::${accessToken}`)}`,
+          },
+          body: JSON.stringify({
+            page,
+            pageSize,
+            startDate: String(sinceMs),
+            endDate: String(endDate),
+          }),
+        });
+        if (response.status === 401 || response.status === 403) return "denied" as const;
+        if (!response.ok) return "failed" as const;
+        const parsed: unknown = await response.json();
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return "failed" as const;
+        }
+        const body = object(parsed);
+        const keys = Object.keys(body);
+        if ("error" in body || "message" in body || "code" in body) return "failed" as const;
+        const count = keys.length === 0 ? 0 : body.totalUsageEventsCount;
+        const events =
+          keys.length === 0 || (keys.length === 1 && keys[0] === "totalUsageEventsCount")
+            ? []
+            : body.usageEventsDisplay;
+        if (
+          (count !== undefined &&
+            (typeof count !== "number" ||
+              !Number.isSafeInteger(count) ||
+              count < 0 ||
+              (total !== undefined && count !== total))) ||
+          !Array.isArray(events) ||
+          events.length > pageSize ||
+          (count === undefined && !Array.isArray(body.usageEventsDisplay))
+        ) {
+          return "failed" as const;
+        }
+        return { count: typeof count === "number" ? count : undefined, events };
+      } catch {
+        return "failed" as const;
+      }
+    };
+    const fetchPages = async () => {
+      const first = await fetchPage(1, undefined);
+      if (typeof first === "string") return first;
+      let total = first.count;
+      const pages: unknown[][] = [first.events];
+      if (total !== undefined && first.events.length === pageSize) {
+        // Without boundary overlap, the short terminal page is the last one in
+        // this range. The first failure aborts the requests still in flight.
+        const knownTotal = total;
+        const rest = await mapBounded(
+          Math.floor(knownTotal / pageSize),
+          pageConcurrency,
+          async (index) => {
+            if (abort.signal.aborted) return "failed" as const;
+            const result = await fetchPage(index + 2, knownTotal);
+            if (typeof result === "string") abort.abort();
+            return result;
+          },
+        );
+        if (rest.includes("denied")) return "denied" as const;
+        for (const result of rest) {
+          if (typeof result === "string") return result;
+          pages.push(result.events);
+          if (result.events.length < pageSize) break;
+        }
+      }
+      // Unknown totals, and ranges extended by boundary overlap, continue one page at a time.
+      while (pages[pages.length - 1]?.length === pageSize) {
+        // A count can include overlapping page boundaries. Allow room to
+        // reconcile them without imposing a fixed account-size limit.
+        if (pages.length >= (total === undefined ? 1000 : Math.ceil(total / pageSize) * 2 + 1)) {
+          return "failed" as const;
+        }
+        const result = await fetchPage(pages.length + 1, total);
+        if (typeof result === "string") return result;
+        total = result.count ?? total;
+        pages.push(result.events);
+      }
+      return { pages, total };
+    };
+    const fetched = await fetchPages();
+    if (fetched === "denied") {
+      return {
+        accountKey,
+        records: [],
+        missing: false,
+        error: "Sign in to Cursor again to read account usage.",
+      };
+    }
+    if (fetched === "failed") throw new Error("Account usage request failed");
+    const { pages, total } = fetched;
     const records: UsageRecord[] = [];
     const occurrences = new Map<string, number>();
-    const pages: unknown[][] = [];
-    let completed = false;
-    const pageSize = 1000;
-    let total: number | undefined;
-    for (let page = 1; ; page++) {
-      // A count can include overlapping page boundaries. Allow room to
-      // reconcile them without imposing a fixed account-size limit.
-      if (page > (total === undefined ? 1000 : Math.ceil(total / pageSize) * 2 + 1)) {
-        throw new Error("Account usage page limit exceeded");
-      }
-      const response = await request("https://cursor.com/api/dashboard/get-filtered-usage-events", {
-        method: "POST",
-        redirect: "error",
-        signal: AbortSignal.any([deadline, AbortSignal.timeout(10_000)]),
-        headers: {
-          "Content-Type": "application/json",
-          Origin: "https://cursor.com",
-          Cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${userId}::${accessToken}`)}`,
-        },
-        body: JSON.stringify({
-          page,
-          pageSize,
-          startDate: String(sinceMs),
-          endDate: String(endDate),
-        }),
-      });
-      if (response.status === 401 || response.status === 403) {
-        return {
-          accountKey,
-          records: [],
-          missing: false,
-          error: "Sign in to Cursor again to read account usage.",
-        };
-      }
-      if (!response.ok) throw new Error("Account usage request failed");
-      const parsed: unknown = await response.json();
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("Invalid account usage page");
-      }
-      const body = object(parsed);
-      const keys = Object.keys(body);
-      if ("error" in body || "message" in body || "code" in body)
-        throw new Error("Account usage error response");
-      const count = keys.length === 0 ? 0 : body.totalUsageEventsCount;
-      const events =
-        keys.length === 0 || (keys.length === 1 && keys[0] === "totalUsageEventsCount")
-          ? []
-          : body.usageEventsDisplay;
-      if (
-        (count !== undefined &&
-          (typeof count !== "number" ||
-            !Number.isSafeInteger(count) ||
-            count < 0 ||
-            (total !== undefined && count !== total))) ||
-        !Array.isArray(events) ||
-        events.length > pageSize ||
-        (count === undefined && !Array.isArray(body.usageEventsDisplay))
-      ) {
-        throw new Error("Inconsistent account usage page");
-      }
-      if (typeof count === "number") total = count;
-      pages.push(events);
-      if (events.length < pageSize) {
-        completed = true;
-        break;
-      }
-    }
-    if (!completed) throw new Error("Account usage page limit exceeded");
     const rawCount = pages.reduce((sum, page) => sum + page.length, 0);
     if (total !== undefined && rawCount < total) throw new Error("Incomplete account usage pages");
     let removalsRemaining = total === undefined ? 0 : rawCount - total;

@@ -22,6 +22,7 @@ function environment(id: string, cost: number | null, hostId = id): EnvironmentU
     environmentId: EnvironmentId.make(id),
     label: id,
     isPending: cost === null,
+    isConnected: true,
     error: null,
     needsCursorKeychainAccess: false,
     summary:
