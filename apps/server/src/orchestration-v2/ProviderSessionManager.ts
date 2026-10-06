@@ -482,7 +482,17 @@ export const layerWithOptions = (
                   // revoke the credential between validation and reservation.
                   reserveMcpCredential(threadId, existing.providerSessionId);
                   const rawToken = existing.authorizationHeader.replace(/^Bearer\s+/, "");
-                  const resolved = yield* mcpSessionRegistry.resolve(rawToken);
+                  // The caller only learns of the reservation once this returns,
+                  // so a stop while resolving must drop it here.
+                  const resolved = yield* mcpSessionRegistry
+                    .resolve(rawToken)
+                    .pipe(
+                      Effect.onInterrupt(() =>
+                        Effect.sync(() =>
+                          dropMcpCredentialReservation(threadId, existing.providerSessionId),
+                        ),
+                      ),
+                    );
                   if (
                     resolved !== undefined &&
                     resolved.thread.threadId === threadId &&

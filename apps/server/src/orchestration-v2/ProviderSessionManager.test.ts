@@ -457,6 +457,11 @@ function layerTest(input: {
   readonly failReleaseEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
+  /** Once armed, holds the next credential lookup until it is interrupted. */
+  readonly pauseResolve?: {
+    readonly armed: Ref.Ref<boolean>;
+    readonly paused: Deferred.Deferred<void>;
+  };
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
@@ -494,6 +499,10 @@ function layerTest(input: {
         : { scopeCloseReached: input.scopeCloseReached }),
     }),
   );
+  const layerConfiguredMcpRegistry =
+    input.pauseResolve === undefined
+      ? layerTestMcpRegistry
+      : layerPausingMcpRegistry(input.pauseResolve);
   const layerProviderEventIngestorTest = ProviderEventIngestor.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -508,7 +517,7 @@ function layerTest(input: {
     layerTestStores,
     layerConfiguredEventSink,
     IdAllocator.layer,
-    layerTestMcpRegistry,
+    layerConfiguredMcpRegistry,
     ProviderSessionManager.layerWithOptions({
       idleTimeoutMs: input.idleTimeoutMs,
       ...(input.maxIdlePinMs === undefined ? {} : { maxIdlePinMs: input.maxIdlePinMs }),
@@ -519,7 +528,7 @@ function layerTest(input: {
           layerConfiguredEventSink,
           IdAllocator.layer,
           layerProviderEventIngestorTest,
-          layerTestMcpRegistry,
+          layerConfiguredMcpRegistry,
           layerTestStores,
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
@@ -547,6 +556,28 @@ const layerTestMcpRegistry = Layer.effect(
   Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
   Layer.provide(NodeServices.layer),
 );
+
+const layerPausingMcpRegistry = (pause: {
+  readonly armed: Ref.Ref<boolean>;
+  readonly paused: Deferred.Deferred<void>;
+}) =>
+  Layer.effect(
+    McpSessionRegistry.McpSessionRegistry,
+    Effect.gen(function* () {
+      const delegate = yield* McpSessionRegistry.McpSessionRegistry;
+      return McpSessionRegistry.McpSessionRegistry.of({
+        ...delegate,
+        resolve: (rawToken) =>
+          Ref.getAndSet(pause.armed, false).pipe(
+            Effect.flatMap((armed) =>
+              armed
+                ? Deferred.succeed(pause.paused, undefined).pipe(Effect.andThen(Effect.never))
+                : delegate.resolve(rawToken),
+            ),
+          ),
+      });
+    }),
+  ).pipe(Layer.provide(layerTestMcpRegistry));
 
 function makeBrowserAccessProject(projectId: ProjectId): Project {
   return {
@@ -1994,6 +2025,7 @@ it.effect(
         const idAllocator = yield* IdAllocator.IdAllocatorV2;
         const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
         const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const eventStore = yield* EventStore.EventStoreV2;
         const now = yield* DateTime.now;
         const owner = ThreadId.make("thread-provider-session-manager-stale-attach-owner");
         const threadId = ThreadId.make("thread-provider-session-manager-stale-attach");
@@ -2031,7 +2063,12 @@ it.effect(
 
         // ...while the session is replaced and the thread opens the new one.
         yield* manager.release({ providerSessionId, reason: "runtime_error" });
-        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const replacement = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
         const config = McpProviderSession.readMcpProviderSession(threadId);
         assert.isDefined(config);
 
@@ -2044,9 +2081,92 @@ it.effect(
         );
         const token = config!.authorizationHeader.replace(/^Bearer\s+/, "");
         assert.equal((yield* registry.resolve(token))?.thread.threadId, threadId);
+        // Still attached: resuming on the replacement does not attach the thread again.
+        const attachedEvents = eventStore
+          .read({ threadId, eventType: "provider-session.attached" })
+          .pipe(
+            Stream.runCollect,
+            Effect.map((events) => events.length),
+          );
+        const attachedBefore = yield* attachedEvents;
+        yield* replacement.resumeThread({
+          threadId,
+          providerThread: makeProviderThread({
+            idAllocator,
+            threadId,
+            providerSessionId,
+            now,
+            nativeThreadId: "native-stale-attach",
+          }),
+        });
+        assert.equal(yield* attachedEvents, attachedBefore);
       }).pipe(
         Effect.provide(
           layerTest({ state, idleTimeoutMs: 60_000, pauseAttachWrite: { armed, paused } }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 revokes a reused credential after a resume stopped while checking it",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const armed = yield* Ref.make(false);
+      const paused = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const now = yield* DateTime.now;
+        const owner = ThreadId.make("thread-provider-session-manager-resolve-stop-owner");
+        const threadId = ThreadId.make("thread-provider-session-manager-resolve-stop");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: owner, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId: owner,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const resume = runtime.resumeThread({
+          threadId,
+          providerThread: makeProviderThread({
+            idAllocator,
+            threadId,
+            providerSessionId,
+            now,
+            nativeThreadId: "native-resolve-stop",
+          }),
+        });
+        // The thread gets a credential, then detaches and keeps it for a re-attach.
+        yield* resume;
+        yield* manager.detach({ providerSessionId, threadId });
+        const config = McpProviderSession.readMcpProviderSession(threadId);
+        assert.isDefined(config);
+        const token = config!.authorizationHeader.replace(/^Bearer\s+/, "");
+
+        // A re-attach is stopped while it checks whether that credential is reusable.
+        yield* Ref.set(armed, true);
+        const stopped = yield* resume.pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(paused);
+        yield* Fiber.interrupt(stopped);
+
+        // Nothing holds the credential now, so a terminal release revokes it.
+        yield* manager.release({ providerSessionId, reason: "manual_shutdown" });
+        assert.isUndefined(yield* registry.resolve(token));
+      }).pipe(
+        Effect.provide(
+          layerTest({ state, idleTimeoutMs: 60_000, pauseResolve: { armed, paused } }),
         ),
       );
     }),
