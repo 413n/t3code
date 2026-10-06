@@ -128,6 +128,30 @@ const layerFlakyReleaseEventSink = (flaky: FlakyReleaseWrites) =>
     }),
   ).pipe(Layer.provide(layerTestEventSink));
 
+// Once armed, holds the next attach write until the writer is interrupted.
+const layerPausingAttachEventSink = (pause: {
+  readonly armed: Ref.Ref<boolean>;
+  readonly paused: Deferred.Deferred<void>;
+}) =>
+  Layer.effect(
+    EventSink.EventSinkV2,
+    Effect.gen(function* () {
+      const delegate = yield* EventSink.EventSinkV2;
+      return EventSink.EventSinkV2.of({
+        ...delegate,
+        write: (input) =>
+          Effect.gen(function* () {
+            const attach = input.events.some((event) => event.type === "provider-session.attached");
+            if (attach && (yield* Ref.getAndSet(pause.armed, false))) {
+              yield* Deferred.succeed(pause.paused, undefined);
+              return yield* Effect.never;
+            }
+            return yield* delegate.write(input);
+          }),
+      });
+    }),
+  ).pipe(Layer.provide(layerTestEventSink));
+
 const CodexCapabilities: OrchestrationV2ProviderCapabilities = CodexProviderCapabilitiesV2;
 const ExclusiveCapabilities: OrchestrationV2ProviderCapabilities = {
   ...CodexCapabilities,
@@ -432,6 +456,7 @@ function layerTest(input: {
   }) => Effect.Effect<void>;
   readonly failReleaseEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
+  readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
@@ -444,9 +469,11 @@ function layerTest(input: {
   const layerConfiguredEventSink =
     input.flakyReleaseWrites !== undefined
       ? layerFlakyReleaseEventSink(input.flakyReleaseWrites)
-      : input.failReleaseEventWrites
-        ? layerFailingReleaseEventSink
-        : layerTestEventSink;
+      : input.pauseAttachWrite !== undefined
+        ? layerPausingAttachEventSink(input.pauseAttachWrite)
+        : input.failReleaseEventWrites
+          ? layerFailingReleaseEventSink
+          : layerTestEventSink;
   const layerRegistry = ProviderAdapterRegistry.layerSingle(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -1890,6 +1917,69 @@ it.effect("ProviderSessionManagerV2 revokes MCP credentials when release persist
       ),
     );
   }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 keeps a thread attached when an earlier attach of it is interrupted",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const armed = yield* Ref.make(false);
+      const paused = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const now = yield* DateTime.now;
+        const owner = ThreadId.make("thread-provider-session-manager-attach-race-owner");
+        const threadId = ThreadId.make("thread-provider-session-manager-attach-race");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: owner, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId: owner,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const resume = runtime.resumeThread({
+          threadId,
+          providerThread: makeProviderThread({
+            idAllocator,
+            threadId,
+            providerSessionId,
+            now,
+            nativeThreadId: "native-attach-race",
+          }),
+        });
+
+        // The first attach of the thread is stopped after attaching it, while
+        // a second attach of the same thread is already on its way.
+        yield* Ref.set(armed, true);
+        const first = yield* resume.pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(paused);
+        const second = yield* resume.pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Fiber.interrupt(first);
+        yield* Fiber.join(second);
+
+        // The second attach owns the thread's attachment and credential.
+        const config = McpProviderSession.readMcpProviderSession(threadId);
+        assert.isDefined(config);
+        const token = config!.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.equal((yield* registry.resolve(token))?.thread.threadId, threadId);
+      }).pipe(
+        Effect.provide(
+          layerTest({ state, idleTimeoutMs: 60_000, pauseAttachWrite: { armed, paused } }),
+        ),
+      );
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 duplicate detach preserves replacement MCP credentials", () =>

@@ -1265,15 +1265,15 @@ export const layerWithOptions = (
               dropMcpCredentialReservation(input.threadId, preparedForCleanup.mcpCredentialId);
             }
           };
-          return Effect.gen(function* () {
-            const attached = yield* threadAttachment.withLock(
-              threadAttachmentKey(input),
+          // The whole attach, including undoing a failed one, holds the
+          // thread's lock: a concurrent attach of the same thread waits, so it
+          // never sees an attachment that this call is about to roll back.
+          const attach = Effect.gen(function* () {
+            const attached = yield* attachThread(input).pipe(
               // Recorded with no gap for an interrupt: cleanup undoes only an
               // attach this call made, never one an earlier open made.
-              attachThread(input).pipe(
-                Effect.tap((attached) => Effect.sync(() => (attachedHere = attached))),
-                Effect.uninterruptible,
-              ),
+              Effect.tap((attached) => Effect.sync(() => (attachedHere = attached))),
+              Effect.uninterruptible,
             );
             if (attached) {
               const prepared = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
@@ -1325,6 +1325,8 @@ export const layerWithOptions = (
                   )
                 : Effect.void,
             ),
+          );
+          return threadAttachment.withLock(threadAttachmentKey(input), attach).pipe(
             // The entry's own record (written above while the thread is
             // attached) guards the credential from here on; the reservation
             // is only needed until then. Ensuring covers defects/interrupts.
