@@ -231,6 +231,8 @@ export const ThreadContextRecord = Schema.Struct({
 });
 export type ThreadContextRecord = typeof ThreadContextRecord.Type;
 
+const isJson = Schema.is(Schema.Json);
+
 /**
  * Catch-all for kinds this build does not know. Known discriminators are excluded so a
  * malformed known record fails its own schema instead of sliding through unchecked.
@@ -241,12 +243,10 @@ export const UnknownContextRecord = Schema.Struct({
   kind: ComposerContextKind.check(Schema.isPattern(KNOWN_KIND_PATTERN)),
   payload: Schema.Unknown.check(
     Schema.makeFilter((payload) => {
-      try {
-        const encoded = JSON.stringify(payload);
-        return encoded !== undefined && encoded.length <= 64_000;
-      } catch {
-        return false;
-      }
+      // Only JSON values, so a payload the wire cannot carry (a Date, NaN, an
+      // undefined field) fails this record alone instead of the whole message.
+      if (!isJson(payload)) return false;
+      return JSON.stringify(payload).length <= 64_000;
     }),
   ),
 });

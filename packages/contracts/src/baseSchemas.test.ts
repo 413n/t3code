@@ -72,6 +72,13 @@ describe("ForwardCompatibleArray", () => {
     ).toEqual([{ name: "a" }]);
   });
 
+  it("still drops the null holes a server on an earlier build sends", () => {
+    expect(fromWire(Named)([{ name: "a" }, null, { name: "b" }])).toEqual([
+      { name: "a" },
+      { name: "b" },
+    ]);
+  });
+
   it("does not accept holes as a decoded value", () => {
     expect(Schema.is(Named)([undefined])).toBe(false);
     expect(Schema.is(Named)([{ name: "a" }])).toBe(true);
