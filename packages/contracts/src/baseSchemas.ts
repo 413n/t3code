@@ -140,13 +140,21 @@ export const ForwardCompatibleArray = <Element extends Schema.Top>(element: Elem
         Schema.UndefinedOr(Schema.toType(element)).pipe(
           Schema.catchEncoding(() => Effect.succeedSome(undefined)),
         ),
+      ).check(
+        // The holes above are an encoding detail: a decoded value has none, so
+        // `Schema.is` and `make` still reject an array that does.
+        Schema.makeFilter((values) => values.every((value) => value !== undefined), {
+          expected: "an array without holes",
+        }),
       ),
       SchemaTransformation.transform<
         ReadonlyArray<Element["Type"]>,
         ReadonlyArray<Element["Type"] | undefined>
       >({
         decode: (values) => values.filter((value) => value !== undefined),
-        encode: (values) => values,
+        // Dropped before the wire, so a wrapper that sees the encoded array as
+        // JSON values never meets a hole.
+        encode: (values) => values.filter((value) => value !== undefined),
       }),
     ),
   ) as unknown as ForwardCompatibleArray<Element>;

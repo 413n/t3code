@@ -48,8 +48,9 @@ describe("ForwardCompatibleArray", () => {
     ]);
   });
 
-  it("sends an element it cannot encode as a hole instead of failing the array", () => {
-    const Named = ForwardCompatibleArray(Schema.Struct({ name: TrimmedNonEmptyString }));
+  const Named = ForwardCompatibleArray(Schema.Struct({ name: TrimmedNonEmptyString }));
+
+  it("drops an element it cannot encode instead of failing the array", () => {
     const wire = JSON.parse(
       JSON.stringify(
         Schema.encodeUnknownSync(Schema.toCodecJson(Named))([
@@ -59,8 +60,21 @@ describe("ForwardCompatibleArray", () => {
         ]),
       ),
     );
-    expect(wire).toEqual([{ name: "a" }, null, { name: "b" }]);
+    expect(wire).toEqual([{ name: "a" }, { name: "b" }]);
     expect(fromWire(Named)(wire)).toEqual([{ name: "a" }, { name: "b" }]);
+  });
+
+  it("drops it too when a wrapper reads the encoded array as JSON values", () => {
+    // How context records are bounded before forward-compatible decoding.
+    const Wrapped = Schema.Array(Schema.Unknown).pipe(Schema.decodeTo(Named));
+    expect(
+      Schema.encodeUnknownSync(Schema.toCodecJson(Wrapped))([{ name: "a" }, { name: " " }]),
+    ).toEqual([{ name: "a" }]);
+  });
+
+  it("does not accept holes as a decoded value", () => {
+    expect(Schema.is(Named)([undefined])).toBe(false);
+    expect(Schema.is(Named)([{ name: "a" }])).toBe(true);
   });
 });
 

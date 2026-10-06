@@ -197,6 +197,17 @@ describe("OrchestrationMessageContext", () => {
     ).toThrow();
   });
 
+  it("sends a message without a record it cannot encode", () => {
+    const wire = Schema.encodeUnknownSync(Schema.toCodecJson(OrchestrationMessageContext))({
+      version: 1,
+      records: [
+        decodeContext({ version: 1, records: [knownRecords.terminal] }).records[0],
+        { ...knownRecords.terminal, contextId: "ctx_2", terminalLabel: "   " },
+      ],
+    });
+    expect(decodeContext(wire).records.map((record) => record.contextId)).toEqual(["ctx_1"]);
+  });
+
   it("normalizes decoded record identifiers", () => {
     const context = decodeContext({
       version: 1,
