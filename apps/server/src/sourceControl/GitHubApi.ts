@@ -431,10 +431,3 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(GitHubApi, make);
-
-const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
-
-/** The JSON body of a REST answer, or none when GitHub sent nothing (204, 304). */
-export function restJson(response: GitHubRestResponse): Option.Option<unknown> {
-  return response.body.trim() === "" ? Option.none() : decodeJson(response.body);
-}
