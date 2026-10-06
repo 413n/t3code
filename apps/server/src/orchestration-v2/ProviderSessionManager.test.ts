@@ -1982,6 +1982,76 @@ it.effect(
     }),
 );
 
+it.effect(
+  "ProviderSessionManagerV2 keeps a replacement session's attachment when a stale attach is interrupted",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const armed = yield* Ref.make(false);
+      const paused = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const now = yield* DateTime.now;
+        const owner = ThreadId.make("thread-provider-session-manager-stale-attach-owner");
+        const threadId = ThreadId.make("thread-provider-session-manager-stale-attach");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: owner, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId: owner,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+
+        // An attach of the thread to this session stalls mid-write...
+        yield* Ref.set(armed, true);
+        const stale = yield* runtime
+          .resumeThread({
+            threadId,
+            providerThread: makeProviderThread({
+              idAllocator,
+              threadId,
+              providerSessionId,
+              now,
+              nativeThreadId: "native-stale-attach",
+            }),
+          })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(paused);
+
+        // ...while the session is replaced and the thread opens the new one.
+        yield* manager.release({ providerSessionId, reason: "runtime_error" });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const config = McpProviderSession.readMcpProviderSession(threadId);
+        assert.isDefined(config);
+
+        yield* Fiber.interrupt(stale);
+
+        // The replacement keeps the thread and its credential.
+        assert.equal(
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+          config!.providerSessionId,
+        );
+        const token = config!.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.equal((yield* registry.resolve(token))?.thread.threadId, threadId);
+      }).pipe(
+        Effect.provide(
+          layerTest({ state, idleTimeoutMs: 60_000, pauseAttachWrite: { armed, paused } }),
+        ),
+      );
+    }),
+);
+
 it.effect("ProviderSessionManagerV2 duplicate detach preserves replacement MCP credentials", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);

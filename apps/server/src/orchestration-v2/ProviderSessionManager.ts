@@ -1175,6 +1175,7 @@ export const layerWithOptions = (
           }),
         );
 
+      /** Returns the runtime the thread was attached to, or undefined if it already was. */
       const attachThread = (input: {
         readonly providerSessionId: ProviderSessionId;
         readonly threadId: ThreadId;
@@ -1184,25 +1185,34 @@ export const layerWithOptions = (
           Ref.modify(sessions, (current) => {
             const entry = current.get(sessionKey(input.providerSessionId));
             if (entry === undefined || entry.attachedThreadIds.has(input.threadId)) {
-              return [false, current] as const;
+              return [undefined, current] as const;
             }
             const updated = new Map(current);
             updated.set(sessionKey(input.providerSessionId), {
               ...entry,
               attachedThreadIds: new Set([...entry.attachedThreadIds, input.threadId]),
             });
-            return [true, updated] as const;
+            return [entry.runtime, updated] as const;
           }),
         );
 
+      /**
+       * Undoes an attach to `runtime`. A replacement session that reopened under
+       * the same id since is left alone.
+       */
       const removeThreadAttachment = (input: {
         readonly providerSessionId: ProviderSessionId;
         readonly threadId: ThreadId;
+        readonly runtime: ProviderAdapterV2SessionRuntime;
       }) =>
         Ref.update(sessions, (current) => {
           const key = sessionKey(input.providerSessionId);
           const entry = current.get(key);
-          if (entry === undefined || !entry.attachedThreadIds.has(input.threadId)) {
+          if (
+            entry === undefined ||
+            entry.runtime !== input.runtime ||
+            !entry.attachedThreadIds.has(input.threadId)
+          ) {
             return current;
           }
           const attachedThreadIds = new Set(entry.attachedThreadIds);
@@ -1256,7 +1266,7 @@ export const layerWithOptions = (
         readonly providerInstanceId: ProviderInstanceId;
       }) =>
         Effect.suspend(() => {
-          let attachedHere = false;
+          let attachedTo: ProviderAdapterV2SessionRuntime | undefined;
           let preparedForCleanup: PreparedMcpCredential | undefined;
           let reservationDropped = false;
           const dropReservation = () => {
@@ -1272,10 +1282,10 @@ export const layerWithOptions = (
             const attached = yield* attachThread(input).pipe(
               // Recorded with no gap for an interrupt: cleanup undoes only an
               // attach this call made, never one an earlier open made.
-              Effect.tap((attached) => Effect.sync(() => (attachedHere = attached))),
+              Effect.tap((runtime) => Effect.sync(() => (attachedTo = runtime))),
               Effect.uninterruptible,
             );
-            if (attached) {
+            if (attached !== undefined) {
               const prepared = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
               preparedForCleanup = prepared;
               if (prepared.mcpCredentialId !== undefined) {
@@ -1308,22 +1318,40 @@ export const layerWithOptions = (
             // An interrupted attach is undone too, so the next attach writes
             // the attachment instead of finding the thread already attached.
             Effect.onError(() =>
-              attachedHere
-                ? removeThreadAttachment(input).pipe(
-                    // Revoke only a credential this attach freshly minted: a REUSED
-                    // credential is by definition held by another live provider
-                    // process, and revoking it thread-wide would break that
-                    // process's MCP client mid-conversation.
+              attachedTo === undefined
+                ? Effect.void
+                : removeThreadAttachment({ ...input, runtime: attachedTo }).pipe(
                     Effect.andThen(
                       Effect.suspend(() => {
                         dropReservation();
-                        return preparedForCleanup?.issued === true
-                          ? clearMcpSession(input.threadId, preparedForCleanup.mcpCredentialId)
-                          : Effect.void;
+                        // Revoke only a credential this attach freshly minted: a
+                        // REUSED credential is by definition held by another
+                        // live provider process, and revoking it thread-wide
+                        // would break that process's MCP client mid-conversation.
+                        if (preparedForCleanup?.issued !== true) return Effect.void;
+                        const mcpCredentialId = preparedForCleanup.mcpCredentialId;
+                        const attachedRuntime = attachedTo;
+                        // As in release: a replacement session (or an open
+                        // configuring one) may have taken the credential up.
+                        return Ref.get(sessions).pipe(
+                          Effect.flatMap((current) =>
+                            (mcpCredentialId !== undefined &&
+                              isMcpCredentialReserved(input.threadId, mcpCredentialId)) ||
+                            Array.from(current.values()).some(
+                              (other) =>
+                                other.runtime !== attachedRuntime &&
+                                (other.attachedThreadIds.has(input.threadId) ||
+                                  (mcpCredentialId !== undefined &&
+                                    other.mcpCredentialIdByThread.get(input.threadId) ===
+                                      mcpCredentialId)),
+                            )
+                              ? Effect.void
+                              : clearMcpSession(input.threadId, mcpCredentialId),
+                          ),
+                        );
                       }),
                     ),
-                  )
-                : Effect.void,
+                  ),
             ),
           );
           return threadAttachment.withLock(threadAttachmentKey(input), attach).pipe(
