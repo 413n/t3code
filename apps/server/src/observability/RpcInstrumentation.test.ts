@@ -269,6 +269,10 @@ describe("WS RPC instrumentation middleware", () => {
           ),
         );
 
+        // Wall and monotonic time disagree before the call starts, so a duration that mixes
+        // the two clocks is caught.
+        yield* TestClock.adjust(Duration.seconds(1));
+        yield* TestClock.setTime(0);
         const consumer = yield* Stream.runDrain(
           client[WS_METHODS.pullRequestsSubscribeRefreshes]({}),
         ).pipe(Effect.forkChild);
