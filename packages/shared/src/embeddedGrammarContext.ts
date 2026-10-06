@@ -8,9 +8,12 @@ const SCRIPT_CONTEXT_BY_LANGUAGE: Partial<Record<string, string>> = {
 };
 
 const STYLE_CONTEXT = "<style>\n";
+// A style hunk that closes a rule before opening one starts among that rule's declarations.
+const STYLE_RULE_CONTEXT = "<style>\n* {\n";
 const CLOSING_SCRIPT = /^\s*<\/script\s*>/i;
 const CLOSING_STYLE = /^\s*<\/style\s*>/i;
 const MARKUP = /^\s*(?:<[A-Za-z!/]|\{[#:/@])/;
+const BRACE = /[{}]/;
 
 /**
  * The block a hunk most likely starts inside, as context to tokenize it with, or `undefined` when
@@ -24,10 +27,12 @@ export function inferEmbeddedGrammarContext(
 ) {
   const scriptContext = SCRIPT_CONTEXT_BY_LANGUAGE[language];
   if (scriptContext === undefined || firstLineNumber <= 1) return undefined;
+  let firstBrace: string | undefined;
   for (const line of lines) {
     if (CLOSING_SCRIPT.test(line)) return scriptContext;
-    if (CLOSING_STYLE.test(line)) return STYLE_CONTEXT;
+    if (CLOSING_STYLE.test(line)) return firstBrace === "}" ? STYLE_RULE_CONTEXT : STYLE_CONTEXT;
     if (MARKUP.test(line)) return undefined;
+    firstBrace ??= BRACE.exec(line)?.[0];
   }
   return scriptContext;
 }

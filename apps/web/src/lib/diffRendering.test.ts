@@ -293,6 +293,26 @@ describe("getRenderablePatch", () => {
     const colors = new Set(toHtml(code.additionLines[0]!).match(/color:[^;"]+/g));
     expect(colors.size).toBeGreaterThan(2);
   });
+
+  it("starts a Svelte style hunk inside the rule it opens in", () => {
+    const parsed = getRenderablePatch(
+      [
+        "diff --git a/App.svelte b/App.svelte",
+        "--- a/App.svelte",
+        "+++ b/App.svelte",
+        "@@ -40,4 +40,4 @@",
+        "     display: grid;",
+        "-    color: red;",
+        "+    color: blue;",
+        "   }",
+        " </style>",
+      ].join("\n"),
+      "review",
+    );
+    expect(parsed?.kind).toBe("files");
+    if (parsed?.kind !== "files") return;
+    expect(parsed.files[0]!.hunks[0]!.grammarContextCode).toBe("<style>\n* {\n");
+  });
 });
 
 describe("diff file reconciliation", () => {

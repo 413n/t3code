@@ -396,6 +396,16 @@ function hasOnlyCommentRowsBetween(
   return true;
 }
 
+/** A segment's lines and the rest of its hunk after them, read lazily. */
+function* linesToHunkEnd(rows: ReadonlyArray<NativeReviewDiffRow>, fromRowIndex: number) {
+  for (let rowIndex = fromRowIndex; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex]!;
+    if (row.kind === "comment") continue;
+    if (!isHighlightableLineRow(row)) return;
+    yield row.content;
+  }
+}
+
 function canShareGrammarContext(
   previous: IndexedNativeReviewDiffLineRow,
   next: IndexedNativeReviewDiffLineRow,
@@ -496,8 +506,7 @@ export async function highlightNativeReviewDiffVisibleRows(
       return;
     }
 
-    const lines = segmentRows.map(({ row }) => row.content);
-    const code = lines.join("\n");
+    const code = segmentRows.map(({ row }) => row.content).join("\n");
     if (
       charactersSinceYield > 0 &&
       charactersSinceYield + code.length > NATIVE_REVIEW_DIFF_TOKENIZE_MAX_CHARACTERS
@@ -506,14 +515,15 @@ export async function highlightNativeReviewDiffVisibleRows(
       charactersSinceYield = 0;
       if (input.signal?.aborted) return;
     }
-    const { row: firstRow } = segmentRows[0]!;
+    // Segments split inside a hunk, so the line that gives the block away can sit after this one.
+    const { row: firstRow, rowIndex: firstRowIndex } = segmentRows[0]!;
     const tokenLines = await highlighter.tokenize(code, {
       lang: segmentFile.language,
       theme,
       grammarContextCode: inferEmbeddedGrammarContext(
         segmentFile.language,
         firstRow.oldLineNumber ?? firstRow.newLineNumber ?? 0,
-        lines,
+        linesToHunkEnd(input.rows, firstRowIndex),
       ),
       signal: input.signal,
     });

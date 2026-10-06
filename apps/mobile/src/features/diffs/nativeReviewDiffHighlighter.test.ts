@@ -258,6 +258,40 @@ describe("highlightNativeReviewDiffVisibleRows", () => {
       expect(colors.size).toBeGreaterThan(1);
     }
   });
+
+  it("colors a Svelte style hunk's deleted and added declarations alike", async () => {
+    const { rows, files } = buildNativeReviewDiffData(
+      buildReviewParsedDiff(
+        [
+          "diff --git a/src/Nav.svelte b/src/Nav.svelte",
+          "--- a/src/Nav.svelte",
+          "+++ b/src/Nav.svelte",
+          "@@ -40,4 +40,4 @@",
+          "   p {",
+          "-    color: red;",
+          "+    color: blue;",
+          "   }",
+          " </style>",
+        ].join("\n"),
+        "svelte-style-hunk",
+      ),
+    );
+    const result = await highlightNativeReviewDiffVisibleRows({
+      rows,
+      files,
+      scheme: "dark",
+      engine: "javascript",
+      firstRowIndex: 0,
+      lastRowIndex: rows.length - 1,
+      overscanRows: 0,
+    });
+    const [deleted, added] = rows
+      .filter((row) => row.content?.startsWith("    color"))
+      .map((row) => result.tokensByRowId[row.id]?.map((token) => token.color));
+
+    expect(new Set(deleted).size).toBeGreaterThan(2);
+    expect(added).toEqual(deleted);
+  });
 });
 
 describe.each(["native", "javascript"] as const)("%s highlighting budgets", (engine) => {
