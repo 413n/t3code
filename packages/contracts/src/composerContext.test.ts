@@ -210,7 +210,7 @@ describe("OrchestrationMessageContext", () => {
     expect(decodeContext(wire).records.map((record) => record.contextId)).toEqual(["ctx_1"]);
   });
 
-  it("sends a message without an unknown-kind record whose payload is not JSON", () => {
+  it("sends a message without the records the wire cannot carry", () => {
     const wire = Schema.encodeUnknownSync(Schema.toCodecJson(OrchestrationMessageContext))({
       version: 1,
       records: [
@@ -221,6 +221,14 @@ describe("OrchestrationMessageContext", () => {
           kind: "future-kind",
           label: "x",
           payload: { count: Number.NaN },
+        },
+        { ...knownRecords["review-comment"], contextId: "ctx_3", fenceLanguage: undefined },
+        {
+          ...base,
+          contextId: "ctx_4",
+          kind: "future-kind",
+          label: "deep",
+          payload: Array.from({ length: 20_000 }).reduce((inner: unknown) => [inner], 0),
         },
       ],
     });
