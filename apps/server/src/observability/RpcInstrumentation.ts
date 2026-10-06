@@ -223,11 +223,9 @@ const recordRpcMetrics = (
   exit: Exit.Exit<unknown, unknown>,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    const elapsedNanos = (yield* Clock.monotonicTimeNanos) - startedAt;
-
     yield* Metric.update(
       Metric.withAttributes(rpcRequestDuration, metricAttributes({ method })),
-      Duration.nanos(elapsedNanos),
+      Duration.nanos((yield* Clock.monotonicTimeNanos) - startedAt),
     );
     yield* Metric.update(
       Metric.withAttributes(
