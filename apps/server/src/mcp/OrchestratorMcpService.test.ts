@@ -572,7 +572,11 @@ describe("OrchestratorMcpService", () => {
     }),
   );
 
-  it.effect("refuses to cancel a task when a task under it now runs above the parent's modes", () =>
+  /**
+   * A Supervised parent cancels its Supervised child, under which a task
+   * now runs at full access. Reports what the cancel did.
+   */
+  const cancelOverRaisedGrandchild = (child: { readonly deleted: boolean }) =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-cancel-grandchild-parent");
       const childThreadId = ThreadId.make("thread:mcp-cancel-grandchild-child");
@@ -640,7 +644,9 @@ describe("OrchestratorMcpService", () => {
             Effect.succeed(
               threadId === grandchildThreadId
                 ? liveThreadShell(threadId)
-                : liveThreadShell(threadId, { runtimeMode: "approval-required" }),
+                : threadId === childThreadId && child.deleted
+                  ? null
+                  : liveThreadShell(threadId, { runtimeMode: "approval-required" }),
             ),
           dispatch: (command) =>
             Ref.update(dispatched, (commands) => [...commands, command]).pipe(
@@ -669,15 +675,36 @@ describe("OrchestratorMcpService", () => {
         issuedAt: 1,
       };
 
-      yield* Effect.gen(function* () {
+      return yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         const error = yield* service
           .cancelTask(scope, { taskId, clientRequestId: "cancel-grandchild-above-modes" })
           .pipe(Effect.flip);
-        assert.equal(error.code, "runtime_mode_escalation_denied");
-        assert.deepEqual(yield* Ref.get(dispatched), []);
-        assert.isFalse(yield* Ref.get(stoppedBelow));
+        return {
+          code: error.code,
+          dispatched: yield* Ref.get(dispatched),
+          stoppedBelow: yield* Ref.get(stoppedBelow),
+        };
       }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(layerDependencies))));
+    });
+
+  it.effect("refuses to cancel a task when a task under it now runs above the parent's modes", () =>
+    Effect.gen(function* () {
+      assert.deepEqual(yield* cancelOverRaisedGrandchild({ deleted: false }), {
+        code: "runtime_mode_escalation_denied",
+        dispatched: [],
+        stoppedBelow: false,
+      });
+    }),
+  );
+
+  it.effect("checks the tasks under a deleted child before cancelling it", () =>
+    Effect.gen(function* () {
+      assert.deepEqual(yield* cancelOverRaisedGrandchild({ deleted: true }), {
+        code: "runtime_mode_escalation_denied",
+        dispatched: [],
+        stoppedBelow: false,
+      });
     }),
   );
 });

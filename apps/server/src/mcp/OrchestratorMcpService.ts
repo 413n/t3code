@@ -1919,8 +1919,8 @@ const make = Effect.gen(function* () {
             const shell = yield* threadManagement
               .getThreadShell(threadId)
               .pipe(Effect.mapError(threadManagementFailure));
-            if (shell === null) return;
-            if (shell.deletedAt === null) {
+            // A deleted thread takes no stop, but the tasks under it still do.
+            if (shell !== null && shell.deletedAt === null) {
               yield* resolveRuntimeMode(parentProjection.thread.runtimeMode, shell.runtimeMode);
               yield* resolveInteractionMode(
                 parentProjection.thread.interactionMode,
