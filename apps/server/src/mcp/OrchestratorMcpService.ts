@@ -1911,18 +1911,32 @@ const make = Effect.gen(function* () {
         const current = yield* readTask(scope, input.taskId);
         const key = yield* requestKey(input.clientRequestId);
         const parentProjection = yield* loadProjection(scope.thread.threadId);
-        // Stopping the child is a write to its thread, which its user may have
-        // raised above the parent's modes since it was delegated.
-        const childShell = yield* threadManagement
-          .getThreadShell(current.childThreadId)
-          .pipe(Effect.mapError(threadManagementFailure));
-        if (childShell !== null && childShell.deletedAt === null) {
-          yield* resolveRuntimeMode(parentProjection.thread.runtimeMode, childShell.runtimeMode);
-          yield* resolveInteractionMode(
-            parentProjection.thread.interactionMode,
-            childShell.interactionMode,
-          );
-        }
+        // Cancelling stops the child and every task under it, each a write to a
+        // thread its user may have raised above the parent's modes since it was
+        // delegated. All of them are checked before anything is stopped.
+        const assertStoppable = (threadId: ThreadId): Effect.Effect<void, OrchestratorMcpFailure> =>
+          Effect.gen(function* () {
+            const shell = yield* threadManagement
+              .getThreadShell(threadId)
+              .pipe(Effect.mapError(threadManagementFailure));
+            if (shell === null) return;
+            if (shell.deletedAt === null) {
+              yield* resolveRuntimeMode(parentProjection.thread.runtimeMode, shell.runtimeMode);
+              yield* resolveInteractionMode(
+                parentProjection.thread.interactionMode,
+                shell.interactionMode,
+              );
+            }
+            const { subagents } = yield* threadManagement
+              .getThreadRecords(threadId, ["subagents"])
+              .pipe(Effect.mapError(threadManagementFailure));
+            for (const task of subagents) {
+              if (task.origin === "app_owned" && task.childThreadId !== null) {
+                yield* assertStoppable(task.childThreadId);
+              }
+            }
+          });
+        yield* assertStoppable(current.childThreadId);
         const parentTask = parentProjection.subagents.find(
           (task) => task.id === input.taskId && task.origin === "app_owned",
         );

@@ -571,6 +571,115 @@ describe("OrchestratorMcpService", () => {
       }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(layerDependencies))));
     }),
   );
+
+  it.effect("refuses to cancel a task when a task under it now runs above the parent's modes", () =>
+    Effect.gen(function* () {
+      const parentThreadId = ThreadId.make("thread:mcp-cancel-grandchild-parent");
+      const childThreadId = ThreadId.make("thread:mcp-cancel-grandchild-child");
+      const grandchildThreadId = ThreadId.make("thread:mcp-cancel-grandchild-grandchild");
+      const taskId = NodeId.make("node:mcp-cancel-grandchild-task");
+      const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const stoppedBelow = yield* Ref.make(false);
+      const appOwnedTask = (id: string, threadId: ThreadId, childId: ThreadId) => ({
+        id: NodeId.make(id),
+        threadId,
+        origin: "app_owned",
+        childThreadId: childId,
+        driver: "codex",
+        model: "gpt-5.6-terra",
+        result: null,
+        completionDelivery: { state: "pending" },
+      });
+      // A Supervised parent delegated a Supervised child, which delegated a task of its own.
+      const projections = new Map([
+        [
+          parentThreadId,
+          {
+            thread: {
+              id: parentThreadId,
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            },
+            runs: [],
+            contextTransfers: [],
+            subagents: [appOwnedTask(taskId, parentThreadId, childThreadId)],
+          },
+        ],
+        [
+          childThreadId,
+          {
+            thread: { id: childThreadId },
+            runs: [{ id: RunId.make("run:mcp-cancel-grandchild-child"), status: "running" }],
+            contextTransfers: [],
+            messages: [],
+            subagents: [
+              appOwnedTask("node:mcp-cancel-grandchild-below", childThreadId, grandchildThreadId),
+            ],
+            providerThreads: [],
+          },
+        ],
+        [
+          grandchildThreadId,
+          {
+            thread: { id: grandchildThreadId },
+            runs: [],
+            contextTransfers: [],
+            messages: [],
+            subagents: [],
+            providerThreads: [],
+          },
+        ],
+      ]) as unknown as ReadonlyMap<ThreadId, OrchestrationV2ThreadProjection>;
+      const layerDependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: (threadId) => Effect.succeed(projections.get(threadId)!),
+          // The child still runs Supervised; its user has since raised the task under it
+          // to full access.
+          getThreadShell: (threadId) =>
+            Effect.succeed(
+              threadId === grandchildThreadId
+                ? liveThreadShell(threadId)
+                : liveThreadShell(threadId, { runtimeMode: "approval-required" }),
+            ),
+          dispatch: (command) =>
+            Ref.update(dispatched, (commands) => [...commands, command]).pipe(
+              Effect.as({} as never),
+            ),
+          stopDelegatedTasks: () => Ref.set(stoppedBelow, true),
+        }),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      const scope: McpInvocationScope = {
+        environmentId: EnvironmentId.make("environment:mcp-cancel-grandchild"),
+        requestNamespace: "provider-session:mcp-cancel-grandchild",
+        thread: {
+          threadId: parentThreadId,
+          providerSessionId: "provider-session:mcp-cancel-grandchild",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const error = yield* service
+          .cancelTask(scope, { taskId, clientRequestId: "cancel-grandchild-above-modes" })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+        assert.deepEqual(yield* Ref.get(dispatched), []);
+        assert.isFalse(yield* Ref.get(stoppedBelow));
+      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(layerDependencies))));
+    }),
+  );
 });
 
 describe("OrchestratorMcpService provider resolution", () => {
