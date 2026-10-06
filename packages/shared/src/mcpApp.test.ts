@@ -84,3 +84,18 @@ describe("tool metadata", () => {
     expect(mcpAppToolCallableByApp({ ui: { visibility: ["model", "app"] } })).toBe(true);
   });
 });
+
+describe("mcpAppFromToolItem", () => {
+  it("reads the app from both the stored output and its compact wire form", async () => {
+    const { compactDynamicToolOutput, mcpAppFromToolItem } = await import("./toolOutput.ts");
+    const app = {
+      attachmentId: "thread-1-abc-html",
+      server: "weather",
+      tool: "get_weather",
+      resourceUri: "ui://weather/dashboard",
+    };
+    const stored = { t3McpApp: app, result: { content: [] } };
+    expect(mcpAppFromToolItem({ output: stored })).toEqual(app);
+    expect(mcpAppFromToolItem({ output: compactDynamicToolOutput(stored) })).toEqual(app);
+  });
+});

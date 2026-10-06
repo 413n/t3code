@@ -37,7 +37,7 @@ interface CompactToolOutput {
   scheduledTaskId?: string;
   status?: "rolled_back";
   htmlRender?: HtmlRenderReference;
-  mcpApp?: McpAppReference;
+  [MCP_APP_OUTPUT_KEY]?: McpAppReference;
   thread?: { threadId: string };
   threads?: Array<{ threadId?: string; status?: "rolled_back" }>;
 }
@@ -124,7 +124,8 @@ export function compactDynamicToolOutput(value: unknown): CompactToolOutput | un
     const htmlRender = readHtmlRenderReference(data.htmlRender);
     if (htmlRender !== undefined) output.htmlRender = htmlRender;
     const mcpApp = readMcpAppReference(data[MCP_APP_OUTPUT_KEY]);
-    if (mcpApp !== undefined) output.mcpApp = mcpApp;
+    // Kept under its stored key, so the compact wire output reads back the same way.
+    if (mcpApp !== undefined) output[MCP_APP_OUTPUT_KEY] = mcpApp;
     const nestedThreadId = Predicate.isObject(data.thread)
       ? boundedId(data.thread.threadId)
       : undefined;
@@ -186,7 +187,7 @@ export function htmlRenderFromToolItem(item: {
 export function mcpAppFromToolItem(item: {
   readonly output?: unknown;
 }): McpAppReference | undefined {
-  return compactDynamicToolOutput(item.output)?.mcpApp;
+  return compactDynamicToolOutput(item.output)?.[MCP_APP_OUTPUT_KEY];
 }
 
 /** Some providers report completion even when command output describes a failure. */

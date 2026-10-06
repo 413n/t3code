@@ -100,6 +100,55 @@ describe("makeMcpAppHost", () => {
     ]);
   });
 
+  it("drops null fields providers report, which the MCP Apps SDK rejects", async () => {
+    const { host, sent } = setup({
+      callTool: async () => ({ content: [], structuredContent: null, _meta: null }),
+    });
+    host.receive({ jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    host.receive({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    host.setToolCall({
+      arguments: {},
+      result: {
+        content: [{ type: "text", text: "t" }],
+        structuredContent: { time: "t" },
+        _meta: null,
+      },
+    });
+    host.receive({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "get-time" } });
+    await flush();
+    expect(sent.find((m) => m.method === "ui/notifications/tool-result")?.params).toEqual({
+      content: [{ type: "text", text: "t" }],
+      structuredContent: { time: "t" },
+    });
+    expect(sent.find((m) => m.id === 2)?.result).toEqual({ content: [] });
+  });
+
+  it("accepts ui/message as one text block or the SDK's block array", async () => {
+    const messages: Array<string> = [];
+    const { host, sent } = setup({ sendMessage: async (text) => void messages.push(text) });
+    host.receive({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/message",
+      params: { role: "user", content: { type: "text", text: "one" } },
+    });
+    host.receive({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "ui/message",
+      params: { role: "user", content: [{ type: "text", text: "two" }] },
+    });
+    host.receive({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "ui/message",
+      params: { role: "user", content: [{ type: "image", data: "x" }] },
+    });
+    await flush();
+    expect(messages).toEqual(["one", "two"]);
+    expect(sent.find((m) => m.id === 3)?.error).toMatchObject({ code: -32602 });
+  });
+
   it("sends only changed context fields, and nothing before initialization", () => {
     const { host, sent, setTheme } = setup();
     setTheme("light");

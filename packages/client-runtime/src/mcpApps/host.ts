@@ -81,6 +81,22 @@ function isId(value: unknown): value is JsonRpcId {
   return typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
 }
 
+/**
+ * A `CallToolResult` as the spec's schema accepts it. Providers can report
+ * absent fields as null (Codex sends `_meta: null`), which the MCP Apps SDK
+ * rejects, dropping the whole notification or response.
+ */
+export function normalizeMcpAppToolResult(result: McpAppCallToolResult): McpAppCallToolResult {
+  return {
+    content: Array.isArray(result.content) ? result.content : [],
+    ...(Predicate.isObject(result.structuredContent)
+      ? { structuredContent: result.structuredContent }
+      : {}),
+    ...(result.isError === true ? { isError: true } : {}),
+    ...(Predicate.isObject(result._meta) ? { _meta: result._meta } : {}),
+  };
+}
+
 const errorMessage = (error: unknown) =>
   error instanceof McpAppHostRefusal
     ? error.message
@@ -112,7 +128,9 @@ export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
     notify("ui/notifications/tool-input", {
       arguments: Predicate.isObject(toolCall.arguments) ? toolCall.arguments : {},
     });
-    if (toolCall.result !== undefined) notify("ui/notifications/tool-result", toolCall.result);
+    if (toolCall.result !== undefined) {
+      notify("ui/notifications/tool-result", normalizeMcpAppToolResult(toolCall.result));
+    }
   };
 
   const answer = (id: JsonRpcId, run: () => Promise<unknown>) => {
@@ -169,7 +187,11 @@ export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
           fail(id, -32602, "tools/call needs a tool name and object arguments.");
           return;
         }
-        answer(id, () => options.callTool({ name, arguments: args as Record<string, unknown> }));
+        answer(id, () =>
+          options
+            .callTool({ name, arguments: args as Record<string, unknown> })
+            .then(normalizeMcpAppToolResult),
+        );
         return;
       }
       case "resources/read": {
@@ -191,16 +213,18 @@ export function makeMcpAppHost(options: McpAppHostOptions): McpAppHost {
         return;
       }
       case "ui/message": {
-        const content = Predicate.isObject(params.content) ? params.content : undefined;
-        if (
-          params.role !== "user" ||
-          content?.type !== "text" ||
-          typeof content.text !== "string"
-        ) {
+        // The SDK sends an array of content blocks; the spec text shows one block.
+        const blocks = Array.isArray(params.content) ? params.content : [params.content];
+        const texts = blocks.map((block) =>
+          Predicate.isObject(block) && block.type === "text" && typeof block.text === "string"
+            ? block.text
+            : undefined,
+        );
+        if (params.role !== "user" || texts.length === 0 || texts.includes(undefined)) {
           fail(id, -32602, "Only text messages from the user role are supported.");
           return;
         }
-        const text = content.text;
+        const text = texts.join("\n").trim();
         answer(id, () => options.sendMessage(text).then(() => ({})));
         return;
       }
