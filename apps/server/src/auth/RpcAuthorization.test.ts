@@ -15,8 +15,8 @@ import {
   RPC_REQUIRED_SCOPES,
   requiredScopeForRpcMethod,
   requiredScopeForDeviceList,
-  rpcScopeAuthorizationLayer,
 } from "./RpcAuthorization.ts";
+import * as RpcAuthorization from "./RpcAuthorization.ts";
 import { rpcInstrumentationLayer } from "../observability/RpcInstrumentation.ts";
 
 describe("RPC authorization scopes", () => {
@@ -151,7 +151,7 @@ describe("RPC scope middleware", () => {
             group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () =>
               Effect.sync(() => handled.push("retry")).pipe(Effect.andThen(Effect.never)),
             ),
-            rpcScopeAuthorizationLayer([AuthOrchestrationReadScope]),
+            RpcAuthorization.layer([AuthOrchestrationReadScope]),
             rpcInstrumentationLayer,
           ),
         ),

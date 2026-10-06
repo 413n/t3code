@@ -21,7 +21,8 @@ import * as Tracer from "effect/Tracer";
 import * as RpcTest from "effect/rpc/RpcTest";
 import * as TestClock from "effect/testing/TestClock";
 
-import { RPC_REQUIRED_SCOPES, rpcScopeAuthorizationLayer } from "../auth/RpcAuthorization.ts";
+import { RPC_REQUIRED_SCOPES } from "../auth/RpcAuthorization.ts";
+import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
 import { rpcInstrumentationLayer } from "./RpcInstrumentation.ts";
 
 type WsRpcMethod = keyof typeof RPC_REQUIRED_SCOPES;
@@ -37,7 +38,7 @@ const groupOf = <const Tags extends ReadonlyArray<WsRpcMethod>>(...tags: Tags) =
 
 /** The middleware ws.ts installs for a connection with `scopes`. */
 const connectionMiddleware = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
-  Layer.merge(rpcScopeAuthorizationLayer(scopes), rpcInstrumentationLayer);
+  Layer.merge(RpcAuthorization.layer(scopes), rpcInstrumentationLayer);
 const readOnlyConnection = connectionMiddleware([AuthOrchestrationReadScope]);
 const taskId = ScheduledTaskId.make("scheduled-task:instrumented");
 const rpcSpanDefaults = { "rpc.transport": "websocket", "rpc.system": "effect-rpc" };
