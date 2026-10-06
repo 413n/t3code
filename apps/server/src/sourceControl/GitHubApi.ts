@@ -145,6 +145,7 @@ export interface GitHubGraphQlInput {
   readonly query: string;
   readonly variables?: Readonly<Record<string, unknown>>;
   readonly allowReserve?: boolean;
+  readonly maxResponseBytes?: number;
 }
 
 export class GitHubApi extends Context.Service<
@@ -488,7 +489,7 @@ export const make = Effect.gen(function* () {
             HttpClientRequest.acceptJson,
             HttpClientRequest.bodyJsonUnsafe({ query, variables: input.variables ?? {} }),
           ),
-          maxResponseBytes: DEFAULT_MAX_RESPONSE_BYTES,
+          maxResponseBytes: input.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
           allowReserve,
           acceptNotModified: false,
           graphql: true,
