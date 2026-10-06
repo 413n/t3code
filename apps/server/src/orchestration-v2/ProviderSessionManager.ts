@@ -1710,10 +1710,15 @@ export const layerWithOptions = (
               // a session keeps the environment (API key, base URL) of the
               // adapter that opened it. Replace a session from an older adapter
               // so the next turn uses the current settings, unless a turn or
-              // background work is still running in it.
+              // background work is still running in it. A session shared with
+              // other threads is kept: one of them may have opened it and not
+              // started its turn yet, and closing it would fail that turn.
+              // Effects for one thread run one at a time, so the opener's own
+              // earlier open has already finished.
               const outdated =
                 live !== undefined &&
                 live.busyCount === 0 &&
+                [...live.attachedThreadIds].every((threadId) => threadId === input.threadId) &&
                 (yield* registry.get(live.runtime.instanceId).pipe(
                   Effect.map((current) => current !== live.adapter),
                   Effect.orElseSucceed(() => false),
@@ -1722,8 +1727,8 @@ export const layerWithOptions = (
                   Effect.catchCause(() => Effect.succeed(false)),
                 ));
               if (outdated) {
-                // Another thread sharing the session can start a turn while the
-                // checks above yield; the generation guard keeps it then.
+                // A turn can still start while the checks above yield; the
+                // generation guard keeps the session then.
                 yield* releaseEntry({
                   providerSessionId: input.providerSessionId,
                   reason: "manual_shutdown",

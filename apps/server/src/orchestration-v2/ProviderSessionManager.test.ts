@@ -1086,6 +1086,56 @@ it.effect(
     }),
 );
 
+it.effect(
+  "ProviderSessionManagerV2 keeps a session shared with another thread after a rebuild",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      let adapter = makeProviderAdapter(state);
+      const layerRegistry = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+          get: () => Effect.sync(() => adapter),
+          list: () => Effect.succeed([modelSelection.instanceId]),
+        }),
+      );
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const firstThreadId = ThreadId.make("thread-provider-session-manager-shared-rebuild-a");
+        const secondThreadId = ThreadId.make("thread-provider-session-manager-shared-rebuild-b");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId: firstThreadId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: firstThreadId, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: secondThreadId, now }),
+          ],
+        });
+        const open = (threadId: ThreadId) =>
+          manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const first = yield* open(firstThreadId);
+        assert.strictEqual(yield* open(secondThreadId), first);
+
+        // The other thread may hold this runtime between its open and its turn
+        // start, so a rebuild must not close it from either side.
+        adapter = makeProviderAdapter(state);
+        assert.strictEqual(yield* open(secondThreadId), first);
+        assert.strictEqual(yield* open(firstThreadId), first);
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, layerRegistry })),
+      );
+    }),
+);
+
 it.effect("ProviderSessionManagerV2 keeps a session with background work after a rebuild", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
