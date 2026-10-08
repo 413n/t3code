@@ -502,3 +502,90 @@ describe("Pi skill references", () => {
     }
   });
 });
+
+describe("Pi shared MCP servers", () => {
+  // Modern Pi discovers shared tools on demand, like t3-code's optional ones.
+  it.each([false, true])(
+    "registers each shared server's tools under its name, with its own headers (modern Pi: %s)",
+    async (modern) => {
+      type Request = { id?: number; method: string; params?: unknown };
+      const requests: Array<{ url: string; headers: Record<string, string>; body: Request }> = [];
+      const fetch = async (
+        url: string,
+        init: { headers: Record<string, string>; body: string },
+      ) => {
+        const body = JSON.parse(init.body) as Request;
+        requests.push({ url, headers: init.headers, body });
+        if (body.id === undefined) return new Response(null, { status: 202 });
+        const tool = url.includes("3050") ? "search" : "t3_thread_read";
+        const result =
+          body.method === "tools/list"
+            ? { tools: [{ name: tool, inputSchema: { type: "object" } }] }
+            : body.method === "tools/call"
+              ? { content: [{ type: "text", text: `${tool} ran` }] }
+              : {};
+        return Response.json({ jsonrpc: "2.0", id: body.id, result });
+      };
+      type Tool = {
+        exposure?: string;
+        execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }>;
+      };
+      const tools = new Map<string, Tool>();
+      const source = NodeModule.stripTypeScriptTypes(
+        PI_T3_MCP_EXTENSION_SOURCE.replace(/^import .*;$/gm, "").replace(
+          "export default async function",
+          "async function",
+        ),
+      );
+      await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
+        fetch,
+        AbortSignal,
+        Type: { Unsafe: (schema: unknown) => schema },
+        process: {
+          env: {
+            T3_MCP_URL: "http://127.0.0.1:43123/mcp",
+            T3_MCP_BEARER_TOKEN: "secret-pi-token",
+            T3_MCP_SHARED_SERVERS: JSON.stringify([
+              {
+                name: "gateway",
+                url: "http://127.0.0.1:3050/mcp",
+                headers: { Authorization: "Bearer gateway-token", "Content-Type": "text/plain" },
+              },
+            ]),
+          },
+        },
+        pi: {
+          on: () => undefined,
+          registerTool: (tool: Tool & { name: string }) => tools.set(tool.name, tool),
+          ...(modern
+            ? {
+                registerMcpServer: () => undefined,
+                getAllTools: () => [
+                  { name: "tool_search", sourceInfo: { path: "builtin:tool-search" } },
+                ],
+              }
+            : {}),
+        },
+      });
+      assert.deepEqual([...tools.keys()].toSorted(), [
+        "mcp__gateway__search",
+        "mcp__t3-code__t3_thread_read",
+        ...(modern ? ["mcp__t3_code__t3_thread_read"] : []),
+      ]);
+      assert.equal(tools.get("mcp__gateway__search")?.exposure, modern ? "deferred" : undefined);
+
+      const result = await tools.get("mcp__gateway__search")!.execute("call-1", { q: "x" });
+      assert.equal(result.content[0]?.text, "search ran");
+      const call = requests.find((request) => request.body.method === "tools/call");
+      assert.equal(call?.url, "http://127.0.0.1:3050/mcp");
+      assert.deepEqual(call?.body.params, { name: "search", arguments: { q: "x" } });
+      // The gateway gets its own header, never T3's credential, and a user
+      // header can't sit beside the protocol's own under another casing.
+      for (const request of requests.filter((entry) => entry.url.includes("3050"))) {
+        assert.equal(request.headers.authorization, "Bearer gateway-token");
+        assert.equal(request.headers["content-type"], "application/json");
+        assert.isUndefined(request.headers["Content-Type"]);
+      }
+    },
+  );
+});
